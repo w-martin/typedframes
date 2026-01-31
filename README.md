@@ -123,8 +123,10 @@ print(df.missing)        # Error: Column 'missing' does not exist in UserFrame
 
 ```bash
 cd rust_pandas_linter
+# For CLI use
 cargo build --release
-cargo test
+# For Python extension use
+maturin develop
 ```
 
 ### Python Plugin

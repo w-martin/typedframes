@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mypy.plugin import MethodContext, Plugin
+from mypy.types import Type
 
 if TYPE_CHECKING:
     from mypy.types import Type
@@ -33,11 +34,12 @@ def is_enabled(project_root: Path) -> bool:
     try:
         with open(config_path, "rb") as f:
             config = tomllib.load(f)
-            return (
+            enabled = (
                 config.get("tool", {})
                 .get("pandas_column_linter", {})
                 .get("enabled", True)
             )
+            return bool(enabled)
     except Exception:  # noqa: BLE001
         return True
 
@@ -64,53 +66,68 @@ class PandasLinterPlugin(Plugin):
             return []
 
         try:
-            # Try to find the binary in the package's bin directory first
-            # (when installed as a package)
-            current_dir = Path(__file__).parent
-            binary_path = (
-                current_dir / "pandas_column_linter" / "bin" / "rust_pandas_linter"
-            )
-            if os.name == "nt":
-                binary_path = binary_path.with_suffix(".exe")
+            import pandas_column_linter
 
-            # Fallback to local development paths
-            if not binary_path.exists():
-                binary_path = (
-                    current_dir
-                    / "rust_pandas_linter"
-                    / "target"
-                    / "release"
-                    / "rust_pandas_linter"
-                )
+            # Use getattr to avoid mypy errors with the dynamic extension module
+            # since it might not be present during static analysis.
+            extension = getattr(pandas_column_linter, "rust_pandas_linter", None)
+            if extension is None:
+                raise ImportError("rust_pandas_linter not found")
+
+            result_json = str(extension.check_file(file_path))
+            errors_from_extension: list[dict[str, Any]] = json.loads(result_json)
+            self._linter_results[file_path] = errors_from_extension
+        except Exception:  # noqa: BLE001
+            # Fallback to local development paths if installed as editable or binary not
+            # in site-packages
+            try:
+                # Try to find the binary in the package's bin directory first
+                # (when installed as a package)
+                current_dir = Path(__file__).parent
+                binary_path = current_dir / "bin" / "rust_pandas_linter"
                 if os.name == "nt":
                     binary_path = binary_path.with_suffix(".exe")
 
-            if not binary_path.exists():
-                binary_path = (
-                    current_dir
-                    / "rust_pandas_linter"
-                    / "target"
-                    / "debug"
-                    / "rust_pandas_linter"
+                # Fallback to local development paths
+                if not binary_path.exists():
+                    binary_path = (
+                        current_dir.parent
+                        / "rust_pandas_linter"
+                        / "target"
+                        / "release"
+                        / "rust_pandas_linter"
+                    )
+                    if os.name == "nt":
+                        binary_path = binary_path.with_suffix(".exe")
+
+                if not binary_path.exists():
+                    binary_path = (
+                        current_dir.parent
+                        / "rust_pandas_linter"
+                        / "target"
+                        / "debug"
+                        / "rust_pandas_linter"
+                    )
+                    if os.name == "nt":
+                        binary_path = binary_path.with_suffix(".exe")
+
+                if not binary_path.exists():
+                    return []
+
+                result = subprocess.run(
+                    [str(binary_path), file_path],
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
-                if os.name == "nt":
-                    binary_path = binary_path.with_suffix(".exe")
-
-            if not binary_path.exists():
-                return []
-
-            result = subprocess.run(
-                [str(binary_path), file_path],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0:
-                errors: list[dict[str, Any]] = json.loads(result.stdout)
-                self._linter_results[file_path] = errors
-                return errors
-        except Exception:  # noqa: BLE001, S110
-            pass
+                if result.returncode == 0:
+                    errors: list[dict[str, Any]] = json.loads(result.stdout)
+                    self._linter_results[file_path] = errors
+                    return errors
+            except Exception:  # noqa: BLE001, S110
+                pass
+        else:
+            return errors_from_extension
         return []
 
     def get_method_hook(

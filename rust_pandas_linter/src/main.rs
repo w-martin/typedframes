@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     let source =
         fs::read_to_string(path).with_context(|| format!("Failed to read file: {:?}", path))?;
     let mut linter = Linter::new();
-    let errors = linter.check_file(&source, path)?;
+    let errors = linter.check_file_internal(&source, path)?;
 
     println!("{}", serde_json::to_string(&errors)?);
 

@@ -1,11 +1,11 @@
 ```shell
-uv run ruff check .
+uv tool run ruff check .
 ```
 
 ```shell
-uv run pytest
+uv tool run ty check .
 ```
 
 ```shell
-uv run mypy .
+uv run pytest tests/
 ```

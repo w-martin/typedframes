@@ -1,3 +1,4 @@
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -23,23 +24,19 @@ class TestPandasLinterIntegration(unittest.TestCase):
         )
 
         # assert
-        assert "Column 'name' does not exist in UserSchema" in result.stdout
+        self.assertIn("Column 'name' does not exist in UserSchema", result.stdout)
 
     def test_should_run_mypy_with_plugin(self) -> None:
         # arrange
         example_file = "examples/typeddict_example.py"
-        binary_path = Path("rust_pandas_linter/target/debug/rust_pandas_linter")
-        if not binary_path.exists():
-            subprocess.run(["cargo", "build"], cwd="rust_pandas_linter", check=True)
-
         # act
+        # Ensure the plugin can find the binary for development
+        env = os.environ.copy()
+        env["PYTHONPATH"] = "."
         result = subprocess.run(
-            ["mypy", example_file],
-            capture_output=True,
-            text=True,
-            check=False,
+            ["mypy", example_file], capture_output=True, text=True, check=False, env=env
         )
 
         # assert
-        assert "Column 'name' does not exist in UserSchema" in result.stdout
-        assert result.returncode == 1
+        self.assertIn("Column 'name' does not exist in UserSchema", result.stdout)
+        self.assertEqual(result.returncode, 1)

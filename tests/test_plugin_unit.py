@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from mypy.options import Options
 
-from pandas_linter_mypy import PandasLinterPlugin
+from pandas_column_linter.mypy import PandasLinterPlugin
 
 
 class TestPandasLinterPluginUnit(unittest.TestCase):
@@ -18,8 +18,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
     def test_should_report_error_on_exact_line_match(self) -> None:
         # arrange
         with (
-            patch("pandas_linter_mypy.get_project_root") as mock_root,
-            patch("pandas_linter_mypy.is_enabled") as mock_enabled,
+            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
+            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
             patch("subprocess.run") as mock_run,
             patch("os.path.exists") as mock_exists,
         ):
@@ -48,8 +48,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         # Test non-match branch
         new_plugin = PandasLinterPlugin(Options())  # New plugin to avoid cache
         with (
-            patch("pandas_linter_mypy.get_project_root") as mock_root,
-            patch("pandas_linter_mypy.is_enabled") as mock_enabled,
+            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
+            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
             patch("subprocess.run") as mock_run,
             patch("os.path.exists") as mock_exists,
         ):
@@ -76,8 +76,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
     def test_should_report_error_on_fuzzy_line_match(self) -> None:
         # arrange
         with (
-            patch("pandas_linter_mypy.get_project_root") as mock_root,
-            patch("pandas_linter_mypy.is_enabled") as mock_enabled,
+            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
+            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
             patch("subprocess.run") as mock_run,
             patch("os.path.exists") as mock_exists,
         ):
@@ -117,7 +117,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
     def test_should_not_run_when_disabled(self) -> None:
         # arrange
-        with patch("pandas_linter_mypy.is_enabled") as mock_enabled:
+        with patch("pandas_column_linter.mypy.is_enabled") as mock_enabled:
             mock_enabled.return_value = False
 
             # act
@@ -182,7 +182,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
     def test_plugin_function(self) -> None:
         # arrange/act/assert
-        from pandas_linter_mypy import plugin
+        from pandas_column_linter.mypy import plugin
 
         assert plugin("1.0") == PandasLinterPlugin
 
@@ -192,8 +192,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         with (
             patch("os.path.exists") as mock_exists,
             patch("subprocess.run") as mock_run,
-            patch("pandas_linter_mypy.get_project_root") as mock_root,
-            patch("pandas_linter_mypy.is_enabled") as mock_enabled,
+            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
+            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
         ):
             mock_exists.return_value = True
             mock_root.return_value = Path()
@@ -213,7 +213,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 class TestUtilsUnit(unittest.TestCase):
     def test_get_project_root(self) -> None:
         # arrange
-        from pandas_linter_mypy import get_project_root
+        from pandas_column_linter.mypy import get_project_root
 
         with (
             patch("pathlib.Path.exists") as mock_exists,
@@ -248,7 +248,7 @@ class TestUtilsUnit(unittest.TestCase):
         # arrange
         import io
 
-        from pandas_linter_mypy import is_enabled
+        from pandas_column_linter.mypy import is_enabled
 
         # Test missing config
         with patch("pathlib.Path.exists") as mock_exists:

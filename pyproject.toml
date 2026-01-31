@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "pandas-column-linter"
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A high-performance linter for pandas DataFrame column schemas"
 readme = "README.md"
 authors = [
-    { name = "Will", email = "will@example.com" }
+    { name = "William Martin" }
 ]
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -16,33 +16,21 @@ dependencies = [
     "mypy",
 ]
 
-[tool.setuptools]
-py-modules = ["pandas_linter_mypy"]
-packages = ["pandas_column_linter"]
-
-[[tool.setuptools-rust.ext-modules]]
-target = "pandas_column_linter.bin.rust_pandas_linter"
-path = "rust_pandas_linter/Cargo.toml"
-binding = "none"
-
-[tool.setuptools.package-data]
-pandas_column_linter = ["bin/*"]
-
-[tool.uv]
-dev-dependencies = [
-    "pytest",
-    "pytest-cov",
-    "ruff",
-]
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "rust_pandas_linter/Cargo.toml"
+python-source = "."
+module-name = "pandas_column_linter.rust_pandas_linter"
 
 [tool.pandas_column_linter]
 enabled = true
 
 [tool.mypy]
 strict = true
+exclude = ["examples/"]
 plugins = [
   "pandera.mypy",
-  "./pandas_linter_mypy.py"
+  "pandas_column_linter.mypy"
 ]
 
 [tool.pytest.ini_options]
@@ -61,6 +49,11 @@ line-length = 88
 target-version = "py311"
 fix = true
 
+[tool.ruff.format]
+# Ensure the formatter respects the limit
+quote-style = "double"
+indent-style = "space"
+
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
@@ -72,6 +65,13 @@ ignore = [
     "C901", # Too complex
     "COM812", # Formatter conflict
     "PTH123", # open() should be replaced by Path.open()
+    "PT009",
+    "PLC0415",
+    "PLR0911", # Too many return statements
+    "PLR0912", # Too many branches
+    "TRY301",  # Abstract raise to an inner function
+    "TRY003",  # Avoid specifying long messages outside the exception class
+    "EM101",   # Exception must not use a string literal
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -81,3 +81,10 @@ ignore = [
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.13",
+]

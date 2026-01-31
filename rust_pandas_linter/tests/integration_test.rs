@@ -23,7 +23,7 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty(), "Should have detected errors");
@@ -53,7 +53,7 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty());
@@ -83,7 +83,7 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty());
@@ -120,7 +120,7 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty(), "Should have detected errors");
@@ -172,7 +172,7 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty());
@@ -220,12 +220,16 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty(), "Should have detected errors");
-    assert!(errors.iter().any(|e| e.message.contains("Column 'missing' does not exist in UserSchema_OrderSchema")));
-    assert!(errors.iter().any(|e| e.message.contains("Column 'typo' does not exist in UserSchema_OrderSchema")));
+    assert!(errors.iter().any(|e| e
+        .message
+        .contains("Column 'missing' does not exist in UserSchema_OrderSchema")));
+    assert!(errors.iter().any(|e| e
+        .message
+        .contains("Column 'typo' does not exist in UserSchema_OrderSchema")));
 }
 
 #[test]
@@ -248,7 +252,7 @@ def main():
     fs::write(&file_path, source).unwrap();
 
     // act
-    let errors = linter.check_file(source, &file_path).unwrap();
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
     assert!(!errors.is_empty());

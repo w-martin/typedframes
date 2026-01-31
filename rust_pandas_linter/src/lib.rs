@@ -1,10 +1,37 @@
-use anyhow::Result;
+use pyo3::prelude::*;
 use rustpython_ast::{self as ast, Expr, Stmt};
 use rustpython_parser::{parse, source_code::LineIndex, Mode};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[pyfunction]
+fn check_file(file_path: String) -> PyResult<String> {
+    let path = Path::new(&file_path);
+    let project_root = find_project_root(path);
+
+    if !is_enabled(&project_root) {
+        return Ok("[]".to_string());
+    }
+
+    let source = fs::read_to_string(path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
+
+    let mut linter = Linter::new();
+    let errors = linter
+        .check_file_internal(&source, path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    serde_json::to_string(&errors)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+}
+
+#[pymodule]
+fn rust_pandas_linter(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(check_file, m)?)?;
+    Ok(())
+}
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -122,7 +149,11 @@ impl Linter {
         }
     }
 
-    pub fn check_file(&mut self, source: &str, path: &Path) -> Result<Vec<LintError>> {
+    pub fn check_file_internal(
+        &mut self,
+        source: &str,
+        path: &Path,
+    ) -> Result<Vec<LintError>, anyhow::Error> {
         self.source = source.to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
         let parsed = parse(source, Mode::Module, &path.to_string_lossy())?;
@@ -305,10 +336,11 @@ impl Linter {
                 }
             }
             Stmt::Assign(assign) => {
-                let source_location = self.line_index.as_ref().unwrap().source_location(
-                    assign.range.start(),
-                    &self.source,
-                );
+                let source_location = self
+                    .line_index
+                    .as_ref()
+                    .unwrap()
+                    .source_location(assign.range.start(), &self.source);
                 let current_line = source_location.row.get() as usize;
 
                 // Check for mutations: df["new_col"] = ...
@@ -407,9 +439,11 @@ impl Linter {
                                                 Some((schemas[0].clone(), schemas[1].clone()));
                                         }
                                     }
-                                } else if let Some(keyword) = call.keywords.iter().find(|k| {
-                                    k.arg.as_ref().map(|s| s.as_str()) == Some("objs")
-                                }) {
+                                } else if let Some(keyword) = call
+                                    .keywords
+                                    .iter()
+                                    .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("objs"))
+                                {
                                     if let Expr::List(list) = &keyword.value {
                                         let mut schemas = Vec::new();
                                         for el in &list.elts {
@@ -476,8 +510,10 @@ impl Linter {
 
                     if is_load_users {
                         if let Expr::Name(target_name) = &assign.targets[0] {
-                            self.variables
-                                .insert(target_name.id.to_string(), ("UserSchema".to_string(), current_line));
+                            self.variables.insert(
+                                target_name.id.to_string(),
+                                ("UserSchema".to_string(), current_line),
+                            );
                         }
                     }
 
@@ -523,10 +559,11 @@ impl Linter {
                 }
             }
             Stmt::AnnAssign(ann_assign) => {
-                let source_location = self.line_index.as_ref().unwrap().source_location(
-                    ann_assign.range.start(),
-                    &self.source,
-                );
+                let source_location = self
+                    .line_index
+                    .as_ref()
+                    .unwrap()
+                    .source_location(ann_assign.range.start(), &self.source);
                 let current_line = source_location.row.get() as usize;
 
                 if let Some(value) = &ann_assign.value {
@@ -569,9 +606,23 @@ impl Linter {
                 // So no mutation tracking needed here for Subscript.
 
                 // Track schema if explicitly hinted: df: DataFrame[UserSchema] = load()
-                if let Expr::Subscript(subscript) = &*ann_assign.annotation {
-                    if let Expr::Name(name) = &*subscript.value {
-                        if name.id.as_str() == "DataFrame" {
+                match &*ann_assign.annotation {
+                    Expr::Subscript(subscript) => {
+                        let mut is_df = false;
+                        let mut name_to_use = None;
+                        if let Expr::Name(name) = &*subscript.value {
+                            name_to_use = Some(name.id.to_string());
+                            if name.id.as_str() == "DataFrame" {
+                                is_df = true;
+                            }
+                        } else if let Expr::Attribute(attr) = &*subscript.value {
+                            name_to_use = Some(attr.attr.to_string());
+                            if attr.attr.as_str() == "DataFrame" {
+                                is_df = true;
+                            }
+                        }
+
+                        if is_df {
                             if let Expr::Name(schema_name) = &*subscript.slice {
                                 if let Expr::Name(target_name) = &*ann_assign.target {
                                     self.variables.insert(
@@ -579,20 +630,72 @@ impl Linter {
                                         (schema_name.id.to_string(), current_line),
                                     );
                                 }
+                            } else if let Expr::Constant(c) = &*subscript.slice {
+                                // Support for quoted type hints: df: "DataFrame[UserSchema]"
+                                if let ast::Constant::Str(s) = &c.value {
+                                    if s.contains("DataFrame[") && s.contains(']') {
+                                        if let Some(start) = s.find('[') {
+                                            if let Some(end) = s.rfind(']') {
+                                                let schema_name = &s[start + 1..end];
+                                                if let Expr::Name(target_name) = &*ann_assign.target
+                                                {
+                                                    self.variables.insert(
+                                                        target_name.id.to_string(),
+                                                        (schema_name.to_string(), current_line),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    } else if let Expr::Attribute(attr) = &*subscript.value {
-                        if attr.attr.as_str() == "DataFrame" {
-                             if let Expr::Name(schema_name) = &*subscript.slice {
-                                if let Expr::Name(target_name) = &*ann_assign.target {
-                                    self.variables.insert(
-                                        target_name.id.to_string(),
-                                        (schema_name.id.to_string(), current_line),
-                                    );
+                        } else if let Some(n) = name_to_use {
+                            // Not "DataFrame", maybe it's "Annotated[DataFrame, UserSchema]" or just "UserSchema"
+                            if n == "Annotated" {
+                                // Handle Annotated[DataFrame, UserSchema]
+                                if let Expr::Tuple(tuple) = &*subscript.slice {
+                                    if tuple.elts.len() >= 2 {
+                                        let mut is_df_in_annotated = false;
+                                        if let Expr::Name(first) = &tuple.elts[0] {
+                                            if first.id.as_str() == "DataFrame" {
+                                                is_df_in_annotated = true;
+                                            }
+                                        }
+                                        if is_df_in_annotated {
+                                            if let Expr::Name(second) = &tuple.elts[1] {
+                                                if let Expr::Name(target_name) = &*ann_assign.target
+                                                {
+                                                    self.variables.insert(
+                                                        target_name.id.to_string(),
+                                                        (second.id.to_string(), current_line),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    Expr::Constant(c) => {
+                        // Handle quoted type hint directly on annotation: df: "DataFrame[UserSchema]"
+                        if let ast::Constant::Str(s) = &c.value {
+                            if s.contains("DataFrame[") && s.contains(']') {
+                                if let Some(start) = s.find('[') {
+                                    if let Some(end) = s.rfind(']') {
+                                        let schema_name = &s[start + 1..end];
+                                        if let Expr::Name(target_name) = &*ann_assign.target {
+                                            self.variables.insert(
+                                                target_name.id.to_string(),
+                                                (schema_name.to_string(), current_line),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
 
                 self.visit_expr(&ann_assign.target, errors);
@@ -611,7 +714,8 @@ impl Linter {
         match expr {
             Expr::Attribute(attr) => {
                 if let Expr::Name(name) = &*attr.value {
-                    if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str()) {
+                    if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str())
+                    {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             let attr_name = attr.attr.as_str();
                             // In pandas, some attributes are valid (e.g. .shape, .columns, .index)
@@ -659,7 +763,8 @@ impl Linter {
             }
             Expr::Subscript(subscript) => {
                 if let Expr::Name(name) = &*subscript.value {
-                    if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str()) {
+                    if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str())
+                    {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             if let Expr::Constant(c) = &*subscript.slice {
                                 if let ast::Constant::Str(col_name) = &c.value {

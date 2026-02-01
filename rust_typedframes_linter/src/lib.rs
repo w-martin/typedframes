@@ -28,7 +28,7 @@ fn check_file(file_path: String) -> PyResult<String> {
 }
 
 #[pymodule]
-fn rust_pandas_linter(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rust_linter(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_file, m)?)?;
     Ok(())
 }
@@ -40,7 +40,7 @@ struct Config {
 
 #[derive(serde::Deserialize)]
 struct ToolConfig {
-    pandas_column_linter: Option<LinterConfig>,
+    typedframes: Option<LinterConfig>,
 }
 
 #[derive(serde::Deserialize)]
@@ -66,7 +66,7 @@ pub fn is_enabled(project_root: &Path) -> bool {
 
     config
         .tool
-        .and_then(|t| t.pandas_column_linter)
+        .and_then(|t| t.typedframes)
         .and_then(|l| l.enabled)
         .unwrap_or(true)
 }
@@ -168,24 +168,20 @@ impl Linter {
         Ok(errors)
     }
 
+    /// Check if a base class name indicates a typedframes schema
+    fn is_schema_base(name: &str) -> bool {
+        matches!(
+            name,
+            "BaseSchema" | "DataFrameModel" | "DataFrame" | "BaseFrame"
+        )
+    }
+
     fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
                 let is_schema = class_def.bases.iter().any(|base| match base {
-                    Expr::Attribute(attr) => {
-                        let attr_name = attr.attr.as_str();
-                        attr_name == "DataFrameModel"
-                            || attr_name == "TypedDict"
-                            || attr_name == "DataFrame"
-                            || attr_name == "BaseFrame"
-                    }
-                    Expr::Name(name) => {
-                        let name_id = name.id.as_str();
-                        name_id == "DataFrameModel"
-                            || name_id == "TypedDict"
-                            || name_id == "DataFrame"
-                            || name_id == "BaseFrame"
-                    }
+                    Expr::Attribute(attr) => Self::is_schema_base(attr.attr.as_str()),
+                    Expr::Name(name) => Self::is_schema_base(name.id.as_str()),
                     _ => false,
                 });
 
@@ -218,7 +214,6 @@ impl Linter {
                                                         } else if let Expr::Name(n) = &keyword.value
                                                         {
                                                             if n.id.as_str() == "DefinedLater" {
-                                                                // Use attribute name if it's DefinedLater for now
                                                                 alias = Some(name.id.to_string());
                                                             }
                                                         }
@@ -229,7 +224,6 @@ impl Linter {
                                                 columns.push(col_name);
                                                 col_added = true;
                                             } else if f == "ColumnSet" || f == "ColumnGroup" {
-                                                // Add the attribute itself too
                                                 columns.push(name.id.to_string());
                                                 for keyword in &call.keywords {
                                                     if keyword.arg.as_ref().map(|s| s.as_str())
@@ -244,7 +238,6 @@ impl Linter {
                                                                         columns.push(s.clone());
                                                                     }
                                                                 } else if let Expr::Name(n) = el {
-                                                                    // For ColumnGroup, members might be other Columns
                                                                     columns.push(n.id.to_string());
                                                                 }
                                                             }
@@ -352,13 +345,11 @@ impl Linter {
                                     if let ast::Constant::Str(col_name) = &c.value {
                                         if let Some(columns) = self.schemas.get_mut(schema_name) {
                                             if !columns.contains(col_name) {
-                                                // Mutation: adding a column not in schema
                                                 errors.push(LintError {
                                                     line: current_line,
                                                     col: source_location.column.get() as usize,
                                                     message: format!("Column '{}' does not exist in {} (mutation tracking)", col_name, schema_name),
                                                 });
-                                                // For now, let's also add it to columns to avoid multiple errors if it's used later
                                                 columns.push(col_name.clone());
                                             }
                                         }
@@ -397,7 +388,6 @@ impl Linter {
                                     }
                                 }
                             } else if func_name == "concat" {
-                                // pd.concat style
                                 if !call.args.is_empty() {
                                     if let Expr::List(list) = &call.args[0] {
                                         let mut schemas = Vec::new();
@@ -414,6 +404,39 @@ impl Linter {
                                             is_merge_or_concat = true;
                                             merge_schema =
                                                 Some((schemas[0].clone(), schemas[1].clone()));
+                                        }
+                                    }
+                                }
+                            } else if func_name == "from_schema" || func_name == "from_pandas" || func_name == "from_polars" {
+                                // PandasFrame.from_schema(df, Schema) or Schema.from_pandas(df)
+                                if let Expr::Attribute(inner_attr) = &*attr.value {
+                                    // This is like PandasFrame.from_schema
+                                    let class_name = inner_attr.attr.as_str();
+                                    if class_name == "PandasFrame" || class_name == "PolarsFrame" {
+                                        // Find the schema argument
+                                        if call.args.len() >= 2 {
+                                            if let Expr::Name(schema_name) = &call.args[1] {
+                                                for target in &assign.targets {
+                                                    if let Expr::Name(target_name) = target {
+                                                        self.variables.insert(
+                                                            target_name.id.to_string(),
+                                                            (schema_name.id.to_string(), current_line),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if let Expr::Name(class_name) = &*attr.value {
+                                    // Schema.from_pandas(df) style
+                                    if self.schemas.contains_key(class_name.id.as_str()) {
+                                        for target in &assign.targets {
+                                            if let Expr::Name(target_name) = target {
+                                                self.variables.insert(
+                                                    target_name.id.to_string(),
+                                                    (class_name.id.to_string(), current_line),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -493,35 +516,11 @@ impl Linter {
                         }
                     }
 
-                    let mut is_load_users = false;
-                    match &*call.func {
-                        Expr::Name(name) => {
-                            if name.id.as_str() == "load_users" {
-                                is_load_users = true;
-                            }
-                        }
-                        Expr::Attribute(attr) => {
-                            if attr.attr.as_str() == "load_users" {
-                                is_load_users = true;
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    if is_load_users {
-                        if let Expr::Name(target_name) = &assign.targets[0] {
-                            self.variables.insert(
-                                target_name.id.to_string(),
-                                ("UserSchema".to_string(), current_line),
-                            );
-                        }
-                    }
-
-                    // Support for direct instantiation: df = DataFrame[Schema](...)
-                    // or pandandic style: df = Schema().read_csv(...)
+                    // Support for DataFrame[Schema](...) instantiation
                     if let Expr::Subscript(subscript) = &*call.func {
                         if let Expr::Name(name) = &*subscript.value {
-                            if name.id.as_str() == "DataFrame" {
+                            let type_name = name.id.as_str();
+                            if type_name == "DataFrame" || type_name == "PandasFrame" || type_name == "PolarsFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
@@ -535,9 +534,8 @@ impl Linter {
                             }
                         }
                     } else if let Expr::Attribute(attr) = &*call.func {
-                        // Handle Schema().read_csv(...)
+                        // Handle Schema().read_csv(...) style
                         let current_expr = &*attr.value;
-                        // Unroll potential chains or just look for the base call
                         if let Expr::Call(inner_call) = current_expr {
                             if let Expr::Name(schema_name) = &*inner_call.func {
                                 if self.schemas.contains_key(schema_name.id.as_str()) {
@@ -570,7 +568,8 @@ impl Linter {
                     if let Expr::Call(call) = &**value {
                         if let Expr::Subscript(subscript) = &*call.func {
                             if let Expr::Name(name) = &*subscript.value {
-                                if name.id.as_str() == "DataFrame" {
+                                let type_name = name.id.as_str();
+                                if type_name == "DataFrame" || type_name == "PandasFrame" || type_name == "PolarsFrame" {
                                     if let Expr::Name(schema_name) = &*subscript.slice {
                                         if let Expr::Name(target_name) = &*ann_assign.target {
                                             self.variables.insert(
@@ -582,7 +581,6 @@ impl Linter {
                                 }
                             }
                         } else if let Expr::Attribute(attr) = &*call.func {
-                            // Handle Schema().read_csv(...) in AnnAssign
                             let current_expr = &*attr.value;
                             if let Expr::Call(inner_call) = current_expr {
                                 if let Expr::Name(schema_name) = &*inner_call.func {
@@ -600,74 +598,48 @@ impl Linter {
                     }
                 }
 
-                // Track mutations in AnnAssign: df: DataFrame[Schema] = ...; df["new"] = ...
-                // Wait, AnnAssign is for the assignment itself.
-                // df["new"] = ... is always an Assign with a Subscript target in AST.
-                // So no mutation tracking needed here for Subscript.
-
-                // Track schema if explicitly hinted: df: DataFrame[UserSchema] = load()
+                // Track schema from type annotation
                 match &*ann_assign.annotation {
                     Expr::Subscript(subscript) => {
-                        let mut is_df = false;
-                        let mut name_to_use = None;
+                        let mut type_name = None;
                         if let Expr::Name(name) = &*subscript.value {
-                            name_to_use = Some(name.id.to_string());
-                            if name.id.as_str() == "DataFrame" {
-                                is_df = true;
-                            }
+                            type_name = Some(name.id.as_str());
                         } else if let Expr::Attribute(attr) = &*subscript.value {
-                            name_to_use = Some(attr.attr.to_string());
-                            if attr.attr.as_str() == "DataFrame" {
-                                is_df = true;
-                            }
+                            type_name = Some(attr.attr.as_str());
                         }
 
-                        if is_df {
-                            if let Expr::Name(schema_name) = &*subscript.slice {
-                                if let Expr::Name(target_name) = &*ann_assign.target {
-                                    self.variables.insert(
-                                        target_name.id.to_string(),
-                                        (schema_name.id.to_string(), current_line),
-                                    );
-                                }
-                            } else if let Expr::Constant(c) = &*subscript.slice {
-                                // Support for quoted type hints: df: "DataFrame[UserSchema]"
-                                if let ast::Constant::Str(s) = &c.value {
-                                    if s.contains("DataFrame[") && s.contains(']') {
-                                        if let Some(start) = s.find('[') {
-                                            if let Some(end) = s.rfind(']') {
-                                                let schema_name = &s[start + 1..end];
-                                                if let Expr::Name(target_name) = &*ann_assign.target
-                                                {
-                                                    self.variables.insert(
-                                                        target_name.id.to_string(),
-                                                        (schema_name.to_string(), current_line),
-                                                    );
-                                                }
-                                            }
-                                        }
+                        if let Some(name) = type_name {
+                            // DataFrame[Schema], PandasFrame[Schema], PolarsFrame[Schema]
+                            if name == "DataFrame" || name == "PandasFrame" || name == "PolarsFrame" {
+                                if let Expr::Name(schema_name) = &*subscript.slice {
+                                    if let Expr::Name(target_name) = &*ann_assign.target {
+                                        self.variables.insert(
+                                            target_name.id.to_string(),
+                                            (schema_name.id.to_string(), current_line),
+                                        );
                                     }
                                 }
-                            }
-                        } else if let Some(n) = name_to_use {
-                            // Not "DataFrame", maybe it's "Annotated[DataFrame, UserSchema]" or just "UserSchema"
-                            if n == "Annotated" {
-                                // Handle Annotated[DataFrame, UserSchema]
+                            } else if name == "Annotated" {
+                                // Annotated[DataFrame, Schema] or Annotated[pl.DataFrame, Schema]
                                 if let Expr::Tuple(tuple) = &*subscript.slice {
                                     if tuple.elts.len() >= 2 {
-                                        let mut is_df_in_annotated = false;
+                                        let mut is_dataframe = false;
                                         if let Expr::Name(first) = &tuple.elts[0] {
-                                            if first.id.as_str() == "DataFrame" {
-                                                is_df_in_annotated = true;
+                                            let first_name = first.id.as_str();
+                                            if first_name == "DataFrame" || first_name.contains("DataFrame") {
+                                                is_dataframe = true;
+                                            }
+                                        } else if let Expr::Attribute(first_attr) = &tuple.elts[0] {
+                                            if first_attr.attr.as_str() == "DataFrame" {
+                                                is_dataframe = true;
                                             }
                                         }
-                                        if is_df_in_annotated {
-                                            if let Expr::Name(second) = &tuple.elts[1] {
-                                                if let Expr::Name(target_name) = &*ann_assign.target
-                                                {
+                                        if is_dataframe {
+                                            if let Expr::Name(schema_name) = &tuple.elts[1] {
+                                                if let Expr::Name(target_name) = &*ann_assign.target {
                                                     self.variables.insert(
                                                         target_name.id.to_string(),
-                                                        (second.id.to_string(), current_line),
+                                                        (schema_name.id.to_string(), current_line),
                                                     );
                                                 }
                                             }
@@ -678,21 +650,9 @@ impl Linter {
                         }
                     }
                     Expr::Constant(c) => {
-                        // Handle quoted type hint directly on annotation: df: "DataFrame[UserSchema]"
+                        // Handle quoted type hints: df: "DataFrame[UserSchema]"
                         if let ast::Constant::Str(s) = &c.value {
-                            if s.contains("DataFrame[") && s.contains(']') {
-                                if let Some(start) = s.find('[') {
-                                    if let Some(end) = s.rfind(']') {
-                                        let schema_name = &s[start + 1..end];
-                                        if let Expr::Name(target_name) = &*ann_assign.target {
-                                            self.variables.insert(
-                                                target_name.id.to_string(),
-                                                (schema_name.to_string(), current_line),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            self.parse_quoted_type_hint(s, ann_assign, current_line);
                         }
                     }
                     _ => {}
@@ -710,6 +670,51 @@ impl Linter {
         }
     }
 
+    fn parse_quoted_type_hint(&mut self, s: &str, ann_assign: &ast::StmtAnnAssign, current_line: usize) {
+        // Handle patterns like "DataFrame[Schema]", "PandasFrame[Schema]", "PolarsFrame[Schema]"
+        // and "Annotated[DataFrame, Schema]", "Annotated[pl.DataFrame, Schema]"
+
+        let patterns = ["DataFrame[", "PandasFrame[", "PolarsFrame["];
+        for pattern in patterns {
+            if s.contains(pattern) {
+                if let Some(start) = s.find('[') {
+                    if let Some(end) = s.rfind(']') {
+                        let schema_name = &s[start + 1..end];
+                        // Handle nested generics by taking the last part
+                        let schema = schema_name.split(',').last().unwrap_or(schema_name).trim();
+                        if let Expr::Name(target_name) = &*ann_assign.target {
+                            self.variables.insert(
+                                target_name.id.to_string(),
+                                (schema.to_string(), current_line),
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Handle Annotated pattern
+        if s.contains("Annotated[") && s.contains("DataFrame") {
+            // Extract schema from Annotated[DataFrame, Schema] or Annotated[pl.DataFrame, Schema]
+            if let Some(start) = s.find("Annotated[") {
+                let inner = &s[start + 10..]; // Skip "Annotated["
+                if let Some(end) = inner.rfind(']') {
+                    let parts: Vec<&str> = inner[..end].split(',').collect();
+                    if parts.len() >= 2 {
+                        let schema = parts[1].trim();
+                        if let Expr::Name(target_name) = &*ann_assign.target {
+                            self.variables.insert(
+                                target_name.id.to_string(),
+                                (schema.to_string(), current_line),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn visit_expr(&self, expr: &Expr, errors: &mut Vec<LintError>) {
         match expr {
             Expr::Attribute(attr) => {
@@ -718,25 +723,26 @@ impl Linter {
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             let attr_name = attr.attr.as_str();
-                            // In pandas, some attributes are valid (e.g. .shape, .columns, .index)
-                            // But for pandandic/pandera, columns are also attributes.
-                            let pandas_internals = [
-                                "shape",
-                                "columns",
-                                "index",
-                                "iloc",
-                                "loc",
-                                "head",
-                                "tail",
-                                "describe",
-                                "info",
-                                "set_index",
-                                "merge",
-                                "concat",
-                                "join",
+                            // Common pandas/polars internal attributes and methods
+                            let internal_attrs = [
+                                "shape", "columns", "index", "iloc", "loc", "head", "tail",
+                                "describe", "info", "set_index", "merge", "concat", "join",
+                                "filter", "select", "with_columns", "group_by", "groupby",
+                                "agg", "sort", "sort_values", "drop", "rename", "apply",
+                                "map", "pipe", "transform", "to_pandas", "to_df", "schema",
+                                "dtypes", "dtype", "cast", "lazy", "collect", "to_dict",
+                                "to_list", "to_numpy", "to_arrow", "write_csv", "write_parquet",
+                                "clone", "clear", "extend", "insert", "item", "n_chunks",
+                                "null_count", "estimated_size", "width", "height", "rows",
+                                "row", "get_column", "get_columns", "explode", "unnest",
+                                "pivot", "unpivot", "melt", "sample", "slice", "limit",
+                                "unique", "n_unique", "value_counts", "is_empty", "is_duplicated",
+                                "unique_counts", "mean", "sum", "min", "max", "std", "var",
+                                "median", "quantile", "fill_null", "fill_nan", "interpolate",
+                                "shift", "diff", "pct_change", "rolling", "ewm",
                             ];
                             if !columns.contains(&attr_name.to_string())
-                                && !pandas_internals.contains(&attr_name)
+                                && !internal_attrs.contains(&attr_name)
                             {
                                 let source_location = self
                                     .line_index
@@ -815,7 +821,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_levenshtein() {
+    fn test_should_compute_levenshtein_distance() {
         // arrange
         let a = "email";
         let b = "emai";
@@ -828,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_best_match() {
+    fn test_should_find_best_match_for_typo() {
         // arrange
         let name = "emai";
         let candidates = vec!["user_id".to_string(), "email".to_string()];
@@ -838,5 +844,71 @@ mod tests {
 
         // assert
         assert_eq!(result, Some("email"));
+    }
+
+    #[test]
+    fn test_should_detect_base_schema_class() {
+        // arrange/act/assert
+        assert!(Linter::is_schema_base("BaseSchema"));
+        assert!(Linter::is_schema_base("DataFrameModel"));
+        assert!(Linter::is_schema_base("DataFrame"));
+        assert!(Linter::is_schema_base("BaseFrame"));
+        assert!(!Linter::is_schema_base("SomeOtherClass"));
+    }
+
+    #[test]
+    fn test_should_lint_base_schema_column_access() {
+        // arrange
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: DataFrame[UserSchema] = load()
+print(df["user_id"])
+print(df["name"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("name"));
+        assert!(errors[0].message.contains("UserSchema"));
+    }
+
+    #[test]
+    fn test_should_lint_annotated_polars_pattern() {
+        // arrange
+        let source = r#"
+from typing import Annotated
+import polars as pl
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: Annotated[pl.DataFrame, UserSchema] = pl.read_csv("data.csv")
+print(df["user_id"])
+print(df["wrong_column"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("wrong_column"));
+        assert!(errors[0].message.contains("UserSchema"));
     }
 }

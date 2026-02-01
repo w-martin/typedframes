@@ -1,52 +1,63 @@
+"""Regression tests for typedframes mypy plugin integration."""
+
+import os
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 
 class TestPluginRegression(unittest.TestCase):
+    """Regression tests for the mypy plugin."""
+
     def setUp(self) -> None:
-        self.example_file = Path("examples/typeddict_example.py").absolute()
+        """Set up test fixtures."""
         self.binary_path = Path(
-            "rust_typedframes_linter/target/debug/rust_typedframes_linter",
+            "rust_typedframes_linter/target/debug/typedframes_linter",
         ).absolute()
         if not self.binary_path.exists():
             subprocess.run(["cargo", "build"], cwd="rust_typedframes_linter", check=True)
 
-        # Create a temporary pyproject.toml without the plugin for regression testing
         self.temp_dir = Path("temp_test_dir")
         self.temp_dir.mkdir(exist_ok=True)
         self.test_py = self.temp_dir / "test_missing.py"
         self.test_py.write_text("""
-from typing import TypedDict
-from pandas import DataFrame
+from typedframes import BaseSchema, Column
 
-class UserSchema(TypedDict):
-    user_id: int
-    email: str
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
 
-def load_users() -> "DataFrame[UserSchema]":
-    return DataFrame({"user_id": [1], "email": ["a@b.com"]})
-
-df = load_users()
+df: "DataFrame[UserSchema]" = load_users()  # type: ignore[name-defined]
 print(df["non_existent"])
 """)
 
+        # Set up environment with PYTHONPATH
+        self.env = os.environ.copy()
+        src_path = str(Path("src").absolute())
+        if "PYTHONPATH" in self.env:
+            self.env["PYTHONPATH"] = f"{src_path}:{self.env['PYTHONPATH']}"
+        else:
+            self.env["PYTHONPATH"] = src_path
+
     def tearDown(self) -> None:
+        """Clean up test fixtures."""
         if self.temp_dir.exists():
             shutil.rmtree(self.temp_dir)
 
     def test_should_not_catch_errors_without_plugin(self) -> None:
-        # act
-        # Run mypy with an empty config to avoid loading the root pyproject.toml
+        """Test that mypy alone doesn't catch column errors."""
+        # arrange
         empty_config = self.temp_dir / "empty_mypy.ini"
-        empty_config.write_text("[mypy]")
+        empty_config.write_text("[mypy]\nignore_missing_imports = true")
+
+        # act
         result = subprocess.run(
             [
                 "mypy",
                 "--config-file",
                 str(empty_config),
-                "--ignore-missing-imports",
                 "--disable-error-code",
                 "type-arg",
                 str(self.test_py),
@@ -54,14 +65,15 @@ print(df["non_existent"])
             capture_output=True,
             text=True,
             check=False,
+            env=self.env,
         )
 
         # assert
-        # mypy by itself doesn't catch the missing column
-        assert "Column 'non_existent' does not exist" not in result.stdout
-        assert result.returncode == 0
+        self.assertNotIn("Column 'non_existent' does not exist", result.stdout)
+        self.assertEqual(result.returncode, 0)
 
     def test_should_catch_errors_with_plugin(self) -> None:
+        """Test that mypy with the plugin catches column errors."""
         # act
         result = subprocess.run(
             [
@@ -75,11 +87,12 @@ print(df["non_existent"])
             capture_output=True,
             text=True,
             check=False,
+            env=self.env,
         )
 
         # assert
-        assert "Column 'non_existent' does not exist in UserSchema" in result.stdout
-        assert result.returncode == 1
+        self.assertIn("Column 'non_existent' does not exist in UserSchema", result.stdout)
+        self.assertEqual(result.returncode, 1)
 
 
 if __name__ == "__main__":

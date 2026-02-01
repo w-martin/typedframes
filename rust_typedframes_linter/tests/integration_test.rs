@@ -1,21 +1,21 @@
-use rust_pandas_linter::Linter;
+use _rust_linter::Linter;
 use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn test_should_detect_missing_column() {
+fn test_should_detect_missing_column_with_base_schema() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-import pandera as pa
-from pandera.typing import DataFrame, Series
+from typedframes import BaseSchema, Column
 
-class UserSchema(pa.DataFrameModel):
-    user_id: Series[int]
-    email: Series[str]
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
 
 def main():
-    df = DataFrame[UserSchema]({"user_id": [1], "email": ["test@example.com"]})
+    df: DataFrame[UserSchema] = load()
+    print(df["user_id"])
     print(df["non_existent"])
 "#;
     let dir = tempdir().unwrap();
@@ -37,15 +37,14 @@ fn test_should_suggest_typo_correction() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-import pandera as pa
-from pandera.typing import DataFrame, Series
+from typedframes import BaseSchema, Column
 
-class UserSchema(pa.DataFrameModel):
-    user_id: Series[int]
-    email: Series[str]
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
 
 def main():
-    df = DataFrame[UserSchema]({"user_id": [1], "email": ["test@example.com"]})
+    df: DataFrame[UserSchema] = load()
     print(df["emai"])
 "#;
     let dir = tempdir().unwrap();
@@ -63,20 +62,56 @@ def main():
 }
 
 #[test]
-fn test_should_support_typed_dict() {
+fn test_should_support_column_alias() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-from typing import TypedDict
-from pandas import DataFrame
+from typedframes import BaseSchema, Column
 
-class UserDict(TypedDict):
-    user_id: int
-    email: str
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str, alias="user_email")
 
 def main():
-    df = DataFrame[UserDict]({"user_id": [1], "email": ["test@example.com"]})
-    print(df["missing"])
+    df: DataFrame[UserSchema] = load()
+    print(df["user_email"])  # OK - alias
+    print(df["email"])       # Error - use alias
+"#;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.py");
+    fs::write(&file_path, source).unwrap();
+
+    // act
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
+
+    // assert
+    assert!(!errors.is_empty());
+    // email (without alias) should be an error
+    assert!(errors.iter().any(|e| e
+        .message
+        .contains("Column 'email' does not exist in UserSchema")));
+    // user_email should be valid
+    assert!(!errors.iter().any(|e| e
+        .message
+        .contains("Column 'user_email' does not exist")));
+}
+
+#[test]
+fn test_should_support_column_set() {
+    // arrange
+    let mut linter = Linter::new();
+    let source = r#"
+from typedframes import BaseSchema, Column, ColumnSet
+
+class SensorSchema(BaseSchema):
+    timestamp = Column(type=str)
+    temperatures = ColumnSet(members=["temp_1", "temp_2", "temp_3"], type=float)
+
+def main():
+    df: DataFrame[SensorSchema] = load()
+    print(df["timestamp"])  # OK
+    print(df["temp_1"])     # OK - ColumnSet member
+    print(df["temp_4"])     # Error - not in members
 "#;
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("test.py");
@@ -89,31 +124,29 @@ def main():
     assert!(!errors.is_empty());
     assert!(errors.iter().any(|e| e
         .message
-        .contains("Column 'missing' does not exist in UserDict")));
+        .contains("Column 'temp_4' does not exist in SensorSchema")));
+    assert!(!errors.iter().any(|e| e
+        .message
+        .contains("Column 'temp_1' does not exist")));
 }
 
 #[test]
-fn test_should_support_pandandic_enhanced() {
+fn test_should_support_annotated_polars_pattern() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-from pandandic import BaseFrame, Column, ColumnSet, ColumnGroup
+from typing import Annotated
+import polars as pl
+from typedframes import BaseSchema, Column
 
-class MyFrame(BaseFrame):
-    foo = Column(type=str)
-    bar = Column(type=int, alias="BAR")
-    multi = ColumnSet(members=["col1", "col2"])
-    grp = ColumnGroup(members=[foo, multi])
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
 
 def main():
-    df = MyFrame().read_csv("test.csv")
-    print(df.foo)       # OK
-    print(df.BAR)       # OK (alias)
-    print(df.col1)      # OK (ColumnSet member)
-    print(df.missing)   # Error
-    print(df["foo"])    # OK
-    print(df["BAR"])    # OK
-    print(df["missing"]) # Error
+    df: Annotated[pl.DataFrame, UserSchema] = pl.read_csv("data.csv")
+    print(df["user_id"])       # OK
+    print(df["wrong_column"])  # Error
 "#;
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("test.py");
@@ -123,49 +156,57 @@ def main():
     let errors = linter.check_file_internal(source, &file_path).unwrap();
 
     // assert
-    assert!(!errors.is_empty(), "Should have detected errors");
+    assert!(!errors.is_empty());
     assert!(errors.iter().any(|e| e
         .message
-        .contains("Column 'missing' does not exist in MyFrame")));
-    // Check that aliases and members are recognized
-    assert!(
-        !errors
-            .iter()
-            .any(|e| e.message.contains("'foo'") && e.message.contains("does not exist")),
-        "foo should exist"
-    );
-    assert!(
-        !errors
-            .iter()
-            .any(|e| e.message.contains("'BAR'") && e.message.contains("does not exist")),
-        "BAR should exist"
-    );
-    assert!(
-        !errors
-            .iter()
-            .any(|e| e.message.contains("'col1'") && e.message.contains("does not exist")),
-        "col1 should exist"
-    );
+        .contains("Column 'wrong_column' does not exist in UserSchema")));
 }
 
 #[test]
-fn test_should_support_pandandic() {
+fn test_should_support_pandas_frame_subscript() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-from pandas import DataFrame
+from typedframes import BaseSchema, Column, PandasFrame
 
-class UserSchema(DataFrame):
-    user_id: int
-    email: str
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
 
 def main():
-    df = UserSchema({"user_id": [1], "email": ["test@example.com"]})
-    # Note: Linter currently tracks variable assignment if it looks like DataFrame[Schema]
-    # or load_users() call. For pandandic subclassing, we might need more logic if it's df = UserSchema(...)
-    # Let's see if our current logic handles df: DataFrame[UserSchema] = ...
-    df2: DataFrame[UserSchema] = DataFrame[UserSchema]({"user_id": [1]})
-    print(df2["missing"])
+    df: PandasFrame[UserSchema] = load()
+    print(df["user_id"])  # OK
+    print(df["missing"])  # Error
+"#;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.py");
+    fs::write(&file_path, source).unwrap();
+
+    // act
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
+
+    // assert
+    assert!(!errors.is_empty());
+    assert!(errors.iter().any(|e| e
+        .message
+        .contains("Column 'missing' does not exist in UserSchema")));
+}
+
+#[test]
+fn test_should_support_polars_frame_subscript() {
+    // arrange
+    let mut linter = Linter::new();
+    let source = r#"
+from typedframes import BaseSchema, Column, PolarsFrame
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+def main():
+    df: PolarsFrame[UserSchema] = load()
+    print(df["user_id"])  # OK
+    print(df["missing"])  # Error
 "#;
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("test.py");
@@ -187,28 +228,27 @@ fn test_should_support_merge_and_concat() {
     let mut linter = Linter::new();
     let source = r#"
 import pandas as pd
-from typing import TypedDict
-from pandas import DataFrame
+from typedframes import BaseSchema, Column
 
-class UserSchema(TypedDict):
-    user_id: int
-    name: str
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    name = Column(type=str)
 
-class OrderSchema(TypedDict):
-    order_id: int
-    user_id: int
-    amount: float
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+    user_id = Column(type=int)
+    amount = Column(type=float)
 
 def main():
     users: DataFrame[UserSchema] = pd.DataFrame({"user_id": [1], "name": ["Alice"]})
     orders: DataFrame[OrderSchema] = pd.DataFrame({"order_id": [101], "user_id": [1], "amount": [50.0]})
-    
+
     # Test merge
     merged = users.merge(orders)
     print(merged.name)     # OK
     print(merged.amount)   # OK
     print(merged.missing)  # Error
-    
+
     # Test concat
     concatenated = pd.concat([users, orders])
     print(concatenated.name)   # OK
@@ -237,14 +277,13 @@ fn test_should_track_mutations() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-from pandera.typing import DataFrame, Series
-import pandera as pa
+from typedframes import BaseSchema, Column
 
-class UserSchema(pa.DataFrameModel):
-    user_id: Series[int]
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
 
 def main():
-    df = DataFrame[UserSchema]({"user_id": [1]})
+    df: DataFrame[UserSchema] = load()
     df["new_column"] = 123
 "#;
     let dir = tempdir().unwrap();
@@ -259,4 +298,36 @@ def main():
     assert!(errors
         .iter()
         .any(|e| e.message.contains("mutation tracking")));
+}
+
+#[test]
+fn test_should_support_schema_from_pandas_pattern() {
+    // arrange
+    let mut linter = Linter::new();
+    let source = r#"
+from typedframes import BaseSchema, Column
+import pandas as pd
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+def main():
+    raw_df = pd.read_csv("data.csv")
+    df = UserSchema.from_pandas(raw_df)
+    print(df["user_id"])  # OK
+    print(df["missing"])  # Error
+"#;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.py");
+    fs::write(&file_path, source).unwrap();
+
+    // act
+    let errors = linter.check_file_internal(source, &file_path).unwrap();
+
+    // assert
+    assert!(!errors.is_empty());
+    assert!(errors.iter().any(|e| e
+        .message
+        .contains("Column 'missing' does not exist in UserSchema")));
 }

@@ -14,6 +14,8 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "mypy",
+    "pandas>=3.0.0",
+    "polars>=1.37.1",
 ]
 
 [project.scripts]
@@ -21,9 +23,9 @@ example-pkg = "typedframes:check"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-manifest-path = "rust_pandas_linter/Cargo.toml"
-python-source = "."
-module-name = "typedframes_linter.rust_typedframes_linter"
+manifest-path = "rust_typedframes_linter/Cargo.toml"
+python-source = "src"
+module-name = "typedframes._rust_linter"
 
 [tool.pytest.ini_options]
 addopts = "--cov=. --cov-report=term-missing --cov-branch"
@@ -35,6 +37,10 @@ omit = [
     "examples/*",
     "tests/*",
 ]
+
+[tool.mypy]
+plugins = ["typedframes.mypy"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 120

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
-use rust_pandas_linter::{find_project_root, is_enabled, Linter};
+use _rust_linter::{find_project_root, is_enabled, Linter};
 use std::env;
 use std::fs;
 use std::path::Path;

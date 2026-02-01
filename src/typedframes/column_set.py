@@ -1,23 +1,76 @@
-from dataclasses import dataclass
-from typing import Any
+"""ColumnSet descriptor for DataFrame schemas."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from .defined_later import DefinedLater
+
+if TYPE_CHECKING:
+    import polars as pl
 
 
 @dataclass
 class ColumnSet:
     """
-    Represents a set of columns with optional type and regex matching capabilities.
+    Represents a set of columns matching a pattern or explicit list.
 
-    This class is used to define a set of columns for further processing, with an
-    optional ability to specify the data type and enable matching based on regular
-    expressions.
+    Used for grouping related columns that share a common type,
+    such as time series data or multi-dimensional measurements.
+
+    Attributes:
+        members: List of column names, or a regex pattern if regex=True.
+            Use DefinedLater if members will be set at runtime.
+        type: The Python type shared by all columns in the set.
+        regex: If True, members is treated as a regex pattern for matching column names.
+        description: Human-readable description of the column set's purpose.
+
+    Example:
+        class SensorData(BaseSchema):
+            # Explicit member list
+            temperatures = ColumnSet(members=["temp_1", "temp_2", "temp_3"], type=float)
+
+            # Regex pattern matching
+            pressures = ColumnSet(members=r"pressure_\\d+", type=float, regex=True)
     """
 
-    members: list[str] | DefinedLater | DefinedLater.__class__  # list of columns matched to this set
-    type: type = Any  # dtype applied to this set
-    regex: bool = False  # enables matching members by regex
+    members: list[str] | str | DefinedLater
+    type: type = Any
+    regex: bool = False
+    description: str = ""
+    name: str = field(default="", init=False)
 
-    def __set_name__(self, _: Any, name: str) -> None:
-        """Set the name attribute of the ColumnSet instance."""
+    def __post_init__(self) -> None:
+        """Normalize regex member to a list."""
+        if self.regex and isinstance(self.members, str):
+            self.members = [self.members]
+
+    def __set_name__(self, owner: Any, name: str) -> None:
+        """Set the name attribute from the class attribute name."""
         self.name = name
+
+    def cols(self, matched_columns: list[str] | None = None) -> list[pl.Expr]:
+        """
+        Return polars column expressions for all columns in this set.
+
+        Args:
+            matched_columns: Optional list of column names that matched this set.
+                If not provided, uses the explicit members list (not applicable for regex).
+
+        Returns:
+            List of polars column expressions.
+
+        Example:
+            df.select(SensorSchema.temperatures.cols())
+        """
+        import polars as pl
+
+        if matched_columns is not None:
+            return [pl.col(c) for c in matched_columns]
+
+        if isinstance(self.members, DefinedLater) or self.regex:
+            msg = "Cannot get column expressions for regex or DefinedLater members without matched_columns"
+            raise ValueError(msg)
+
+        return [pl.col(c) for c in self.members]

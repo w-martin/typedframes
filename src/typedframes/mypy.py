@@ -1,4 +1,4 @@
-"""Mypy plugin for pandas column linting."""
+"""Mypy plugin for typedframes column linting."""
 
 import json
 import os
@@ -39,8 +39,8 @@ def is_enabled(project_root: Path) -> bool:
         return True
 
 
-class PandasLinterPlugin(Plugin):
-    """Mypy plugin to integrate the Rust pandas linter."""
+class TypedFramesPlugin(Plugin):
+    """Mypy plugin to integrate the typedframes Rust linter."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the plugin."""
@@ -60,91 +60,78 @@ class PandasLinterPlugin(Plugin):
         if not is_enabled(project_root):
             return []
 
+        errors: list[dict[str, Any]] = []
+
         try:
-            from src import typedframes
+            # Try to import the Rust extension module
+            from typedframes._rust_linter import check_file
 
-            # Use getattr to avoid mypy errors with the dynamic extension module
-            # since it might not be present during static analysis.
-            extension = getattr(typedframes, "rust_typedframes_linter", None)
-            if extension is None:
-                raise ImportError("rust_typedframes_linter not found")
-
-            result_json = str(extension.check_file(file_path))
-            errors_from_extension: list[dict[str, Any]] = json.loads(result_json)
-            self._linter_results[file_path] = errors_from_extension
+            result_json = str(check_file(file_path))
+            errors = json.loads(result_json)
+            self._linter_results[file_path] = errors
+            return errors
+        except ImportError:
+            pass
         except Exception:  # noqa: BLE001
-            # Fallback to local development paths if installed as editable or binary not
-            # in site-packages
-            try:
-                # Try to find the binary in the package's bin directory first
-                # (when installed as a package)
-                current_dir = Path(__file__).parent
-                binary_path = current_dir / "bin" / "rust_typedframes_linter"
-                if os.name == "nt":
-                    binary_path = binary_path.with_suffix(".exe")
+            pass
 
-                # Fallback to local development paths
-                if not binary_path.exists():
-                    binary_path = (
-                        current_dir.parent
-                        / "rust_typedframes_linter"
-                        / "target"
-                        / "release"
-                        / "rust_typedframes_linter"
-                    )
-                    if os.name == "nt":
-                        binary_path = binary_path.with_suffix(".exe")
+        # Fallback to binary if extension module not available
+        try:
+            current_dir = Path(__file__).parent
+            binary_name = "typedframes_linter"
+            if os.name == "nt":
+                binary_name += ".exe"
 
-                if not binary_path.exists():
-                    binary_path = (
-                        current_dir.parent / "rust_typedframes_linter" / "target" / "debug" / "rust_typedframes_linter"
-                    )
-                    if os.name == "nt":
-                        binary_path = binary_path.with_suffix(".exe")
+            # Try several possible locations
+            search_paths = [
+                current_dir / "bin" / binary_name,
+                project_root / "rust_typedframes_linter" / "target" / "release" / binary_name,
+                project_root / "rust_typedframes_linter" / "target" / "debug" / binary_name,
+            ]
 
-                if not binary_path.exists():
-                    return []
+            binary_path = None
+            for path in search_paths:
+                if path.exists():
+                    binary_path = path
+                    break
 
-                result = subprocess.run(
-                    [str(binary_path), file_path],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode == 0:
-                    errors: list[dict[str, Any]] = json.loads(result.stdout)
-                    self._linter_results[file_path] = errors
-                    return errors
-            except Exception:  # noqa: BLE001, S110
-                pass
-        else:
-            return errors_from_extension
+            if binary_path is None:
+                return []
+
+            result = subprocess.run(
+                [str(binary_path), file_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                errors = json.loads(result.stdout)
+                self._linter_results[file_path] = errors
+                return errors
+        except Exception:  # noqa: BLE001, S110
+            pass
+
         return []
 
     def get_method_hook(
         self,
         fullname: str,
     ) -> Callable[[MethodContext], "Type"] | None:
-        """Return a hook for pandas access methods."""
-        # We target the common methods where column access happens
+        """Return a hook for DataFrame access methods."""
+        # Target common methods where column access happens
         if fullname.endswith((".__getitem__", ".__setitem__")):
-            return self.check_pandas_access
+            return self.check_column_access
         return None
 
-    def check_pandas_access(self, context: MethodContext) -> "Type":
-        """Check if the pandas column access is valid."""
-        # Determine the file path of the current module being checked
+    def check_column_access(self, context: MethodContext) -> "Type":
+        """Check if the DataFrame column access is valid."""
         file_path = getattr(context.api, "path", None)
         if not file_path:
             return context.default_return_type
 
         errors = self._run_linter(file_path)
-
         line = context.context.line
 
-        # Multiple errors might happen on the same line
-        # (though unlikely for pandas access in one statement)
-        # but let's be thorough.
         matched = False
         for err in errors:
             if err["line"] == line:
@@ -152,9 +139,7 @@ class PandasLinterPlugin(Plugin):
                 matched = True
 
         if not matched:
-            # In some cases mypy context line might be slightly different
-            # from parser line if it's a multi-line expression.
-            # Let's try to match within a small range if no exact match.
+            # Try fuzzy matching for multi-line expressions
             for err in errors:
                 if abs(err["line"] - line) <= 1:
                     context.api.fail(err["message"], context.context)
@@ -162,6 +147,10 @@ class PandasLinterPlugin(Plugin):
         return context.default_return_type
 
 
-def plugin(version: str) -> type[PandasLinterPlugin]:  # noqa: ARG001
+# Keep old name for backwards compatibility
+PandasLinterPlugin = TypedFramesPlugin
+
+
+def plugin(version: str) -> type[TypedFramesPlugin]:  # noqa: ARG001
     """Entry point for the mypy plugin."""
-    return PandasLinterPlugin
+    return TypedFramesPlugin

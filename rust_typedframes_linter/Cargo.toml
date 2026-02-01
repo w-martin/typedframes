@@ -9,7 +9,7 @@ homepage = "https://github.com/w-martin/typedframes"
 documentation = "https://github.com/w-martin/typedframes"
 
 [lib]
-name = "typedframes_linter"
+name = "_rust_linter"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]

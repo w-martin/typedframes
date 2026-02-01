@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from mypy.options import Options
 
-from src.typedframes.mypy import PandasLinterPlugin
+from typedframes.mypy import TypedFramesPlugin as PandasLinterPlugin
 
 
 class TestPandasLinterPluginUnit(unittest.TestCase):
@@ -37,7 +37,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
             context.context.line = 10
 
             # act
-            self.plugin.check_pandas_access(context)
+            self.plugin.check_column_access(context)
 
             # assert
             context.api.fail.assert_called_once_with(
@@ -68,7 +68,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
             context.api.fail = MagicMock()
 
             # act
-            new_plugin.check_pandas_access(context)
+            new_plugin.check_column_access(context)
 
             # assert
             context.api.fail.assert_not_called()
@@ -95,7 +95,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
             context.context.line = 11  # One line off
 
             # act
-            self.plugin.check_pandas_access(context)
+            self.plugin.check_column_access(context)
 
             # assert
             context.api.fail.assert_called_once_with(
@@ -110,7 +110,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         context.default_return_type = MagicMock()
 
         # act
-        result = self.plugin.check_pandas_access(context)
+        result = self.plugin.check_column_access(context)
 
         # assert
         assert result == context.default_return_type
@@ -170,15 +170,15 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
     def test_get_method_hook(self) -> None:
         # arrange/act/assert
-        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__getitem__") == self.plugin.check_pandas_access
-        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__setitem__") == self.plugin.check_pandas_access
+        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__getitem__") == self.plugin.check_column_access
+        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__setitem__") == self.plugin.check_column_access
         assert self.plugin.get_method_hook("other") is None
 
     def test_plugin_function(self) -> None:
         # arrange/act/assert
-        from src.typedframes.mypy import plugin
+        from typedframes.mypy import TypedFramesPlugin, plugin
 
-        assert plugin("1.0") == PandasLinterPlugin
+        assert plugin("1.0") == TypedFramesPlugin
 
     def test_plugin_should_handle_unsuccessful_subprocess(self) -> None:
         # arrange

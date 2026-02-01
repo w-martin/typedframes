@@ -1,31 +1,77 @@
-from examples.pandera_example import UserSchema
-from typedframes import BaseSchema, Column, ColumnSet
-# from typedframes.pandas import PandasFrame
-# from typedframes.polars import PolarsFrame
+"""Example usage of typedframes for pandas and polars DataFrames."""
+
+from typing import Annotated
 
 import pandas as pd
+import polars as pl
+
+from typedframes import BaseSchema, Column, ColumnSet, PandasFrame
 
 
 class UserSchema(BaseSchema):
+    """Schema for user data."""
+
     user_id = Column(type=int)
     email = Column(type=str, alias="email_address")
-    metadata = ColumnSet(members=["age", "gender"])
+    metadata = ColumnSet(members=["age", "gender"], type=str)
 
 
-def main() -> None:
-    # Use from_df for example purposes
-    # PandasFrame[UserSchema]().from_df(
-    #     pd.DataFrame(
-    #         {
-    #             "user_id": [1],
-    #             "email_address": ["a@b.com"],
-    #             "age": [20],
-    #             "gender": ["m"],
-    #         },
-    #     ),
-    # )
-    pass
+def pandas_example() -> None:
+    """Demonstrate PandasFrame usage with schema-aware attribute access."""
+    raw_df = pd.DataFrame(
+        {
+            "user_id": [1, 2, 3],
+            "email_address": ["a@b.com", "c@d.com", "e@f.com"],
+            "age": ["25", "30", "35"],
+            "gender": ["M", "F", "M"],
+        },
+    )
 
-    # Typo detection on attribute
-    # DESIRED: Error: Column 'emai' does not exist in UserFrame
-    # (did you mean 'email_address'?)
+    # Create a typed PandasFrame
+    df: PandasFrame[UserSchema] = PandasFrame.from_schema(raw_df, UserSchema)
+
+    # Access columns by schema attribute names
+    print("User IDs:", df.user_id.tolist())
+    print("Emails:", df["email_address"].tolist())  # Uses alias name
+
+    # Schema operations preserve type
+    filtered = df[df.user_id > 1]
+    print("Filtered schema:", filtered.schema)
+
+    # This would be caught by the linter:
+    # print(df["wrong_column"])  # Error: Column 'wrong_column' does not exist
+
+
+def polars_example() -> None:
+    """Demonstrate PolarsFrame usage with full autocomplete."""
+    df: Annotated[pl.DataFrame, UserSchema] = pl.DataFrame(
+        {
+            "user_id": [1, 2, 3],
+            "email_address": ["a@b.com", "c@d.com", "e@f.com"],
+            "age": ["25", "30", "35"],
+            "gender": ["M", "F", "M"],
+        },
+    )
+
+    # Full polars API with autocomplete
+    result = df.filter(pl.col("user_id") > 1)
+    print("Filtered polars:\n", result)
+
+    # Use schema column references for type-safe access
+    result2 = df.filter(UserSchema.user_id.col > 1)
+    print("Schema-based filter:\n", result2)
+
+    # Select using schema columns
+    result3 = df.select(UserSchema.user_id.col, UserSchema.email.col)
+    print("Selected columns:\n", result3)
+
+    # This would be caught by the linter:
+    # print(df["typo_column"])  # Error: Column 'typo_column' does not exist
+
+
+if __name__ == "__main__":
+    print("=== Pandas Example ===")
+    pandas_example()
+
+    print("\n=== Polars Example ===")
+    polars_example()

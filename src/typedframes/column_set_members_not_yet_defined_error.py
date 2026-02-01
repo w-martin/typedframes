@@ -1,16 +1,24 @@
-from .column_set import ColumnSet
+"""Error for undefined ColumnSet members."""
 
 
 class ColumnSetMembersNotYetDefinedError(Exception):
-    """Exception raised when a ColumnSet is used with an undefined member list."""
+    """Exception raised when a ColumnSet is accessed before its members are defined."""
 
-    def __init__(self, column_set: ColumnSet) -> None:
-        self._column_set = column_set
+    def __init__(self, column_set_name: str) -> None:
+        """
+        Initialize the error.
+
+        Args:
+            column_set_name: The name of the ColumnSet with undefined members.
+        """
+        self._column_set_name = column_set_name
+        super().__init__(str(self))
 
     def __str__(self) -> str:
-        """
-        Return a string representation of the error message.
+        """Return a string representation of the error message."""
+        return f"ColumnSet '{self._column_set_name}' has members=DefinedLater but was accessed before members were set."
 
-        For situations where a ColumnSet is used with an undefined member list.
-        """
-        return f"Error. ColumnSet with name {self._column_set.name} was used with a member list that is not defined."
+    @property
+    def column_set_name(self) -> str:
+        """Return the name of the ColumnSet with undefined members."""
+        return self._column_set_name

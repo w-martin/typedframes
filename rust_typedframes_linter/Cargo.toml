@@ -1,19 +1,19 @@
 [package]
-name = "pandas_column_linter"
+name = "typedframes_linter"
 version = "0.1.0"
 edition = "2021"
-description = "A high-performance Rust-based linter for pandas DataFrame column schemas"
+description = "A high-performance Rust-based linter for typedframes DataFrame column schemas"
 license = "MIT"
-repository = "https://github.com/w-martin/pandas_type_checking"
-homepage = "https://github.com/w-martin/pandas_type_checking"
-documentation = "https://github.com/w-martin/pandas_type_checking"
+repository = "https://github.com/w-martin/typedframes"
+homepage = "https://github.com/w-martin/typedframes"
+documentation = "https://github.com/w-martin/typedframes"
 
 [lib]
-name = "rust_pandas_linter"
+name = "typedframes_linter"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "rust_pandas_linter"
+name = "typedframes_linter"
 path = "src/main.rs"
 
 [profile.release]

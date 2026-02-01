@@ -8,10 +8,10 @@ class TestPluginRegression(unittest.TestCase):
     def setUp(self) -> None:
         self.example_file = Path("examples/typeddict_example.py").absolute()
         self.binary_path = Path(
-            "rust_pandas_linter/target/debug/rust_pandas_linter",
+            "rust_typedframes_linter/target/debug/rust_typedframes_linter",
         ).absolute()
         if not self.binary_path.exists():
-            subprocess.run(["cargo", "build"], cwd="rust_pandas_linter", check=True)
+            subprocess.run(["cargo", "build"], cwd="rust_typedframes_linter", check=True)
 
         # Create a temporary pyproject.toml without the plugin for regression testing
         self.temp_dir = Path("temp_test_dir")

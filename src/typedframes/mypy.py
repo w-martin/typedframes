@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mypy.plugin import MethodContext, Plugin
-from mypy.types import Type
 
 if TYPE_CHECKING:
     from mypy.types import Type
@@ -34,11 +33,7 @@ def is_enabled(project_root: Path) -> bool:
     try:
         with open(config_path, "rb") as f:
             config = tomllib.load(f)
-            enabled = (
-                config.get("tool", {})
-                .get("pandas_column_linter", {})
-                .get("enabled", True)
-            )
+            enabled = config.get("tool", {}).get("typedframes", {}).get("enabled", True)
             return bool(enabled)
     except Exception:  # noqa: BLE001
         return True
@@ -66,13 +61,13 @@ class PandasLinterPlugin(Plugin):
             return []
 
         try:
-            import pandas_column_linter
+            from src import typedframes
 
             # Use getattr to avoid mypy errors with the dynamic extension module
             # since it might not be present during static analysis.
-            extension = getattr(pandas_column_linter, "rust_pandas_linter", None)
+            extension = getattr(typedframes, "rust_typedframes_linter", None)
             if extension is None:
-                raise ImportError("rust_pandas_linter not found")
+                raise ImportError("rust_typedframes_linter not found")
 
             result_json = str(extension.check_file(file_path))
             errors_from_extension: list[dict[str, Any]] = json.loads(result_json)
@@ -84,7 +79,7 @@ class PandasLinterPlugin(Plugin):
                 # Try to find the binary in the package's bin directory first
                 # (when installed as a package)
                 current_dir = Path(__file__).parent
-                binary_path = current_dir / "bin" / "rust_pandas_linter"
+                binary_path = current_dir / "bin" / "rust_typedframes_linter"
                 if os.name == "nt":
                     binary_path = binary_path.with_suffix(".exe")
 
@@ -92,21 +87,17 @@ class PandasLinterPlugin(Plugin):
                 if not binary_path.exists():
                     binary_path = (
                         current_dir.parent
-                        / "rust_pandas_linter"
+                        / "rust_typedframes_linter"
                         / "target"
                         / "release"
-                        / "rust_pandas_linter"
+                        / "rust_typedframes_linter"
                     )
                     if os.name == "nt":
                         binary_path = binary_path.with_suffix(".exe")
 
                 if not binary_path.exists():
                     binary_path = (
-                        current_dir.parent
-                        / "rust_pandas_linter"
-                        / "target"
-                        / "debug"
-                        / "rust_pandas_linter"
+                        current_dir.parent / "rust_typedframes_linter" / "target" / "debug" / "rust_typedframes_linter"
                     )
                     if os.name == "nt":
                         binary_path = binary_path.with_suffix(".exe")

@@ -20,15 +20,15 @@ jobs:
 
       - name: Rust format check
         run: cargo fmt --all -- --check
-        working-directory: rust_pandas_linter
+        working-directory: rust_typedframes_linter
 
       - name: Rust lint
         run: cargo clippy -- -D warnings
-        working-directory: rust_pandas_linter
+        working-directory: rust_typedframes_linter
 
       - name: Rust tests
         run: cargo test
-        working-directory: rust_pandas_linter
+        working-directory: rust_typedframes_linter
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -103,10 +103,10 @@ jobs:
 
       - name: Build sdist and wheel
         run: |
-          mkdir -p pandas_column_linter/bin
-          cp rust_pandas_linter/target/${{ matrix.target }}/release/rust_pandas_linter* pandas_column_linter/bin/ || true
+          mkdir -p typedframes/bin
+          cp rust_pandas_linter/target/${{ matrix.target }}/release/rust_pandas_linter* typedframes/bin/ || true
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            cp rust_pandas_linter/target/${{ matrix.target }}/release/rust_pandas_linter.exe pandas_column_linter/bin/
+            cp rust_pandas_linter/target/${{ matrix.target }}/release/rust_pandas_linter.exe typedframes/bin/
           fi
           
           # Use a platform-specific wheel tag if needed
@@ -176,11 +176,11 @@ jobs:
         run: |
           # Wait a bit for PyPI to update
           sleep 60
-          pip install pandas-column-linter==${GITHUB_REF#refs/tags/v}
-          pip install pytest mypy pandera pandas pandandic
+          pip install typedframes==${GITHUB_REF#refs/tags/v}
+          pip install pytest mypy pandera pandas pandandic polars
 
       - name: Run tests against published package
         run: |
           # Remove src to ensure we use the installed package
-          rm -rf pandas_column_linter pandas_linter_mypy.py
+          rm -rf src
           pytest tests/test_integration.py

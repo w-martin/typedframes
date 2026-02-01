@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from mypy.options import Options
 
-from pandas_column_linter.mypy import PandasLinterPlugin
+from src.typedframes.mypy import PandasLinterPlugin
 
 
 class TestPandasLinterPluginUnit(unittest.TestCase):
@@ -18,8 +18,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
     def test_should_report_error_on_exact_line_match(self) -> None:
         # arrange
         with (
-            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
-            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
+            patch("typedframes.mypy.get_project_root") as mock_root,
+            patch("typedframes.mypy.is_enabled") as mock_enabled,
             patch("subprocess.run") as mock_run,
             patch("os.path.exists") as mock_exists,
         ):
@@ -48,8 +48,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         # Test non-match branch
         new_plugin = PandasLinterPlugin(Options())  # New plugin to avoid cache
         with (
-            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
-            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
+            patch("typedframes.mypy.get_project_root") as mock_root,
+            patch("typedframes.mypy.is_enabled") as mock_enabled,
             patch("subprocess.run") as mock_run,
             patch("os.path.exists") as mock_exists,
         ):
@@ -76,8 +76,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
     def test_should_report_error_on_fuzzy_line_match(self) -> None:
         # arrange
         with (
-            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
-            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
+            patch("typedframes.mypy.get_project_root") as mock_root,
+            patch("typedframes.mypy.is_enabled") as mock_enabled,
             patch("subprocess.run") as mock_run,
             patch("os.path.exists") as mock_exists,
         ):
@@ -117,7 +117,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
     def test_should_not_run_when_disabled(self) -> None:
         # arrange
-        with patch("pandas_column_linter.mypy.is_enabled") as mock_enabled:
+        with patch("typedframes.mypy.is_enabled") as mock_enabled:
             mock_enabled.return_value = False
 
             # act
@@ -170,19 +170,13 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
     def test_get_method_hook(self) -> None:
         # arrange/act/assert
-        assert (
-            self.plugin.get_method_hook("pandas.core.frame.DataFrame.__getitem__")
-            == self.plugin.check_pandas_access
-        )
-        assert (
-            self.plugin.get_method_hook("pandas.core.frame.DataFrame.__setitem__")
-            == self.plugin.check_pandas_access
-        )
+        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__getitem__") == self.plugin.check_pandas_access
+        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__setitem__") == self.plugin.check_pandas_access
         assert self.plugin.get_method_hook("other") is None
 
     def test_plugin_function(self) -> None:
         # arrange/act/assert
-        from pandas_column_linter.mypy import plugin
+        from src.typedframes.mypy import plugin
 
         assert plugin("1.0") == PandasLinterPlugin
 
@@ -192,8 +186,8 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         with (
             patch("os.path.exists") as mock_exists,
             patch("subprocess.run") as mock_run,
-            patch("pandas_column_linter.mypy.get_project_root") as mock_root,
-            patch("pandas_column_linter.mypy.is_enabled") as mock_enabled,
+            patch("typedframes.mypy.get_project_root") as mock_root,
+            patch("typedframes.mypy.is_enabled") as mock_enabled,
         ):
             mock_exists.return_value = True
             mock_root.return_value = Path()
@@ -213,7 +207,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 class TestUtilsUnit(unittest.TestCase):
     def test_get_project_root(self) -> None:
         # arrange
-        from pandas_column_linter.mypy import get_project_root
+        from src.typedframes.mypy import get_project_root
 
         with (
             patch("pathlib.Path.exists") as mock_exists,
@@ -248,7 +242,7 @@ class TestUtilsUnit(unittest.TestCase):
         # arrange
         import io
 
-        from pandas_column_linter.mypy import is_enabled
+        from src.typedframes.mypy import is_enabled
 
         # Test missing config
         with patch("pathlib.Path.exists") as mock_exists:
@@ -260,7 +254,7 @@ class TestUtilsUnit(unittest.TestCase):
             patch("pathlib.Path.exists") as mock_exists,
             patch(
                 "builtins.open",
-                return_value=io.BytesIO(b"[tool.pandas_column_linter]\nenabled = true"),
+                return_value=io.BytesIO(b"[tool.typedframes]\nenabled = true"),
             ),
         ):
             mock_exists.return_value = True
@@ -272,7 +266,7 @@ class TestUtilsUnit(unittest.TestCase):
             patch(
                 "builtins.open",
                 return_value=io.BytesIO(
-                    b"[tool.pandas_column_linter]\nenabled = false",
+                    b"[tool.typedframes]\nenabled = false",
                 ),
             ),
         ):

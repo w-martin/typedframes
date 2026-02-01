@@ -3,9 +3,9 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pandas-column-linter"
+name = "typedframes"
 version = "0.1.0"
-description = "A high-performance linter for pandas DataFrame column schemas"
+description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
 readme = "README.md"
 authors = [
     { name = "William Martin" }
@@ -16,22 +16,14 @@ dependencies = [
     "mypy",
 ]
 
+[project.scripts]
+example-pkg = "typedframes:check"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 manifest-path = "rust_pandas_linter/Cargo.toml"
 python-source = "."
-module-name = "pandas_column_linter.rust_pandas_linter"
-
-[tool.pandas_column_linter]
-enabled = true
-
-[tool.mypy]
-strict = true
-exclude = ["examples/"]
-plugins = [
-  "pandera.mypy",
-  "pandas_column_linter.mypy"
-]
+module-name = "typedframes_linter.rust_typedframes_linter"
 
 [tool.pytest.ini_options]
 addopts = "--cov=. --cov-report=term-missing --cov-branch"
@@ -45,7 +37,7 @@ omit = [
 ]
 
 [tool.ruff]
-line-length = 88
+line-length = 120
 target-version = "py311"
 fix = true
 
@@ -57,6 +49,8 @@ indent-style = "space"
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
+    "D100",
+    "D107",
     "D203", # One of D203 or D211 must be ignored
     "D212", # One of D212 or D213 must be ignored
     "S603", # subprocess call: check for execution of untrusted input
@@ -69,15 +63,15 @@ ignore = [
     "PLC0415",
     "PLR0911", # Too many return statements
     "PLR0912", # Too many branches
-    "TRY301",  # Abstract raise to an inner function
-    "TRY003",  # Avoid specifying long messages outside the exception class
-    "EM101",   # Exception must not use a string literal
+    "TRY301", # Abstract raise to an inner function
+    "TRY003", # Avoid specifying long messages outside the exception class
+    "EM101", # Exception must not use a string literal
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "D", "ANN", "SLF001", "PLC0415", "S108"]
-"examples/*" = ["T201", "D", "ANN", "S101", "PLC0415"]
-"pandas_linter_mypy.py" = ["PLC0415"]
+"examples/*" = ["T201", "D", "ANN", "S101", "PLC0415",
+    "INP001"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
@@ -88,3 +82,12 @@ dev = [
     "pytest-cov>=7.0.0",
     "ruff>=0.14.13",
 ]
+
+[tool.ty.terminal]
+output-format = "concise"
+
+[[tool.ty.overrides]]
+include = ["examples/*.py"]
+
+[tool.ty.overrides.rules]
+unused-ignore-comment = "ignore"

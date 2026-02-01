@@ -1,1 +1,0 @@
-"""Pandas column linter package."""

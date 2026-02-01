@@ -1,4 +1,8 @@
 ```shell
+uv tool run ruff format .
+```
+
+```shell
 uv tool run ruff check .
 ```
 

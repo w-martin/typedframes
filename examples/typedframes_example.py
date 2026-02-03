@@ -39,7 +39,8 @@ def pandas_example() -> None:
     print("Filtered schema:", filtered.schema)
 
     # This would be caught by the linter:
-    # print(df["wrong_column"])  # Error: Column 'wrong_column' does not exist
+    print(df["wrong_column"])  # Error: Column 'wrong_column' does not exist
+    print(df["user_i"])  # Error: Column 'user_i' does not exist (typo)
 
 
 def polars_example() -> None:
@@ -66,7 +67,12 @@ def polars_example() -> None:
     print("Selected columns:\n", result3)
 
     # This would be caught by the linter:
-    # print(df["typo_column"])  # Error: Column 'typo_column' does not exist
+    print(df["typo_column"])  # Error: Column 'typo_column' does not exist
+    print(df["user_id_typo"])
+
+    # Mutation tracking: adding a column that's not in the schema
+    # (In standard pandas this is allowed, but typedframes linter can flag it)
+    df["new_column"] = 123
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ class ColumnGroupError(Exception):
             column: The name of the column that matched multiple groups.
             first_match: The first Column or ColumnSet that matched.
             second_match: The second ColumnSet that matched.
+
         """
         self._column = column
         self._first_match = first_match

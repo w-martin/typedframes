@@ -60,20 +60,16 @@ class TypedFramesPlugin(Plugin):
         if not is_enabled(project_root):
             return []
 
-        errors: list[dict[str, Any]] = []
-
         try:
             # Try to import the Rust extension module
             from typedframes._rust_linter import check_file
-
+        except ImportError:
+            pass
+        else:
             result_json = str(check_file(file_path))
             errors = json.loads(result_json)
             self._linter_results[file_path] = errors
             return errors
-        except ImportError:
-            pass
-        except Exception:  # noqa: BLE001
-            pass
 
         # Fallback to binary if extension module not available
         try:

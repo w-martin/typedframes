@@ -10,6 +10,7 @@ class ColumnSetMembersNotYetDefinedError(Exception):
 
         Args:
             column_set_name: The name of the ColumnSet with undefined members.
+
         """
         self._column_set_name = column_set_name
         super().__init__(str(self))

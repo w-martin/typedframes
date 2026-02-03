@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 class BaseSchema:
-    """
+    r"""
     Backend-agnostic schema definition for DataFrame validation.
 
     Define your DataFrame schema once and use it for static analysis
@@ -41,6 +41,7 @@ class BaseSchema:
         # Use with type annotations for static analysis:
         df: Annotated[pd.DataFrame, UserData] = pd.read_csv("data.csv")
         df: Annotated[pl.DataFrame, UserData] = pl.read_csv("data.csv")
+
     """
 
     _column_map: ClassVar[dict[str, Column] | None] = None
@@ -56,33 +57,21 @@ class BaseSchema:
     def columns(cls) -> dict[str, Column]:
         """Return mapping of attribute names to Column definitions."""
         if cls._column_map is None:
-            cls._column_map = {
-                name: col
-                for name, col in cls.__dict__.items()
-                if isinstance(col, Column)
-            }
+            cls._column_map = {name: col for name, col in cls.__dict__.items() if isinstance(col, Column)}
         return cls._column_map
 
     @classmethod
     def column_sets(cls) -> dict[str, ColumnSet]:
         """Return mapping of attribute names to ColumnSet definitions."""
         if cls._column_set_map is None:
-            cls._column_set_map = {
-                name: cs
-                for name, cs in cls.__dict__.items()
-                if isinstance(cs, ColumnSet)
-            }
+            cls._column_set_map = {name: cs for name, cs in cls.__dict__.items() if isinstance(cs, ColumnSet)}
         return cls._column_set_map
 
     @classmethod
     def column_groups(cls) -> dict[str, ColumnGroup]:
         """Return mapping of attribute names to ColumnGroup definitions."""
         if cls._column_group_map is None:
-            cls._column_group_map = {
-                name: cg
-                for name, cg in cls.__dict__.items()
-                if isinstance(cg, ColumnGroup)
-            }
+            cls._column_group_map = {name: cg for name, cg in cls.__dict__.items() if isinstance(cg, ColumnGroup)}
         return cls._column_group_map
 
     @classmethod
@@ -123,6 +112,7 @@ class BaseSchema:
             ColumnAliasNotYetDefinedError: If a Column has alias=DefinedLater.
             ColumnSetMembersNotYetDefinedError: If a ColumnSet has members=DefinedLater.
             ColumnGroupError: If a column matches multiple ColumnSets (when not greedy).
+
         """
         greedy = greedy if greedy is not None else cls.greedy_column_sets
         column_consumed_map: dict[str, list[str]] = defaultdict(list)
@@ -137,9 +127,7 @@ class BaseSchema:
         if not cls.column_sets():
             return {k: v.type for k, v in key_column_map.items()}, dict(column_consumed_map)
 
-        column_bag: list[Column | ColumnSet | None] = [
-            key_column_map.get(c) for c in dataframe_columns
-        ]
+        column_bag: list[Column | ColumnSet | None] = [key_column_map.get(c) for c in dataframe_columns]
         consumed: list[bool] = [col is not None for col in column_bag]
 
         for cs in cls.column_sets().values():
@@ -160,14 +148,13 @@ class BaseSchema:
                         column_consumed_map[cs.name].append(col_name)
 
             for cs in regex_sets:
-                if isinstance(cs.members, list):
-                    if any(re.match(pattern, col_name) for pattern in cs.members):
-                        if consumed[i] and not greedy:
-                            raise ColumnGroupError(col_name, column_bag[i], cs)
-                        if not consumed[i]:
-                            consumed[i] = True
-                            column_bag[i] = cs
-                            column_consumed_map[cs.name].append(col_name)
+                if isinstance(cs.members, list) and any(re.match(pattern, col_name) for pattern in cs.members):
+                    if consumed[i] and not greedy:
+                        raise ColumnGroupError(col_name, column_bag[i], cs)
+                    if not consumed[i]:
+                        consumed[i] = True
+                        column_bag[i] = cs
+                        column_consumed_map[cs.name].append(col_name)
 
         result: dict[str, type] = {}
         for i, col_or_set in enumerate(column_bag):
@@ -196,10 +183,9 @@ class BaseSchema:
                 if col_name not in defined:
                     is_matched = False
                     for cs in cls.column_sets().values():
-                        if cs.regex and isinstance(cs.members, list):
-                            if any(re.match(p, col_name) for p in cs.members):
-                                is_matched = True
-                                break
+                        if cs.regex and isinstance(cs.members, list) and any(re.match(p, col_name) for p in cs.members):
+                            is_matched = True
+                            break
                     if not is_matched:
                         errors.append(f"Unexpected column: {col_name}")
 

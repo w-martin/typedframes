@@ -19,6 +19,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_collect_columns(self) -> None:
         """Test that columns() returns all Column definitions."""
+
         # arrange
         class TestSchema(BaseSchema):
             user_id = Column(type=int)
@@ -34,6 +35,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_collect_column_sets(self) -> None:
         """Test that column_sets() returns all ColumnSet definitions."""
+
         # arrange
         class TestSchema(BaseSchema):
             scores = ColumnSet(members=["score_1", "score_2"], type=float)
@@ -47,6 +49,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_collect_column_groups(self) -> None:
         """Test that column_groups() returns all ColumnGroup definitions."""
+
         # arrange
         class TestSchema(BaseSchema):
             user_id = Column(type=int)
@@ -62,6 +65,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_return_all_column_names(self) -> None:
         """Test that all_column_names() returns column names including aliases."""
+
         # arrange
         class TestSchema(BaseSchema):
             user_id = Column(type=int)
@@ -80,6 +84,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_compute_column_map(self) -> None:
         """Test that compute_column_map correctly maps DataFrame columns."""
+
         # arrange
         class TestSchema(BaseSchema):
             user_id = Column(type=int)
@@ -88,7 +93,7 @@ class TestBaseSchema(unittest.TestCase):
         df_columns = ["user_id", "email", "extra"]
 
         # act
-        type_map, consumed_map = TestSchema.compute_column_map(df_columns)
+        type_map, _ = TestSchema.compute_column_map(df_columns)
 
         # assert
         self.assertEqual(type_map["user_id"], int)
@@ -97,6 +102,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_match_column_set_members(self) -> None:
         """Test that compute_column_map matches ColumnSet members."""
+
         # arrange
         class TestSchema(BaseSchema):
             scores = ColumnSet(members=["score_1", "score_2"], type=float)
@@ -114,6 +120,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_match_regex_column_set(self) -> None:
         """Test that compute_column_map matches regex ColumnSet patterns."""
+
         # arrange
         class TestSchema(BaseSchema):
             temps = ColumnSet(members=r"temp_\d+", type=float, regex=True)
@@ -121,7 +128,7 @@ class TestBaseSchema(unittest.TestCase):
         df_columns = ["temp_1", "temp_2", "other"]
 
         # act
-        type_map, consumed_map = TestSchema.compute_column_map(df_columns)
+        type_map, _ = TestSchema.compute_column_map(df_columns)
 
         # assert
         self.assertEqual(type_map["temp_1"], float)
@@ -130,6 +137,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_raise_for_defined_later_alias(self) -> None:
         """Test that compute_column_map raises for DefinedLater alias."""
+
         # arrange
         class TestSchema(BaseSchema):
             user_id = Column(type=int, alias=DefinedLater)
@@ -140,6 +148,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_raise_for_defined_later_members(self) -> None:
         """Test that compute_column_map raises for DefinedLater members."""
+
         # arrange
         class TestSchema(BaseSchema):
             scores = ColumnSet(members=DefinedLater, type=float)
@@ -150,6 +159,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_raise_for_column_group_conflict(self) -> None:
         """Test that compute_column_map raises for conflicting ColumnSets."""
+
         # arrange
         class TestSchema(BaseSchema):
             temps = ColumnSet(members=["temp_1"], type=float)
@@ -163,6 +173,7 @@ class TestBaseSchema(unittest.TestCase):
 
     def test_should_allow_greedy_column_sets(self) -> None:
         """Test that greedy=True allows columns to match multiple sets."""
+
         # arrange
         class TestSchema(BaseSchema):
             greedy_column_sets = True
@@ -172,13 +183,14 @@ class TestBaseSchema(unittest.TestCase):
         df_columns = ["temp_1"]
 
         # act
-        type_map, consumed_map = TestSchema.compute_column_map(df_columns)
+        type_map, _ = TestSchema.compute_column_map(df_columns)
 
         # assert
         self.assertEqual(type_map["temp_1"], float)
 
     def test_should_validate_columns(self) -> None:
         """Test that validate_columns checks for missing columns."""
+
         # arrange
         class TestSchema(BaseSchema):
             user_id = Column(type=int)

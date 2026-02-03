@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .defined_later import DefinedLater
-
 if TYPE_CHECKING:
     import polars as pl
+
+    from .defined_later import DefinedLater
 
 
 @dataclass
@@ -28,6 +28,7 @@ class Column:
             user_id = Column(type=int)
             email = Column(type=str, alias="user_email")
             age = Column(type=int, nullable=True, description="User's age in years")
+
     """
 
     type: type = Any
@@ -55,6 +56,7 @@ class Column:
         Example:
             df.filter(UserSchema.age.col > 18)
             df.select(UserSchema.email.col, UserSchema.user_id.col)
+
         """
         import polars as pl
 

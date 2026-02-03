@@ -10,6 +10,7 @@ class ColumnAliasNotYetDefinedError(Exception):
 
         Args:
             column_name: The name of the column with undefined alias.
+
         """
         self._column_name = column_name
         super().__init__(str(self))

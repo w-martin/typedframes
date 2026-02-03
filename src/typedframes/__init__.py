@@ -1,4 +1,4 @@
-"""
+r"""
 typedframes - Type-safe DataFrame schemas for pandas and polars.
 
 Provides schema definitions for DataFrames that enable:

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 import pandas as pd
 
 from .base_schema import BaseSchema
-from .column import Column
 from .column_alias_not_yet_defined_error import ColumnAliasNotYetDefinedError
-from .column_group import ColumnGroup
-from .column_set import ColumnSet
 from .column_set_members_not_yet_defined_error import ColumnSetMembersNotYetDefinedError
 from .defined_later import DefinedLater
 
@@ -38,9 +35,10 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
 
         df = PandasFrame.from_schema(pd.read_csv("data.csv"), UserData)
         df.user_id  # Access column by schema attribute name
+
     """
 
-    _metadata = ["_schema_class", "_column_consumed_map"]
+    _metadata: ClassVar[list[str]] = ["_schema_class", "_column_consumed_map"]
 
     _schema_class: type[SchemaT] | None
     _column_consumed_map: dict[str, list[str]]
@@ -60,6 +58,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
             schema: The schema class to associate with this DataFrame.
             column_consumed_map: Pre-computed ColumnSet consumption map.
             **kwargs: Additional arguments passed to pd.DataFrame.
+
         """
         super().__init__(data, **kwargs)
         self._schema_class = schema
@@ -83,6 +82,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
 
         Returns:
             PandasFrame with schema metadata.
+
         """
         if column_consumed_map is None:
             _, column_consumed_map = schema.compute_column_map(list(df.columns))

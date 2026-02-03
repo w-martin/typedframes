@@ -1,6 +1,5 @@
 """Integration tests for typedframes linter."""
 
-import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -24,7 +23,7 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
         """Test that the linter detects missing columns."""
         # arrange
         sut = Path("rust_typedframes_linter/target/debug/typedframes_linter").absolute()
-        example_file = Path("examples/linter_test_example.py").absolute()
+        example_file = Path("examples/typedframes_example.py").absolute()
 
         # act
         result = subprocess.run(
@@ -35,13 +34,13 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
         )
 
         # assert
-        self.assertIn("Column 'name' does not exist in UserSchema", result.stdout)
+        self.assertIn("Column 'wrong_column' does not exist", result.stdout)
 
     def test_should_suggest_typo_correction(self) -> None:
         """Test that the linter suggests corrections for typos."""
         # arrange
         sut = Path("rust_typedframes_linter/target/debug/typedframes_linter").absolute()
-        example_file = Path("examples/linter_test_example.py").absolute()
+        example_file = Path("examples/typedframes_example.py").absolute()
 
         # act
         result = subprocess.run(
@@ -52,13 +51,13 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
         )
 
         # assert
-        self.assertIn("did you mean 'email'?", result.stdout)
+        self.assertIn("did you mean 'user_id'?", result.stdout)
 
     def test_should_track_mutations(self) -> None:
         """Test that the linter tracks column mutations."""
         # arrange
         sut = Path("rust_typedframes_linter/target/debug/typedframes_linter").absolute()
-        example_file = Path("examples/linter_test_example.py").absolute()
+        example_file = Path("examples/typedframes_example.py").absolute()
 
         # act
         result = subprocess.run(
@@ -76,13 +75,13 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
         # arrange
         from typedframes._rust_linter import check_file
 
-        example_file = str(Path("examples/linter_test_example.py").absolute())
+        example_file = str(Path("examples/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
 
         # assert
-        self.assertIn("name", result)
+        self.assertIn("wrong_column", result)
         self.assertIn("does not exist", result)
 
 

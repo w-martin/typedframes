@@ -34,12 +34,9 @@ Usage:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, TypeVar
+from typing import Annotated, TypeVar
 
 from .base_schema import BaseSchema
-
-if TYPE_CHECKING:
-    import polars as pl
 
 SchemaT = TypeVar("SchemaT", bound=BaseSchema)
 
@@ -66,6 +63,7 @@ class PolarsFrame:
 
         # Schema-based column access (for building expressions)
         df.filter(UserSchema.user_id.col > 10)
+
     """
 
     def __class_getitem__(cls, schema: type[SchemaT]) -> type:
@@ -77,6 +75,7 @@ class PolarsFrame:
 
         Returns:
             Annotated[pl.DataFrame, schema] for type checking.
+
         """
         import polars as pl
 

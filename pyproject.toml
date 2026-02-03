@@ -66,6 +66,7 @@ ignore = [
     "COM812", # Formatter conflict
     "PTH123", # open() should be replaced by Path.open()
     "PT009",
+    "PT027",
     "PLC0415",
     "PLR0911", # Too many return statements
     "PLR0912", # Too many branches

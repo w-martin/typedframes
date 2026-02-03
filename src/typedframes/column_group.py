@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class ColumnGroup:
-    """
+    r"""
     Groups multiple Columns and ColumnSets for convenient access.
 
     Useful for organizing related columns that span multiple Column/ColumnSet
@@ -32,6 +32,7 @@ class ColumnGroup:
 
             # Group for convenient access to all sensor data
             all_sensors = ColumnGroup(members=[temperatures, pressures])
+
     """
 
     members: list[Column | ColumnSet | ColumnGroup]
@@ -52,6 +53,7 @@ class ColumnGroup:
 
         Returns:
             List of column names.
+
         """
         consumed_map = consumed_map or {}
         result: list[str] = []
@@ -83,6 +85,7 @@ class ColumnGroup:
 
         Example:
             df.select(SensorSchema.all_sensors.cols())
+
         """
         import polars as pl
 

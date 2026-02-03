@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class ColumnSet:
-    """
+    r"""
     Represents a set of columns matching a pattern or explicit list.
 
     Used for grouping related columns that share a common type,
@@ -33,6 +33,7 @@ class ColumnSet:
 
             # Regex pattern matching
             pressures = ColumnSet(members=r"pressure_\\d+", type=float, regex=True)
+
     """
 
     members: list[str] | str | DefinedLater
@@ -63,6 +64,7 @@ class ColumnSet:
 
         Example:
             df.select(SensorSchema.temperatures.cols())
+
         """
         import polars as pl
 

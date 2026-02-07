@@ -89,9 +89,35 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
 
         return cls(df, schema=schema, column_consumed_map=column_consumed_map)
 
-    def __getattr__(
+    def _lookup_schema_item(
+        self, item: str, schema: type[SchemaT], consumed_map: dict[str, list[str]]
+    ) -> pd.Series | pd.DataFrame | None:
+        """Look up item in schema columns, column sets, and column groups."""
+        # Check columns
+        if item in schema.columns():
+            col = schema.columns()[item]
+            if col.alias is DefinedLater:
+                raise ColumnAliasNotYetDefinedError(col.name)
+            effective_name = col.alias if isinstance(col.alias, str) else col.name
+            return self[effective_name]
+
+        # Check column sets
+        if item in schema.column_sets():
+            cs = schema.column_sets()[item]
+            if cs.members is DefinedLater:
+                raise ColumnSetMembersNotYetDefinedError(cs.name)
+            return self[consumed_map.get(cs.name, [])]
+
+        # Check column groups
+        if item in schema.column_groups():
+            group = schema.column_groups()[item]
+            return self[group.get_column_names(consumed_map)]
+
+        return None
+
+    def __getattr__(  # ty: ignore[override-of-final-method, invalid-method-override]
         self, item: str
-    ) -> pd.Series | pd.DataFrame:  # ty: ignore[invalid-method-override, override-of-final-method]
+    ) -> pd.Series | pd.DataFrame:
         """
         Access columns by schema attribute name.
 
@@ -99,40 +125,21 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         before falling back to standard pandas attribute access.
         """
         if item.startswith("_") or item in {"_schema_class", "_column_consumed_map"}:
-            return object.__getattribute__(self, item)  # type: ignore[return-value]  # ty: ignore[unused-ignore-comment]
+            return object.__getattribute__(self, item)
 
         try:
             schema = object.__getattribute__(self, "_schema_class")
             consumed_map = object.__getattribute__(self, "_column_consumed_map")
         except AttributeError:
-            return super().__getattribute__(item)  # type: ignore[return-value]  # ty: ignore[unused-ignore-comment]
+            schema = None
+            consumed_map = {}
 
-        if schema is None:
-            return super().__getattribute__(item)  # type: ignore[return-value]  # ty: ignore[unused-ignore-comment]
+        if schema is not None:
+            result = self._lookup_schema_item(item, schema, consumed_map)
+            if result is not None:
+                return result
 
-        column_map = schema.columns()
-        if item in column_map:
-            col = column_map[item]
-            if col.alias is DefinedLater:
-                raise ColumnAliasNotYetDefinedError(col.name)
-            effective_name = col.alias if isinstance(col.alias, str) else col.name
-            return self[effective_name]
-
-        column_set_map = schema.column_sets()
-        if item in column_set_map:
-            cs = column_set_map[item]
-            if cs.members is DefinedLater:
-                raise ColumnSetMembersNotYetDefinedError(cs.name)
-            matched = consumed_map.get(cs.name, [])
-            return self[matched]
-
-        column_group_map = schema.column_groups()
-        if item in column_group_map:
-            group = column_group_map[item]
-            col_names = group.get_column_names(consumed_map)
-            return self[col_names]
-
-        return super().__getattribute__(item)  # type: ignore[return-value]  # ty: ignore[unused-ignore-comment]
+        return super().__getattribute__(item)
 
     @property
     def _constructor(self) -> type[Self]:

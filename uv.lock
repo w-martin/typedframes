@@ -841,6 +841,35 @@ wheels = [
 ]
 
 [[package]]
+name = "pyrefly"
+version = "0.51.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/cd/9fba932665ef1049cbf4cdbdefd997f02802c69373b97ec8aa07ab9fc003/pyrefly-0.51.1.tar.gz", hash = "sha256:5835c93e568a7507926095b67ef269ecf3842eba604c0ac49290943b2b3bb21b", size = 4947820, upload-time = "2026-02-05T19:04:01.423Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/d2/aa49c4ea9190ce52ab610fd17c28f4899ae18844eeaa40576d628f8be17d/pyrefly-0.51.1-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:7d4b9c13edf6a0c1ef1fb80c8429ed1ce023d6c1faa282032b32900bc4ae7fc1", size = 11977835, upload-time = "2026-02-05T19:03:40.659Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/d4/96822a5f5262453a29ac97a07e7098267367bbac8117f6cee9885f320e7c/pyrefly-0.51.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:252d920b21a1ce0e00f077f560e48913370fbff3b6aab4426902eab9a57f5bee", size = 11556062, upload-time = "2026-02-05T19:03:42.95Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/86/c386fd3f04c519c44751c85291d2109b9cdbbfec5a5b4fc79f6648e45cba/pyrefly-0.51.1-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c48ec5c9f24361e903e1c60a0a32099ddd1d12b47c314414a980db2129ff040d", size = 32847386, upload-time = "2026-02-05T19:03:45.713Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/f4/7bac5a7baba3cb445affd0922fbacb4abdfc3d2abb8784d8b3a65f7c55f3/pyrefly-0.51.1-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:10e4ee82a90e493a07d4d8bc9683185005169f17454ad56d37c19f4794387581", size = 35150779, upload-time = "2026-02-05T19:03:48.449Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/d3/4947ea6745045a884885d1f30693e6d3f567dee02b1cd80f96d5d83e7246/pyrefly-0.51.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:cffebed312e85c4af91b9e398cf26c988ad4b442e815300e8478c1e0176f826a", size = 36274600, upload-time = "2026-02-05T19:03:51.72Z" },
+    { url = "https://files.pythonhosted.org/packages/40/5a/0debe6ee5fe84c4bb1e87a40830d0db757729b2595830391165f0c134ff6/pyrefly-0.51.1-py3-none-win32.whl", hash = "sha256:8ce1693457a4d856faf35ec519f7866ee13dd79d7db085e95caec8eaa21f1450", size = 10967000, upload-time = "2026-02-05T19:03:54.168Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/f6/50b7fe84a79f02681c2aed97dec3710da0bbdf514d1d5703a229c81e20c6/pyrefly-0.51.1-py3-none-win_amd64.whl", hash = "sha256:42c05e88da2f18aeab45e9b0384ef8e776630ed270c8bfcb33e0668757ea2d4f", size = 11747107, upload-time = "2026-02-05T19:03:56.384Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/aa/1fd05568b1c14140e659133efd9a0d8243274bf950d6c10ed64cbc2d51d4/pyrefly-0.51.1-py3-none-win_arm64.whl", hash = "sha256:c0f30432cfaf13c7c2d4188c94146cdaab2ce52bbd292d48c7d18ad4a168ecfb", size = 11270642, upload-time = "2026-02-05T19:03:58.909Z" },
+]
+
+[[package]]
+name = "pyright"
+version = "1.1.408"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nodeenv" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/74/b2/5db700e52554b8f025faa9c3c624c59f1f6c8841ba81ab97641b54322f16/pyright-1.1.408.tar.gz", hash = "sha256:f28f2321f96852fa50b5829ea492f6adb0e6954568d1caa3f3af3a5f555eb684", size = 4400578, upload-time = "2026-01-08T08:07:38.795Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/82/a2c93e32800940d9573fb28c346772a14778b84ba7524e691b324620ab89/pyright-1.1.408-py3-none-any.whl", hash = "sha256:090b32865f4fdb1e0e6cd82bf5618480d48eecd2eb2e70f960982a3d9a4c17c1", size = 6399144, upload-time = "2026-01-08T08:07:37.082Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1119,6 +1148,8 @@ dev = [
     { name = "licensecheck" },
     { name = "maturin" },
     { name = "pre-commit" },
+    { name = "pyrefly" },
+    { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -1139,6 +1170,8 @@ dev = [
     { name = "licensecheck", specifier = ">=2024.0.0" },
     { name = "maturin", specifier = ">=1.11.5" },
     { name = "pre-commit", specifier = ">=3.7.0" },
+    { name = "pyrefly", specifier = ">=0.51.1" },
+    { name = "pyright", specifier = ">=1.1.408" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest-cov", specifier = ">=7.0.0" },
     { name = "ruff", specifier = ">=0.14.13" },

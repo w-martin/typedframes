@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .column import Column
 from .column_set import ColumnSet
@@ -39,7 +39,7 @@ class ColumnGroup:
     description: str = ""
     name: str = field(default="", init=False)
 
-    def __set_name__(self, owner: Any, name: str) -> None:
+    def __set_name__(self, owner: type, name: str) -> None:
         """Set the name attribute from the class attribute name."""
         self.name = name
 
@@ -66,7 +66,7 @@ class ColumnGroup:
                 if member.name in consumed_map:
                     result.extend(consumed_map[member.name])
                 elif isinstance(member.members, list):
-                    result.extend(member.members)  # ty: ignore[invalid-argument-type]
+                    result.extend(member.members)
             elif isinstance(member, ColumnGroup):
                 result.extend(member.get_column_names(consumed_map))
 

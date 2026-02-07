@@ -1,3 +1,5 @@
+"""Example demonstrating pandera schema validation vs typedframes approach."""
+
 import pandera as pa  # ty: ignore[unresolved-import]
 from pandera.typing import DataFrame, Series  # ty: ignore[unresolved-import]
 
@@ -17,6 +19,7 @@ class OrderSchema(pa.DataFrameModel):
 
 
 def load_users() -> DataFrame[UserSchema]:
+    """Load sample user data."""
     return DataFrame[UserSchema](
         {"user_id": [1, 2], "email": ["foo@baz.com", "bar@qux.com"]},
     )
@@ -27,6 +30,7 @@ def process_orders(df: DataFrame[OrderSchema]) -> None:
 
 
 def main() -> None:
+    """Demonstrate schema validation use cases."""
     # Passing wrong schema to function
     # We load users (UserSchema) but pass to function expecting orders (OrderSchema)
     users = load_users()

@@ -1,78 +1,42 @@
 # Claude Code Instructions for typedframes
 
-## Test Style Guidelines
-
-### Test Naming Convention
-- Use `test_should_<expected_behavior>` naming pattern
-- Example: `test_should_detect_missing_column`, `test_should_preserve_type_after_merge`
-
-### Test Structure (AAA Pattern)
-All tests must follow the Arrange-Act-Assert pattern:
-
-```python
-def test_should_do_something(self) -> None:
-    """Describe what the test verifies."""
-    # arrange
-    sut = SystemUnderTest()
-    expected = "expected_value"
-
-    # act
-    result = sut.do_something()
-
-    # assert
-    self.assertEqual(result, expected)
-```
-
-### Test Organization
-- Use `unittest.TestCase` for all test classes
-- Unit tests go in `tests/test_<module>.py`
-- Integration tests go in `tests/test_integration.py`
-- Keep unit and integration tests separate
-
-### Mocking Guidelines
-- Minimize use of `patch` - prefer dependency injection where possible
-- When mocking is necessary, mock at the boundary (e.g., external services, file system)
-- Avoid mocking internal implementation details
-
-### Test File Structure
-- No `if __name__ == "__main__"` blocks - pytest handles test discovery
-- One test class per file matching the module under test
-- Import the system under test (sut) from the main package
-
-### Example Test
-
-```python
-"""Unit tests for Column class."""
-
-import unittest
-
-from typedframes import Column
-
-
-class TestColumn(unittest.TestCase):
-    """Unit tests for Column descriptor."""
-
-    def test_should_create_column_with_type(self) -> None:
-        """Test that Column can be created with a specific type."""
-        # arrange
-        expected_type = int
-
-        # act
-        sut = Column(type=expected_type)
-
-        # assert
-        self.assertEqual(sut.type, expected_type)
-```
+## Test Guidelines
+- Name tests `test_should_<expected_behavior>`
+- Follow AAA pattern: `# arrange`, `# act`, `# assert` comments
+- Use `unittest.TestCase` for all tests
+- Unit tests: `tests/test_<module>.py`, Integration: `tests/test_integration.py`
+- No `if __name__ == "__main__"` blocks
+- Minimize `patch` usage - prefer dependency injection
 
 ## Code Style
-- Use type hints for all function signatures
-- Follow PEP 8 with 120 character line limit
-- Use Google-style docstrings
-- Run `uv run inv lint` before committing
+- Type hints on all functions
+- 120 char line limit
+- Google-style docstrings
+- Custom exceptions with descriptive messages
 
-## Running Tests
-```bash
-uv run inv test      # Run all tests with coverage
-uv run inv lint      # Run linters
-uv run inv all       # Run all checks
-```
+## Lint Ignore Policy
+- Never add ignore rules without user approval
+- Never skip bandit rules
+- Exceptions must be general patterns, not case-by-case
+
+### Agreed Exceptions (pyproject.toml)
+- `D203`, `D212`: Conflict with D211/D213
+- `COM812`: Conflicts with ruff formatter
+- `PT009`, `PT027`: Using unittest.TestCase
+- `PLC0415`: Lazy imports for optional dependencies (polars/pandas)
+- `ANN401`: Any needed for pandas compatibility and Python protocols
+- `tests/*`: `S101` (assert), `SLF001` (private access), `S603`/`S607` (subprocess)
+- `tests/fixtures/*`: `T201` (print for test output)
+- `examples/*`: `T201` (print), `INP001` (standalone scripts)
+- `mypy.py`: `S603` (subprocess for linter execution)
+
+## Commands
+- `uv run inv build` - Build Rust linter (if source changed)
+- `uv run inv test` - Tests with coverage (auto-builds)
+- `uv run inv lint` - All linters
+- `uv run inv all` - Full check suite
+
+## Documentation Policy
+- Never add future work, roadmap items, or collaboration suggestions without user approval
+- Never add "Contributing" sections or invitations for external contributions
+- Check with user before suggesting any planned features or improvements

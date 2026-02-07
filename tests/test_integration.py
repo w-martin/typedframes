@@ -4,20 +4,11 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from typedframes._rust_linter import check_file  # ty: ignore[unresolved-import]
+
 
 class TestTypedFramesLinterIntegration(unittest.TestCase):
     """Integration tests for the Rust linter."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        """Build the Rust linter binary if needed."""
-        binary_path = Path("rust_typedframes_linter/target/debug/typedframes_linter")
-        if not binary_path.exists():
-            subprocess.run(
-                ["cargo", "build"],
-                cwd="rust_typedframes_linter",
-                check=True,
-            )
 
     def test_should_detect_missing_column(self) -> None:
         """Test that the linter detects missing columns."""
@@ -73,8 +64,6 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
     def test_should_run_via_python_extension(self) -> None:
         """Test that the Rust linter works via Python extension."""
         # arrange
-        from typedframes._rust_linter import check_file  # ty: ignore[unresolved-import]
-
         example_file = str(Path("examples/typedframes_example.py").absolute())
 
         # act

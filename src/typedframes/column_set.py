@@ -37,7 +37,7 @@ class ColumnSet:
     """
 
     members: list[str] | str | type[DefinedLater]  # ty: ignore[invalid-type-form]
-    type: type = Any  # ty: ignore[invalid-type-form]
+    type: type = Any
     regex: bool = False
     description: str = ""
     name: str = field(default="", init=False)
@@ -47,7 +47,7 @@ class ColumnSet:
         if self.regex and isinstance(self.members, str):
             self.members = [self.members]
 
-    def __set_name__(self, owner: Any, name: str) -> None:
+    def __set_name__(self, owner: type, name: str) -> None:
         """Set the name attribute from the class attribute name."""
         self.name = name
 
@@ -75,4 +75,4 @@ class ColumnSet:
             msg = "Cannot get column expressions for regex or DefinedLater members without matched_columns"
             raise ValueError(msg)
 
-        return [pl.col(c) for c in self.members]  # ty: ignore[not-iterable]
+        return [pl.col(c) for c in self.members]

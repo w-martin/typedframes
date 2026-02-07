@@ -1,8 +1,6 @@
 """Mypy plugin for typedframes column linting."""
 
 import json
-import os
-import subprocess
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -31,12 +29,16 @@ def is_enabled(project_root: Path) -> bool:
     if not config_path.exists():
         return True
     try:
-        with open(config_path, "rb") as f:
+        with config_path.open("rb") as f:
             config = tomllib.load(f)
             enabled = config.get("tool", {}).get("typedframes", {}).get("enabled", True)
             return bool(enabled)
     except Exception:  # noqa: BLE001
         return True
+
+
+class LinterNotFoundError(Exception):
+    """Raised when the typedframes linter cannot be found or executed."""
 
 
 class TypedFramesPlugin(Plugin):
@@ -47,6 +49,13 @@ class TypedFramesPlugin(Plugin):
         super().__init__(*args, **kwargs)
         self._linter_results: dict[str, list[dict[str, Any]]] = {}
 
+    def _run_via_extension(self, file_path: str) -> list[dict[str, Any]]:
+        """Run the linter via the Rust extension module."""
+        from typedframes._rust_linter import check_file  # ty: ignore[unresolved-import]
+
+        result_json = str(check_file(file_path))
+        return json.loads(result_json)
+
     def _run_linter(self, file_path: str) -> list[dict[str, Any]]:
         """Run the Rust linter on the given file."""
         if file_path in self._linter_results:
@@ -55,59 +64,22 @@ class TypedFramesPlugin(Plugin):
         if not file_path or "site-packages" in file_path or file_path.endswith(".pyi"):
             return []
 
-        path_obj = Path(file_path)
-        project_root = get_project_root(path_obj)
+        project_root = get_project_root(Path(file_path))
         if not is_enabled(project_root):
             return []
 
         try:
-            # Try to import the Rust extension module
-            from typedframes._rust_linter import check_file  # ty: ignore[unresolved-import]
-        except ImportError:
-            pass
-        else:
-            result_json = str(check_file(file_path))
-            errors = json.loads(result_json)
-            self._linter_results[file_path] = errors
-            return errors
-
-        # Fallback to binary if extension module not available
-        try:
-            current_dir = Path(__file__).parent
-            binary_name = "typedframes_linter"
-            if os.name == "nt":
-                binary_name += ".exe"
-
-            # Try several possible locations
-            search_paths = [
-                current_dir / "bin" / binary_name,
-                project_root / "rust_typedframes_linter" / "target" / "release" / binary_name,
-                project_root / "rust_typedframes_linter" / "target" / "debug" / binary_name,
-            ]
-
-            binary_path = None
-            for path in search_paths:
-                if path.exists():
-                    binary_path = path
-                    break
-
-            if binary_path is None:
-                return []
-
-            result = subprocess.run(
-                [str(binary_path), file_path],
-                capture_output=True,
-                text=True,
-                check=False,
+            errors = self._run_via_extension(file_path)
+        except ImportError as e:
+            msg = (
+                "typedframes linter extension not found. "
+                "Ensure the package is properly installed with 'uv add typedframes' "
+                "or build from source with 'uv run maturin develop'."
             )
-            if result.returncode == 0:
-                errors = json.loads(result.stdout)
-                self._linter_results[file_path] = errors
-                return errors
-        except Exception:  # noqa: BLE001, S110
-            pass
+            raise LinterNotFoundError(msg) from e
 
-        return []
+        self._linter_results[file_path] = errors
+        return errors
 
     def get_method_hook(
         self,

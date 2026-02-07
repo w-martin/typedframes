@@ -85,9 +85,45 @@ class BaseSchema:
 
         for cs in cls.column_sets().values():
             if not cs.regex and isinstance(cs.members, list):
-                names.extend(cs.members)  # ty: ignore[invalid-argument-type]
+                names.extend(cs.members)
 
         return names
+
+    @classmethod
+    def _build_key_column_map(cls) -> dict[str, Column]:
+        """Build mapping of column keys to Column objects, validating aliases."""
+        key_column_map: dict[str, Column] = {}
+        for col in cls.columns().values():
+            if col.alias is DefinedLater:
+                raise ColumnAliasNotYetDefinedError(col.name)
+            key = col.alias if isinstance(col.alias, str) else col.name
+            key_column_map[key] = col
+        return key_column_map
+
+    @classmethod
+    def _match_column_to_set(
+        cls,
+        col_name: str,
+        cs: ColumnSet,
+        *,
+        consumed: bool,
+        greedy: bool,
+        current_match: Column | ColumnSet | None,
+    ) -> bool:
+        """Check if column matches a ColumnSet. Returns True if matched."""
+        if not isinstance(cs.members, list):
+            return False
+
+        matches = (
+            any(re.match(pattern, col_name) for pattern in cs.members)
+            if cs.regex
+            else col_name in cs.members
+        )
+
+        if matches and consumed and not greedy:
+            raise ColumnGroupError(col_name, current_match, cs)
+
+        return matches and not consumed
 
     @classmethod
     def compute_column_map(
@@ -116,13 +152,7 @@ class BaseSchema:
         """
         greedy = greedy if greedy is not None else cls.greedy_column_sets
         column_consumed_map: dict[str, list[str]] = defaultdict(list)
-
-        key_column_map: dict[str, Column] = {}
-        for col in cls.columns().values():
-            if col.alias is DefinedLater:
-                raise ColumnAliasNotYetDefinedError(col.name)
-            key = col.alias if isinstance(col.alias, str) else col.name
-            key_column_map[key] = col
+        key_column_map = cls._build_key_column_map()
 
         if not cls.column_sets():
             return {k: v.type for k, v in key_column_map.items()}, dict(column_consumed_map)
@@ -134,29 +164,15 @@ class BaseSchema:
             if cs.members is DefinedLater:
                 raise ColumnSetMembersNotYetDefinedError(cs.name)
 
-        exact_sets = [cs for cs in cls.column_sets().values() if not cs.regex]
-        regex_sets = [cs for cs in cls.column_sets().values() if cs.regex]
-
+        column_sets_list = list(cls.column_sets().values())
         for i, col_name in enumerate(dataframe_columns):
-            for cs in exact_sets:
-                if isinstance(cs.members, list) and col_name in cs.members:
-                    if consumed[i] and not greedy:
-                        raise ColumnGroupError(col_name, column_bag[i], cs)
-                    if not consumed[i]:
-                        consumed[i] = True
-                        column_bag[i] = cs
-                        column_consumed_map[cs.name].append(col_name)
-
-            for cs in regex_sets:
-                if isinstance(cs.members, list) and any(
-                    re.match(pattern, col_name) for pattern in cs.members
-                ):  # ty: ignore[no-matching-overload]
-                    if consumed[i] and not greedy:
-                        raise ColumnGroupError(col_name, column_bag[i], cs)
-                    if not consumed[i]:
-                        consumed[i] = True
-                        column_bag[i] = cs
-                        column_consumed_map[cs.name].append(col_name)
+            for cs in column_sets_list:
+                if cls._match_column_to_set(
+                    col_name, cs, consumed=consumed[i], greedy=greedy, current_match=column_bag[i]
+                ):
+                    consumed[i] = True
+                    column_bag[i] = cs
+                    column_consumed_map[cs.name].append(col_name)
 
         result: dict[str, type] = {}
         for i, col_or_set in enumerate(column_bag):
@@ -187,7 +203,7 @@ class BaseSchema:
                     for cs in cls.column_sets().values():
                         if (
                             cs.regex and isinstance(cs.members, list) and any(re.match(p, col_name) for p in cs.members)
-                        ):  # ty: ignore[no-matching-overload]
+                        ):
                             is_matched = True
                             break
                     if not is_matched:

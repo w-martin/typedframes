@@ -3,8 +3,8 @@
 **Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime.**
 
 ```python
-from src.typedframes import BaseSchema, Column
-from src.typedframes import PandasFrame
+from typedframes import BaseSchema, Column
+from typedframes import PandasFrame
 
 
 class UserData(BaseSchema):
@@ -17,6 +17,23 @@ def process(df: PandasFrame[UserData]) -> None:
     df['user_id']  # ✓ OK
     df['username']  # ✗ Error: Column 'username' not in UserData
 ```
+
+---
+
+## Table of Contents
+
+- [Why typedframes?](#why-typedframes)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Static Analysis](#static-analysis)
+- [Type Safety With Multiple Backends](#type-safety-with-multiple-backends)
+- [Features](#features)
+- [Advanced Usage](#advanced-usage)
+- [Examples](#examples)
+- [Static Analysis Performance](#static-analysis-performance)
+- [Comparison](#comparison)
+- [Philosophy](#philosophy)
+- [FAQ](#faq)
 
 ---
 
@@ -54,7 +71,7 @@ uv add typedframes
 ### Define Your Schema (Once)
 
 ```python
-from src.typedframes import BaseSchema, Column, ColumnSet
+from typedframes import BaseSchema, Column, ColumnSet
 
 
 class SalesData(BaseSchema):
@@ -69,7 +86,7 @@ class SalesData(BaseSchema):
 ### Use With Pandas
 
 ```python
-from src.typedframes import PandasFrame
+from typedframes import PandasFrame
 
 # Load data with schema
 df: PandasFrame[SalesData] = SalesData().read_csv("sales.csv")
@@ -93,7 +110,7 @@ grouped = df.groupby('customer_id')['revenue'].sum()
 ### Use With Polars
 
 ```python
-from src.typedframes import PolarsFrame
+from typedframes import PolarsFrame
 
 # Same schema, different backend
 df: PolarsFrame[SalesData] = SalesData(backend="polars").read_csv("sales.csv")
@@ -191,9 +208,9 @@ mypy src/
 typedframes uses **explicit backend types** to ensure complete type safety:
 
 ```python
-from src.typedframes import BaseSchema, Column
-from src.typedframes import PandasFrame
-from src.typedframes import PolarsFrame
+from typedframes import BaseSchema, Column
+from typedframes import PandasFrame
+from typedframes import PolarsFrame
 import polars as pl
 
 
@@ -247,7 +264,7 @@ summary(df_polars)  # ✓ OK
 ### Clean Schema Definition
 
 ```python
-from src.typedframes import BaseSchema, Column, ColumnSet, ColumnGroup
+from typedframes import BaseSchema, Column, ColumnSet, ColumnGroup
 
 
 class TimeSeriesData(BaseSchema):
@@ -262,7 +279,7 @@ class TimeSeriesData(BaseSchema):
 ### Beautiful Runtime API
 
 ```python
-from src.typedframes import PandasFrame
+from typedframes import PandasFrame
 
 df: PandasFrame[TimeSeriesData] = TimeSeriesData().read_csv("sensors.csv")
 
@@ -282,7 +299,7 @@ df[['timestamp', 'temp_sensor_1']]  # Multi-column select
 ### Column-Level Static Checking
 
 ```python
-from src.typedframes import PandasFrame
+from typedframes import PandasFrame
 
 
 def daily_summary(data: PandasFrame[TimeSeriesData]) -> PandasFrame[DailySummary]:
@@ -321,7 +338,7 @@ df.sensors.mean()  # All sensor columns (different count, same code)
 ### Dynamic Column Aliasing
 
 ```python
-from src.typedframes import DefinedLater
+from typedframes import DefinedLater
 
 
 class FlexibleSchema(BaseSchema):
@@ -340,8 +357,8 @@ customer_ids = df.id_column  # Accesses 'customer_id' column
 ### Working With Both Backends
 
 ```python
-from src.typedframes import PandasFrame
-from src.typedframes import PolarsFrame
+from typedframes import PandasFrame
+from typedframes import PolarsFrame
 
 
 class ProcessingPipeline:
@@ -369,9 +386,9 @@ class ProcessingPipeline:
 Use typedframes for schemas and static analysis, Pandera for runtime validation:
 
 ```python
-from src.typedframes import BaseSchema, Column
-from src.typedframes import PandasFrame
-from src.typedframes import to_pandera_schema
+from typedframes import BaseSchema, Column
+from typedframes import PandasFrame
+from typedframes import to_pandera_schema
 import pandera as pa
 
 
@@ -399,7 +416,7 @@ validated_df = pandera_schema.validate(df)  # Runtime checks
 ### Optional Runtime Validation
 
 ```python
-from src.typedframes import Column, Field
+from typedframes import Column, Field
 
 
 class UserData(BaseSchema):
@@ -420,8 +437,8 @@ df = UserData().read_csv("users.csv", validate=True)
 ### Basic CSV Processing
 
 ```python
-from src.typedframes import BaseSchema, Column
-from src.typedframes import PandasFrame
+from typedframes import BaseSchema, Column
+from typedframes import PandasFrame
 
 
 class Orders(BaseSchema):
@@ -442,8 +459,8 @@ revenue = calculate_revenue(df)
 ### Time Series Analysis
 
 ```python
-from src.typedframes import BaseSchema, Column, ColumnSet, ColumnGroup
-from src.typedframes import PandasFrame
+from typedframes import BaseSchema, Column, ColumnSet, ColumnGroup
+from typedframes import PandasFrame
 
 
 class SensorData(BaseSchema):
@@ -464,8 +481,8 @@ all_readings_stats = df.all_sensors.describe()
 ### Multi-Step Pipeline
 
 ```python
-from src.typedframes import BaseSchema, Column
-from src.typedframes import PandasFrame
+from typedframes import BaseSchema, Column
+from typedframes import PandasFrame
 
 
 class RawSales(BaseSchema):
@@ -505,8 +522,8 @@ def analyze(df: PandasFrame[AggregatedSales]) -> float:
 ### Polars Performance Pipeline
 
 ```python
-from src.typedframes import BaseSchema, Column
-from src.typedframes import PolarsFrame
+from typedframes import BaseSchema, Column
+from typedframes import PolarsFrame
 import polars as pl
 
 
@@ -532,34 +549,110 @@ result = efficient_aggregation(df)
 
 ---
 
+## Static Analysis Performance
+
+Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
+
+**Benchmark results** (12 Python files, 5 runs each, caches cleared):
+
+| Tool | Version | What it does | Time |
+|------|---------|--------------|------|
+| typedframes | 0.1.0 | DataFrame column checker | 1ms ±19µs |
+| ruff | 0.14.13 | Linter (no type checking) | 53ms ±9ms |
+| ty | 0.0.14 | Type checker | 131ms ±14ms |
+| pyrefly | 0.51.1 | Type checker | 248ms ±14ms |
+| mypy | 1.19.1 | Type checker (no plugin) | 6.88s ±170ms |
+| mypy + typedframes | 1.19.1 | Type checker + column checker | 6.98s ±92ms |
+| pyright | 1.1.408 | Type checker | 2.02s ±201ms |
+
+**Note:** On small codebases, startup time dominates. On larger projects, ty and pyrefly are typically 10-60x faster than mypy/pyright.
+
+*Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
+
+The typedframes binary performs only DataFrame column checking, while full type checkers (mypy, pyright, ty) analyze all Python types. Use both: the binary for fast iteration, mypy for comprehensive checking.
+
+**Note:** ty (Astral) does not currently support mypy plugins, so use the standalone binary for column checking with ty.
+
+---
+
 ## Comparison
 
-### vs Pandera
+### Feature Matrix (Static Analysis Focus)
 
-| Feature | typedframes | Pandera |
-|---------|-------------|---------|
-| Static analysis | ✅ Full support | ⚠️ Limited/broken |
-| Runtime validation | ⚠️ Optional | ✅ Excellent |
-| Schema API | ✅ Clean (`Column`) | ⚠️ Verbose (`Series[T]`) |
-| Column grouping | ✅ ColumnSet/ColumnGroup | ❌ No |
-| Polars support | ✅ Yes (explicit types) | ✅ Yes |
-| Backend type safety | ✅ Yes | ❌ No |
-| Performance overhead | ✅ Zero | ⚠️ Validation cost |
+Comprehensive comparison of pandas/DataFrame typing and validation tools. **typedframes focuses on static analysis**—catching errors at lint-time before your code runs.
 
-**Use typedframes for:** Static analysis, clean schemas, development-time checking
-**Use Pandera for:** Runtime validation, production data quality checks
-**Use both together:** typedframes schemas + Pandera validation via integration
+| Feature | typedframes | Pandera | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame | narwhals |
+|---------|-------------|---------|----------------------|--------------|-------------|-------------------|-------------|----------|
+| **Version tested** | 0.1.0 | 0.29.0 | 0.3.6 | 3.0.0 | 0.1.2 | 1.1.3 | 3.7.0 | 2.16.0 |
+| **Analysis Type** |
+| When errors are caught | **Static (lint-time)** | Runtime | Static + Runtime | Static | Runtime | Runtime | Static + Runtime | Runtime |
+| **Static Analysis (our focus)** |
+| Mypy plugin | ✅ Yes | ⚠️ Limited | ✅ Yes | ✅ Yes | ❌ No | ❌ No | ⚠️ Basic | ❌ No |
+| Standalone checker | ✅ Rust (~1ms) | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No |
+| Column name checking | ✅ Yes | ⚠️ Limited | ✅ Yes | ❌ No | ❌ No | ❌ No | ✅ Yes | ❌ No |
+| Column type checking | ✅ Yes | ⚠️ Limited | ✅ Yes | ❌ No | ❌ No | ❌ No | ✅ Yes | ❌ No |
+| Typo suggestions | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Runtime Validation** |
+| Data validation | ⚠️ Optional | ✅ Excellent | ✅ typeguard | ❌ No | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No |
+| Value constraints | ❌ No | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No | ✅ Yes | ❌ No |
+| **Schema Features** |
+| Column grouping | ✅ ColumnSet | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No |
+| Regex column matching | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No |
+| Deferred column names | ✅ DefinedLater | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Backend Support** |
+| Pandas | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ❌ Own | ✅ Yes |
+| Polars | ✅ Yes | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No | ❌ Own | ✅ Yes |
+| DuckDB, cuDF, etc. | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ❌ No | ✅ Yes |
+| **Project Status (Feb 2026)** |
+| Active development | ✅ Yes | ✅ Yes | ⚠️ Low | ✅ Yes | ❌ Inactive | ⚠️ Low | ✅ Yes | ✅ Yes |
 
-### vs pandas-stubs
+**Legend:** ✅ Full support | ⚠️ Limited/Partial | ❌ Not supported
 
-| Feature | typedframes | pandas-stubs |
-|---------|-------------|--------------|
-| Column-level types | ✅ Yes | ❌ No |
-| API-level types | ✅ Yes (via stubs) | ✅ Yes |
-| Runtime benefits | ✅ Clean access | ❌ None |
-| Schema definition | ✅ Built-in | ❌ Manual |
+### Tool Descriptions
 
-**typedframes builds on pandas-stubs** - we provide column-level checking while pandas-stubs provides API-level types.
+- **[Pandera](https://pandera.readthedocs.io/)** (v0.29.0): Excellent runtime validation. Static analysis support exists but has limitations—column access via `df["column"]` is not validated, and schema mismatches between functions may not be caught.
+
+- **[strictly_typed_pandas](https://strictly-typed-pandas.readthedocs.io/)** (v0.3.6): Provides `DataSet[Schema]` type hints with mypy support. No standalone checker. No polars support. Runtime validation via typeguard.
+
+- **[pandas-stubs](https://github.com/pandas-dev/pandas-stubs)** (v3.0.0): Official pandas type stubs. Provides API-level types but no column-level checking.
+
+- **[dataenforce](https://github.com/CedricFR/dataenforce)** (v0.1.2): Runtime validation via decorator. Marked as experimental/not production-ready. Appears inactive.
+
+- **[pandas-type-checks](https://pypi.org/project/pandas-type-checks/)** (v1.1.3): Runtime validation decorator. No static analysis.
+
+- **[StaticFrame](https://github.com/static-frame/static-frame)** (v3.7.0): Alternative immutable DataFrame library with built-in static typing. Not compatible with pandas/polars—requires using StaticFrame's own DataFrame implementation.
+
+- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.16.0): Compatibility layer that provides a unified API across pandas, polars, DuckDB, cuDF, and more. Solves a different problem—write-once-run-anywhere portability, not type safety. See [Why Abstraction Layers Don't Solve Type Safety](#why-abstraction-layers-dont-solve-type-safety) below.
+
+### Type Checkers (Not DataFrame-Specific)
+
+These are general Python type checkers. They don't validate DataFrame column names, but they can be used alongside typedframes for comprehensive type checking:
+
+- **[mypy](https://mypy-lang.org/)** (v1.19.1): The original Python type checker. typedframes provides a mypy plugin for column checking. See [performance benchmarks](#static-analysis-performance).
+
+- **[ty](https://github.com/astral-sh/ty)** (v0.0.14, Astral): New Rust-based type checker, 10-60x faster than mypy on large codebases. Does not support mypy plugins—use typedframes standalone checker.
+
+- **[pyrefly](https://pyrefly.org/)** (v0.51.1, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast, but no DataFrame column checking.
+
+- **[pyright](https://github.com/microsoft/pyright)** (v1.1.408, Microsoft): Type checker powering Pylance/VSCode. No mypy plugin support—use typedframes standalone checker.
+
+### Not Directly Comparable
+
+These tools serve different purposes:
+
+- **[pandas_lint](https://github.com/Jean-EstevezT/pandas_lint)**: Lints pandas code patterns (performance, best practices). Does not check column names/types.
+- **[pandas-vet](https://github.com/deppen8/pandas-vet)**: Flake8 plugin for pandas best practices. Does not check column names/types.
+
+### When to Use What
+
+| Use Case | Recommended Tool |
+|----------|------------------|
+| Static column checking (existing pandas/polars) | **typedframes** |
+| Runtime data validation | Pandera |
+| Both static + runtime | typedframes + Pandera |
+| Cross-library portability (write once, run anywhere) | narwhals |
+| Immutable DataFrames from scratch | StaticFrame |
+| Pandas API type hints only | pandas-stubs |
 
 ---
 
@@ -589,33 +682,47 @@ We use explicit `PandasFrame` and `PolarsFrame` types because:
 **We reject:**
 - ❌ "Universal DataFrame" abstractions (you lose features)
 - ❌ Implicit backend detection (runtime errors)
-- ❌ Lowest-common-denominator APIs (why use polars then?)
+- ❌ Lowest-common-denominator APIs
+
+The reason to choose polars over pandas is its lazy evaluation, native parallelism, and expressive query syntax. If you wrap it in an abstraction that only exposes shared features, you lose the advantages that made polars worthwhile. typedframes lets you use each library's full API while still getting schema-level type safety.
+
+### Why Abstraction Layers Don't Solve Type Safety
+
+Tools like [narwhals](https://narwhals-dev.github.io/narwhals/) solve a different problem: writing portable code that runs on pandas, polars, DuckDB, cuDF, and other backends. This is useful for library authors who want to support multiple backends without maintaining separate codebases.
+
+However, abstraction layers don't provide column-level type safety:
+
+```python
+import narwhals as nw
+
+def process(df: nw.DataFrame) -> nw.DataFrame:
+    # No static checking - "revenue" typo won't be caught until runtime
+    return df.filter(nw.col("revnue") > 100)  # Typo: "revnue" vs "revenue"
+```
+
+**The fundamental issue:** Abstraction layers abstract over *which library* you're using, not *what columns* your data has. They can't know at lint-time whether "revenue" is a valid column in your DataFrame.
+
+typedframes solves the orthogonal problem of schema safety:
+
+```python
+from typedframes import PolarsFrame
+
+class SalesData(BaseSchema):
+    revenue = Column(type=float)
+
+def process(df: PolarsFrame[SalesData]) -> PolarsFrame[SalesData]:
+    return df.filter(df['revnue'] > 100)  # ✗ Error at lint-time: 'revnue' not in SalesData
+```
+
+**Use narwhals when:** You're writing a library that needs to work with multiple DataFrame backends.
+
+**Use typedframes when:** You want to catch column name/type errors before your code runs.
 
 ### Why No Built-in Validation?
 
-**Validation belongs at data ingestion, not in Python.**
-
-If you're validating DataFrames in Python, your data pipeline needs fixing.
+Ideally, validation happens at the point of data ingestion rather than in Python application code. If you're validating DataFrames in Python, consider whether your data pipeline could enforce constraints earlier.
 
 That said, we provide Pandera integration for cases where runtime validation is genuinely necessary.
-
----
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md)
-
-**Priority areas:**
-- Transformation tracking (select, rename, join, merge)
-- Better error messages
-- More examples and documentation
-- Performance optimizations
-
-**Future possibilities:**
-- Dask support
-- Modin support
-- Ray datasets support
-- Pyright plugin
 
 ---
 
@@ -634,17 +741,7 @@ MIT License - see [LICENSE](LICENSE)
 - [x] Mypy plugin
 - [x] Standalone checker (Rust)
 - [x] Explicit backend types
-
-**In Progress:**
-- [ ] Transformation tracking
-- [ ] Better error messages
-- [ ] More comprehensive examples
-
-**Future:**
-- [ ] Pyright plugin
-- [ ] Auto-generated .pyi stubs
-- [ ] Dask/Modin support
-- [ ] Integration with more validation libraries
+- [x] Merge/join schema preservation
 
 ---
 

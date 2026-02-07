@@ -31,13 +31,13 @@ class Column:
 
     """
 
-    type: type = Any  # ty: ignore[invalid-type-form]
+    type: type = Any
     alias: str | type[DefinedLater] | None = None  # ty: ignore[invalid-type-form]
     nullable: bool = False
     description: str = ""
     name: str = field(default="", init=False)
 
-    def __set_name__(self, owner: Any, name: str) -> None:
+    def __set_name__(self, owner: type, name: str) -> None:
         """Set the name attribute from the class attribute name."""
         self.name = name
 

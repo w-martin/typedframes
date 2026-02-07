@@ -57,31 +57,21 @@ indent-style = "space"
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
-    "D100",
-    "D107",
-    "D203", # One of D203 or D211 must be ignored
-    "D212", # One of D212 or D213 must be ignored
-    "S603", # subprocess call: check for execution of untrusted input
-    "S607", # Starting a process with a partial executable path
-    "ANN401", # Any is disallowed in *args/**kwargs
-    "C901", # Too complex
-    "COM812", # Formatter conflict
-    "PTH123", # open() should be replaced by Path.open()
-    "PT009",
-    "PT027",
-    "PLC0414", # Import alias does not rename original package (intentional for re-exports)
-    "PLC0415",
-    "PLR0911", # Too many return statements
-    "PLR0912", # Too many branches
-    "TRY301", # Abstract raise to an inner function
-    "TRY003", # Avoid specifying long messages outside the exception class
-    "EM101", # Exception must not use a string literal
+    "D203",   # Conflicts with D211
+    "D212",   # Conflicts with D213
+    "COM812", # Conflicts with ruff formatter
+    "PT009",  # Using unittest.TestCase
+    "PT027",  # Using unittest.TestCase
+    "PLC0415",  # Lazy imports for optional dependencies (polars/pandas)
+    "ANN401",  # Any needed for pandas compatibility and Python protocols
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "D", "ANN", "SLF001", "PLC0415", "S108"]
-"examples/*" = ["T201", "D", "ANN", "S101", "PLC0415",
-    "INP001"]
+"tests/*" = ["S101", "SLF001", "S603", "S607"]
+"tests/fixtures/*" = ["T201"]
+"examples/*" = ["T201", "INP001"]
+"src/typedframes/mypy.py" = ["S603"]
+"benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
@@ -97,6 +87,8 @@ dev = [
     "licensecheck>=2024.0.0",
     "maturin>=1.11.5",
     "pre-commit>=3.7.0",
+    "pyrefly>=0.51.1",
+    "pyright>=1.1.408",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
     "ruff>=0.14.13",
@@ -104,7 +96,6 @@ dev = [
 
 [tool.bandit]
 exclude_dirs = ["tests", "examples"]
-skips = ["B101", "B110", "B404", "B603"]  # B101=assert, B110=try-except-pass, B404=subprocess import, B603=subprocess call
 
 [tool.coverage.report]
 fail_under = 50

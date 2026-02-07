@@ -1,6 +1,7 @@
 """Unit tests for Column class."""
 
 import unittest
+from typing import Any
 
 from typedframes import Column, DefinedLater
 
@@ -11,8 +12,6 @@ class TestColumn(unittest.TestCase):
     def test_should_create_column_with_defaults(self) -> None:
         """Test that Column can be created with default values."""
         # arrange/act
-        from typing import Any
-
         sut = Column()
 
         # assert

@@ -1,4 +1,6 @@
-import builtins
+"""Unit tests for the mypy plugin."""
+
+import io
 import json
 import sys
 import unittest
@@ -7,26 +9,22 @@ from unittest.mock import MagicMock, patch
 
 from mypy.options import Options
 
+from typedframes.mypy import LinterNotFoundError, get_project_root, is_enabled, plugin
 from typedframes.mypy import TypedFramesPlugin as PandasLinterPlugin
-
-original_import = builtins.__import__
-
-
-def make_import_fail(name, *args, **kwargs):
-    """Helper to make specific imports fail."""
-    if name == "typedframes._rust_linter":
-        raise ImportError("Mocked import failure")
-    return original_import(name, *args, **kwargs)
 
 
 class TestPandasLinterPluginUnit(unittest.TestCase):
+    """Unit tests for the PandasLinterPlugin class."""
+
     def setUp(self) -> None:
+        """Set up test fixtures."""
         # arrange
         self.plugin = PandasLinterPlugin(Options())
         self.test_file = "test.py"
         self.error_data = [{"line": 10, "message": "Column 'foo' does not exist"}]
 
     def test_should_report_error_on_exact_line_match(self) -> None:
+        """Test that errors are reported on exact line matches."""
         # arrange - mock the rust extension
         mock_check_file = MagicMock(return_value=json.dumps(self.error_data))
 
@@ -75,6 +73,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
             context.api.fail.assert_not_called()
 
     def test_should_report_error_on_fuzzy_line_match(self) -> None:
+        """Test that errors are reported on fuzzy line matches within tolerance."""
         # arrange - mock the rust extension
         mock_check_file = MagicMock(return_value=json.dumps(self.error_data))
 
@@ -100,6 +99,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
             )
 
     def test_should_return_default_when_no_path(self) -> None:
+        """Test that default return type is used when no path is available."""
         # arrange
         context = MagicMock()
         context.api.path = None
@@ -109,9 +109,10 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         result = self.plugin.check_column_access(context)
 
         # assert
-        assert result == context.default_return_type
+        self.assertEqual(result, context.default_return_type)
 
     def test_should_not_run_when_disabled(self) -> None:
+        """Test that linter does not run when disabled in config."""
         # arrange
         with patch("typedframes.mypy.is_enabled") as mock_enabled:
             mock_enabled.return_value = False
@@ -120,9 +121,10 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
             errors = self.plugin._run_linter(self.test_file)
 
             # assert
-            assert errors == []
+            self.assertEqual(errors, [])
 
     def test_should_return_cached_results(self) -> None:
+        """Test that cached results are returned for previously linted files."""
         # arrange
         self.plugin._linter_results[self.test_file] = self.error_data
 
@@ -130,99 +132,63 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         errors = self.plugin._run_linter(self.test_file)
 
         # assert
-        assert errors == self.error_data
+        self.assertEqual(errors, self.error_data)
 
     def test_should_return_empty_for_ignored_paths(self) -> None:
+        """Test that ignored paths return empty results."""
         # arrange/act/assert
-        assert self.plugin._run_linter("") == []
-        assert self.plugin._run_linter("site-packages/foo.py") == []
-        assert self.plugin._run_linter("foo.pyi") == []
+        self.assertEqual(self.plugin._run_linter(""), [])
+        self.assertEqual(self.plugin._run_linter("site-packages/foo.py"), [])
+        self.assertEqual(self.plugin._run_linter("foo.pyi"), [])
 
-    def test_should_handle_missing_binary(self) -> None:
-        # arrange - make the rust extension import fail, then check binary path
+    def test_should_raise_error_when_extension_not_found(self) -> None:
+        """Test that LinterNotFoundError is raised when extension cannot be imported."""
+        # arrange
         new_plugin = PandasLinterPlugin(Options())
 
         with (
             patch("typedframes.mypy.get_project_root") as mock_root,
             patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch("builtins.__import__", side_effect=make_import_fail),
-            patch("os.path.exists") as mock_exists,
         ):
             mock_enabled.return_value = True
             mock_root.return_value = Path()
-            mock_exists.return_value = False
 
-            # act
-            errors = new_plugin._run_linter(self.test_file)
+            # Remove the rust linter from modules to simulate import failure
+            with patch.dict(sys.modules, {"typedframes._rust_linter": None}):
+                # act/assert
+                with self.assertRaises(LinterNotFoundError) as ctx:
+                    new_plugin._run_linter(self.test_file)
 
-            # assert
-            assert errors == []
+                self.assertIn("typedframes linter extension not found", str(ctx.exception))
 
-    def test_should_handle_subprocess_error(self) -> None:
-        # arrange - make the rust extension import fail, then subprocess error
-        new_plugin = PandasLinterPlugin(Options())
-
-        with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch("builtins.__import__", side_effect=make_import_fail),
-            patch("os.path.exists") as mock_exists,
-            patch("subprocess.run") as mock_run,
-        ):
-            mock_enabled.return_value = True
-            mock_root.return_value = Path()
-            mock_exists.return_value = True
-            mock_run.side_effect = Exception("error")
-
-            # act
-            errors = new_plugin._run_linter(self.test_file)
-
-            # assert
-            assert errors == []
-
-    def test_get_method_hook(self) -> None:
+    def test_should_get_method_hook(self) -> None:
+        """Test that get_method_hook returns correct hooks for DataFrame methods."""
         # arrange/act/assert
-        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__getitem__") == self.plugin.check_column_access
-        assert self.plugin.get_method_hook("pandas.core.frame.DataFrame.__setitem__") == self.plugin.check_column_access
-        assert self.plugin.get_method_hook("other") is None
+        self.assertEqual(
+            self.plugin.get_method_hook("pandas.core.frame.DataFrame.__getitem__"),
+            self.plugin.check_column_access,
+        )
+        self.assertEqual(
+            self.plugin.get_method_hook("pandas.core.frame.DataFrame.__setitem__"),
+            self.plugin.check_column_access,
+        )
+        self.assertIsNone(self.plugin.get_method_hook("other"))
 
-    def test_plugin_function(self) -> None:
-        # arrange/act/assert
-        from typedframes.mypy import TypedFramesPlugin, plugin
+    def test_should_return_plugin_class(self) -> None:
+        """Test that plugin function returns the TypedFramesPlugin class."""
+        # arrange/act
+        result = plugin("1.0")
 
-        assert plugin("1.0") == TypedFramesPlugin
-
-    def test_plugin_should_handle_unsuccessful_subprocess(self) -> None:
-        # arrange - make the rust extension import fail, then subprocess returns error
-        new_plugin = PandasLinterPlugin(Options())
-
-        with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch("builtins.__import__", side_effect=make_import_fail),
-            patch("os.path.exists") as mock_exists,
-            patch("subprocess.run") as mock_run,
-        ):
-            mock_enabled.return_value = True
-            mock_root.return_value = Path()
-            mock_exists.return_value = True
-
-            mock_process = MagicMock()
-            mock_process.returncode = 1
-            mock_run.return_value = mock_process
-
-            # act
-            errors = new_plugin._run_linter(self.test_file)
-
-            # assert
-            assert errors == []
+        # assert
+        self.assertEqual(result, PandasLinterPlugin)
 
 
 class TestUtilsUnit(unittest.TestCase):
-    def test_get_project_root(self) -> None:
-        # arrange
-        from src.typedframes.mypy import get_project_root
+    """Unit tests for utility functions."""
 
+    def test_should_find_project_root(self) -> None:
+        """Test that project root is found by looking for pyproject.toml."""
+        # arrange
         with (
             patch("pathlib.Path.exists") as mock_exists,
             patch("pathlib.Path.is_file") as mock_is_file,
@@ -236,7 +202,7 @@ class TestUtilsUnit(unittest.TestCase):
             root = get_project_root(Path("/a/b/c.py"))
 
             # assert
-            assert root == Path("/a")
+            self.assertEqual(root, Path("/a"))
 
         # Test case where it reaches root without finding pyproject.toml
         with (
@@ -250,47 +216,50 @@ class TestUtilsUnit(unittest.TestCase):
             root = get_project_root(Path("/"))
 
             # assert
-            assert root == Path("/")
+            self.assertEqual(root, Path("/"))
 
-    def test_is_enabled(self) -> None:
-        # arrange
-        import io
-
-        from src.typedframes.mypy import is_enabled
+    def test_should_check_enabled_status(self) -> None:
+        """Test that is_enabled reads config correctly."""
+        # arrange - test path (not real, mocked)
+        test_path = Path("/fake/project")
 
         # Test missing config
         with patch("pathlib.Path.exists") as mock_exists:
             mock_exists.return_value = False
-            assert is_enabled(Path("/tmp"))
+            # act/assert
+            self.assertTrue(is_enabled(test_path))
 
         # Test enabled
         with (
             patch("pathlib.Path.exists") as mock_exists,
-            patch(
-                "builtins.open",
+            patch.object(
+                Path,
+                "open",
                 return_value=io.BytesIO(b"[tool.typedframes]\nenabled = true"),
             ),
         ):
             mock_exists.return_value = True
-            assert is_enabled(Path("/tmp"))
+            # act/assert
+            self.assertTrue(is_enabled(test_path))
 
         # Test disabled
         with (
             patch("pathlib.Path.exists") as mock_exists,
-            patch(
-                "builtins.open",
-                return_value=io.BytesIO(
-                    b"[tool.typedframes]\nenabled = false",
-                ),
+            patch.object(
+                Path,
+                "open",
+                return_value=io.BytesIO(b"[tool.typedframes]\nenabled = false"),
             ),
         ):
             mock_exists.return_value = True
-            assert not is_enabled(Path("/tmp"))
+            # act/assert
+            self.assertFalse(is_enabled(test_path))
 
         # Test exception
         with (
             patch("pathlib.Path.exists") as mock_exists,
-            patch("builtins.open", side_effect=Exception()),
+            patch.object(Path, "open", side_effect=Exception()),
         ):
             mock_exists.return_value = True
-            assert is_enabled(Path("/tmp"))
+            # act/assert
+            self.assertTrue(is_enabled(test_path))

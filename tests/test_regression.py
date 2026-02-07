@@ -14,7 +14,7 @@ class TestPluginRegression(unittest.TestCase):
         test_file = "tests/fixtures/missing_column.py"
 
         # act - run mypy without the plugin
-        stdout, stderr, exit_code = mypy_run(
+        stdout, _stderr, _exit_code = mypy_run(
             [
                 "--ignore-missing-imports",
                 "--no-error-summary",
@@ -33,7 +33,7 @@ class TestPluginRegression(unittest.TestCase):
         test_file = "tests/fixtures/missing_column.py"
 
         # act - run mypy with pyproject.toml config (includes plugin)
-        stdout, stderr, exit_code = mypy_run([test_file])
+        stdout, _stderr, exit_code = mypy_run([test_file])
 
         # assert
         self.assertIn("Column 'non_existent' does not exist in UserSchema", stdout)

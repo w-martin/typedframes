@@ -28,12 +28,13 @@ python-source = "src"
 module-name = "typedframes._rust_linter"
 
 [tool.pytest.ini_options]
-addopts = "--cov=. --cov-report=term-missing --cov-branch"
+addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-branch -n auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
 branch = true
 omit = [
+    "benchmarks/*",
     "examples/*",
     "tests/*",
     "tasks.py",
@@ -70,6 +71,7 @@ ignore = [
 "tests/*" = ["S101", "SLF001", "S603", "S607"]
 "tests/fixtures/*" = ["T201"]
 "examples/*" = ["T201", "INP001"]
+"tasks.py" = ["T201"]
 "src/typedframes/mypy.py" = ["S603"]
 "benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]
 
@@ -83,6 +85,7 @@ convention = "google"
 dev = [
     "bandit>=1.7.0",
     "complexipy>=0.7.0",
+    "coverage-threshold>=0.6.2",
     "invoke>=2.2.0",
     "licensecheck>=2024.0.0",
     "maturin>=1.11.5",
@@ -91,6 +94,7 @@ dev = [
     "pyright>=1.1.408",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.14.13",
 ]
 
@@ -98,12 +102,17 @@ dev = [
 exclude_dirs = ["tests", "examples"]
 
 [tool.coverage.report]
-fail_under = 50
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
 ]
+
+[tool.coverage-threshold]
+line_coverage_min = 100
+branch_coverage_min = 100
+file_line_coverage_min = 100
+file_branch_coverage_min = 100
 
 [tool.ty.terminal]
 output-format = "concise"

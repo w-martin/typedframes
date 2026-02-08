@@ -86,6 +86,29 @@ pub fn find_project_root(start_path: &Path) -> PathBuf {
     }
 }
 
+/// Reserved pandas/polars method names that shouldn't be used as column names
+const RESERVED_METHODS: &[&str] = &[
+    "shape", "columns", "index", "iloc", "loc", "head", "tail",
+    "describe", "info", "set_index", "merge", "concat", "join",
+    "filter", "select", "with_columns", "group_by", "groupby",
+    "agg", "sort", "sort_values", "drop", "rename", "apply",
+    "map", "pipe", "transform", "to_pandas", "to_df", "schema",
+    "dtypes", "dtype", "cast", "lazy", "collect", "to_dict",
+    "to_list", "to_numpy", "to_arrow", "write_csv", "write_parquet",
+    "clone", "clear", "extend", "insert", "item", "n_chunks",
+    "null_count", "estimated_size", "width", "height", "rows",
+    "row", "get_column", "get_columns", "explode", "unnest",
+    "pivot", "unpivot", "melt", "sample", "slice", "limit",
+    "unique", "n_unique", "value_counts", "is_empty", "is_duplicated",
+    "unique_counts", "mean", "sum", "min", "max", "std", "var",
+    "median", "quantile", "fill_null", "fill_nan", "interpolate",
+    "shift", "diff", "pct_change", "rolling", "ewm", "count",
+    "first", "last", "len", "all", "any", "copy", "values",
+    "T", "axes", "empty", "ndim", "size", "keys", "items",
+    "pop", "update", "get", "add", "sub", "mul", "div", "mod",
+    "pow", "abs", "round", "floor", "ceil", "clip", "corr", "cov",
+];
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -211,11 +234,6 @@ impl Linter {
                                                             {
                                                                 alias = Some(s.clone());
                                                             }
-                                                        } else if let Expr::Name(n) = &keyword.value
-                                                        {
-                                                            if n.id.as_str() == "DefinedLater" {
-                                                                alias = Some(name.id.to_string());
-                                                            }
                                                         }
                                                     }
                                                 }
@@ -276,11 +294,6 @@ impl Linter {
                                                             {
                                                                 alias = Some(s.clone());
                                                             }
-                                                        } else if let Expr::Name(n) = &keyword.value
-                                                        {
-                                                            if n.id.as_str() == "DefinedLater" {
-                                                                alias = Some(name.id.to_string());
-                                                            }
                                                         }
                                                     }
                                                 }
@@ -318,6 +331,24 @@ impl Linter {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Warn about column names that conflict with reserved methods
+                    for col_name in &columns {
+                        if RESERVED_METHODS.contains(&col_name.as_str()) {
+                            let source_location = self
+                                .line_index
+                                .as_ref()
+                                .unwrap()
+                                .source_location(class_def.range.start(), &self.source);
+                            errors.push(LintError {
+                                line: source_location.row.get() as usize,
+                                col: source_location.column.get() as usize,
+                                message: format!(
+                                    "Column name '{}' in {} conflicts with a pandas/polars method. This will shadow the method when accessed via attribute syntax (df.{}). Consider renaming to '{}_value' or similar.",
+                                    col_name, class_def.name, col_name, col_name
+                                ),
+                            });
                         }
                     }
                     self.schemas.insert(class_def.name.to_string(), columns);
@@ -723,26 +754,8 @@ impl Linter {
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             let attr_name = attr.attr.as_str();
-                            // Common pandas/polars internal attributes and methods
-                            let internal_attrs = [
-                                "shape", "columns", "index", "iloc", "loc", "head", "tail",
-                                "describe", "info", "set_index", "merge", "concat", "join",
-                                "filter", "select", "with_columns", "group_by", "groupby",
-                                "agg", "sort", "sort_values", "drop", "rename", "apply",
-                                "map", "pipe", "transform", "to_pandas", "to_df", "schema",
-                                "dtypes", "dtype", "cast", "lazy", "collect", "to_dict",
-                                "to_list", "to_numpy", "to_arrow", "write_csv", "write_parquet",
-                                "clone", "clear", "extend", "insert", "item", "n_chunks",
-                                "null_count", "estimated_size", "width", "height", "rows",
-                                "row", "get_column", "get_columns", "explode", "unnest",
-                                "pivot", "unpivot", "melt", "sample", "slice", "limit",
-                                "unique", "n_unique", "value_counts", "is_empty", "is_duplicated",
-                                "unique_counts", "mean", "sum", "min", "max", "std", "var",
-                                "median", "quantile", "fill_null", "fill_nan", "interpolate",
-                                "shift", "diff", "pct_change", "rolling", "ewm",
-                            ];
                             if !columns.contains(&attr_name.to_string())
-                                && !internal_attrs.contains(&attr_name)
+                                && !RESERVED_METHODS.contains(&attr_name)
                             {
                                 let source_location = self
                                     .line_index

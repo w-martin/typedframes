@@ -3,7 +3,7 @@
 import unittest
 from typing import Any
 
-from typedframes import Column, DefinedLater
+from typedframes import Column
 
 
 class TestColumn(unittest.TestCase):
@@ -107,11 +107,3 @@ class TestColumn(unittest.TestCase):
 
         # assert
         self.assertEqual(result, "email_address")
-
-    def test_should_support_defined_later_alias(self) -> None:
-        """Test that Column accepts DefinedLater as alias."""
-        # arrange/act
-        sut = Column(type=str, alias=DefinedLater)
-
-        # assert
-        self.assertIs(sut.alias, DefinedLater)

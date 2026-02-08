@@ -2,7 +2,7 @@
 
 import unittest
 
-from typedframes import ColumnSet, DefinedLater
+from typedframes import ColumnSet
 
 
 class TestColumnSet(unittest.TestCase):
@@ -73,10 +73,15 @@ class TestColumnSet(unittest.TestCase):
 
         self.assertIn("regex", str(context.exception))
 
-    def test_should_support_defined_later_members(self) -> None:
-        """Test that ColumnSet accepts DefinedLater as members."""
-        # arrange/act
-        sut = ColumnSet(members=DefinedLater, type=str)
+    def test_should_return_polars_expression_for_single_string_member(self) -> None:
+        """Test that cols() handles a single string member (non-regex, non-list)."""
+        # arrange — construct ColumnSet with string member, regex=False
+        # __post_init__ only normalizes when regex=True, so str stays as str
+        sut = ColumnSet(members="single_col", type=float, regex=False)
+
+        # act
+        result = sut.cols()
 
         # assert
-        self.assertIs(sut.members, DefinedLater)
+        self.assertEqual(len(result), 1)
+        self.assertIn("single_col", str(result[0]))

@@ -292,11 +292,18 @@ def main() -> None:
         ToolInfo("ruff", ["uv", "run", "ruff", "check"], "Linter (no type checking)"),
         ToolInfo("ty", ["uv", "run", "ty", "check"], "Type checker", needs_cache_clear=True),
         ToolInfo("pyrefly", ["uv", "run", "pyrefly", "check"], "Type checker", needs_cache_clear=True),
-        ToolInfo("mypy", ["uv", "run", "mypy", "--config-file", "/dev/null",
-                         "--ignore-missing-imports", "--no-incremental"],
-                 "Type checker (no plugin)", needs_cache_clear=True),
-        ToolInfo("mypy + typedframes", ["uv", "run", "mypy", "--no-incremental"],
-                 "Type checker + column checker", needs_cache_clear=True),
+        ToolInfo(
+            "mypy",
+            ["uv", "run", "mypy", "--config-file", "/dev/null", "--ignore-missing-imports", "--no-incremental"],
+            "Type checker (no plugin)",
+            needs_cache_clear=True,
+        ),
+        ToolInfo(
+            "mypy + typedframes",
+            ["uv", "run", "mypy", "--no-incremental"],
+            "Type checker + column checker",
+            needs_cache_clear=True,
+        ),
         ToolInfo("pyright", ["npx", "pyright"], "Type checker", needs_cache_clear=True),
     ]
 

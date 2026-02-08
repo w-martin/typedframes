@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .defined_later import DefinedLater
-
 if TYPE_CHECKING:
     import polars as pl
 
@@ -21,7 +19,6 @@ class ColumnSet:
 
     Attributes:
         members: List of column names, or a regex pattern if regex=True.
-            Use DefinedLater if members will be set at runtime.
         type: The Python type shared by all columns in the set.
         regex: If True, members is treated as a regex pattern for matching column names.
         description: Human-readable description of the column set's purpose.
@@ -36,7 +33,7 @@ class ColumnSet:
 
     """
 
-    members: list[str] | str | type[DefinedLater]  # ty: ignore[invalid-type-form]
+    members: list[str] | str
     type: type = Any
     regex: bool = False
     description: str = ""
@@ -71,8 +68,11 @@ class ColumnSet:
         if matched_columns is not None:
             return [pl.col(c) for c in matched_columns]
 
-        if self.members is DefinedLater or self.regex:
-            msg = "Cannot get column expressions for regex or DefinedLater members without matched_columns"
+        if self.regex:
+            msg = "Cannot get column expressions for regex members without matched_columns"
             raise ValueError(msg)
+
+        if isinstance(self.members, str):
+            return [pl.col(self.members)]
 
         return [pl.col(c) for c in self.members]

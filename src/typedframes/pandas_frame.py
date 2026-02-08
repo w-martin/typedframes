@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 import pandas as pd
 
 from .base_schema import BaseSchema
-from .column_alias_not_yet_defined_error import ColumnAliasNotYetDefinedError
-from .column_set_members_not_yet_defined_error import ColumnSetMembersNotYetDefinedError
-from .defined_later import DefinedLater
 
 if TYPE_CHECKING:
     from typing import Self
@@ -96,16 +93,11 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         # Check columns
         if item in schema.columns():
             col = schema.columns()[item]
-            if col.alias is DefinedLater:
-                raise ColumnAliasNotYetDefinedError(col.name)
-            effective_name = col.alias if isinstance(col.alias, str) else col.name
-            return self[effective_name]
+            return self[col.column_name]
 
         # Check column sets
         if item in schema.column_sets():
             cs = schema.column_sets()[item]
-            if cs.members is DefinedLater:
-                raise ColumnSetMembersNotYetDefinedError(cs.name)
             return self[consumed_map.get(cs.name, [])]
 
         # Check column groups

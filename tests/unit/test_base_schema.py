@@ -2,15 +2,15 @@
 
 import unittest
 
+import pandas as pd
+import polars as pl
+
 from typedframes import (
     BaseSchema,
     Column,
-    ColumnAliasNotYetDefinedError,
     ColumnGroup,
     ColumnGroupError,
     ColumnSet,
-    ColumnSetMembersNotYetDefinedError,
-    DefinedLater,
 )
 
 
@@ -135,28 +135,6 @@ class TestBaseSchema(unittest.TestCase):
         self.assertEqual(type_map["temp_2"], float)
         self.assertNotIn("other", type_map)
 
-    def test_should_raise_for_defined_later_alias(self) -> None:
-        """Test that compute_column_map raises for DefinedLater alias."""
-
-        # arrange
-        class TestSchema(BaseSchema):
-            user_id = Column(type=int, alias=DefinedLater)
-
-        # act/assert
-        with self.assertRaises(ColumnAliasNotYetDefinedError):
-            TestSchema.compute_column_map(["user_id"])
-
-    def test_should_raise_for_defined_later_members(self) -> None:
-        """Test that compute_column_map raises for DefinedLater members."""
-
-        # arrange
-        class TestSchema(BaseSchema):
-            scores = ColumnSet(members=DefinedLater, type=float)
-
-        # act/assert
-        with self.assertRaises(ColumnSetMembersNotYetDefinedError):
-            TestSchema.compute_column_map(["score_1"])
-
     def test_should_raise_for_column_group_conflict(self) -> None:
         """Test that compute_column_map raises for conflicting ColumnSets."""
 
@@ -203,3 +181,142 @@ class TestBaseSchema(unittest.TestCase):
 
         # assert
         self.assertIn("Missing required column: email", errors)
+
+    def test_should_return_all_column_names_without_column_sets(self) -> None:
+        """Test that all_column_names works when schema has no ColumnSets."""
+
+        # arrange
+        class TestSchema(BaseSchema):
+            user_id = Column(type=int)
+            email = Column(type=str)
+
+        # act
+        result = TestSchema.all_column_names()
+
+        # assert
+        self.assertEqual(result, ["user_id", "email"])
+
+    def test_should_validate_extra_columns_when_disallowed(self) -> None:
+        """Test that validate_columns reports extra columns when allow_extra_columns is False."""
+
+        # arrange
+        class StrictSchema(BaseSchema):
+            allow_extra_columns = False
+            user_id = Column(type=int)
+
+        df_columns = ["user_id", "extra_col"]
+
+        # act
+        errors = StrictSchema.validate_columns(df_columns)
+
+        # assert
+        self.assertIn("Unexpected column: extra_col", errors)
+
+    def test_should_allow_regex_matched_extra_columns(self) -> None:
+        """Test that regex-matched columns are not flagged as extra."""
+
+        # arrange
+        class StrictSchema(BaseSchema):
+            allow_extra_columns = False
+            timestamp = Column(type=str)
+            temps = ColumnSet(members=r"temp_\d+", type=float, regex=True)
+
+        df_columns = ["timestamp", "temp_1", "temp_2"]
+
+        # act
+        errors = StrictSchema.validate_columns(df_columns)
+
+        # assert
+        self.assertEqual(errors, [])
+
+    def test_should_passthrough_from_pandas(self) -> None:
+        """Test that from_pandas returns the DataFrame unchanged."""
+
+        # arrange
+        class TestSchema(BaseSchema):
+            user_id = Column(type=int)
+
+        df = pd.DataFrame({"user_id": [1, 2]})
+
+        # act
+        result = TestSchema.from_pandas(df)
+
+        # assert
+        self.assertIs(result, df)
+
+    def test_should_passthrough_from_polars(self) -> None:
+        """Test that from_polars returns the DataFrame unchanged."""
+
+        # arrange
+        class TestSchema(BaseSchema):
+            user_id = Column(type=int)
+
+        df = pl.DataFrame({"user_id": [1, 2]})
+
+        # act
+        result = TestSchema.from_polars(df)
+
+        # assert
+        self.assertIs(result, df)
+
+    def test_should_reject_invalid_type_in_resolve_columns(self) -> None:
+        """Test that _resolve_columns raises TypeError for non-Column/ColumnSet items."""
+
+        # arrange
+        class TestSchema(BaseSchema):
+            user_id = Column(type=int)
+
+        # act/assert
+        with self.assertRaises(TypeError) as ctx:
+            TestSchema._resolve_columns(["not_a_column"])  # type: ignore[list-item]
+
+        self.assertIn("Expected Column or ColumnSet", str(ctx.exception))
+
+    def test_should_support_radd_operator(self) -> None:
+        """Test that __radd__ supports reverse addition."""
+
+        # arrange
+        class SchemaA(BaseSchema):
+            col_a = Column(type=int)
+
+        class SchemaB(BaseSchema):
+            col_b = Column(type=str)
+
+        # act — trigger __radd__ via SchemaMeta
+        result = SchemaA.__radd__(SchemaB)
+
+        # assert
+        columns = result.columns()
+        self.assertIn("col_b", columns)
+        self.assertIn("col_a", columns)
+
+    def test_should_handle_non_list_members_in_match_column_to_set(self) -> None:
+        """Test that _match_column_to_set returns False when members is not a list."""
+
+        # arrange
+        class TestSchema(BaseSchema):
+            readings = ColumnSet(members="single_col", type=float, regex=False)
+
+        cs = TestSchema.column_sets()["readings"]
+
+        # act
+        result = TestSchema._match_column_to_set("single_col", cs, consumed=False, greedy=False, current_match=None)
+
+        # assert
+        self.assertFalse(result)
+
+    def test_should_validate_extra_columns_with_regex_match(self) -> None:
+        """Test that regex-matched columns trigger the is_matched=True/break path."""
+
+        # arrange
+        class StrictSchema(BaseSchema):
+            allow_extra_columns = False
+            timestamp = Column(type=str)
+            temps = ColumnSet(members=r"temp_\d+", type=float, regex=True)
+
+        # act — "temp_1" matches regex, should NOT be flagged; "extra" should be flagged
+        errors = StrictSchema.validate_columns(["timestamp", "temp_1", "extra"])
+
+        # assert
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Unexpected column: extra", errors)

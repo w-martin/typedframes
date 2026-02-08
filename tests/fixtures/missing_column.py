@@ -14,10 +14,12 @@ class UserSchema(BaseSchema):
     email = Column(type=str)
 
 
-df: Annotated[pl.DataFrame, UserSchema] = pl.DataFrame({
-    "user_id": [1, 2],
-    "email": ["a@b.com", "c@d.com"],
-})
+df: Annotated[pl.DataFrame, UserSchema] = pl.DataFrame(
+    {
+        "user_id": [1, 2],
+        "email": ["a@b.com", "c@d.com"],
+    }
+)
 
 # This should be caught by the linter
 print(df["non_existent"])

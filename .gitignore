@@ -27,3 +27,6 @@ Thumbs.db
 
 .idea
 *.so
+.claude
+coverage.json
+.complexipy_cache

@@ -72,3 +72,32 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
         # assert
         self.assertIn("wrong_column", result)
         self.assertIn("does not exist", result)
+
+    def test_should_warn_about_reserved_method_names(self) -> None:
+        """Test that the linter warns about column names that shadow pandas/polars methods."""
+        # arrange
+        import json
+        import tempfile
+
+        source = """
+from typedframes import BaseSchema, Column
+
+class BadSchema(BaseSchema):
+    mean = Column(type=float)
+    user_id = Column(type=int)
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        # act
+        result = check_file(temp_file)
+        errors = json.loads(result)
+
+        # assert
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mean", errors[0]["message"])
+        self.assertIn("conflicts with a pandas/polars method", errors[0]["message"])
+
+        # cleanup
+        Path(temp_file).unlink()

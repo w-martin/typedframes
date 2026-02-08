@@ -14,10 +14,12 @@ class UserSchema(BaseSchema):
     email = Column(type=str)
 
 
-df: Annotated[pl.DataFrame, UserSchema] = pl.DataFrame({
-    "user_id": [1, 2],
-    "email": ["foo@baz.com", "bar@qux.com"],
-})
+df: Annotated[pl.DataFrame, UserSchema] = pl.DataFrame(
+    {
+        "user_id": [1, 2],
+        "email": ["foo@baz.com", "bar@qux.com"],
+    }
+)
 
 # Issue 1: Accessing non-existent column
 print(df["name"])  # Should error: Column 'name' does not exist in UserSchema

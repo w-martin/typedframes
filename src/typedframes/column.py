@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import polars as pl
 
-from .defined_later import DefinedLater  # noqa: TC001
-
 
 @dataclass
 class Column:
@@ -19,7 +17,6 @@ class Column:
     Attributes:
         type: The Python type of the column (e.g., int, str, float).
         alias: Optional alternative name for the column in the actual DataFrame.
-            Use DefinedLater if the alias will be set at runtime.
         nullable: Whether the column allows null values.
         description: Human-readable description of the column's purpose.
 
@@ -32,7 +29,7 @@ class Column:
     """
 
     type: type = Any
-    alias: str | type[DefinedLater] | None = None  # ty: ignore[invalid-type-form]
+    alias: str | None = None
     nullable: bool = False
     description: str = ""
     name: str = field(default="", init=False)
@@ -42,7 +39,7 @@ class Column:
         self.name = name
 
     @property
-    def column_name(self) -> str | type[DefinedLater] | None:  # ty: ignore[invalid-type-form]
+    def column_name(self) -> str:
         """Return the effective column name (alias if set, otherwise attribute name)."""
         return self.alias or self.name
 
@@ -60,11 +57,8 @@ class Column:
         """
         import polars as pl
 
-        effective_name = self.alias if isinstance(self.alias, str) else self.name
-        return pl.col(effective_name)
+        return pl.col(self.column_name)
 
     def __str__(self) -> str:
         """Return the column name as a string for use in subscript access."""
-        if isinstance(self.alias, str):
-            return self.alias
-        return self.name
+        return self.column_name

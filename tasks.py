@@ -28,44 +28,45 @@ def _needs_build() -> bool:
 def build(ctx: Context, *, force: bool = False) -> None:
     """Build the Rust linter binary if needed."""
     if force or _needs_build():
-        ctx.run("echo 'Building Rust linter...'", pty=True)
-        ctx.run("cargo build", cwd=str(RUST_DIR), pty=True)
+        print("Building Rust linter...")
+        ctx.run(f"cd {RUST_DIR} && cargo build")
     else:
-        ctx.run("echo 'Rust linter is up to date.'", pty=True)
+        print("Rust linter is up to date.")
 
 
 @task(name="format")
 def format_code(ctx: Context) -> None:
     """Run ruff format on the codebase."""
-    ctx.run("uv run ruff format .", pty=True)
+    ctx.run("ruff format .")
 
 
 @task
 def lint(ctx: Context) -> None:
     """Run all linters: ruff check, ty check, bandit, complexipy."""
-    ctx.run("uv run ruff check .", pty=True)
-    ctx.run("uv run ty check .", pty=True)
-    ctx.run("uv run bandit -r src/ -c pyproject.toml", pty=True)
-    ctx.run("uv run complexipy src/ --max-complexity-allowed 50", pty=True)
+    ctx.run("ruff check .")
+    ctx.run("ty check .")
+    ctx.run("bandit -r src/ -c pyproject.toml")
+    ctx.run("complexipy src/ --max-complexity-allowed 50")
 
 
 @task
 def lint_fix(ctx: Context) -> None:
     """Run ruff check with --fix and ruff format."""
-    ctx.run("uv run ruff check --fix .", pty=True)
-    ctx.run("uv run ruff format .", pty=True)
+    ctx.run("ruff check --fix .")
+    ctx.run("ruff format .")
 
 
 @task(pre=[build])
 def test(ctx: Context) -> None:
     """Run pytest with branch coverage. Builds Rust linter if needed."""
-    ctx.run("uv run python -m pytest tests/", pty=True)
+    ctx.run("python -m pytest tests/")
+    ctx.run("coverage-threshold")
 
 
 @task
 def verify_licences(ctx: Context) -> None:
     """Run licensecheck to verify dependency licenses."""
-    ctx.run("uv run licensecheck", pty=True)
+    ctx.run("licensecheck", pty=True)
 
 
 @task(name="all", pre=[build])

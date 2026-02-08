@@ -42,28 +42,26 @@ Usage:
     df: PolarsFrame[UserSchema] = pl.read_csv("users.csv")
 """
 
+__version__ = "0.1.0"
+
 from .base_schema import BaseSchema as BaseSchema
 from .column import Column as Column
-from .column_alias_not_yet_defined_error import ColumnAliasNotYetDefinedError as ColumnAliasNotYetDefinedError
 from .column_group import ColumnGroup as ColumnGroup
 from .column_group_error import ColumnGroupError as ColumnGroupError
 from .column_set import ColumnSet as ColumnSet
-from .column_set_members_not_yet_defined_error import (
-    ColumnSetMembersNotYetDefinedError as ColumnSetMembersNotYetDefinedError,
-)
-from .defined_later import DefinedLater as DefinedLater
 from .pandas_frame import PandasFrame as PandasFrame
 from .polars_frame import PolarsFrame as PolarsFrame
+from .schema_algebra import SchemaConflictError as SchemaConflictError
+from .schema_algebra import combine_schemas as combine_schemas
 
 __all__ = [
     "BaseSchema",
     "Column",
-    "ColumnAliasNotYetDefinedError",
     "ColumnGroup",
     "ColumnGroupError",
     "ColumnSet",
-    "ColumnSetMembersNotYetDefinedError",
-    "DefinedLater",
     "PandasFrame",
     "PolarsFrame",
+    "SchemaConflictError",
+    "combine_schemas",
 ]

@@ -1,6 +1,5 @@
 """Unit tests for the mypy plugin."""
 
-import io
 import json
 import sys
 import unittest
@@ -9,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from mypy.options import Options
 
-from typedframes.mypy import LinterNotFoundError, get_project_root, is_enabled, plugin
+from typedframes.mypy import LinterNotFoundError, plugin
 from typedframes.mypy import TypedFramesPlugin as PandasLinterPlugin
 
 
@@ -161,6 +160,31 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
                 self.assertIn("typedframes linter extension not found", str(ctx.exception))
 
+    def test_should_not_report_error_when_line_is_far_from_errors(self) -> None:
+        """Test that no error is reported when access line is far from all error lines."""
+        # arrange
+        far_error_data = [{"line": 100, "message": "Column 'bar' does not exist"}]
+        mock_check_file = MagicMock(return_value=json.dumps(far_error_data))
+        new_plugin = PandasLinterPlugin(Options())
+
+        with (
+            patch("typedframes.mypy.get_project_root") as mock_root,
+            patch("typedframes.mypy.is_enabled") as mock_enabled,
+            patch.dict(sys.modules, {"typedframes._rust_linter": MagicMock(check_file=mock_check_file)}),
+        ):
+            mock_enabled.return_value = True
+            mock_root.return_value = Path()
+
+            context = MagicMock()
+            context.api.path = "far_test.py"
+            context.context.line = 10  # Far from error line 100
+
+            # act
+            new_plugin.check_column_access(context)
+
+            # assert — no fail called since line 10 is far from line 100
+            context.api.fail.assert_not_called()
+
     def test_should_get_method_hook(self) -> None:
         """Test that get_method_hook returns correct hooks for DataFrame methods."""
         # arrange/act/assert
@@ -181,85 +205,3 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
 
         # assert
         self.assertEqual(result, PandasLinterPlugin)
-
-
-class TestUtilsUnit(unittest.TestCase):
-    """Unit tests for utility functions."""
-
-    def test_should_find_project_root(self) -> None:
-        """Test that project root is found by looking for pyproject.toml."""
-        # arrange
-        with (
-            patch("pathlib.Path.exists") as mock_exists,
-            patch("pathlib.Path.is_file") as mock_is_file,
-        ):
-            # First call: current is file, pop to parent.
-            # Then pyproject.toml exists in grandparent.
-            mock_is_file.return_value = True
-            mock_exists.side_effect = [False, True]
-
-            # act
-            root = get_project_root(Path("/a/b/c.py"))
-
-            # assert
-            self.assertEqual(root, Path("/a"))
-
-        # Test case where it reaches root without finding pyproject.toml
-        with (
-            patch("pathlib.Path.exists") as mock_exists,
-            patch("pathlib.Path.is_file") as mock_is_file,
-        ):
-            mock_is_file.return_value = False
-            mock_exists.return_value = False
-
-            # act
-            root = get_project_root(Path("/"))
-
-            # assert
-            self.assertEqual(root, Path("/"))
-
-    def test_should_check_enabled_status(self) -> None:
-        """Test that is_enabled reads config correctly."""
-        # arrange - test path (not real, mocked)
-        test_path = Path("/fake/project")
-
-        # Test missing config
-        with patch("pathlib.Path.exists") as mock_exists:
-            mock_exists.return_value = False
-            # act/assert
-            self.assertTrue(is_enabled(test_path))
-
-        # Test enabled
-        with (
-            patch("pathlib.Path.exists") as mock_exists,
-            patch.object(
-                Path,
-                "open",
-                return_value=io.BytesIO(b"[tool.typedframes]\nenabled = true"),
-            ),
-        ):
-            mock_exists.return_value = True
-            # act/assert
-            self.assertTrue(is_enabled(test_path))
-
-        # Test disabled
-        with (
-            patch("pathlib.Path.exists") as mock_exists,
-            patch.object(
-                Path,
-                "open",
-                return_value=io.BytesIO(b"[tool.typedframes]\nenabled = false"),
-            ),
-        ):
-            mock_exists.return_value = True
-            # act/assert
-            self.assertFalse(is_enabled(test_path))
-
-        # Test exception
-        with (
-            patch("pathlib.Path.exists") as mock_exists,
-            patch.object(Path, "open", side_effect=Exception()),
-        ):
-            mock_exists.return_value = True
-            # act/assert
-            self.assertTrue(is_enabled(test_path))

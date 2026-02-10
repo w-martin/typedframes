@@ -87,7 +87,13 @@ class ColumnGroup:
             df.select(SensorSchema.all_sensors.cols())
 
         """
-        import polars as pl
+        try:
+            import polars as pl
+        except ImportError:
+            from .missing_dependency_error import MissingDependencyError
+
+            package = "polars"
+            raise MissingDependencyError(package, "ColumnGroup.cols") from None
 
         names = self.get_column_names(consumed_map)
         return [pl.col(n) for n in names]

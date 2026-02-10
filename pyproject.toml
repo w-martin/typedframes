@@ -1,6 +1,6 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "typedframes"
@@ -12,20 +12,17 @@ authors = [
 ]
 license = { text = "MIT" }
 requires-python = ">=3.11"
-dependencies = [
-    "mypy",
-    "pandas>=3.0.0",
-    "polars>=1.37.1",
-]
+dependencies = []
 
-[project.scripts]
-example-pkg = "typedframes:check"
+[project.optional-dependencies]
+pandas = ["pandas>=3.0.0"]
+polars = ["polars>=1.37.1"]
 
-[tool.maturin]
-features = ["pyo3/extension-module"]
-manifest-path = "rust_typedframes_linter/Cargo.toml"
-python-source = "src"
-module-name = "typedframes._rust_linter"
+[tool.uv.workspace]
+members = ["typedframes-lint"]
+
+[tool.uv.sources]
+typedframes-lint = { workspace = true }
 
 [tool.pytest.ini_options]
 addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-branch -n auto"
@@ -42,7 +39,7 @@ omit = [
 
 [tool.mypy]
 mypy_path = "src"
-plugins = ["typedframes.mypy"]
+plugins = ["typedframes_lint.mypy"]
 ignore_missing_imports = true
 
 [tool.ruff]
@@ -72,7 +69,7 @@ ignore = [
 "tests/fixtures/*" = ["T201"]
 "examples/*" = ["T201", "INP001"]
 "tasks.py" = ["T201"]
-"src/typedframes/mypy.py" = ["S603"]
+"typedframes-lint/src/typedframes_lint/mypy.py" = ["S603"]
 "benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]
 
 [tool.ruff.lint.mccabe]
@@ -83,6 +80,9 @@ convention = "google"
 
 [dependency-groups]
 dev = [
+    "typedframes-lint",
+    "pandas>=3.0.0",
+    "polars>=1.37.1",
     "bandit>=1.7.0",
     "complexipy>=0.7.0",
     "coverage-threshold>=0.6.2",
@@ -118,7 +118,26 @@ file_branch_coverage_min = 100
 output-format = "concise"
 
 [[tool.ty.overrides]]
+include = ["tests/**/*.py"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+unused-ignore-comment = "ignore"
+
+[[tool.ty.overrides]]
 include = ["examples/*.py"]
 
 [tool.ty.overrides.rules]
 unused-ignore-comment = "ignore"
+invalid-type-form = "ignore"
+
+[[tool.ty.overrides]]
+include = ["benchmarks/**/*.py"]
+
+[tool.ty.overrides.rules]
+no-matching-overload = "ignore"
+
+[tool.licensecheck]
+using = "PEP631"
+groups = ["dev"]
+ignore_packages = ["mypy-extensions", "typedframes", "typedframes-lint", "pyrefly"]

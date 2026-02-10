@@ -63,7 +63,13 @@ class ColumnSet:
             df.select(SensorSchema.temperatures.cols())
 
         """
-        import polars as pl
+        try:
+            import polars as pl
+        except ImportError:
+            from .missing_dependency_error import MissingDependencyError
+
+            package = "polars"
+            raise MissingDependencyError(package, "ColumnSet.cols") from None
 
         if matched_columns is not None:
             return [pl.col(c) for c in matched_columns]

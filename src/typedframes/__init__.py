@@ -12,15 +12,17 @@ Core Classes:
     ColumnSet: Define a group of columns matching a pattern.
     ColumnGroup: Group multiple Columns/ColumnSets for convenient access.
 
-Frame Classes:
-    PandasFrame: pandas DataFrame subclass with schema-aware attribute access.
-    PolarsFrame: Type annotation for polars DataFrames (uses Annotated pattern).
+Frame Classes (separate imports):
+    PandasFrame: ``from typedframes.pandas import PandasFrame``
+    PolarsFrame: ``from typedframes.polars import PolarsFrame``
 
 Usage:
     from typing import Annotated
     import pandas as pd
     import polars as pl
-    from typedframes import BaseSchema, Column, ColumnSet, PandasFrame, PolarsFrame
+    from typedframes import BaseSchema, Column, ColumnSet
+    from typedframes.pandas import PandasFrame
+    from typedframes.polars import PolarsFrame
 
     class UserSchema(BaseSchema):
         user_id = Column(type=int)
@@ -49,8 +51,7 @@ from .column import Column as Column
 from .column_group import ColumnGroup as ColumnGroup
 from .column_group_error import ColumnGroupError as ColumnGroupError
 from .column_set import ColumnSet as ColumnSet
-from .pandas_frame import PandasFrame as PandasFrame
-from .polars_frame import PolarsFrame as PolarsFrame
+from .missing_dependency_error import MissingDependencyError as MissingDependencyError
 from .schema_algebra import SchemaConflictError as SchemaConflictError
 from .schema_algebra import combine_schemas as combine_schemas
 
@@ -60,8 +61,7 @@ __all__ = [
     "ColumnGroup",
     "ColumnGroupError",
     "ColumnSet",
-    "PandasFrame",
-    "PolarsFrame",
+    "MissingDependencyError",
     "SchemaConflictError",
     "combine_schemas",
 ]

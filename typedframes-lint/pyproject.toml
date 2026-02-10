@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "typedframes-lint"
+version = "0.1.0"
+description = "Rust linter + mypy plugin for typedframes"
+requires-python = ">=3.11"
+dependencies = ["typedframes", "mypy"]
+
+[tool.uv.sources]
+typedframes = { workspace = true }
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "rust_typedframes_linter/Cargo.toml"
+python-source = "src"
+module-name = "typedframes_lint._rust_linter"

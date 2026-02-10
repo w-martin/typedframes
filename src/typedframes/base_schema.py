@@ -23,13 +23,13 @@ class SchemaMeta(type):
         """Combine two schema classes using the + operator."""
         from .schema_algebra import combine_schemas
 
-        return combine_schemas(cls, other)
+        return combine_schemas(cls, other)  # ty: ignore[invalid-argument-type]
 
     def __radd__(cls, other: type[BaseSchema]) -> type[BaseSchema]:
         """Support reverse addition for schema combination."""
         from .schema_algebra import combine_schemas
 
-        return combine_schemas(other, cls)
+        return combine_schemas(other, cls)  # ty: ignore[invalid-argument-type]
 
 
 class BaseSchema(metaclass=SchemaMeta):

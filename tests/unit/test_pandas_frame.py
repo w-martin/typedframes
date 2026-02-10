@@ -4,7 +4,8 @@ import unittest
 
 import pandas as pd
 
-from typedframes import BaseSchema, Column, ColumnGroup, ColumnSet, PandasFrame
+from typedframes import BaseSchema, Column, ColumnGroup, ColumnSet
+from typedframes.pandas import PandasFrame
 
 
 class UserSchema(BaseSchema):

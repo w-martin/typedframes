@@ -55,7 +55,13 @@ class Column:
             df.select(UserSchema.email.col, UserSchema.user_id.col)
 
         """
-        import polars as pl
+        try:
+            import polars as pl
+        except ImportError:
+            from .missing_dependency_error import MissingDependencyError
+
+            package = "polars"
+            raise MissingDependencyError(package, "Column.col") from None
 
         return pl.col(self.column_name)
 

@@ -7,9 +7,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from mypy.options import Options
-
-from typedframes.mypy import LinterNotFoundError, plugin
-from typedframes.mypy import TypedFramesPlugin as PandasLinterPlugin
+from typedframes_lint.mypy import LinterNotFoundError, plugin
+from typedframes_lint.mypy import TypedFramesPlugin as PandasLinterPlugin
 
 
 class TestPandasLinterPluginUnit(unittest.TestCase):
@@ -28,9 +27,9 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         mock_check_file = MagicMock(return_value=json.dumps(self.error_data))
 
         with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch.dict(sys.modules, {"typedframes._rust_linter": MagicMock(check_file=mock_check_file)}),
+            patch("typedframes_lint.mypy.get_project_root") as mock_root,
+            patch("typedframes_lint.mypy.is_enabled") as mock_enabled,
+            patch.dict(sys.modules, {"typedframes_lint._rust_linter": MagicMock(check_file=mock_check_file)}),
         ):
             mock_enabled.return_value = True
             mock_root.return_value = Path()
@@ -53,9 +52,9 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         mock_check_file_empty = MagicMock(return_value=json.dumps([]))
 
         with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch.dict(sys.modules, {"typedframes._rust_linter": MagicMock(check_file=mock_check_file_empty)}),
+            patch("typedframes_lint.mypy.get_project_root") as mock_root,
+            patch("typedframes_lint.mypy.is_enabled") as mock_enabled,
+            patch.dict(sys.modules, {"typedframes_lint._rust_linter": MagicMock(check_file=mock_check_file_empty)}),
         ):
             mock_enabled.return_value = True
             mock_root.return_value = Path()
@@ -77,9 +76,9 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         mock_check_file = MagicMock(return_value=json.dumps(self.error_data))
 
         with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch.dict(sys.modules, {"typedframes._rust_linter": MagicMock(check_file=mock_check_file)}),
+            patch("typedframes_lint.mypy.get_project_root") as mock_root,
+            patch("typedframes_lint.mypy.is_enabled") as mock_enabled,
+            patch.dict(sys.modules, {"typedframes_lint._rust_linter": MagicMock(check_file=mock_check_file)}),
         ):
             mock_enabled.return_value = True
             mock_root.return_value = Path()
@@ -113,7 +112,7 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
     def test_should_not_run_when_disabled(self) -> None:
         """Test that linter does not run when disabled in config."""
         # arrange
-        with patch("typedframes.mypy.is_enabled") as mock_enabled:
+        with patch("typedframes_lint.mypy.is_enabled") as mock_enabled:
             mock_enabled.return_value = False
 
             # act
@@ -146,14 +145,14 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         new_plugin = PandasLinterPlugin(Options())
 
         with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
+            patch("typedframes_lint.mypy.get_project_root") as mock_root,
+            patch("typedframes_lint.mypy.is_enabled") as mock_enabled,
         ):
             mock_enabled.return_value = True
             mock_root.return_value = Path()
 
             # Remove the rust linter from modules to simulate import failure
-            with patch.dict(sys.modules, {"typedframes._rust_linter": None}):
+            with patch.dict(sys.modules, {"typedframes_lint._rust_linter": None}):
                 # act/assert
                 with self.assertRaises(LinterNotFoundError) as ctx:
                     new_plugin._run_linter(self.test_file)
@@ -168,9 +167,9 @@ class TestPandasLinterPluginUnit(unittest.TestCase):
         new_plugin = PandasLinterPlugin(Options())
 
         with (
-            patch("typedframes.mypy.get_project_root") as mock_root,
-            patch("typedframes.mypy.is_enabled") as mock_enabled,
-            patch.dict(sys.modules, {"typedframes._rust_linter": MagicMock(check_file=mock_check_file)}),
+            patch("typedframes_lint.mypy.get_project_root") as mock_root,
+            patch("typedframes_lint.mypy.is_enabled") as mock_enabled,
+            patch.dict(sys.modules, {"typedframes_lint._rust_linter": MagicMock(check_file=mock_check_file)}),
         ):
             mock_enabled.return_value = True
             mock_root.return_value = Path()

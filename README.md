@@ -4,7 +4,7 @@
 
 ```python
 from typedframes import BaseSchema, Column
-from typedframes import PandasFrame
+from typedframes.pandas import PandasFrame
 
 
 class UserData(BaseSchema):
@@ -46,10 +46,10 @@ def process(df: PandasFrame[UserData]) -> None:
 **What you get:**
 
 - ✅ **Static analysis** - Catch column errors at lint-time with mypy or the standalone checker
-- ✅ **Beautiful runtime UX** - `df.column_group.mean()` instead of ugly column lists
+- ✅ **Beautiful runtime UX** - `df.column_group.mean()` (pandas) instead of ugly column lists
 - ✅ **Works with pandas AND polars** - Same schema API, explicit backend types
 - ✅ **Dynamic column matching** - Regex-based ColumnSets for time-series data
-- ✅ **Zero runtime overhead** - No validation slowdown (use Pandera if you need that)
+- ✅ **Zero runtime overhead** - No validation, no slowdown
 - ✅ **Type-safe backends** - Type checker knows pandas vs polars methods
 
 ---
@@ -86,10 +86,11 @@ class SalesData(BaseSchema):
 ### Use With Pandas
 
 ```python
-from typedframes import PandasFrame
+import pandas as pd
+from typedframes.pandas import PandasFrame
 
 # Load data with schema
-df: PandasFrame[SalesData] = SalesData().read_csv("sales.csv")
+df = PandasFrame.from_schema(pd.read_csv("sales.csv"), SalesData)
 
 # Clean attribute access
 print(df.revenue.sum())
@@ -110,25 +111,25 @@ grouped = df.groupby('customer_id')['revenue'].sum()
 ### Use With Polars
 
 ```python
-from typedframes import PolarsFrame
+from typedframes.polars import PolarsFrame
+import polars as pl
 
 # Same schema, different backend
-df: PolarsFrame[SalesData] = SalesData(backend="polars").read_csv("sales.csv")
+df: PolarsFrame[SalesData] = pl.read_csv("sales.csv")
 
-# Same clean attribute API
-print(df.revenue.sum())
-print(df.metrics.mean())
+# Use schema column references for type-safe expressions
+print(df.select(SalesData.revenue.col).sum())
 
 
 # Type-safe polars operations
 def analyze_polars(data: PolarsFrame[SalesData]) -> float:
-    return data.select(['revenue']).mean()
+    return data.select(SalesData.revenue.col).mean()
     # return data.select(['profit'])  # ✗ Error at lint-time
 
 
 # Polars methods work as expected
-filtered = df.filter(df['revenue'] > 1000)
-grouped = df.group_by('customer_id').agg(pl.col('revenue').sum())
+filtered = df.filter(SalesData.revenue.col > 1000)
+grouped = df.group_by('customer_id').agg(SalesData.revenue.col.sum())
 ```
 
 ---
@@ -180,11 +181,11 @@ typedframes check src/ --json
 ```shell
 # Add to pyproject.toml
 [tool.mypy]
-plugins = ["typedframes.mypy_plugin"]
+plugins = ["typedframes_lint.mypy"]
 
 # Or mypy.ini
 [mypy]
-plugins = typedframes.mypy_plugin
+plugins = typedframes_lint.mypy
 
 # Run mypy
 mypy src/
@@ -250,7 +251,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | Column type checking            | ✅ Yes                  | ⚠️ Limited  | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     |
 | Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     |
 | **Runtime Validation**          |
-| Data validation                 | ⚠️ Optional            | ✅ Excellent | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     |
+| Data validation                 | ❌ No                   | ✅ Excellent | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     |
 | Value constraints               | ❌ No                   | ✅ Yes       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     |
 | **Schema Features**             |
 | Column grouping                 | ✅ ColumnSet            | ❌ No        | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     |
@@ -318,14 +319,14 @@ These tools serve different purposes:
 
 ### When to Use What
 
-| Use Case                                             | Recommended Tool      |
-|------------------------------------------------------|-----------------------|
-| Static column checking (existing pandas/polars)      | **typedframes**       |
-| Runtime data validation                              | Pandera               |
-| Both static + runtime                                | typedframes + Pandera |
-| Cross-library portability (write once, run anywhere) | narwhals              |
-| Immutable DataFrames from scratch                    | StaticFrame           |
-| Pandas API type hints only                           | pandas-stubs          |
+| Use Case                                             | Recommended Tool                       |
+|------------------------------------------------------|----------------------------------------|
+| Static column checking (existing pandas/polars)      | **typedframes**                        |
+| Runtime data validation                              | Pandera                                |
+| Both static + runtime                                | typedframes + Pandera (separate tools) |
+| Cross-library portability (write once, run anywhere) | narwhals                               |
+| Immutable DataFrames from scratch                    | StaticFrame                            |
+| Pandas API type hints only                           | pandas-stubs                           |
 
 ---
 
@@ -335,8 +336,9 @@ typedframes uses **explicit backend types** to ensure complete type safety:
 
 ```python
 from typedframes import BaseSchema, Column
-from typedframes import PandasFrame
-from typedframes import PolarsFrame
+from typedframes.pandas import PandasFrame
+from typedframes.polars import PolarsFrame
+import pandas as pd
 import polars as pl
 
 
@@ -356,31 +358,12 @@ def polars_analyze(df: PolarsFrame[UserData]) -> PolarsFrame[UserData]:
 
 
 # Type checker prevents mixing backends
-df_pandas = UserData().read_csv("data.csv")
-df_polars = UserData(backend="polars").read_csv("data.csv")
+df_pandas = PandasFrame.from_schema(pd.read_csv("data.csv"), UserData)
+df_polars: PolarsFrame[UserData] = pl.read_csv("data.csv")
 
 pandas_analyze(df_pandas)  # ✓ OK
 polars_analyze(df_polars)  # ✓ OK
 pandas_analyze(df_polars)  # ✗ Type error: Expected PandasFrame, got PolarsFrame
-```
-
-### Backend-Agnostic Code
-
-For code that works with both backends, use the schema's attribute API:
-
-```python
-from typing import Union
-
-def summary(df: Union[PandasFrame[UserData], PolarsFrame[UserData]]) -> dict:
-    # Schema attributes work for both backends
-    return {
-        'mean_id': df.user_id.mean(),
-        'unique_emails': df.email.nunique()
-    }
-
-# Works with both
-summary(df_pandas)  # ✓ OK
-summary(df_polars)  # ✓ OK
 ```
 
 ---
@@ -405,9 +388,10 @@ class TimeSeriesData(BaseSchema):
 ### Beautiful Runtime API
 
 ```python
-from typedframes import PandasFrame
+import pandas as pd
+from typedframes.pandas import PandasFrame
 
-df: PandasFrame[TimeSeriesData] = TimeSeriesData().read_csv("sensors.csv")
+df = PandasFrame.from_schema(pd.read_csv("sensors.csv"), TimeSeriesData)
 
 # Access column groups as DataFrames
 temps = df.temperature  # All temp_sensor_* columns
@@ -417,7 +401,7 @@ all_sensors = df.sensors  # All sensor columns
 avg_temp = df.temperature.mean()
 max_pressure = df.pressure.max()
 
-# Standard pandas/polars access still works
+# Standard pandas access still works
 df['timestamp']  # Single column
 df[['timestamp', 'temp_sensor_1']]  # Multi-column select
 ```
@@ -425,7 +409,7 @@ df[['timestamp', 'temp_sensor_1']]  # Multi-column select
 ### Column-Level Static Checking
 
 ```python
-from typedframes import PandasFrame
+from typedframes.pandas import PandasFrame
 
 
 def daily_summary(data: PandasFrame[TimeSeriesData]) -> PandasFrame[DailySummary]:
@@ -450,10 +434,10 @@ class SensorReadings(BaseSchema):
     sensors = ColumnSet(type=float, members=r"sensor_\d+", regex=True)
 
 # Works regardless of how many sensor columns exist
-df = SensorReadings().read_csv("readings_2024_01.csv")  # 50 sensors
+df = PandasFrame.from_schema(pd.read_csv("readings_2024_01.csv"), SensorReadings)  # 50 sensors
 df.sensors.mean()  # All sensor columns
 
-df = SensorReadings().read_csv("readings_2024_02.csv")  # 75 sensors
+df = PandasFrame.from_schema(pd.read_csv("readings_2024_02.csv"), SensorReadings)  # 75 sensors
 df.sensors.mean()  # All sensor columns (different count, same code)
 ```
 
@@ -468,7 +452,8 @@ Schema-typed DataFrames preserve their type through common operations:
 **Pandas:**
 
 ```python
-from typedframes import BaseSchema, Column, PandasFrame
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
 import pandas as pd
 
 
@@ -502,7 +487,7 @@ merged = users.merge(orders, on='user_id')       # Also works
 
 **Polars:**
 ```python
-from typedframes import PolarsFrame
+from typedframes.polars import PolarsFrame
 import polars as pl
 
 
@@ -534,7 +519,8 @@ When you merge, concat, or subset DataFrames, the resulting schema changes. Sche
 transformations and type the result — using column references instead of strings, so typos are caught immediately.
 
 ```python
-from typedframes import BaseSchema, Column, PandasFrame
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
 import pandas as pd
 
 
@@ -575,82 +561,6 @@ Overlapping columns with the same type are allowed (common after merges). Confli
 
 See [`examples/schema_algebra_example.py`](examples/schema_algebra_example.py) for a complete walkthrough.
 
-### Working With Both Backends
-
-```python
-from typedframes import PandasFrame
-from typedframes import PolarsFrame
-
-
-class ProcessingPipeline:
-    """Use polars for heavy lifting, pandas for ML"""
-
-    def load_and_filter(self, path: str) -> PolarsFrame[RawData]:
-        # Polars is faster for large CSV files
-        df = RawData(backend="polars").read_csv(path)
-        return df.filter(df['value'] > 100)
-
-    def prepare_for_ml(self, df: PolarsFrame[RawData]) -> PandasFrame[RawData]:
-        # Convert to pandas for sklearn
-        pandas_df = df.to_pandas()
-        return RawData().from_df(pandas_df)
-
-    def train(self, df: PandasFrame[RawData]) -> None:
-        # ML libraries expect pandas
-        from sklearn.ensemble import RandomForestRegressor
-        model = RandomForestRegressor()
-        model.fit(df[['value']], df['target'])
-```
-
-### Integration With Pandera
-
-Use typedframes for schemas and static analysis, Pandera for runtime validation:
-
-```python
-from typedframes import BaseSchema, Column
-from typedframes import PandasFrame
-from typedframes import to_pandera_schema
-import pandera as pa
-
-
-class UserData(BaseSchema):
-    user_id = Column(type=int)
-    email = Column(type=str)
-    age = Column(type=int)
-
-
-# Get static analysis from typedframes
-def process(df: PandasFrame[UserData]) -> None:
-    df['user_id']  # ✓ Static checking works
-    df['name']  # ✗ Error at lint-time
-
-
-# Get runtime validation from Pandera when needed
-pandera_schema = to_pandera_schema(UserData)
-
-df = pd.read_csv("users.csv")
-validated_df = pandera_schema.validate(df)  # Runtime checks
-
-# Best of both worlds: static + runtime checking
-```
-
-### Optional Runtime Validation
-
-```python
-from typedframes import Column, Field
-
-
-class UserData(BaseSchema):
-    user_id = Column(type=int, validators=[Field(gt=0)])
-    age = Column(type=int, validators=[Field(ge=0, le=120)])
-    email = Column(type=str)
-
-
-# Validation is opt-in
-df = UserData().read_csv("users.csv", validate=True)
-# Raises ValidationError if data doesn't match constraints
-```
-
 ---
 
 ## Examples
@@ -659,7 +569,8 @@ df = UserData().read_csv("users.csv", validate=True)
 
 ```python
 from typedframes import BaseSchema, Column
-from typedframes import PandasFrame
+from typedframes.pandas import PandasFrame
+import pandas as pd
 
 
 class Orders(BaseSchema):
@@ -673,7 +584,7 @@ def calculate_revenue(orders: PandasFrame[Orders]) -> float:
     return orders['total'].sum()
 
 
-df = Orders().read_csv("orders.csv")
+df = PandasFrame.from_schema(pd.read_csv("orders.csv"), Orders)
 revenue = calculate_revenue(df)
 ```
 
@@ -681,7 +592,8 @@ revenue = calculate_revenue(df)
 
 ```python
 from typedframes import BaseSchema, Column, ColumnSet, ColumnGroup
-from typedframes import PandasFrame
+from typedframes.pandas import PandasFrame
+import pandas as pd
 
 
 class SensorData(BaseSchema):
@@ -692,7 +604,7 @@ class SensorData(BaseSchema):
     all_sensors = ColumnGroup(members=[temperature, humidity])
 
 
-df: PandasFrame[SensorData] = SensorData().read_csv("sensors.csv")
+df = PandasFrame.from_schema(pd.read_csv("sensors.csv"), SensorData)
 
 # Clean, type-safe operations
 avg_temp_per_row = df.temperature.mean(axis=1)
@@ -703,7 +615,8 @@ all_readings_stats = df.all_sensors.describe()
 
 ```python
 from typedframes import BaseSchema, Column
-from typedframes import PandasFrame
+from typedframes.pandas import PandasFrame
+import pandas as pd
 
 
 class RawSales(BaseSchema):
@@ -726,11 +639,11 @@ def aggregate_daily(df: PandasFrame[RawSales]) -> PandasFrame[AggregatedSales]:
     }).reset_index()
 
     result.columns = ['date', 'total_revenue', 'total_quantity']
-    return AggregatedSales().from_df(result)
+    return PandasFrame.from_schema(result, AggregatedSales)
 
 
 # Type-safe pipeline
-raw = RawSales().read_csv("sales.csv")
+raw = PandasFrame.from_schema(pd.read_csv("sales.csv"), RawSales)
 aggregated = aggregate_daily(raw)
 
 
@@ -744,7 +657,7 @@ def analyze(df: PandasFrame[AggregatedSales]) -> float:
 
 ```python
 from typedframes import BaseSchema, Column
-from typedframes import PolarsFrame
+from typedframes.polars import PolarsFrame
 import polars as pl
 
 
@@ -754,17 +667,16 @@ class LargeDataset(BaseSchema):
     category = Column(type=str)
 
 
-def efficient_aggregation(df: PolarsFrame[LargeDataset]) -> PolarsFrame[LargeDataset]:
-    # Polars lazy evaluation
+def efficient_aggregation(df: PolarsFrame[LargeDataset]) -> pl.DataFrame:
     return (
-        df.filter(pl.col('value') > 100)
+        df.filter(LargeDataset.value.col > 100)
         .group_by('category')
-        .agg(pl.col('value').mean())
+        .agg(LargeDataset.value.col.mean())
     )
 
 
 # Polars handles large files efficiently
-df = LargeDataset(backend="polars").read_csv("huge_file.csv")
+df: PolarsFrame[LargeDataset] = pl.read_csv("huge_file.csv")
 result = efficient_aggregation(df)
 ```
 
@@ -819,7 +731,7 @@ def process(df: nw.DataFrame) -> nw.DataFrame:
 typedframes solves the orthogonal problem of schema safety:
 
 ```python
-from typedframes import PolarsFrame
+from typedframes.polars import PolarsFrame
 
 class SalesData(BaseSchema):
     revenue = Column(type=float)
@@ -834,9 +746,9 @@ def process(df: PolarsFrame[SalesData]) -> PolarsFrame[SalesData]:
 
 ### Why No Built-in Validation?
 
-Ideally, validation happens at the point of data ingestion rather than in Python application code. If you're validating DataFrames in Python, consider whether your data pipeline could enforce constraints earlier.
-
-That said, we provide Pandera integration for cases where runtime validation is genuinely necessary.
+Ideally, validation happens at the point of data ingestion rather than in Python application code. If you're validating
+DataFrames in Python, consider whether your data pipeline could enforce constraints earlier. Use Pandera for cases where
+runtime validation is genuinely necessary.
 
 ---
 
@@ -861,6 +773,10 @@ MIT License - see [LICENSE](LICENSE)
 
 **Planned:**
 
+- [ ] **Pandera integration** - `to_pandera_schema(MySchema)` to convert typedframes schemas to Pandera schemas for
+  runtime validation
+- [ ] **Optional runtime validation** - `Field` class with constraints (`gt`, `ge`, `lt`, `le`) on Column definitions,
+  opt-in validation at data load time
 - [ ] **IDE Integration (.pyi stubs)** - Generate `.pyi` stub files for schema definitions to enable autocomplete in
   IDEs (VSCode, PyCharm) without running the type checker
 
@@ -871,11 +787,8 @@ MIT License - see [LICENSE](LICENSE)
 **Q: Do I need to choose between pandas and polars?**
 A: No. Define your schema once, use it with both. Just use the appropriate type (`PandasFrame` or `PolarsFrame`) in your function signatures.
 
-**Q: Can I write backend-agnostic functions?**
-A: Yes, using `Union[PandasFrame[T], PolarsFrame[T]]` or by using only the schema attribute API (`df.column_name`).
-
 **Q: Does this replace Pandera?**
-A: No, it complements it. Use typedframes for static analysis, Pandera for runtime validation. We provide integration helpers.
+A: No, it complements it. Use typedframes for static analysis, Pandera for runtime validation.
 
 **Q: Is the standalone checker required?**
 A: No. You can use just the mypy plugin, just the standalone checker, or both. They catch the same errors.

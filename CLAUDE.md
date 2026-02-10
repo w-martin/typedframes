@@ -1,5 +1,12 @@
 # Claude Code Instructions for typedframes
 
+## Package Structure
+
+- `typedframes` (core): Pure Python schemas, columns, frames — no Rust, no mypy
+- `typedframes-lint` (workspace member): Rust binary + mypy plugin
+- Optional deps: `typedframes[pandas]`, `typedframes[polars]`
+- Import pattern: `from typedframes.pandas import PandasFrame`, `from typedframes.polars import PolarsFrame`
+
 ## Test Guidelines
 - Name tests `test_should_<expected_behavior>`
 - Follow AAA pattern: `# arrange`, `# act`, `# assert` comments
@@ -29,10 +36,11 @@
 - `tests/*`: `S101` (assert), `SLF001` (private access), `S603`/`S607` (subprocess)
 - `tests/fixtures/*`: `T201` (print for test output)
 - `examples/*`: `T201` (print), `INP001` (standalone scripts)
-- `mypy.py`: `S603` (subprocess for linter execution)
+- `typedframes-lint/src/typedframes_lint/mypy.py`: `S603` (subprocess for linter execution)
 
 ## Commands
-- `uv run inv build` - Build Rust linter (if source changed)
+
+- `uv run inv build` - Build Rust linter in `typedframes-lint/` (if source changed)
 - `uv run inv test` - Tests with coverage (auto-builds)
 - `uv run inv lint` - All linters
 - `uv run inv all` - Full check suite

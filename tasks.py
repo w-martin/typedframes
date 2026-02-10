@@ -4,7 +4,7 @@ from pathlib import Path
 
 from invoke import Context, task
 
-RUST_DIR = Path("rust_typedframes_linter")
+RUST_DIR = Path("typedframes-lint/rust_typedframes_linter")
 BINARY_PATH = RUST_DIR / "target" / "debug" / "typedframes_linter"
 
 
@@ -66,7 +66,7 @@ def test(ctx: Context) -> None:
 @task
 def verify_licences(ctx: Context) -> None:
     """Run licensecheck to verify dependency licenses."""
-    ctx.run("licensecheck", pty=True)
+    ctx.run("licensecheck")
 
 
 @task(name="all", pre=[build])

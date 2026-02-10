@@ -30,3 +30,4 @@ Thumbs.db
 .claude
 coverage.json
 .complexipy_cache
+**/target

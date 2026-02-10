@@ -2,7 +2,8 @@
 
 import pandas as pd
 
-from typedframes import BaseSchema, Column, PandasFrame
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
 
 
 # -- Define schemas ----------------------------------------------------------

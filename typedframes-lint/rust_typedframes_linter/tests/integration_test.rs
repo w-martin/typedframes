@@ -167,7 +167,8 @@ fn test_should_support_pandas_frame_subscript() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-from typedframes import BaseSchema, Column, PandasFrame
+from typedframes.pandas import PandasFrame
+from typedframes import BaseSchema, Column
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
@@ -197,7 +198,8 @@ fn test_should_support_polars_frame_subscript() {
     // arrange
     let mut linter = Linter::new();
     let source = r#"
-from typedframes import BaseSchema, Column, PolarsFrame
+from typedframes.polars import PolarsFrame
+from typedframes import BaseSchema, Column
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)

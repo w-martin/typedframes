@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from typedframes.mypy import get_project_root, is_enabled
+from typedframes_lint.mypy import get_project_root, is_enabled
 
 
 class TestUtilsUnit(unittest.TestCase):

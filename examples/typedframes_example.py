@@ -5,7 +5,8 @@ from typing import Annotated
 import pandas as pd
 import polars as pl
 
-from typedframes import BaseSchema, Column, ColumnSet, PandasFrame
+from typedframes import BaseSchema, Column, ColumnSet
+from typedframes.pandas import PandasFrame
 
 
 class UserSchema(BaseSchema):

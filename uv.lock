@@ -10,6 +10,12 @@ resolution-markers = [
     "python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "typedframes",
+    "typedframes-lint",
+]
+
 [[package]]
 name = "appdirs"
 version = "1.4.4"
@@ -1177,9 +1183,12 @@ wheels = [
 name = "typedframes"
 version = "0.1.0"
 source = { editable = "." }
-dependencies = [
-    { name = "mypy" },
+
+[package.optional-dependencies]
+pandas = [
     { name = "pandas" },
+]
+polars = [
     { name = "polars" },
 ]
 
@@ -1191,6 +1200,8 @@ dev = [
     { name = "invoke" },
     { name = "licensecheck" },
     { name = "maturin" },
+    { name = "pandas" },
+    { name = "polars" },
     { name = "pre-commit" },
     { name = "pyrefly" },
     { name = "pyright" },
@@ -1198,14 +1209,15 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ruff" },
+    { name = "typedframes-lint" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "mypy" },
-    { name = "pandas", specifier = ">=3.0.0" },
-    { name = "polars", specifier = ">=1.37.1" },
+    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=3.0.0" },
+    { name = "polars", marker = "extra == 'polars'", specifier = ">=1.37.1" },
 ]
+provides-extras = ["pandas", "polars"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1215,6 +1227,8 @@ dev = [
     { name = "invoke", specifier = ">=2.2.0" },
     { name = "licensecheck", specifier = ">=2024.0.0" },
     { name = "maturin", specifier = ">=1.11.5" },
+    { name = "pandas", specifier = ">=3.0.0" },
+    { name = "polars", specifier = ">=1.37.1" },
     { name = "pre-commit", specifier = ">=3.7.0" },
     { name = "pyrefly", specifier = ">=0.51.1" },
     { name = "pyright", specifier = ">=1.1.408" },
@@ -1222,6 +1236,22 @@ dev = [
     { name = "pytest-cov", specifier = ">=7.0.0" },
     { name = "pytest-xdist", specifier = ">=3.5.0" },
     { name = "ruff", specifier = ">=0.14.13" },
+    { name = "typedframes-lint", editable = "typedframes-lint" },
+]
+
+[[package]]
+name = "typedframes-lint"
+version = "0.1.0"
+source = { editable = "typedframes-lint" }
+dependencies = [
+    { name = "mypy" },
+    { name = "typedframes" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mypy" },
+    { name = "typedframes", editable = "." },
 ]
 
 [[package]]

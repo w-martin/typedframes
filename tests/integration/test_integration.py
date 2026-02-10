@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from typedframes._rust_linter import check_file  # ty: ignore[unresolved-import]
+from typedframes_lint._rust_linter import check_file  # ty: ignore[unresolved-import]
 
 
 class TestTypedFramesLinterIntegration(unittest.TestCase):
@@ -13,7 +13,7 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
     def test_should_detect_missing_column(self) -> None:
         """Test that the linter detects missing columns."""
         # arrange
-        sut = Path("rust_typedframes_linter/target/debug/typedframes_linter").absolute()
+        sut = Path("typedframes-lint/rust_typedframes_linter/target/debug/typedframes_linter").absolute()
         example_file = Path("examples/typedframes_example.py").absolute()
 
         # act
@@ -30,7 +30,7 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
     def test_should_suggest_typo_correction(self) -> None:
         """Test that the linter suggests corrections for typos."""
         # arrange
-        sut = Path("rust_typedframes_linter/target/debug/typedframes_linter").absolute()
+        sut = Path("typedframes-lint/rust_typedframes_linter/target/debug/typedframes_linter").absolute()
         example_file = Path("examples/typedframes_example.py").absolute()
 
         # act
@@ -47,7 +47,7 @@ class TestTypedFramesLinterIntegration(unittest.TestCase):
     def test_should_track_mutations(self) -> None:
         """Test that the linter tracks column mutations."""
         # arrange
-        sut = Path("rust_typedframes_linter/target/debug/typedframes_linter").absolute()
+        sut = Path("typedframes-lint/rust_typedframes_linter/target/debug/typedframes_linter").absolute()
         example_file = Path("examples/typedframes_example.py").absolute()
 
         # act

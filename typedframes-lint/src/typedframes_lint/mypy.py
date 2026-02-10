@@ -51,7 +51,7 @@ class TypedFramesPlugin(Plugin):
 
     def _run_via_extension(self, file_path: str) -> list[dict[str, Any]]:
         """Run the linter via the Rust extension module."""
-        from typedframes._rust_linter import check_file  # ty: ignore[unresolved-import]
+        from typedframes_lint._rust_linter import check_file  # ty: ignore[unresolved-import]
 
         result_json = str(check_file(file_path))
         return json.loads(result_json)

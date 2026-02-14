@@ -387,12 +387,7 @@ def run_codebase_benchmarks(
 def find_binary(project_root: Path) -> Path:
     """Find the typedframes checker binary (release or debug)."""
     binary_path = (
-            project_root
-            / "typedframes-checker"
-            / "rust_typedframes_checker"
-            / "target"
-            / "release"
-            / "typedframes_checker"
+            project_root / "typedframes-checker" / "rust_typedframes_checker" / "target" / "release" / "typedframes_checker"
     )
     if not binary_path.exists():
         binary_path = (
@@ -425,24 +420,26 @@ def build_tools(binary_path: Path) -> list[ToolInfo]:
     tools: list[ToolInfo] = []
     if binary_path.exists():
         tools.append(ToolInfo("typedframes", [str(binary_path)], "DataFrame column checker"))
-    tools.extend([
-        ToolInfo("ruff", ["uv", "run", "ruff", "check"], "Linter (no type checking)"),
-        ToolInfo("ty", ["uv", "run", "ty", "check"], "Type checker", needs_cache_clear=True),
-        ToolInfo("pyrefly", ["uv", "run", "pyrefly", "check"], "Type checker", needs_cache_clear=True),
-        ToolInfo(
-            "mypy",
-            ["uv", "run", "mypy", "--config-file", str(vanilla_cfg)],
-            "Type checker (no plugin)",
-            needs_cache_clear=True,
-        ),
-        ToolInfo(
-            "mypy + typedframes",
-            ["uv", "run", "mypy", "--config-file", str(plugin_cfg)],
-            "Type checker + column checker",
-            needs_cache_clear=True,
-        ),
-        ToolInfo("pyright", ["npx", "pyright"], "Type checker", needs_cache_clear=True),
-    ])
+    tools.extend(
+        [
+            ToolInfo("ruff", ["uv", "run", "ruff", "check"], "Linter (no type checking)"),
+            ToolInfo("ty", ["uv", "run", "ty", "check"], "Type checker", needs_cache_clear=True),
+            ToolInfo("pyrefly", ["uv", "run", "pyrefly", "check"], "Type checker", needs_cache_clear=True),
+            ToolInfo(
+                "mypy",
+                ["uv", "run", "mypy", "--config-file", str(vanilla_cfg)],
+                "Type checker (no plugin)",
+                needs_cache_clear=True,
+            ),
+            ToolInfo(
+                "mypy + typedframes",
+                ["uv", "run", "mypy", "--config-file", str(plugin_cfg)],
+                "Type checker + column checker",
+                needs_cache_clear=True,
+            ),
+            ToolInfo("pyright", ["npx", "pyright"], "Type checker", needs_cache_clear=True),
+        ]
+    )
     return tools
 
 

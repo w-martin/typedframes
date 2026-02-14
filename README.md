@@ -519,20 +519,24 @@ def select_columns(df: PolarsFrame[UserSchema]) -> pl.DataFrame:
     return df.select([UserSchema.user_id.col, UserSchema.email.col])
 ```
 
-### Schema Algebra
+### Schema Composition
 
-When you merge, concat, or subset DataFrames, the resulting schema changes. Schema algebra lets you describe these
-transformations and type the result — using column references instead of strings, so typos are caught immediately.
+Compose upward — build bigger schemas from smaller ones via inheritance. Type checkers see all columns natively.
 
 ```python
 from typedframes import BaseSchema, Column
 from typedframes.pandas import PandasFrame
-import pandas as pd
 
 
-class Users(BaseSchema):
+# Start with the smallest useful schema
+class UserPublic(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
+    name = Column(type=str)
+
+
+# Extend it — never strip down
+class UserFull(UserPublic):
     password_hash = Column(type=str)
 
 
@@ -542,28 +546,19 @@ class Orders(BaseSchema):
     total = Column(type=float)
 
 
-users: PandasFrame[Users] = ...
+# Combine via multiple inheritance
+class UserOrders(UserPublic, Orders):
+  """Type checkers see all columns from both parents."""
+  ...
+
+
+# Or use the + operator
+UserOrders = UserPublic + Orders
+
+users: PandasFrame[UserPublic] = ...
 orders: PandasFrame[Orders] = ...
-
-# Combine schemas for merge/concat results
-UserOrders = Users + Orders
-# UserOrders has: user_id, email, password_hash, order_id, total
 merged: PandasFrame[UserOrders] = PandasFrame.from_schema(
-  users.merge(orders, on=str(Users.user_id)), UserOrders
-)
-
-# Select specific columns (column references, not strings)
-UserBasic = Users.select([Users.user_id, Users.email])
-# UserBasic has: user_id, email
-basic: PandasFrame[UserBasic] = PandasFrame.from_schema(
-  users[UserBasic.all_column_names()], UserBasic
-)
-
-# Drop columns
-UserPublic = Users.drop([Users.password_hash])
-# UserPublic has: user_id, email
-public: PandasFrame[UserPublic] = PandasFrame.from_schema(
-  users[UserPublic.all_column_names()], UserPublic
+  users.merge(orders, on=str(UserPublic.user_id)), UserOrders
 )
 ```
 
@@ -821,7 +816,7 @@ MIT License - see [LICENSE](LICENSE)
 - [x] Standalone checker (Rust)
 - [x] Explicit backend types
 - [x] Merge/join schema preservation
-- [x] Schema Algebra (`SchemaA + SchemaB`, `.select()`, `.drop()`)
+- [x] Schema Composition (multiple inheritance, `SchemaA + SchemaB`)
 - [x] Column name collision warnings
 - [x] Pandera integration (`to_pandera_schema()`)
 
@@ -829,8 +824,6 @@ MIT License - see [LICENSE](LICENSE)
 
 - [ ] **Optional runtime validation** - `Field` class with constraints (`gt`, `ge`, `lt`, `le`) on Column definitions,
   opt-in validation at data load time
-- [ ] **IDE Integration (.pyi stubs)** - Generate `.pyi` stub files for enhanced schema autocomplete in IDEs
-  (VSCode, PyCharm). Basic type inference already works via `__getitem__` overloads without stubs.
 
 ---
 

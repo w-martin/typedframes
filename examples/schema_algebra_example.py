@@ -1,4 +1,4 @@
-"""Schema algebra example — typing the results of merge, concat, and column subsetting."""
+"""Schema composition example — compose upward, never strip down."""
 
 import pandas as pd
 
@@ -6,15 +6,20 @@ from typedframes import BaseSchema, Column
 from typedframes.pandas import PandasFrame
 
 
-# -- Define schemas ----------------------------------------------------------
+# -- Compose upward: base schemas first, extend via inheritance ---------------
 
 
-class Users(BaseSchema):
-    """User account data."""
+class UserPublic(BaseSchema):
+    """Public user data — the minimal user schema."""
 
     user_id = Column(type=int)
     email = Column(type=str)
     name = Column(type=str)
+
+
+class UserFull(UserPublic):
+    """Full user record including sensitive data. Extends UserPublic."""
+
     password_hash = Column(type=str)
 
 
@@ -22,22 +27,29 @@ class Orders(BaseSchema):
     """Order transaction data."""
 
     order_id = Column(type=int)
-    user_id = Column(type=int)  # same name & type as Users.user_id — OK
+    user_id = Column(type=int)  # same name & type as UserPublic.user_id — OK
     total = Column(type=float)
+
+
+# -- Combine schemas via multiple inheritance ---------------------------------
+# Type checkers see all columns natively — no stubs or plugins needed.
+
+
+class UserOrders(UserPublic, Orders):
+    """Combined schema for merged user/order data."""
 
 
 # -- Wrap raw DataFrames as PandasFrames -------------------------------------
 
-users: PandasFrame[Users] = PandasFrame.from_schema(
+users: PandasFrame[UserPublic] = PandasFrame.from_schema(
     pd.DataFrame(
         {
             "user_id": [1, 2],
             "email": ["a@b.com", "c@d.com"],
             "name": ["Alice", "Bob"],
-            "password_hash": ["hash1", "hash2"],
         }
     ),
-    Users,
+    UserPublic,
 )
 
 orders: PandasFrame[Orders] = PandasFrame.from_schema(
@@ -51,43 +63,17 @@ orders: PandasFrame[Orders] = PandasFrame.from_schema(
     Orders,
 )
 
-# -- Combine schemas with + --------------------------------------------------
-# Use when you pd.merge or pd.concat(axis=1) two DataFrames.
-
-UserOrders = Users + Orders
-# UserOrders has: user_id, email, name, password_hash, order_id, total
+# -- Use the combined schema for merge results --------------------------------
 
 merged: PandasFrame[UserOrders] = PandasFrame.from_schema(
-    users.merge(orders, on=str(Users.user_id)),
+    users.merge(orders, on=str(UserPublic.user_id)),
     UserOrders,
 )
-print("Merged schema columns:", list(UserOrders.columns().keys()))
+print("UserOrders columns:", list(UserOrders.columns().keys()))
 print(merged)
 print()
 
-# -- Select columns with .select() -------------------------------------------
-# Use when you subset a DataFrame to fewer columns.
+# -- The + operator also works for quick composition --------------------------
 
-UserBasic = Users.select([Users.user_id, Users.email])
-# UserBasic has: user_id, email
-
-basic: PandasFrame[UserBasic] = PandasFrame.from_schema(
-    users[UserBasic.all_column_names()],
-    UserBasic,
-)
-print("Selected schema columns:", list(UserBasic.columns().keys()))
-print(basic)
-print()
-
-# -- Drop columns with .drop() -----------------------------------------------
-# Use when you need to exclude sensitive or unwanted columns.
-
-UserPublic = Users.drop([Users.password_hash])
-# UserPublic has: user_id, email, name
-
-public: PandasFrame[UserPublic] = PandasFrame.from_schema(
-    users[UserPublic.all_column_names()],
-    UserPublic,
-)
-print("Dropped schema columns:", list(UserPublic.columns().keys()))
-print(public)
+UserOrdersDynamic = UserPublic + Orders
+print("Dynamic combination columns:", list(UserOrdersDynamic.columns().keys()))

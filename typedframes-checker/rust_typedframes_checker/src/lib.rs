@@ -218,12 +218,23 @@ impl Linter {
             Stmt::ClassDef(class_def) => {
                 let is_schema = class_def.bases().iter().any(|base| match base {
                     Expr::Attribute(attr) => Self::is_schema_base(attr.attr.as_str()),
-                    Expr::Name(name) => Self::is_schema_base(name.id.as_str()),
+                    Expr::Name(name) => {
+                        Self::is_schema_base(name.id.as_str())
+                            || self.schemas.contains_key(name.id.as_str())
+                    }
                     _ => false,
                 });
 
                 if is_schema {
+                    // Inherit columns from parent schemas (MI support)
                     let mut columns = Vec::new();
+                    for base in class_def.bases() {
+                        if let Expr::Name(name) = base {
+                            if let Some(parent_cols) = self.schemas.get(name.id.as_str()) {
+                                columns.extend(parent_cols.clone());
+                            }
+                        }
+                    }
                     for body_stmt in &class_def.body {
                         if let Stmt::AnnAssign(ann_assign) = body_stmt {
                             if let Expr::Name(name) = ann_assign.target.as_ref() {
@@ -333,6 +344,9 @@ impl Linter {
                             }
                         }
                     }
+                    // Deduplicate columns (MI may bring overlapping columns)
+                    columns.sort();
+                    columns.dedup();
                     // Warn about column names that conflict with reserved methods
                     for col_name in &columns {
                         if RESERVED_METHODS.contains(&col_name.as_str()) {

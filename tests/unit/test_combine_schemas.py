@@ -1,4 +1,4 @@
-"""Unit tests for combine_schemas function."""
+"""Unit tests for schema composition (combine_schemas and multiple inheritance)."""
 
 import unittest
 
@@ -43,7 +43,7 @@ class SensorData(BaseSchema):
 
 
 class TestCombineSchemas(unittest.TestCase):
-    """Tests for combine_schemas function."""
+    """Tests for combine_schemas function and multiple inheritance composition."""
 
     def test_should_combine_two_schemas(self) -> None:
         """Test that combine_schemas creates a schema with all columns."""
@@ -156,3 +156,127 @@ class TestCombineSchemas(unittest.TestCase):
         # assert — schema_a's sensors should win
         cs = combined.column_sets()["sensors"]
         self.assertEqual(cs.members, ["temp_1"])
+
+    def test_should_compose_via_multiple_inheritance(self) -> None:
+        """Test that MI creates a schema with columns from all parents."""
+
+        # act
+        class UserOrders(Users, Orders):
+            """Combined user and order data."""
+
+        # assert
+        columns = UserOrders.columns()
+        self.assertIn("user_id", columns)
+        self.assertIn("email", columns)
+        self.assertIn("name", columns)
+        self.assertIn("order_id", columns)
+        self.assertIn("total", columns)
+
+    def test_should_preserve_types_via_multiple_inheritance(self) -> None:
+        """Test that MI preserves column types from parents."""
+
+        # act
+        class UserOrders(Users, Orders):
+            """Combined user and order data."""
+
+        # assert
+        columns = UserOrders.columns()
+        self.assertEqual(columns["user_id"].type, int)
+        self.assertEqual(columns["email"].type, str)
+        self.assertEqual(columns["total"].type, float)
+
+    def test_should_allow_identical_overlap_via_multiple_inheritance(self) -> None:
+        """Test that MI allows overlapping columns with identical types."""
+
+        # act — user_id appears in both with type int
+        class UserOrders(Users, Orders):
+            """Combined user and order data."""
+
+        # assert
+        columns = UserOrders.columns()
+        self.assertEqual(columns["user_id"].type, int)
+        self.assertEqual(len(columns), 5)
+
+    def test_should_raise_on_conflicting_types_via_multiple_inheritance(self) -> None:
+        """Test that MI raises SchemaConflictError for type conflicts."""
+        # act/assert
+        with self.assertRaises(SchemaConflictError) as ctx:
+            class _Conflict(Users, OrdersConflict):
+                """Should fail due to user_id type conflict."""
+
+        self.assertIn("user_id", str(ctx.exception))
+
+    def test_should_inherit_column_sets_via_multiple_inheritance(self) -> None:
+        """Test that MI inherits ColumnSets from parents."""
+
+        # act
+        class Combined(Users, SensorData):
+            """Combined with sensor data."""
+
+        # assert
+        self.assertIn("sensors", Combined.column_sets())
+        self.assertIn("user_id", Combined.columns())
+        self.assertIn("timestamp", Combined.columns())
+
+    def test_should_compose_upward_via_single_inheritance(self) -> None:
+        """Test the compose-upward pattern: extend base with more columns."""
+
+        # arrange
+        class UserPublic(BaseSchema):
+            """Public user data."""
+
+            user_id = Column(type=int)
+            email = Column(type=str)
+
+        # act
+        class UserFull(UserPublic):
+            """Full user data including sensitive fields."""
+
+            password_hash = Column(type=str)
+
+        # assert
+        columns = UserFull.columns()
+        self.assertIn("user_id", columns)
+        self.assertIn("email", columns)
+        self.assertIn("password_hash", columns)
+        self.assertEqual(len(columns), 3)
+
+    def test_should_support_radd_for_reverse_addition(self) -> None:
+        """Test that __radd__ supports reverse addition via SchemaMeta."""
+
+        # arrange
+        class SchemaA(BaseSchema):
+            """Schema A."""
+
+            col_a = Column(type=int)
+
+        class SchemaB(BaseSchema):
+            """Schema B."""
+
+            col_b = Column(type=str)
+
+        # act — trigger __radd__ via SchemaMeta
+        result = SchemaA.__radd__(SchemaB)
+
+        # assert
+        columns = result.columns()
+        self.assertIn("col_b", columns)
+        self.assertIn("col_a", columns)
+
+    def test_should_not_leak_child_columns_to_parent(self) -> None:
+        """Test that child columns don't pollute the parent schema."""
+
+        # arrange
+        class Parent(BaseSchema):
+            """Parent schema."""
+
+            col_a = Column(type=int)
+
+        class _Child(Parent):
+            """Child with extra column."""
+
+            col_b = Column(type=str)
+
+        # assert — parent should only have its own column
+        self.assertEqual(len(Parent.columns()), 1)
+        self.assertIn("col_a", Parent.columns())

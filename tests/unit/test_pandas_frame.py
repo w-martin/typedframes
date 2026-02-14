@@ -358,9 +358,13 @@ class TestPandasFrame(unittest.TestCase):
     def test_should_groupby_column_set(self) -> None:
         """Test that groupby accepts a ColumnSet descriptor."""
         # arrange
-        raw_df = pd.DataFrame({
-            "timestamp": ["t1", "t1", "t2"], "temp_1": [20.0, 20.0, 25.0], "temp_2": [30.0, 30.0, 35.0],
-        })
+        raw_df = pd.DataFrame(
+            {
+                "timestamp": ["t1", "t1", "t2"],
+                "temp_1": [20.0, 20.0, 25.0],
+                "temp_2": [30.0, 30.0, 35.0],
+            }
+        )
         sut = PandasFrame.from_schema(raw_df, SensorSchema)
 
         # act
@@ -418,9 +422,13 @@ class TestPandasFrame(unittest.TestCase):
     def test_should_groupby_list_with_column_set(self) -> None:
         """Test that groupby accepts a list containing a ColumnSet."""
         # arrange
-        raw_df = pd.DataFrame({
-            "timestamp": ["t1", "t1", "t2"], "temp_1": [20.0, 20.0, 25.0], "temp_2": [30.0, 30.0, 35.0],
-        })
+        raw_df = pd.DataFrame(
+            {
+                "timestamp": ["t1", "t1", "t2"],
+                "temp_1": [20.0, 20.0, 25.0],
+                "temp_2": [30.0, 30.0, 35.0],
+            }
+        )
         sut = PandasFrame.from_schema(raw_df, SensorSchema)
 
         # act

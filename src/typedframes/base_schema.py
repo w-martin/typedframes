@@ -17,7 +17,30 @@ if TYPE_CHECKING:
 
 
 class SchemaMeta(type):
-    """Metaclass for BaseSchema that enables class-level + operator."""
+    """Metaclass for BaseSchema that enables class-level + operator and MI conflict detection."""
+
+    def __new__(mcs, name: str, bases: tuple[type, ...], namespace: dict) -> SchemaMeta:
+        """Create a new schema class, checking for column type conflicts across bases."""
+        cls = super().__new__(mcs, name, bases, namespace)
+        # Detect column type conflicts across multiple schema bases
+        seen_columns: dict[str, tuple[type, str]] = {}
+        for base in cls.__mro__:
+            if base is cls or not isinstance(base, SchemaMeta):
+                continue
+            for attr_val in base.__dict__.values():
+                if isinstance(attr_val, Column):
+                    col_name = attr_val.column_name
+                    if col_name in seen_columns:
+                        existing_type, existing_source = seen_columns[col_name]
+                        if attr_val.type != existing_type:
+                            from .schema_algebra import SchemaConflictError
+
+                            raise SchemaConflictError(
+                                col_name, existing_type, existing_source, attr_val.type, base.__name__
+                            )
+                    else:
+                        seen_columns[col_name] = (attr_val.type, base.__name__)
+        return cls  # type: ignore[return-value]
 
     def __add__(cls, other: type[BaseSchema]) -> type[BaseSchema]:
         """Combine two schema classes using the + operator."""
@@ -30,6 +53,14 @@ class SchemaMeta(type):
         from .schema_algebra import combine_schemas
 
         return combine_schemas(other, cls)  # ty: ignore[invalid-argument-type]
+
+
+def _collect_from_mro(cls: type, descriptor_type: type) -> dict:
+    """Collect descriptors of a given type from the full MRO (child overrides parent)."""
+    result: dict = {}
+    for klass in reversed(cls.__mro__):
+        result.update({name: val for name, val in klass.__dict__.items() if isinstance(val, descriptor_type)})
+    return result
 
 
 class BaseSchema(metaclass=SchemaMeta):
@@ -68,23 +99,23 @@ class BaseSchema(metaclass=SchemaMeta):
 
     @classmethod
     def columns(cls) -> dict[str, Column]:
-        """Return mapping of attribute names to Column definitions."""
-        if cls._column_map is None:
-            cls._column_map = {name: col for name, col in cls.__dict__.items() if isinstance(col, Column)}
+        """Return mapping of attribute names to Column definitions, including inherited."""
+        if "_column_map" not in cls.__dict__ or cls._column_map is None:
+            cls._column_map = _collect_from_mro(cls, Column)
         return cls._column_map
 
     @classmethod
     def column_sets(cls) -> dict[str, ColumnSet]:
-        """Return mapping of attribute names to ColumnSet definitions."""
-        if cls._column_set_map is None:
-            cls._column_set_map = {name: cs for name, cs in cls.__dict__.items() if isinstance(cs, ColumnSet)}
+        """Return mapping of attribute names to ColumnSet definitions, including inherited."""
+        if "_column_set_map" not in cls.__dict__ or cls._column_set_map is None:
+            cls._column_set_map = _collect_from_mro(cls, ColumnSet)
         return cls._column_set_map
 
     @classmethod
     def column_groups(cls) -> dict[str, ColumnGroup]:
-        """Return mapping of attribute names to ColumnGroup definitions."""
-        if cls._column_group_map is None:
-            cls._column_group_map = {name: cg for name, cg in cls.__dict__.items() if isinstance(cg, ColumnGroup)}
+        """Return mapping of attribute names to ColumnGroup definitions, including inherited."""
+        if "_column_group_map" not in cls.__dict__ or cls._column_group_map is None:
+            cls._column_group_map = _collect_from_mro(cls, ColumnGroup)
         return cls._column_group_map
 
     @classmethod
@@ -223,133 +254,3 @@ class BaseSchema(metaclass=SchemaMeta):
         The linter performs static validation; this provides runtime metadata.
         """
         return df
-
-    @classmethod
-    def _resolve_columns(cls, items: list[Column | ColumnSet]) -> tuple[dict[str, Column], dict[str, ColumnSet]]:
-        """Resolve a list of Column/ColumnSet references to their attribute names via identity check.
-
-        Returns:
-            Tuple of (matched_columns, matched_column_sets) dicts mapping attr name to descriptor.
-
-        Raises:
-            ValueError: If any item does not belong to this schema.
-
-        """
-        matched_cols: dict[str, Column] = {}
-        matched_sets: dict[str, ColumnSet] = {}
-
-        for item in items:
-            found = False
-            if isinstance(item, Column):
-                for attr_name, col in cls.columns().items():
-                    if col is item:
-                        matched_cols[attr_name] = col
-                        found = True
-                        break
-                if not found:
-                    label = item.name or repr(item)
-                    msg = f"Column '{label}' does not belong to {cls.__name__}"
-                    raise ValueError(msg)
-            elif isinstance(item, ColumnSet):
-                for attr_name, cs in cls.column_sets().items():
-                    if cs is item:
-                        matched_sets[attr_name] = cs
-                        found = True
-                        break
-                if not found:
-                    label = item.name or repr(item)
-                    msg = f"ColumnSet '{label}' does not belong to {cls.__name__}"
-                    raise ValueError(msg)
-            else:
-                msg = f"Expected Column or ColumnSet, got {type(item).__name__}"
-                raise TypeError(msg)
-
-        return matched_cols, matched_sets
-
-    @classmethod
-    def select(cls, columns: list[Column | ColumnSet], name: str | None = None) -> type[BaseSchema]:
-        """Create a new schema with only the specified columns.
-
-        Args:
-            columns: List of Column or ColumnSet instances belonging to this schema.
-            name: Optional name for the new schema. Defaults to "<SchemaName>_Select".
-
-        Returns:
-            A new schema class with only the specified columns.
-
-        Raises:
-            ValueError: If any column does not belong to this schema.
-
-        """
-        matched_cols, matched_sets = cls._resolve_columns(columns)
-
-        select_name = name or f"{cls.__name__}_Select"
-        attrs: dict = {}
-
-        for col_name, col in matched_cols.items():
-            attrs[col_name] = Column(
-                type=col.type,
-                alias=col.alias,
-                nullable=col.nullable,
-                description=col.description,
-            )
-
-        for cs_name, cs in matched_sets.items():
-            attrs[cs_name] = ColumnSet(
-                members=cs.members.copy() if isinstance(cs.members, list) else cs.members,
-                type=cs.type,
-                regex=cs.regex,
-                description=cs.description,
-            )
-
-        new_schema = type(select_name, (BaseSchema,), attrs)
-
-        for attr_name, attr_value in attrs.items():
-            attr_value.__set_name__(new_schema, attr_name)
-
-        return new_schema
-
-    @classmethod
-    def drop(cls, columns: list[Column | ColumnSet], name: str | None = None) -> type[BaseSchema]:
-        """Create a new schema excluding the specified columns.
-
-        Args:
-            columns: List of Column or ColumnSet instances belonging to this schema to exclude.
-            name: Optional name for the new schema. Defaults to "<SchemaName>_Drop".
-
-        Returns:
-            A new schema class without the specified columns.
-
-        Raises:
-            ValueError: If any column does not belong to this schema.
-
-        """
-        matched_cols, matched_sets = cls._resolve_columns(columns)
-
-        drop_name = name or f"{cls.__name__}_Drop"
-        attrs: dict = {}
-
-        for col_name, col in cls.columns().items():
-            if col_name not in matched_cols:
-                attrs[col_name] = Column(
-                    type=col.type,
-                    alias=col.alias,
-                    nullable=col.nullable,
-                    description=col.description,
-                )
-
-        for cs_name, cs in cls.column_sets().items():
-            if cs_name not in matched_sets:
-                attrs[cs_name] = ColumnSet(
-                    members=cs.members.copy() if isinstance(cs.members, list) else cs.members,
-                    type=cs.type,
-                    regex=cs.regex,
-                    description=cs.description,
-                )
-
-        new_schema = type(drop_name, (BaseSchema,), attrs)
-
-        for attr_name, attr_value in attrs.items():
-            attr_value.__set_name__(new_schema, attr_name)
-
-        return new_schema

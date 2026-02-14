@@ -275,37 +275,6 @@ class TestBaseSchema(unittest.TestCase):
         # assert
         self.assertIs(result, df)
 
-    def test_should_reject_invalid_type_in_resolve_columns(self) -> None:
-        """Test that _resolve_columns raises TypeError for non-Column/ColumnSet items."""
-
-        # arrange
-        class TestSchema(BaseSchema):
-            user_id = Column(type=int)
-
-        # act/assert
-        with self.assertRaises(TypeError) as ctx:
-            TestSchema._resolve_columns(["not_a_column"])  # type: ignore[list-item]
-
-        self.assertIn("Expected Column or ColumnSet", str(ctx.exception))
-
-    def test_should_support_radd_operator(self) -> None:
-        """Test that __radd__ supports reverse addition."""
-
-        # arrange
-        class SchemaA(BaseSchema):
-            col_a = Column(type=int)
-
-        class SchemaB(BaseSchema):
-            col_b = Column(type=str)
-
-        # act — trigger __radd__ via SchemaMeta
-        result = SchemaA.__radd__(SchemaB)
-
-        # assert
-        columns = result.columns()
-        self.assertIn("col_b", columns)
-        self.assertIn("col_a", columns)
-
     def test_should_handle_non_list_members_in_match_column_to_set(self) -> None:
         """Test that _match_column_to_set returns False when members is not a list."""
 

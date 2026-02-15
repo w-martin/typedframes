@@ -22,6 +22,13 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "warn"
+
 [dependencies]
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }

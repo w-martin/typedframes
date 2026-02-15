@@ -118,11 +118,11 @@ fn levenshtein(a: &str, b: &str) -> usize {
     let b_len = b_chars.len();
     let mut matrix = vec![vec![0; b_len + 1]; a_len + 1];
 
-    for i in 0..=a_len {
-        matrix[i][0] = i;
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=b_len {
-        matrix[0][j] = j;
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
     }
 
     for i in 1..=a_len {
@@ -165,6 +165,12 @@ pub struct Linter {
     source: String,
 }
 
+impl Default for Linter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Linter {
     pub fn new() -> Self {
         Self {
@@ -177,9 +183,14 @@ impl Linter {
     }
 
     fn source_location(&self, offset: ruff_text_size::TextSize) -> (usize, usize) {
-        let source_code = SourceCode::new(&self.source, self.line_index.as_ref().unwrap());
+        let source_code = SourceCode::new(
+            &self.source,
+            self.line_index
+                .as_ref()
+                .expect("LineIndex should be initialized before calling source_location"),
+        );
         let loc = source_code.line_column(offset);
-        (loc.line.get() as usize, loc.column.get() as usize)
+        (loc.line.get(), loc.column.get())
     }
 
     pub fn check_file_internal(
@@ -776,7 +787,7 @@ impl Linter {
                     if let Some(end) = s.rfind(']') {
                         let schema_name = &s[start + 1..end];
                         // Handle nested generics by taking the last part
-                        let schema = schema_name.split(',').last().unwrap_or(schema_name).trim();
+                        let schema = schema_name.split(',').next_back().unwrap_or(schema_name).trim();
                         if let Expr::Name(target_name) = &*ann_assign.target {
                             self.variables.insert(
                                 target_name.id.to_string(),
@@ -1011,5 +1022,72 @@ print(df["emai"])
         assert!(errors[0].message.contains("UserSchema"));
         assert!(errors[1].message.contains("emai"));
         assert!(errors[1].message.contains("did you mean 'email'"));
+    }
+
+    #[test]
+    fn test_find_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sub = root.join("a/b/c");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+
+        assert_eq!(find_project_root(&sub), root);
+        assert_eq!(find_project_root(root), root);
+    }
+
+    #[test]
+    fn test_is_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        
+        // Case 1: No pyproject.toml -> enabled by default
+        assert!(is_enabled(root));
+
+        // Case 2: pyproject.toml without tool section -> enabled by default
+        fs::write(root.join("pyproject.toml"), "[tool.something]\nenabled = false").unwrap();
+        assert!(is_enabled(root));
+
+        // Case 3: pyproject.toml with tool.typedframes.enabled = false
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\nenabled = false").unwrap();
+        assert!(!is_enabled(root));
+
+        // Case 4: pyproject.toml with tool.typedframes.enabled = true
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\nenabled = true").unwrap();
+        assert!(is_enabled(root));
+    }
+
+    #[test]
+    fn test_levenshtein() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("flaw", "lawn"), 2);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("equal", "equal"), 0);
+    }
+
+    #[test]
+    fn test_extract_schema_from_annotation() {
+        let source = "x: PandasFrame[MySchema] = df";
+        let parsed = parse_module(source).unwrap();
+        let stmt = &parsed.into_syntax().body[0];
+        if let Stmt::AnnAssign(ann) = stmt {
+            let schema = Linter::extract_schema_from_annotation(&ann.annotation);
+            assert_eq!(schema, Some("MySchema"));
+        } else {
+            panic!("Expected AnnAssign");
+        }
+    }
+
+    #[test]
+    fn test_visitor_various_stmts() {
+        let source = r#"
+class Other: pass
+def func(): pass
+x = 1
+"#;
+        let mut linter = Linter::new();
+        let errors = linter.check_file_internal(source, Path::new("test.py")).unwrap();
+        assert!(errors.is_empty());
     }
 }

@@ -42,11 +42,13 @@ def format_code(ctx: Context) -> None:
 
 @task
 def lint(ctx: Context) -> None:
-    """Run all linters: ruff check, ty check, bandit, complexipy."""
+    """Run all linters: ruff check, ty check, bandit, complexipy, cargo clippy."""
     ctx.run("ruff check .")
     ctx.run("ty check .")
     ctx.run("bandit -r src/ -c pyproject.toml")
     ctx.run("complexipy src/ --max-complexity-allowed 50")
+    print("Running Rust clippy...")
+    ctx.run(f"cd {RUST_DIR} && cargo clippy -- -D warnings")
 
 
 @task
@@ -58,9 +60,12 @@ def lint_fix(ctx: Context) -> None:
 
 @task(pre=[build])
 def test(ctx: Context) -> None:
-    """Run pytest with branch coverage. Builds Rust checker if needed."""
+    """Run pytest with branch coverage and Rust tests. Builds Rust checker if needed."""
+    print("Running Python tests...")
     ctx.run("python -m pytest tests/")
     ctx.run("coverage-threshold")
+    print("Running Rust tests...")
+    ctx.run(f"cd {RUST_DIR} && cargo test")
 
 
 @task

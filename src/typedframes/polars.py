@@ -43,7 +43,6 @@ SchemaT = TypeVar("SchemaT", bound=BaseSchema)
 if TYPE_CHECKING:
     import polars as pl
 
-
     class PolarsFrame(pl.DataFrame, Generic[SchemaT]):  # type: ignore[misc]
         """
         Type stub for schema-annotated polars DataFrames.

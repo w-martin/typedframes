@@ -88,7 +88,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         if column_consumed_map is None:
             _, column_consumed_map = schema.compute_column_map(list(df.columns))
 
-        return cls(df, schema=schema, column_consumed_map=column_consumed_map)
+        return cls(df, schema=schema, column_consumed_map=column_consumed_map)  # ty: ignore[no-matching-overload]
 
     @classmethod
     def read_csv(cls, filepath_or_buffer: Any, schema: type[SchemaT], **kwargs: Any) -> PandasFrame[SchemaT]:
@@ -174,7 +174,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         @overload
         def __getitem__(self, key: pd.Series) -> PandasFrame[SchemaT]: ...
 
-    def __getitem__(
+    def __getitem__(  # ty: ignore[invalid-method-override]
             self,
             key: Column | ColumnSet | ColumnGroup | str | list[str] | pd.Series,
     ) -> pd.Series | pd.DataFrame:
@@ -239,7 +239,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         """Return constructor for slicing/operations to preserve PandasFrame type."""
 
         def constructor(data: Any, **kwargs: Any) -> PandasFrame[SchemaT]:
-            return PandasFrame(
+            return PandasFrame(  # ty: ignore[no-matching-overload]
                 data,
                 schema=self._schema_class,
                 column_consumed_map=self._column_consumed_map,

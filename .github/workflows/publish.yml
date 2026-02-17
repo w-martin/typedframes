@@ -32,18 +32,17 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+        with:
+          python-version: 3.11
 
-      - name: Set up Python
-        run: uv python install 3.11
+      - name: Install dependencies
+        run: uv sync
 
       - name: Python format check
         run: uv run inv format-check
 
       - name: Python lint
         run: uv run inv lint
-
-      - name: Build extension module
-        run: uv run maturin develop
 
       - name: Python tests
         run: uv run inv test

@@ -1,3 +1,35 @@
+//! Rust-based static analyser for typedframes, exposed to Python via PyO3.
+//!
+//! # Architecture
+//!
+//! The checker operates in two phases:
+//!
+//! 1. **Index phase** (`build_project_index`) — walks all `.py` files in the project,
+//!    parses each one with `ruff_python_parser`, and extracts a lightweight symbol table
+//!    (`ProjectIndex`) containing schema definitions and annotated function return types.
+//!    The index is serialised to MessagePack bytes (via `rmp_serde`) and passed back to
+//!    the Python caller in memory — no files are written to disk.
+//!
+//! 2. **Check phase** (`check_file`) — parses a single file, optionally deserialises the
+//!    project index, resolves cross-file imports, and runs the [`Linter`] AST visitor.
+//!    The visitor walks statements with [`Linter::visit_stmt`] (schema/variable tracking)
+//!    and validates column access expressions with [`Linter::visit_expr`].  Diagnostics
+//!    are returned as a JSON array of [`LintError`] objects.
+//!
+//! # Typo suggestions
+//!
+//! When a column name is not found in the known schema, the analyser computes the
+//! Levenshtein edit distance between the unknown name and every known column.  If the
+//! closest match is within distance ≤ 2 it is included in the diagnostic message as a
+//! "did you mean?" hint.  See [`levenshtein`] and [`find_best_match`].
+//!
+//! # Inline suppression
+//!
+//! Lines containing `# typedframes: ignore` suppress all diagnostics on that line.
+//! `# typedframes: ignore[code1, code2]` suppresses only the listed diagnostic codes.
+//! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
+//! after all errors have been collected.
+
 use pyo3::prelude::*;
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
@@ -7,6 +39,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+/// Check a single Python file for DataFrame column errors.
+///
+/// Accepts an optional MessagePack-serialised [`ProjectIndex`] (produced by
+/// [`build_project_index`]) so the linter can resolve cross-file imports, e.g. a schema
+/// defined in `schemas.py` and used in `pipeline.py`.  Returns a JSON array of
+/// [`LintError`] objects, or `"[]"` when the linter is disabled in `pyproject.toml`.
 #[pyfunction]
 #[pyo3(signature = (file_path, index_bytes = None))]
 fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<String> {
@@ -41,6 +79,13 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
 }
 
+/// Build a cross-file symbol index for an entire project.
+///
+/// Walks all `.py` files under `project_root`, parses each one, and extracts
+/// schema definitions and annotated function return types into a [`ProjectIndex`].
+/// The index is serialised with MessagePack and returned as raw bytes so it can be
+/// held in Python memory and passed to subsequent [`check_file`] calls without any
+/// intermediate disk I/O.
 #[pyfunction]
 fn build_project_index(project_root: String) -> PyResult<Vec<u8>> {
     let root = Path::new(&project_root);
@@ -56,22 +101,29 @@ fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// Root deserialisation target for `pyproject.toml`.
 #[derive(serde::Deserialize)]
 struct Config {
     tool: Option<ToolConfig>,
 }
 
+// `[tool]` section of `pyproject.toml`.
 #[derive(serde::Deserialize)]
 struct ToolConfig {
     typedframes: Option<LinterConfig>,
 }
 
+// `[tool.typedframes]` configuration block.
+// All fields are optional; absent keys default to `true`.
 #[derive(serde::Deserialize)]
 struct LinterConfig {
-    enabled: Option<bool>,
-    warnings: Option<bool>,
+    enabled: Option<bool>,  // default: true
+    warnings: Option<bool>, // default: true
 }
 
+// Read `[tool.typedframes]` from `pyproject.toml` at `project_root`.
+// Returns a config with all fields `None` if the file is absent, unreadable, or has no
+// `[tool.typedframes]` section; callers use `.unwrap_or(true)` on each field.
 fn load_linter_config(project_root: &Path) -> LinterConfig {
     let config_path = project_root.join("pyproject.toml");
     if !config_path.exists() {
@@ -110,10 +162,15 @@ fn load_linter_config(project_root: &Path) -> LinterConfig {
         })
 }
 
+/// Return `true` if the linter is enabled for `project_root` (default: `true`).
 pub fn is_enabled(project_root: &Path) -> bool {
     load_linter_config(project_root).enabled.unwrap_or(true)
 }
 
+/// Walk up the directory tree from `start_path` until a `pyproject.toml` is found.
+///
+/// Returns the directory containing `pyproject.toml`, or `start_path` itself if no
+/// `pyproject.toml` exists anywhere in the ancestor chain (e.g. standalone scripts).
 pub fn find_project_root(start_path: &Path) -> PathBuf {
     let mut current = start_path.to_path_buf();
     if current.is_file() {
@@ -131,27 +188,35 @@ pub fn find_project_root(start_path: &Path) -> PathBuf {
 
 // ── Index structs ──────────────────────────────────────────────────────────────
 
+// Return-type information extracted from an annotated function definition.
 #[derive(Serialize, Deserialize)]
 struct IndexFunction {
-    returns_schema: String,
-    returns_frame: String,
+    returns_schema: String, // BaseSchema subclass name, e.g. "OrderSchema"; empty if none
+    returns_frame: String,  // reserved for future use
 }
 
+// Symbol table for a single `.py` file, stored inside ProjectIndex.
 #[derive(Serialize, Deserialize)]
 struct IndexEntry {
-    schemas: HashMap<String, Vec<String>>,
-    functions: HashMap<String, IndexFunction>,
-    exports: Vec<String>,
+    schemas: HashMap<String, Vec<String>>, // schema name -> column list
+    functions: HashMap<String, IndexFunction>, // function name -> return type info
+    exports: Vec<String>,                  // names in __all__, for wildcard-import resolution
 }
 
+// In-memory cross-file symbol index.
+// Serialised as MessagePack so it can be held in Python memory and passed to check_file
+// without any intermediate disk I/O.  The version field allows future format migrations.
 #[derive(Serialize, Deserialize)]
 struct ProjectIndex {
-    version: u32,
-    files: HashMap<String, IndexEntry>,
+    version: u32,                       // format version, currently always 1
+    files: HashMap<String, IndexEntry>, // absolute file path -> IndexEntry
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
 
+// Recursively collect all `.py` files under `dir`, skipping hidden entries (`.venv`,
+// `.git`, etc.).  Uses an explicit stack rather than recursion to avoid stack overflow
+// on very deep trees.
 fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -176,6 +241,9 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
     result
 }
 
+// Parse one `.py` file and extract its symbols into an IndexEntry.
+// Runs the linter in index mode (diagnostics discarded) to collect schemas and
+// functions, then separately parses `__all__` assignments for wildcard-import support.
 fn index_file(path: &Path) -> Option<IndexEntry> {
     let source = fs::read_to_string(path).ok()?;
 
@@ -234,6 +302,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
     })
 }
 
+// Build a ProjectIndex by indexing every `.py` file under `project_root`.
 fn build_index_internal(project_root: &Path) -> ProjectIndex {
     let py_files = collect_py_files(project_root);
     let mut files = HashMap::new();
@@ -256,8 +325,8 @@ const CODE_RESERVED_NAME: &str = "reserved-name";
 const CODE_UNTRACKED_DATAFRAME: &str = "untracked-dataframe";
 const CODE_DROPPED_UNKNOWN_COLUMN: &str = "dropped-unknown-column";
 
-/// Return true if the source line at `line` (1-indexed) carries a
-/// `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
+// Return true if the source line at `line` (1-indexed) carries a
+// `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
 fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
     let lines: Vec<&str> = source.lines().collect();
     if line == 0 || line > lines.len() {
@@ -284,7 +353,7 @@ fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Reserved pandas/polars method names that shouldn't be used as column names
+// Reserved pandas/polars method names that shouldn't be used as column names
 const RESERVED_METHODS: &[&str] = &[
     "shape",
     "columns",
@@ -446,6 +515,11 @@ const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "bfill",
 ];
 
+// Compute the Levenshtein edit distance between two strings using the Wagner–Fischer
+// dynamic-programming algorithm.  matrix[i][j] = minimum single-character edits
+// (insert, delete, substitute) to transform a[..i] into b[..j].
+// Time: O(|a| × |b|).  Space: O(|a| × |b|).
+// Ref: Wagner & Fischer (1974), doi:10.1145/321796.321811
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -476,6 +550,9 @@ fn levenshtein(a: &str, b: &str) -> usize {
     matrix[a_len][b_len]
 }
 
+// Find the closest candidate to `name` within Levenshtein distance ≤ 2.
+// The threshold catches common typos (transposed letters, off-by-one characters) while
+// avoiding spurious "did you mean?" hints for completely unrelated names.
 fn find_best_match<'a>(name: &str, candidates: &'a [String]) -> Option<&'a str> {
     candidates
         .iter()
@@ -485,15 +562,51 @@ fn find_best_match<'a>(name: &str, candidates: &'a [String]) -> Option<&'a str> 
         .map(|(c, _)| c.as_str())
 }
 
+/// A single diagnostic produced by the linter.
+///
+/// Serialises to JSON for the Python API and to the text/GitHub formats in the CLI.
+/// Line and column numbers are 1-indexed to match editor conventions and the output
+/// of `ruff_source_file::SourceCode::line_column` via `OneIndexed::get()`.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct LintError {
+    /// 1-indexed source line.
     pub line: usize,
+    /// 1-indexed source column.
     pub col: usize,
+    /// Diagnostic code, e.g. `"unknown-column"`.  See the `CODE_*` constants.
     pub code: String,
+    /// Human-readable description, optionally including a typo suggestion.
     pub message: String,
-    pub severity: String, // "error" or "warning"
+    /// `"error"` or `"warning"`.
+    pub severity: String,
 }
 
+/// AST visitor that tracks DataFrame schemas and validates column access.
+///
+/// # State model
+///
+/// The linter maintains three pieces of mutable state as it walks the AST:
+///
+/// * `schemas` — maps a schema name to its list of known column names.  Schemas are
+///   created from `BaseSchema` class definitions, inferred from `usecols=`/`columns=`
+///   arguments, and synthesised for intermediate results of method chains
+///   (e.g. `df.drop(...)`, `df.rename(...)`).  Inferred schema names are prefixed with
+///   `__inferred_` to distinguish them from user-defined ones in error messages.
+///
+/// * `variables` — maps a variable name to `(schema_name, line_defined)`.  Updated
+///   whenever a variable is assigned a DataFrame value.  The `line_defined` is used in
+///   error messages to tell the user where the schema was established.
+///
+/// * `functions` — maps a function name to the schema name it returns, populated from
+///   return-type annotations (`-> Annotated[pd.DataFrame, MySchema]`).  Used when a
+///   call result is assigned to a new variable.
+///
+/// # Visitor pattern
+///
+/// `visit_stmt` handles statement-level nodes (class definitions, assignments, function
+/// definitions, `del` statements).  `visit_expr` handles expression-level column access
+/// checks (`df["col"]`, `df.col`, `pl.col("col")`).  Both methods recurse into child
+/// nodes manually rather than using a trait-based visitor, keeping control flow explicit.
 pub struct Linter {
     schemas: HashMap<String, Vec<String>>,
     variables: HashMap<String, (String, usize)>, // var_name -> (schema_name, defined_at_line)
@@ -519,6 +632,9 @@ impl Linter {
         }
     }
 
+    // Convert a byte offset to a 1-indexed (line, column) pair using the pre-built
+    // LineIndex (O(log n) binary search).  Values come from OneIndexed::get() so they
+    // are already 1-based — no adjustment needed at call sites.
     fn source_location(&self, offset: ruff_text_size::TextSize) -> (usize, usize) {
         let source_code = SourceCode::new(
             &self.source,
@@ -530,6 +646,8 @@ impl Linter {
         (loc.line.get(), loc.column.get())
     }
 
+    // Parse `source`, walk the AST, then filter out any diagnostic whose line carries a
+    // `# typedframes: ignore` comment.  Returns the surviving errors.
     pub fn check_file_internal(
         &mut self,
         source: &str,
@@ -549,7 +667,7 @@ impl Linter {
         Ok(errors)
     }
 
-    /// Load schemas and functions from cross-file index based on import statements.
+    // Load schemas and functions from cross-file index based on import statements.
     fn load_cross_file_symbols(
         &mut self,
         index: &ProjectIndex,
@@ -606,7 +724,7 @@ impl Linter {
         }
     }
 
-    /// Check if a base class name indicates a typedframes schema
+    // Check if a base class name indicates a typedframes schema
     fn is_schema_base(name: &str) -> bool {
         matches!(
             name,
@@ -622,12 +740,12 @@ impl Linter {
         }
     }
 
-    /// Check if a type name is a DataFrame/Frame type
+    // Check if a type name is a DataFrame/Frame type
     fn is_frame_type(name: &str) -> bool {
         matches!(name, "DataFrame" | "PandasFrame" | "PolarsFrame")
     }
 
-    /// Extract schema name from a type annotation like PandasFrame[Schema]
+    // Extract schema name from a type annotation like PandasFrame[Schema]
     fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Subscript(subscript) => {
@@ -666,8 +784,8 @@ impl Linter {
         }
     }
 
-    /// Extract a list of string literals from a `["a", "b", ...]` list expression.
-    /// Returns None if the expression is not a list or any element is not a string literal.
+    // Extract a list of string literals from a `["a", "b", ...]` list expression.
+    // Returns None if the expression is not a list or any element is not a string literal.
     fn extract_string_list(expr: &Expr) -> Option<Vec<String>> {
         if let Expr::List(list) = expr {
             let mut result = Vec::new();
@@ -684,7 +802,7 @@ impl Linter {
         }
     }
 
-    /// Extract columns from a list or single string expression.
+    // Extract columns from a list or single string expression.
     fn extract_string_list_or_single(expr: &Expr) -> Option<Vec<String>> {
         match expr {
             Expr::List(_) => Self::extract_string_list(expr),
@@ -693,7 +811,7 @@ impl Linter {
         }
     }
 
-    /// Extract column names from a load function call (usecols/columns kwarg or dtype/schema dict keys).
+    // Extract column names from a load function call (usecols/columns kwarg or dtype/schema dict keys).
     fn extract_load_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
         for keyword in &call.arguments.keywords {
             let kw_name = keyword.arg.as_ref().map(|s| s.as_str());
@@ -723,7 +841,7 @@ impl Linter {
         None
     }
 
-    /// Extract dropped column names from a drop() call.
+    // Extract dropped column names from a drop() call.
     fn extract_drop_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
         // Check `columns=` kwarg first (pandas pattern — always correct for column drops)
         for keyword in &call.arguments.keywords {
@@ -761,7 +879,7 @@ impl Linter {
         None
     }
 
-    /// Extract rename mapping from a rename() call: {"old": "new", ...}.
+    // Extract rename mapping from a rename() call: {"old": "new", ...}.
     fn extract_rename_mapping(call: &ast::ExprCall) -> Option<HashMap<String, String>> {
         // Check `columns={"old": "new"}` kwarg (pandas)
         for keyword in &call.arguments.keywords {
@@ -796,14 +914,14 @@ impl Linter {
         Some(map)
     }
 
-    /// Create a synthetic inferred schema and register it. Returns the schema name.
+    // Create a synthetic inferred schema and register it. Returns the schema name.
     fn make_inferred_schema(&mut self, cols: Vec<String>, var: &str, line: usize) -> String {
         let name = format!("__inferred_{}_at_{}", var, line);
         self.schemas.insert(name.clone(), cols);
         name
     }
 
-    /// Extract a column name from a `pl.col("name")` or `col("name")` call expression.
+    // Extract a column name from a `pl.col("name")` or `col("name")` call expression.
     fn extract_pl_col_name(expr: &Expr) -> Option<String> {
         if let Expr::Call(call) = expr {
             let is_col_call = match &*call.func {
@@ -826,8 +944,8 @@ impl Linter {
         None
     }
 
-    /// Recursively collect all column names referenced via `pl.col("name")` / `col("name")`
-    /// in an expression tree. Handles chained calls, lists, tuples, comparisons, and binary ops.
+    // Recursively collect all column names referenced via `pl.col("name")` / `col("name")`
+    // in an expression tree. Handles chained calls, lists, tuples, comparisons, and binary ops.
     fn collect_pl_col_names(expr: &Expr) -> Vec<String> {
         if let Some(name) = Self::extract_pl_col_name(expr) {
             return vec![name];
@@ -878,8 +996,8 @@ impl Linter {
         }
     }
 
-    /// Validate any `pl.col("name")` / `col("name")` references in a call's arguments
-    /// against the schema of a tracked receiver variable.
+    // Validate any `pl.col("name")` / `col("name")` references in a call's arguments
+    // against the schema of a tracked receiver variable.
     fn validate_pl_col_args_on_receiver(
         &self,
         recv_name: &str,
@@ -931,7 +1049,7 @@ impl Linter {
         }
     }
 
-    /// Remove a column in-place from `recv`'s schema. Used for `del df['col']` and `df.pop('col')`.
+    // Remove a column in-place from `recv`'s schema. Used for `del df['col']` and `df.pop('col')`.
     fn remove_column_inplace(
         &mut self,
         recv: &str,
@@ -974,7 +1092,7 @@ impl Linter {
         }
     }
 
-    /// Add a column in-place to `recv`'s schema. Used for `df.insert(loc, col, value)`.
+    // Add a column in-place to `recv`'s schema. Used for `df.insert(loc, col, value)`.
     fn add_column_inplace(&mut self, recv: &str, col_name: &str, line: usize) {
         let base_info = self.variables.get(recv).map(|(s, l)| (s.clone(), *l));
         let Some((schema_name, _)) = base_info else {
@@ -988,6 +1106,15 @@ impl Linter {
         }
     }
 
+    // Walk a statement node, updating linter state and collecting diagnostics.
+    //
+    // ClassDef      — detect BaseSchema subclasses; collect inherited + declared columns.
+    // FunctionDef   — record annotated return types for cross-assignment schema tracking.
+    // Assign        — track load calls, method-chain results (drop/rename/select/…),
+    //                 DataFrame[Schema](...) instantiation, and merge/concat.
+    // AnnAssign     — handle `df: Annotated[pd.DataFrame, S]` and quoted annotations.
+    // Expr          — delegate column-access checks to visit_expr.
+    // Delete        — handle `del df["col"]` in-place mutations.
     fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
@@ -1001,7 +1128,10 @@ impl Linter {
                 });
 
                 if is_schema {
-                    // Inherit columns from parent schemas (MI support)
+                    // Collect inherited columns first (multiple-inheritance support).
+                    // Each named base that is already registered as a schema contributes
+                    // its columns; later bases can shadow earlier ones by appending, but
+                    // duplicate column names are left for the schema author to resolve.
                     let mut columns = Vec::new();
                     for base in class_def.bases() {
                         if let Expr::Name(name) = base {
@@ -1010,6 +1140,14 @@ impl Linter {
                             }
                         }
                     }
+                    // Walk the class body to extract column definitions.
+                    // Three declaration forms are supported:
+                    //   1. `col: Column(...)` / `col = Column(...)` — explicit column,
+                    //      may have an `alias=` keyword that overrides the attribute name.
+                    //   2. `col: ColumnSet(members=[...])` — a named group that also
+                    //      expands its member strings as individual columns.
+                    //   3. Any other annotated attribute — treated as a plain column
+                    //      whose name equals the attribute name.
                     for body_stmt in &class_def.body {
                         if let Stmt::AnnAssign(ann_assign) = body_stmt {
                             if let Expr::Name(name) = ann_assign.target.as_ref() {
@@ -1831,6 +1969,10 @@ impl Linter {
 
                     if is_merge_or_concat {
                         if let Some((s1, s2)) = merge_schema {
+                            // Union semantics: the result of merge/concat contains every
+                            // column from both inputs.  Sort + dedup gives a stable,
+                            // canonical column order and eliminates duplicates that arise
+                            // when both DataFrames share key columns (e.g. a join key).
                             let mut combined_cols = Vec::new();
                             if let Some(cols1) = self.schemas.get(&s1) {
                                 combined_cols.extend(cols1.clone());
@@ -2146,6 +2288,20 @@ impl Linter {
         }
     }
 
+    // Validate column access expressions against known schemas.
+    //
+    // Checked expression kinds:
+    //
+    // * `Attribute` (`df.col_name`) — validates `col_name` against the schema of `df`
+    //   if `df` is a tracked variable, skipping names in `RESERVED_METHODS`.
+    // * `Subscript` (`df["col_name"]`) — validates the string literal key.
+    // * `Call` — recurses into positional arguments and, when the callee is
+    //   `receiver.method(...)`, recurses only into `receiver` rather than the method
+    //   name itself.  This avoids false positives where the method name (e.g. `assign`,
+    //   `groupby`) is mistakenly checked as a column.
+    //
+    // Typo suggestions are added via find_best_match when the edit distance to the
+    // closest known column name is ≤ 2.
     fn visit_expr(&self, expr: &Expr, errors: &mut Vec<LintError>) {
         match expr {
             Expr::Attribute(attr) => {

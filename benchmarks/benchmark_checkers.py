@@ -182,12 +182,25 @@ def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> s
 
 
 def clear_caches(target_dir: Path) -> None:
-    """Clear type checker caches to ensure fair comparison."""
+    """Clear type checker caches to ensure fair comparison.
+
+    Notes on cache locations:
+    - mypy: writes .mypy_cache/ in the project directory (cleared here)
+    - pyright: writes its analysis cache to ~/.cache/pyright/ on macOS/Linux,
+      NOT to .pyright/ in the project — both are cleared for safety
+    - ruff: bypassed via --no-cache flag on the ruff invocation (no path to clear)
+    - ty: writes .ty/ in the project directory; ~/.cache/ty/ cleared for safety
+      in case ty uses a platform cache dir in the installed version
+    """
     cache_dirs = [
         target_dir / ".mypy_cache",
+        # pyright project-level dir (usually empty, but cleared for safety)
         target_dir / ".pyright",
-        target_dir / ".ruff_cache",
+        # pyright user-level analysis cache (the real cache on macOS/Linux)
+        Path.home() / ".cache" / "pyright",
         target_dir / ".ty",
+        # ty user-level cache (belt-and-suspenders in case version uses platform dir)
+        Path.home() / ".cache" / "ty",
     ]
     for cache_dir in cache_dirs:
         if cache_dir.exists():
@@ -400,7 +413,9 @@ def build_tools() -> list[ToolInfo]:
     tools.append(ToolInfo("typedframes", ["uv", "run", "typedframes", "check"], "DataFrame column checker"))
     tools.extend(
         [
-            ToolInfo("ruff", ["uv", "run", "ruff", "check"], "Linter (no type checking)"),
+            # --no-cache bypasses ruff's cache (~/.cache/ruff/) so every run is cold;
+            # this is more reliable than trying to clear a path that may not exist.
+            ToolInfo("ruff", ["uv", "run", "ruff", "check", "--no-cache"], "Linter (no type checking)"),
             ToolInfo("ty", ["uv", "run", "ty", "check"], "Type checker", needs_cache_clear=True),
             ToolInfo("pyrefly", ["uv", "run", "pyrefly", "check"], "Type checker", needs_cache_clear=True),
             ToolInfo(

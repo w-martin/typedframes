@@ -6,6 +6,8 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 06:00 UTC — catches toolchain/dep drift on main
 
 jobs:
   lint-and-test:

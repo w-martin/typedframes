@@ -596,29 +596,29 @@ See [`examples/schema_algebra_example.py`](examples/schema_algebra_example.py) f
 Comprehensive comparison of pandas/DataFrame typing and validation tools. **typedframes focuses on static analysis**
 —catching errors at lint-time before your code runs.
 
-| Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals |
-|---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|
-| **Version tested**              | 0.2.0                  | 0.29.0      | 1.4.3              | 0.3.6                 | 3.0.0        | 0.1.2       | 1.1.3              | 3.7.0            | 2.16.0   |
+| Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
+|---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
+| **Version tested**              | 0.2.0                  | 0.29.0      | 1.4.3              | 0.3.6                 | 3.0.0        | 0.1.2       | 1.1.3              | 3.7.0            | 2.16.0   | —                | —                |
 | **Analysis Type**               |
-| When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Static + Runtime      | Static       | Runtime     | Runtime            | Static + Runtime | Runtime  |
+| When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Static + Runtime      | Static       | Runtime     | Runtime            | Static + Runtime | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
-| Mypy plugin                     | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ✅ Yes        | ❌ No        | ❌ No               | ⚠️ Basic         | ❌ No     |
-| Standalone checker              | ✅ Rust (~1ms)          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     |
-| Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     |
-| Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     |
-| Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     |
+| Mypy plugin                     | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ✅ Yes        | ❌ No        | ❌ No               | ⚠️ Basic         | ❌ No     | ❌ No             | ❌ No             |
+| Standalone checker              | ✅ Rust (~1ms)          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
+| Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ❌ No             | ❌ No             |
+| Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ❌ No             | ❌ No             |
+| Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | **Runtime Validation**          |
-| Data validation                 | ❌ No                   | ✅ Excellent | ✅ Excellent        | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     |
-| Value constraints               | ❌ No                   | ✅ Yes       | ✅ Excellent        | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     |
+| Data validation                 | ❌ No                   | ✅ Excellent | ✅ Excellent        | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |
+| Value constraints               | ❌ No                   | ✅ Yes       | ✅ Excellent        | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |
 | **Schema Features**             |
-| Column grouping                 | ✅ ColumnGroup          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     |
-| Regex column matching           | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     |
+| Column grouping                 | ✅ ColumnGroup          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
+| Regex column matching           | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | **Backend Support**             |
-| Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    |
-| Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    |
-| DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    |
+| Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ❌ No             |
+| Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes (only)     |
+| DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
 | **Project Status (Feb 2026)**   |
-| Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    |
+| Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
 
 **Legend:** ✅ Full support | ⚠️ Limited/Partial | ❌ Not supported
 
@@ -652,6 +652,17 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   "expectations" (assertions) about data values, distributions, and schema properties. Excellent for runtime
   validation, data documentation, and data quality monitoring. No static analysis or column-level type checking in
   code. Supports pandas, Spark, and SQL backends.
+
+- **[dataframely](https://github.com/Quantco/dataframely)**: Polars-only runtime validation library from Quantco.
+  Schemas are defined as classes inheriting `dy.Schema` with typed descriptor fields (`dy.String()`, `dy.Float64()`)
+  and `@dy.rule()` decorators for cross-column and group-level constraints. Returns `dy.DataFrame[Schema]` generic
+  types that give call-site narrowing to type checkers, but does not validate column subscript access inside function
+  bodies. No lint-time or static analysis capability. Supports nullability, string constraints, numeric bounds,
+  cross-column rules, soft validation, test data generation, and SQLAlchemy/PyArrow export.
+
+- **[patito](https://github.com/JakobGM/patito)**: Polars-only runtime validation library using a Pydantic-style
+  `patito.Model` class. Validates DataFrames against model definitions using polars' native type system. No static
+  analysis or standalone checker. Actively maintained (626 stars, last commit May 2026).
 
 ### Type Checkers (Not DataFrame-Specific)
 

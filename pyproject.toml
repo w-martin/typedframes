@@ -98,6 +98,7 @@ docs = [
 dev = [
     "pandas>=3.0.1",
     "pandera>=0.29.0",
+    "pip-audit>=2.7",
     "polars>=1.38.1",
     "bandit>=1.9.3",
     "complexipy>=5.2.0",

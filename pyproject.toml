@@ -25,9 +25,16 @@ dependencies = []
 typedframes = "typedframes.cli:main"
 
 [project.optional-dependencies]
-pandas = ["pandas>=2.3.3"]
-pandera = ["pandera>=0.29.0"]
-polars = ["polars>=1.38.1"]
+# pandas>=2.0: all APIs used (_metadata, _constructor, read_csv/parquet/json/excel,
+# DataFrame subclassing) are stable since 2.0; no 2.3.x-specific API found.
+pandas = ["pandas>=2.0"]
+# pandera>=0.20.0: only core APIs used (DataFrameSchema, Column with dtype/nullable/regex);
+# no 0.29.x-specific API found. Lower bound aligns with pre-1.0 stable interface.
+pandera = ["pandera>=0.20.0"]
+# polars>=1.0: all usage is pass-through to pl.read_csv/parquet/json/excel and
+# pl.DataFrame type annotations; no 1.38.x-specific API found. polars 1.0 (Jul 2024)
+# stabilised the public API.
+polars = ["polars>=1.0"]
 mypy = ["mypy"]
 
 [tool.maturin]

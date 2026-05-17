@@ -348,7 +348,6 @@ def run_codebase_benchmarks(
     target: str,
     target_dir: Path,
     tools: list[ToolInfo],
-    project_root: Path,
 ) -> list[BenchmarkResult]:
     """Run benchmarks for a single codebase."""
     print(f"\n{'=' * 60}")
@@ -363,15 +362,9 @@ def run_codebase_benchmarks(
     for tool in tools:
         print(f"  Running {tool.name}...", end=" ", flush=True)
 
-        # Use example file for typedframes binary
-        if "typedframes_checker" in str(tool.cmd[0]):
-            bench_target = str(project_root / "examples" / "typedframes_example.py")
-        else:
-            bench_target = target
-
         result = run_benchmark(
             tool,
-            bench_target,
+            target,
             clear_cache_func=clear_cache if tool.needs_cache_clear else None,
         )
         results.append(result)
@@ -382,14 +375,6 @@ def run_codebase_benchmarks(
             print(f"SKIPPED: {result.error}")
 
     return results
-
-
-def find_binary(project_root: Path) -> Path:
-    """Find the typedframes checker binary (release or debug)."""
-    binary_path = project_root / "rust" / "target" / "release" / "typedframes_checker"
-    if not binary_path.exists():
-        binary_path = project_root / "rust" / "target" / "debug" / "typedframes_checker"
-    return binary_path
 
 
 def _create_mypy_config(*, with_plugin: bool = False) -> Path:
@@ -403,14 +388,17 @@ def _create_mypy_config(*, with_plugin: bool = False) -> Path:
     return config_path
 
 
-def build_tools(binary_path: Path) -> list[ToolInfo]:
+def build_tools() -> list[ToolInfo]:
     """Build the list of tools to benchmark."""
     vanilla_cfg = _create_mypy_config()
     plugin_cfg = _create_mypy_config(with_plugin=True)
 
     tools: list[ToolInfo] = []
-    if binary_path.exists():
-        tools.append(ToolInfo("typedframes", [str(binary_path)], "DataFrame column checker"))
+    # Use the Python CLI (uv run typedframes check <target>) so that both files
+    # and directories are handled correctly.  The old approach invoked the raw
+    # Rust binary, which only accepts a single file, and the benchmark had to
+    # special-case a hardcoded example file — invalidating multi-file results.
+    tools.append(ToolInfo("typedframes", ["uv", "run", "typedframes", "check"], "DataFrame column checker"))
     tools.extend(
         [
             ToolInfo("ruff", ["uv", "run", "ruff", "check"], "Linter (no type checking)"),
@@ -475,8 +463,7 @@ def main() -> None:
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
-    binary_path = find_binary(project_root)
-    tools = build_tools(binary_path)
+    tools = build_tools()
 
     # Copy typedframes src/ to /tmp
     tf_tmp = copy_to_tmp(project_root / "src", "typedframes-src")
@@ -489,7 +476,7 @@ def main() -> None:
     print("Clearing caches between runs for fair comparison")
 
     # Run typedframes benchmarks
-    tf_results = run_codebase_benchmarks(tf_label, str(tf_tmp), tf_tmp, tools, project_root)
+    tf_results = run_codebase_benchmarks(tf_label, str(tf_tmp), tf_tmp, tools)
 
     # Collect per-tool, per-codebase results
     tool_results: dict[str, dict[str, BenchmarkResult | None]] = {}
@@ -507,7 +494,7 @@ def main() -> None:
             ge_file_count = count_python_files(ge_dir)
             ge_label = "great_expectations"
             print(f"\nGreat Expectations: {ge_file_count} Python files")
-            ge_results = run_codebase_benchmarks(ge_label, str(ge_dir), ge_dir, tools, project_root)
+            ge_results = run_codebase_benchmarks(ge_label, str(ge_dir), ge_dir, tools)
             codebase_labels.append((ge_label, ge_file_count))
             for result in ge_results:
                 tool_results.setdefault(result.name, {})[ge_label] = result

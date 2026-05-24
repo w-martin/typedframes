@@ -1925,8 +1925,7 @@ impl Linter {
                                     let mut schemas = Vec::new();
                                     for el in &list.elts {
                                         if let Expr::Name(n) = el {
-                                            if let Some((s, _)) =
-                                                self.variables.get(n.id.as_str())
+                                            if let Some((s, _)) = self.variables.get(n.id.as_str())
                                             {
                                                 schemas.push(s.clone());
                                             }
@@ -1947,8 +1946,7 @@ impl Linter {
                                     let mut schemas = Vec::new();
                                     for el in &list.elts {
                                         if let Expr::Name(n) = el {
-                                            if let Some((s, _)) =
-                                                self.variables.get(n.id.as_str())
+                                            if let Some((s, _)) = self.variables.get(n.id.as_str())
                                             {
                                                 schemas.push(s.clone());
                                             }

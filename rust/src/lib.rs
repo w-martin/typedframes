@@ -1937,10 +1937,11 @@ impl Linter {
                                             Some((schemas[0].clone(), schemas[1].clone()));
                                     }
                                 }
-                            } else if let Some(keyword) =
-                                call.arguments.keywords.iter().find(|k| {
-                                    k.arg.as_ref().map(|s| s.as_str()) == Some("objs")
-                                })
+                            } else if let Some(keyword) = call
+                                .arguments
+                                .keywords
+                                .iter()
+                                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("objs"))
                             {
                                 if let Expr::List(list) = &keyword.value {
                                     let mut schemas = Vec::new();

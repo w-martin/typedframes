@@ -47,11 +47,11 @@ jobs:
       - name: Python tests
         run: uv run inv test
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
         with:
-          files: coverage.xml
-          fail_ci_if_error: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: coverage.lcov
 
   verify-version:
     name: Verify tag matches pyproject.toml version

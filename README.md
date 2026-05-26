@@ -3,7 +3,7 @@
 [![CI](https://github.com/w-martin/typedframes/actions/workflows/publish.yml/badge.svg)](https://github.com/w-martin/typedframes/actions/workflows/publish.yml)
 [![PyPI version](https://img.shields.io/pypi/v/typedframes.svg)](https://pypi.org/project/typedframes/)
 [![Python versions](https://img.shields.io/pypi/pyversions/typedframes.svg)](https://pypi.org/project/typedframes/)
-[![Coverage](https://codecov.io/gh/w-martin/typedframes/branch/main/graph/badge.svg)](https://codecov.io/gh/w-martin/typedframes)
+[![Coverage](https://coveralls.io/repos/github/w-martin/typedframes/badge.svg?branch=main)](https://coveralls.io/github/w-martin/typedframes?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > ⚠️ **Project Status: Proof of Concept**

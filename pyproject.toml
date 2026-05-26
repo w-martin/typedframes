@@ -37,7 +37,7 @@ module-name = "typedframes._rust_checker"
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
-addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-report=xml --cov-branch -n auto"
+addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-report=lcov --cov-branch -n auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]

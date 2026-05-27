@@ -1919,47 +1919,44 @@ impl Linter {
                                 );
                             }
                         }
-                        Expr::Name(name) => {
-                            if name.id.as_str() == "concat" {
-                                if !call.arguments.args.is_empty() {
-                                    if let Expr::List(list) = &call.arguments.args[0] {
-                                        let mut schemas = Vec::new();
-                                        for el in &list.elts {
-                                            if let Expr::Name(n) = el {
-                                                if let Some((s, _)) =
-                                                    self.variables.get(n.id.as_str())
-                                                {
-                                                    schemas.push(s.clone());
-                                                }
+                        Expr::Name(name) if name.id.as_str() == "concat" => {
+                            if !call.arguments.args.is_empty() {
+                                if let Expr::List(list) = &call.arguments.args[0] {
+                                    let mut schemas = Vec::new();
+                                    for el in &list.elts {
+                                        if let Expr::Name(n) = el {
+                                            if let Some((s, _)) = self.variables.get(n.id.as_str())
+                                            {
+                                                schemas.push(s.clone());
                                             }
-                                        }
-                                        if schemas.len() >= 2 {
-                                            is_merge_or_concat = true;
-                                            merge_schema =
-                                                Some((schemas[0].clone(), schemas[1].clone()));
                                         }
                                     }
-                                } else if let Some(keyword) =
-                                    call.arguments.keywords.iter().find(|k| {
-                                        k.arg.as_ref().map(|s| s.as_str()) == Some("objs")
-                                    })
-                                {
-                                    if let Expr::List(list) = &keyword.value {
-                                        let mut schemas = Vec::new();
-                                        for el in &list.elts {
-                                            if let Expr::Name(n) = el {
-                                                if let Some((s, _)) =
-                                                    self.variables.get(n.id.as_str())
-                                                {
-                                                    schemas.push(s.clone());
-                                                }
+                                    if schemas.len() >= 2 {
+                                        is_merge_or_concat = true;
+                                        merge_schema =
+                                            Some((schemas[0].clone(), schemas[1].clone()));
+                                    }
+                                }
+                            } else if let Some(keyword) = call
+                                .arguments
+                                .keywords
+                                .iter()
+                                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("objs"))
+                            {
+                                if let Expr::List(list) = &keyword.value {
+                                    let mut schemas = Vec::new();
+                                    for el in &list.elts {
+                                        if let Expr::Name(n) = el {
+                                            if let Some((s, _)) = self.variables.get(n.id.as_str())
+                                            {
+                                                schemas.push(s.clone());
                                             }
                                         }
-                                        if schemas.len() >= 2 {
-                                            is_merge_or_concat = true;
-                                            merge_schema =
-                                                Some((schemas[0].clone(), schemas[1].clone()));
-                                        }
+                                    }
+                                    if schemas.len() >= 2 {
+                                        is_merge_or_concat = true;
+                                        merge_schema =
+                                            Some((schemas[0].clone(), schemas[1].clone()));
                                     }
                                 }
                             }

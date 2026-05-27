@@ -13,3 +13,18 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: Rust format check
+        entry: bash -c 'cd rust && cargo fmt --all -- --check'
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: Rust clippy
+        entry: bash -c 'cd rust && cargo clippy -- -D warnings'
+        language: system
+        files: \.rs$
+        pass_filenames: false

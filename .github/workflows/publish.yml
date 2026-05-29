@@ -164,6 +164,10 @@ jobs:
           VERSION="${GITHUB_REF#refs/tags/v}"
           for i in {1..10}; do
             pip install typedframes==${VERSION} && break
+            if [ "$i" -eq 10 ]; then
+              echo "Error: typedframes==${VERSION} not available on PyPI after 10 attempts (5 minutes)"
+              exit 1
+            fi
             echo "Attempt $i failed, retrying in 30s..."
             sleep 30
           done

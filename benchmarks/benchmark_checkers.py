@@ -129,7 +129,7 @@ def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> s
         "ruff": ["uv", "run", "ruff", "--version"],
         "ty": ["uv", "run", "ty", "--version"],
         "mypy": ["uv", "run", "mypy", "--version"],
-        "pyright": ["npx", "pyright", "--version"],
+        "pyright": ["uv", "run", "pyright", "--version"],
         "pyrefly": ["uv", "run", "pyrefly", "--version"],
         "typedframes": None,  # No --version flag, use package version
     }
@@ -433,7 +433,7 @@ def build_tools() -> list[ToolInfo]:
                 "Type checker + column checker",
                 needs_cache_clear=True,
             ),
-            ToolInfo("pyright", ["npx", "pyright"], "Type checker", needs_cache_clear=True),
+            ToolInfo("pyright", ["uv", "run", "pyright"], "Type checker", needs_cache_clear=True),
         ]
     )
     return tools

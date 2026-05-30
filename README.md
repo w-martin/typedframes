@@ -377,12 +377,13 @@ Fast feedback reduces development time. The typedframes Rust binary provides nea
 
 | Tool | Version | What it does | typedframes (13 files) | great_expectations (488 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.2.1 | DataFrame column checker | 42ms ±408µs | 310ms ±10ms |
-| ruff | 0.15.4 | Linter (no type checking) | 27ms ±843µs | 261ms ±4ms |
-| ty | 0.0.19 | Type checker | 70ms ±3ms | 834ms ±85ms |
-| pyrefly | 0.54.0 | Type checker | 120ms ±1ms | 1.11s ±14ms |
-| mypy | 1.19.1 | Type checker (no plugin) | 3.49s ±34ms | 4.60s ±462ms |
-| mypy + typedframes | 1.19.1 | Type checker + column checker | 3.67s ±111ms | 4.64s ±44ms |
+| typedframes | 0.2.1 | DataFrame column checker | 43ms ±531µs | 285ms ±4ms |
+| ruff | 0.15.4 | Linter (no type checking) | 27ms ±932µs | 251ms ±2ms |
+| ty | 0.0.19 | Type checker | 67ms ±1ms | 793ms ±14ms |
+| pyrefly | 0.54.0 | Type checker | 120ms ±2ms | 1.11s ±13ms |
+| mypy | 1.19.1 | Type checker (no plugin) | 3.47s ±15ms | 4.43s ±66ms |
+| mypy + typedframes | 1.19.1 | Type checker + column checker | 3.52s ±40ms | 4.79s ±113ms |
+| pyright | 1.1.408 | Type checker | 822ms ±55ms | 3.43s ±54ms |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 

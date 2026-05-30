@@ -101,10 +101,9 @@ def clone_great_expectations(ge_path: str | None) -> Path | None:
         ge_src = src / "great_expectations" if (src / "great_expectations").exists() else src
         return copy_to_tmp(ge_src, "great_expectations")
 
-    clone_dir = BENCH_DIR / "great-expectations-repo"
-    if not (clone_dir / ".git").exists():
+    clone_dir = Path(tempfile.mkdtemp(prefix="typedframes_ge_"))
+    try:
         print("Cloning Great Expectations (shallow)...", flush=True)
-        clone_dir.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
             ["git", "clone", "--depth", "1", GE_REPO_URL, str(clone_dir)],
             capture_output=True,
@@ -115,13 +114,13 @@ def clone_great_expectations(ge_path: str | None) -> Path | None:
         if result.returncode != 0:
             print(f"Failed to clone: {result.stderr.strip()}")
             return None
-    else:
-        print("Reusing existing Great Expectations clone")
 
-    ge_src = _find_ge_source(clone_dir)
-    if ge_src:
-        return copy_to_tmp(ge_src, "great_expectations")
-    return None
+        ge_src = _find_ge_source(clone_dir)
+        if ge_src:
+            return copy_to_tmp(ge_src, "great_expectations")
+        return None
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> str:
@@ -130,7 +129,7 @@ def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> s
         "ruff": ["uv", "run", "ruff", "--version"],
         "ty": ["uv", "run", "ty", "--version"],
         "mypy": ["uv", "run", "mypy", "--version"],
-        "pyright": ["npx", "pyright", "--version"],
+        "pyright": ["uv", "run", "pyright", "--version"],
         "pyrefly": ["uv", "run", "pyrefly", "--version"],
         "typedframes": None,  # No --version flag, use package version
     }
@@ -183,12 +182,25 @@ def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> s
 
 
 def clear_caches(target_dir: Path) -> None:
-    """Clear type checker caches to ensure fair comparison."""
+    """Clear type checker caches to ensure fair comparison.
+
+    Notes on cache locations:
+    - mypy: writes .mypy_cache/ in the project directory (cleared here)
+    - pyright: writes its analysis cache to ~/.cache/pyright/ on macOS/Linux,
+      NOT to .pyright/ in the project — both are cleared for safety
+    - ruff: bypassed via --no-cache flag on the ruff invocation (no path to clear)
+    - ty: writes .ty/ in the project directory; ~/.cache/ty/ cleared for safety
+      in case ty uses a platform cache dir in the installed version
+    """
     cache_dirs = [
         target_dir / ".mypy_cache",
+        # pyright project-level dir (usually empty, but cleared for safety)
         target_dir / ".pyright",
-        target_dir / ".ruff_cache",
+        # pyright user-level analysis cache (the real cache on macOS/Linux)
+        Path.home() / ".cache" / "pyright",
         target_dir / ".ty",
+        # ty user-level cache (belt-and-suspenders in case version uses platform dir)
+        Path.home() / ".cache" / "ty",
     ]
     for cache_dir in cache_dirs:
         if cache_dir.exists():
@@ -294,8 +306,11 @@ def generate_markdown_table(
         sep_parts,
     ]
     for tool_name, per_codebase in tool_results.items():
+        results = [per_codebase.get(label) for label, _ in codebase_labels]
+        if all(r is not None and not r.success for r in results):
+            continue
         version, description = tool_meta[tool_name]
-        cells = [_format_cell(per_codebase.get(label)) for label, _ in codebase_labels]
+        cells = [_format_cell(r) for r in results]
         lines.append(f"| {tool_name} | {version} | {description} | " + " | ".join(cells) + " |")
 
     lines.append("")
@@ -348,7 +363,6 @@ def run_codebase_benchmarks(
     target: str,
     target_dir: Path,
     tools: list[ToolInfo],
-    project_root: Path,
 ) -> list[BenchmarkResult]:
     """Run benchmarks for a single codebase."""
     print(f"\n{'=' * 60}")
@@ -363,15 +377,9 @@ def run_codebase_benchmarks(
     for tool in tools:
         print(f"  Running {tool.name}...", end=" ", flush=True)
 
-        # Use example file for typedframes binary
-        if "typedframes_checker" in str(tool.cmd[0]):
-            bench_target = str(project_root / "examples" / "typedframes_example.py")
-        else:
-            bench_target = target
-
         result = run_benchmark(
             tool,
-            bench_target,
+            target,
             clear_cache_func=clear_cache if tool.needs_cache_clear else None,
         )
         results.append(result)
@@ -382,14 +390,6 @@ def run_codebase_benchmarks(
             print(f"SKIPPED: {result.error}")
 
     return results
-
-
-def find_binary(project_root: Path) -> Path:
-    """Find the typedframes checker binary (release or debug)."""
-    binary_path = project_root / "rust" / "target" / "release" / "typedframes_checker"
-    if not binary_path.exists():
-        binary_path = project_root / "rust" / "target" / "debug" / "typedframes_checker"
-    return binary_path
 
 
 def _create_mypy_config(*, with_plugin: bool = False) -> Path:
@@ -403,17 +403,22 @@ def _create_mypy_config(*, with_plugin: bool = False) -> Path:
     return config_path
 
 
-def build_tools(binary_path: Path) -> list[ToolInfo]:
+def build_tools() -> list[ToolInfo]:
     """Build the list of tools to benchmark."""
     vanilla_cfg = _create_mypy_config()
     plugin_cfg = _create_mypy_config(with_plugin=True)
 
     tools: list[ToolInfo] = []
-    if binary_path.exists():
-        tools.append(ToolInfo("typedframes", [str(binary_path)], "DataFrame column checker"))
+    # Use the Python CLI (uv run typedframes check <target>) so that both files
+    # and directories are handled correctly.  The old approach invoked the raw
+    # Rust binary, which only accepts a single file, and the benchmark had to
+    # special-case a hardcoded example file — invalidating multi-file results.
+    tools.append(ToolInfo("typedframes", ["uv", "run", "typedframes", "check"], "DataFrame column checker"))
     tools.extend(
         [
-            ToolInfo("ruff", ["uv", "run", "ruff", "check"], "Linter (no type checking)"),
+            # --no-cache bypasses ruff's cache (~/.cache/ruff/) so every run is cold;
+            # this is more reliable than trying to clear a path that may not exist.
+            ToolInfo("ruff", ["uv", "run", "ruff", "check", "--no-cache"], "Linter (no type checking)"),
             ToolInfo("ty", ["uv", "run", "ty", "check"], "Type checker", needs_cache_clear=True),
             ToolInfo("pyrefly", ["uv", "run", "pyrefly", "check"], "Type checker", needs_cache_clear=True),
             ToolInfo(
@@ -428,7 +433,7 @@ def build_tools(binary_path: Path) -> list[ToolInfo]:
                 "Type checker + column checker",
                 needs_cache_clear=True,
             ),
-            ToolInfo("pyright", ["npx", "pyright"], "Type checker", needs_cache_clear=True),
+            ToolInfo("pyright", ["uv", "run", "pyright"], "Type checker", needs_cache_clear=True),
         ]
     )
     return tools
@@ -475,8 +480,7 @@ def main() -> None:
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
-    binary_path = find_binary(project_root)
-    tools = build_tools(binary_path)
+    tools = build_tools()
 
     # Copy typedframes src/ to /tmp
     tf_tmp = copy_to_tmp(project_root / "src", "typedframes-src")
@@ -489,7 +493,7 @@ def main() -> None:
     print("Clearing caches between runs for fair comparison")
 
     # Run typedframes benchmarks
-    tf_results = run_codebase_benchmarks(tf_label, str(tf_tmp), tf_tmp, tools, project_root)
+    tf_results = run_codebase_benchmarks(tf_label, str(tf_tmp), tf_tmp, tools)
 
     # Collect per-tool, per-codebase results
     tool_results: dict[str, dict[str, BenchmarkResult | None]] = {}
@@ -507,7 +511,7 @@ def main() -> None:
             ge_file_count = count_python_files(ge_dir)
             ge_label = "great_expectations"
             print(f"\nGreat Expectations: {ge_file_count} Python files")
-            ge_results = run_codebase_benchmarks(ge_label, str(ge_dir), ge_dir, tools, project_root)
+            ge_results = run_codebase_benchmarks(ge_label, str(ge_dir), ge_dir, tools)
             codebase_labels.append((ge_label, ge_file_count))
             for result in ge_results:
                 tool_results.setdefault(result.name, {})[ge_label] = result

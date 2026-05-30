@@ -101,10 +101,9 @@ def clone_great_expectations(ge_path: str | None) -> Path | None:
         ge_src = src / "great_expectations" if (src / "great_expectations").exists() else src
         return copy_to_tmp(ge_src, "great_expectations")
 
-    clone_dir = BENCH_DIR / "great-expectations-repo"
-    if not (clone_dir / ".git").exists():
+    clone_dir = Path(tempfile.mkdtemp(prefix="typedframes_ge_"))
+    try:
         print("Cloning Great Expectations (shallow)...", flush=True)
-        clone_dir.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
             ["git", "clone", "--depth", "1", GE_REPO_URL, str(clone_dir)],
             capture_output=True,
@@ -115,13 +114,13 @@ def clone_great_expectations(ge_path: str | None) -> Path | None:
         if result.returncode != 0:
             print(f"Failed to clone: {result.stderr.strip()}")
             return None
-    else:
-        print("Reusing existing Great Expectations clone")
 
-    ge_src = _find_ge_source(clone_dir)
-    if ge_src:
-        return copy_to_tmp(ge_src, "great_expectations")
-    return None
+        ge_src = _find_ge_source(clone_dir)
+        if ge_src:
+            return copy_to_tmp(ge_src, "great_expectations")
+        return None
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> str:

@@ -375,17 +375,14 @@ Fast feedback reduces development time. The typedframes Rust binary provides nea
 
 **Benchmark results** (10 runs, 3 warmup, caches cleared between runs):
 
-| Tool               | Version | What it does                  | typedframes (13 files) | great_expectations (490 files) |
-|--------------------|---------|-------------------------------|------------------------|--------------------------------|
-| typedframes        | 0.2.0   | DataFrame column checker      | 9ms ±2ms               | *stale — needs re-run*         |
-| ruff               | 0.15.4  | Linter (no type checking)     | 64ms ±16ms             | 360ms ±18ms                    |
-| ty                 | 0.0.19  | Type checker                  | 115ms ±22ms            | 1.65s ±26ms                    |
-| pyrefly            | 0.54.0  | Type checker                  | 3.78s ±7.53s           | 693ms ±33ms                    |
-| mypy               | 1.19.1  | Type checker (no plugin)      | 13.85s ±1.08s          | 12.13s ±400ms                  |
-| mypy + typedframes | 1.19.1  | Type checker + column checker | 13.51s ±273ms          | 13.89s ±491ms                  |
-| pyright            | 1.1.408 | Type checker                  | 2.10s ±422ms           | 8.37s ±253ms                   |
-
-**Note:** The typedframes great_expectations column previously showed 930µs because the benchmark was mistakenly run against a single example file rather than the full corpus. That figure has been removed pending a re-run with the corrected benchmark.
+| Tool | Version | What it does | typedframes (13 files) | great_expectations (488 files) |
+|------|---------|--------------|------------------------|--------------------------------|
+| typedframes | 0.2.1 | DataFrame column checker | 42ms ±408µs | 310ms ±10ms |
+| ruff | 0.15.4 | Linter (no type checking) | 27ms ±843µs | 261ms ±4ms |
+| ty | 0.0.19 | Type checker | 70ms ±3ms | 834ms ±85ms |
+| pyrefly | 0.54.0 | Type checker | 120ms ±1ms | 1.11s ±14ms |
+| mypy | 1.19.1 | Type checker (no plugin) | 3.49s ±34ms | 4.60s ±462ms |
+| mypy + typedframes | 1.19.1 | Type checker + column checker | 3.67s ±111ms | 4.64s ±44ms |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 

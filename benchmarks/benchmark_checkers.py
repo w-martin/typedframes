@@ -306,8 +306,11 @@ def generate_markdown_table(
         sep_parts,
     ]
     for tool_name, per_codebase in tool_results.items():
+        results = [per_codebase.get(label) for label, _ in codebase_labels]
+        if all(r is not None and not r.success for r in results):
+            continue
         version, description = tool_meta[tool_name]
-        cells = [_format_cell(per_codebase.get(label)) for label, _ in codebase_labels]
+        cells = [_format_cell(r) for r in results]
         lines.append(f"| {tool_name} | {version} | {description} | " + " | ".join(cells) + " |")
 
     lines.append("")

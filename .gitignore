@@ -27,7 +27,7 @@ Thumbs.db
 *.so
 .claude
 coverage.json
-coverage.xml
+coverage.lcov
 .complexipy_cache
 **/target
 site/

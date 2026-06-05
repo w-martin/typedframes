@@ -1000,6 +1000,6 @@ Inspired by the needs of ML/data science teams working with complex data pipelin
 
 ---
 
-**Questions? Issues? Ideas?** [Open an issue](https://github.com/yourusername/typedframes/issues)
+**Questions? Issues? Ideas?** [Open an issue](https://github.com/w-martin/typedframes/issues)
 
 **Ready to catch DataFrame bugs before runtime?** `pip install typedframes`

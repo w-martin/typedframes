@@ -21,6 +21,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/w-martin/typedframes"
+Documentation = "https://typedframes.readthedocs.io/en/latest/"
+Repository = "https://github.com/w-martin/typedframes"
+"Issue Tracker" = "https://github.com/w-martin/typedframes/issues"
+
 [project.scripts]
 typedframes = "typedframes.cli:main"
 

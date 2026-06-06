@@ -9,7 +9,7 @@ description = "Static analysis for pandas and polars DataFrames. Catch column er
 keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"
 authors = [
-    { name = "William Martin", email = "will.st4@gmail.com" }
+    { name = "William Martin" }
 ]
 license = "MIT"
 requires-python = ">=3.11"

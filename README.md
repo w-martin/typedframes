@@ -614,8 +614,8 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | Column grouping                 | ✅ ColumnGroup          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Regex column matching           | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | **Backend Support**             |
-| Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ❌ No             |
-| Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes (only)     |
+| Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ⚠️ Limited        |
+| Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes            |
 | DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
 | **Project Status (Feb 2026)**   |
 | Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
@@ -660,9 +660,10 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   bodies. No lint-time or static analysis capability. Supports nullability, string constraints, numeric bounds,
   cross-column rules, soft validation, test data generation, and SQLAlchemy/PyArrow export.
 
-- **[patito](https://github.com/JakobGM/patito)**: Polars-only runtime validation library using a Pydantic-style
-  `patito.Model` class. Validates DataFrames against model definitions using polars' native type system. No static
-  analysis or standalone checker. Actively maintained (626 stars, last commit May 2026).
+- **[patito](https://github.com/JakobGM/patito)**: Runtime validation library using a Pydantic-style `patito.Model`
+  class. Polars is the primary backend; pandas is supported but works by converting to Polars via PyArrow (an
+  undeclared dependency). DuckDB is not supported despite appearing in some documentation—validation crashes immediately
+  on DuckDB relations. No static analysis or standalone checker.
 
 ### Type Checkers (Not DataFrame-Specific)
 

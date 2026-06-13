@@ -7,7 +7,8 @@ on:
   pull_request:
     branches: [ main ]
   schedule:
-    - cron: "0 9 * * 1"  # Weekly Monday 09:00 UTC
+    - cron: '0 6 * * 1'  # Weekly Monday 06:00 UTC — catches toolchain/dep drift on main
+    - cron: "0 9 * * 1"  # Weekly Monday 09:00 UTC (security-audit)
 
 jobs:
   lint-and-test:

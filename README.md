@@ -3,7 +3,7 @@
 [![CI](https://github.com/w-martin/typedframes/actions/workflows/publish.yml/badge.svg)](https://github.com/w-martin/typedframes/actions/workflows/publish.yml)
 [![PyPI version](https://img.shields.io/pypi/v/typedframes.svg)](https://pypi.org/project/typedframes/)
 [![Python versions](https://img.shields.io/pypi/pyversions/typedframes.svg)](https://pypi.org/project/typedframes/)
-[![Coverage](https://codecov.io/gh/w-martin/typedframes/branch/main/graph/badge.svg)](https://codecov.io/gh/w-martin/typedframes)
+[![Coverage](https://coveralls.io/repos/github/w-martin/typedframes/badge.svg?branch=main)](https://coveralls.io/github/w-martin/typedframes?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > ⚠️ **Project Status: Proof of Concept**
@@ -294,7 +294,7 @@ typedframes check src/
 - Catches column name errors
 - Validates schema mismatches between functions
 - Checks both pandas and polars code
-- 10-100x faster than mypy
+- Significantly faster than mypy (see benchmarks below)
 
 **Use this for:**
 - Fast feedback during development
@@ -375,17 +375,15 @@ Fast feedback reduces development time. The typedframes Rust binary provides nea
 
 **Benchmark results** (10 runs, 3 warmup, caches cleared between runs):
 
-| Tool               | Version | What it does                  | typedframes (13 files) | great_expectations (490 files)† |
-|--------------------|---------|-------------------------------|------------------------|---------------------------------|
-| typedframes        | 0.2.0   | DataFrame column checker      | 9ms ±2ms               | 930µs ±89µs                     |
-| ruff               | 0.15.4  | Linter (no type checking)     | 64ms ±16ms             | 360ms ±18ms                     |
-| ty                 | 0.0.19  | Type checker                  | 115ms ±22ms            | 1.65s ±26ms                     |
-| pyrefly            | 0.54.0  | Type checker                  | 3.78s ±7.53s           | 693ms ±33ms                     |
-| mypy               | 1.19.1  | Type checker (no plugin)      | 13.85s ±1.08s          | 12.13s ±400ms                   |
-| mypy + typedframes | 1.19.1  | Type checker + column checker | 13.51s ±273ms          | 13.89s ±491ms                   |
-| pyright            | 1.1.408 | Type checker                  | 2.10s ±422ms           | 8.37s ±253ms                    |
-
-*† great_expectations column from previous benchmark run.*
+| Tool | Version | What it does | typedframes (13 files) | great_expectations (488 files) |
+|------|---------|--------------|------------------------|--------------------------------|
+| typedframes | 0.2.1 | DataFrame column checker | 43ms ±531µs | 285ms ±4ms |
+| ruff | 0.15.4 | Linter (no type checking) | 27ms ±932µs | 251ms ±2ms |
+| ty | 0.0.19 | Type checker | 67ms ±1ms | 793ms ±14ms |
+| pyrefly | 0.54.0 | Type checker | 120ms ±2ms | 1.11s ±13ms |
+| mypy | 1.19.1 | Type checker (no plugin) | 3.47s ±15ms | 4.43s ±66ms |
+| mypy + typedframes | 1.19.1 | Type checker + column checker | 3.52s ±40ms | 4.79s ±113ms |
+| pyright | 1.1.408 | Type checker | 822ms ±55ms | 3.43s ±54ms |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -1002,6 +1000,6 @@ Inspired by the needs of ML/data science teams working with complex data pipelin
 
 ---
 
-**Questions? Issues? Ideas?** [Open an issue](https://github.com/yourusername/typedframes/issues)
+**Questions? Issues? Ideas?** [Open an issue](https://github.com/w-martin/typedframes/issues)
 
 **Ready to catch DataFrame bugs before runtime?** `pip install typedframes`

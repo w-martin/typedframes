@@ -6,20 +6,33 @@ build-backend = "maturin"
 name = "typedframes"
 version = "0.2.1"
 description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
+keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"
 authors = [
     { name = "William Martin" }
 ]
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.11"
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/w-martin/typedframes"
+Documentation = "https://typedframes.readthedocs.io/en/latest/"
+Repository = "https://github.com/w-martin/typedframes"
+"Issue Tracker" = "https://github.com/w-martin/typedframes/issues"
 
 [project.scripts]
 typedframes = "typedframes.cli:main"
@@ -37,7 +50,7 @@ module-name = "typedframes._rust_checker"
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
-addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-report=xml --cov-branch -n auto"
+addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-report=lcov --cov-branch -n auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
@@ -98,6 +111,7 @@ docs = [
 dev = [
     "pandas>=3.0.1",
     "pandera>=0.29.0",
+    "pip-audit>=2.7",
     "polars>=1.38.1",
     "bandit>=1.9.3",
     "complexipy>=5.2.0",

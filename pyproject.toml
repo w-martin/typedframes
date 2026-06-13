@@ -38,9 +38,9 @@ Repository = "https://github.com/w-martin/typedframes"
 typedframes = "typedframes.cli:main"
 
 [project.optional-dependencies]
-pandas = ["pandas>=2.3.3"]
-pandera = ["pandera>=0.29.0"]
-polars = ["polars>=1.38.1"]
+pandas = ["pandas>=2.0"]
+pandera = ["pandera>=0.20.0"]
+polars = ["polars>=1.0"]
 mypy = ["mypy"]
 
 [tool.maturin]

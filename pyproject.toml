@@ -184,6 +184,18 @@ invalid-argument-type = "ignore"
 possibly-missing-attribute = "ignore"
 
 [[tool.ty.overrides]]
+include = ["examples/**/*.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+unresolved-reference = "ignore"
+invalid-assignment = "ignore"
+invalid-return-type = "ignore"
+invalid-argument-type = "ignore"
+possibly-missing-attribute = "ignore"
+
+[[tool.ty.overrides]]
 include = ["benchmarks/**/*.py"]
 
 [tool.ty.overrides.rules]

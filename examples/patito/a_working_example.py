@@ -41,7 +41,7 @@ def validate_polars_success() -> None:
     )
 
     try:
-        OrderModel.validate(df)
+        validated = OrderModel.validate(df)
         print("✓ Validation passed")
         print(f"  Shape: {validated.shape}")
         print(f"  Columns: {validated.columns}")
@@ -123,7 +123,7 @@ def validate_pandas_success() -> None:
 
     try:
         # patito converts pandas to polars internally
-        OrderModel.validate(df)
+        validated = OrderModel.validate(df)
         print("✓ Validation passed")
         print(f"  Type of result: {type(validated).__name__}")
         print(f"  Shape: {validated.shape}")

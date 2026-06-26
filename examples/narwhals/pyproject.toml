@@ -1,0 +1,15 @@
+[project]
+name = "narwhals-examples"
+version = "0.1.0"
+description = "Example comparing narwhals with typedframes"
+requires-python = ">=3.11"
+dependencies = [
+    "narwhals>=2.16.0",
+    "pandas",
+    "polars",
+    "mypy",
+    "typedframes[mypy]>=0.2.1",
+]
+
+[tool.typedframes]
+enabled = true

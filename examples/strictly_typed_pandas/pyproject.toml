@@ -1,0 +1,15 @@
+[project]
+name = "stp-comparison"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "mypy>=2.1.0",
+    "pandas>=2.2.3",
+    "polars>=1.41.2",
+    "strictly-typed-pandas>=0.3.0",
+    "typedframes[mypy]>=0.2.1",
+]
+
+[tool.typedframes]
+enabled = true

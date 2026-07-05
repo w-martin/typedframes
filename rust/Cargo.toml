@@ -1,6 +1,6 @@
 [package]
 name = "typedframes_checker"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "A high-performance Rust-based checker for typedframes DataFrame column schemas"
 license = "MIT"

@@ -1,0 +1,48 @@
+================================================================================
+MYPY TEST RESULTS
+================================================================================
+
+FILE: b_static_analysis.py (NO PLUGIN)
+COMMAND: uv run mypy b_static_analysis.py --config-file mypy.ini 2>&1
+RESULT: Success: no issues found in 1 source file
+
+ISSUES PRESENT IN CODE:
+  - Line 47: df["custmer_name"] — typo, should be "customer_name"
+  - Line 57: df["sku"] — wrong column, should be "product_sku"
+  - Line 67: df["qty"] — wrong column, should be "quantity"
+
+ANALYSIS: mypy sees ZERO errors. Without the plugin, mypy has no column awareness.
+          The decorator's type specification is pure runtime metadata.
+
+================================================================================
+
+FILE: c_typedframes_comparison.py (WITH PLUGIN)
+COMMAND: uv run mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini 2>&1
+RESULT: 1 error detected
+
+c_typedframes_comparison.py:70: error: Column 'sku' does not exist in OrderSchema (defined at line 66)  [misc]
+
+ISSUES PRESENT IN CODE:
+  - Line 47: orders_checked["custmer_name"] — NOT CAUGHT (plugin appears to have limits)
+  - Line 70: orders_checked["sku"] — ✓ CAUGHT by typedframes plugin
+  - Line 83: orders_checked["qty"] — NOT CAUGHT (appears to be filtered out)
+
+ANALYSIS: typedframes plugin catches at least some column access errors statically.
+          The plugin successfully identifies unknown columns in the OrderSchema.
+          Some errors may be filtered or not caught due to plugin limitations.
+
+================================================================================
+
+CONCLUSION
+==========
+
+pandas-type-checks (b_static_analysis.py):
+  ✗ Zero static error detection
+  ✓ Runtime decorator works (verified in a_working_example.py)
+  ✓ Simple API
+
+typedframes (c_typedframes_comparison.py):
+  ✓ Catches column access errors statically (at least some)
+  ✓ mypy plugin provides type-aware DataFrame checking
+  ✓ Annotation-based approach integrates with mypy
+  ✓ Development-time error detection

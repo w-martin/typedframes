@@ -1,0 +1,16 @@
+[project]
+name = "dataframely-example"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "dataframely>=2.10.0",
+    "mypy>=2.1.0",
+    "polars>=1.41.2",
+]
+
+[dependency-groups]
+dev = [
+    "pandas>=3.0.3",
+    "typedframes[mypy]>=0.2.1",
+]

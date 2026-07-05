@@ -1,0 +1,21 @@
+[project]
+name = "static_frame_examples"
+version = "0.1.0"
+description = "StaticFrame vs typedframes comparison examples"
+requires-python = ">=3.10"
+dependencies = [
+    "mypy>=1.19.1",
+    "static-frame>=3.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pandas>=3.0.1",
+    "typedframes[mypy]>=0.2.1",
+]
+
+[tool.typedframes]
+enabled = true
+
+[tool.uv.sources]
+typedframes = { workspace = true }

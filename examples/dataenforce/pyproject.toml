@@ -1,0 +1,18 @@
+[project]
+name = "dataenforce-comparison"
+version = "0.1.0"
+description = "Comparison example between dataenforce and typedframes"
+requires-python = ">=3.11"
+dependencies = [
+    "dataenforce>=0.1.2",
+    "mypy>=1.19.1",
+    "pandas>=3.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "typedframes[mypy]>=0.2.1",
+]
+
+[tool.uv.sources]
+typedframes = { workspace = true }

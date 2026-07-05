@@ -92,7 +92,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "SLF001", "S603", "S607"]
 "tests/fixtures/*" = ["T201"]
-"examples/*" = ["T201", "INP001", "D100", "D101", "D103"]
+"examples/*" = ["T201", "INP001", "D100", "D101", "D103", "BLE001", "ERA001", "F821", "PLR2004"]
 "tasks.py" = ["T201"]
 "src/typedframes/cli.py" = ["T201"]
 "benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]
@@ -184,6 +184,18 @@ invalid-argument-type = "ignore"
 possibly-missing-attribute = "ignore"
 
 [[tool.ty.overrides]]
+include = ["examples/**/*.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+unresolved-reference = "ignore"
+invalid-assignment = "ignore"
+invalid-return-type = "ignore"
+invalid-argument-type = "ignore"
+possibly-missing-attribute = "ignore"
+
+[[tool.ty.overrides]]
 include = ["benchmarks/**/*.py"]
 
 [tool.ty.overrides.rules]
@@ -197,3 +209,6 @@ warnings = true
 using = "PEP631"
 groups = ["dev"]
 ignore_packages = ["mypy-extensions", "typedframes", "pyrefly"]
+
+[tool.uv.workspace]
+exclude = ["examples/*"]

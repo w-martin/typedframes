@@ -1,0 +1,15 @@
+[project]
+name = "pandas-stubs-example"
+version = "0.1.0"
+description = "Comparison of pandas-stubs vs typedframes type checking"
+requires-python = ">=3.11"
+dependencies = [
+    "mypy>=2.1.0",
+    "pandas>=3.0.3",
+    "pandas-stubs>=3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "typedframes[mypy]>=0.2.1",
+]

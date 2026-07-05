@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gx-examples"
+version = "0.1.0"
+description = "Great Expectations examples and comparison with typedframes"
+requires-python = ">=3.11"
+dependencies = [
+    "great-expectations>=1.4.0",
+    "pandas>=2.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "typedframes[mypy]>=0.2.1",
+]

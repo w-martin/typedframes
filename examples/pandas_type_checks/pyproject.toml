@@ -1,0 +1,11 @@
+[project]
+name = "pandas-type-checks-example"
+version = "0.1.0"
+description = "Pandas type checking comparison"
+requires-python = ">=3.11"
+dependencies = [
+    "mypy>=2.1.0",
+    "pandas>=3.0.3",
+    "pandas-type-checks>=1.1.0",
+    "typedframes[mypy]>=0.2.1",
+]

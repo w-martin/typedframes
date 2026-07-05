@@ -596,14 +596,14 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.2.0                  | 0.29.0      | 1.4.3              | 0.3.6                 | 3.0.0        | 0.1.2       | 1.1.3              | 3.7.0            | 2.16.0   | —                | —                |
+| **Version tested**              | 0.2.1                  | 0.29.0      | 1.18.0             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 4.1.0            | 2.22.1   | 2.10.1           | 0.8.6            |
 | **Analysis Type**               |
-| When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Static + Runtime      | Static       | Runtime     | Runtime            | Static + Runtime | Runtime  | Runtime          | Runtime          |
+| When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
-| Mypy plugin                     | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ✅ Yes        | ❌ No        | ❌ No               | ⚠️ Basic         | ❌ No     | ❌ No             | ❌ No             |
+| Mypy plugin                     | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ✅ Yes        | ❌ No        | ❌ No               | ⚠️ Basic         | ❌ No     | ❌ No             | ❌ No             |
 | Standalone checker              | ✅ Rust (~1ms)          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
-| Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ❌ No             | ❌ No             |
-| Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ✅ Yes                 | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ❌ No             | ❌ No             |
+| Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
+| Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | **Runtime Validation**          |
 | Data validation                 | ❌ No                   | ✅ Excellent | ✅ Excellent        | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |
@@ -626,8 +626,9 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   but has limitations—column access via `df["column"]` is not validated, and schema mismatches between functions may not
   be caught.
 
-- **[strictly_typed_pandas](https://strictly-typed-pandas.readthedocs.io/)** (v0.3.6): Provides `DataSet[Schema]` type
-  hints with mypy support. No standalone checker. No polars support. Runtime validation via typeguard.
+- **[strictly_typed_pandas](https://strictly-typed-pandas.readthedocs.io/)** (v0.3.7): Provides `DataSet[Schema]` type
+  hints for runtime validation via typeguard. Despite documentation implying mypy support, there is no mypy plugin —
+  column access errors are not caught statically. No standalone checker. No polars support.
 
 - **[pandas-stubs](https://github.com/pandas-dev/pandas-stubs)** (v3.0.0): Official pandas type stubs. Provides
   API-level types but no column-level checking.
@@ -638,27 +639,28 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 - **[pandas-type-checks](https://pypi.org/project/pandas-type-checks/)** (v1.1.3): Runtime validation decorator. No
   static analysis.
 
-- **[StaticFrame](https://github.com/static-frame/static-frame)** (v3.7.0): Alternative immutable DataFrame library with
-  built-in static typing. Not compatible with pandas/polars—requires using StaticFrame's own DataFrame implementation.
+- **[StaticFrame](https://github.com/static-frame/static-frame)** (v4.1.0): Alternative immutable DataFrame library.
+  Not compatible with pandas/polars — requires a full rewrite to StaticFrame's own API. Column access is still
+  string-based; mypy does not catch column name typos. Type safety comes from immutability guarantees, not schema checking.
 
-- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.16.0): Compatibility layer that provides a unified API
+- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.22.1): Compatibility layer that provides a unified API
   across pandas, polars, DuckDB, cuDF, and more. Solves a different problem—write-once-run-anywhere portability, not
   type safety. See [Why Abstraction Layers Don't Solve Type Safety](#why-abstraction-layers-dont-solve-type-safety)
   below.
 
-- **[Great Expectations](https://greatexpectations.io/)** (v1.4.3): Comprehensive data quality framework. Defines
+- **[Great Expectations](https://greatexpectations.io/)** (v1.18.0): Comprehensive data quality framework. Defines
   "expectations" (assertions) about data values, distributions, and schema properties. Excellent for runtime
   validation, data documentation, and data quality monitoring. No static analysis or column-level type checking in
   code. Supports pandas, Spark, and SQL backends.
 
-- **[dataframely](https://github.com/Quantco/dataframely)**: Polars-only runtime validation library from Quantco.
+- **[dataframely](https://github.com/Quantco/dataframely)** (v2.10.1): Polars-only runtime validation library from Quantco.
   Schemas are defined as classes inheriting `dy.Schema` with typed descriptor fields (`dy.String()`, `dy.Float64()`)
   and `@dy.rule()` decorators for cross-column and group-level constraints. Returns `dy.DataFrame[Schema]` generic
   types that give call-site narrowing to type checkers, but does not validate column subscript access inside function
   bodies. No lint-time or static analysis capability. Supports nullability, string constraints, numeric bounds,
   cross-column rules, soft validation, test data generation, and SQLAlchemy/PyArrow export.
 
-- **[patito](https://github.com/JakobGM/patito)**: Runtime validation library using a Pydantic-style `patito.Model`
+- **[patito](https://github.com/JakobGM/patito)** (v0.8.6): Runtime validation library using a Pydantic-style `patito.Model`
   class. Polars is the primary backend; pandas is supported but works by converting to Polars via PyArrow (an
   undeclared dependency). DuckDB is not supported despite appearing in some documentation—validation crashes immediately
   on DuckDB relations. No static analysis or standalone checker.

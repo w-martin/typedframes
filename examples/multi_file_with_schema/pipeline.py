@@ -14,12 +14,18 @@ this file.
 Compare with ``examples/multi_file_inference/`` where each file is checked
 independently using only ``usecols=``/``columns=`` inference.  Here, the schema
 travels with the function call across the file boundary.
+
+``report_missing_columns`` below demonstrates a third mechanism: a function
+*parameter* annotated with a schema (see ``reports.py``) is itself a contract,
+checked at every call site — even when, as here, the caller supplies a frame
+carrying a different, narrower schema.
 """
 
 from __future__ import annotations
 
 from loaders import load_customers, load_orders
-from schemas import OrderSchema
+from reports import build_customer_report
+from schemas import CustomerSchema, OrderSchema
 
 LARGE_ORDER_AMOUNT = 1000
 
@@ -74,6 +80,9 @@ def polars_summary(customers_path: str) -> None:
     print(customers["region"])  # ✓ OK — in CustomerSchema
     # Accessing customers["email"] would error: 'email' not in CustomerSchema
 
+    # Descriptor .s access — refactor-safe, IDE-autocomplete friendly
+    print(customers[CustomerSchema.name.s])  # ✓ OK — descriptor resolves to "name"
+
     # select() narrows the inferred set
     slim = customers.select(["customer_id", "name"])
     print(slim["customer_id"])  # ✓ OK
@@ -88,3 +97,21 @@ def wrong_column_cross_file(path: str) -> None:
     """
     orders = load_orders(path)
     print(orders["revenue"])  # ✗ unknown-column — 'revenue' not in OrderSchema
+
+
+def report_missing_columns(orders_path: str) -> None:
+    """Passes an OrderSchema frame where the full ReportSchema is required.
+
+    ``load_orders`` returns ``Annotated[pd.DataFrame, OrderSchema]`` — only
+    {order_id, customer_id, amount, status}. ``build_customer_report``
+    (reports.py) requires every ``ReportSchema`` column, since that's how its
+    parameter is annotated — it adds {name, region, amount_vat} from the
+    customer side of the join. The mismatch is caught via missing-column at
+    this call site, even though the function it's missing columns for lives
+    in a third file.
+    """
+    orders = load_orders(orders_path)
+    build_customer_report(orders)
+    # ✗ missing-column: 'orders' passed to build_customer_report (reports.py:25)
+    #   is missing column(s) {amount_vat, name, region}
+    #   — available: {amount, customer_id, order_id, status}

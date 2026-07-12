@@ -11,6 +11,11 @@ Expected mypy output (pandera.mypy plugin):
     [arg-type]
 
 Column name errors (lines 53-54) are NOT caught by pandera's mypy plugin.
+
+Note: typedframes' *standalone* checker (`typedframes check`, no mypy involved)
+recognizes pandera's ``DataFrameModel``/``DataFrame[Schema]`` pattern natively
+and independently catches the wrong-schema-argument case below too, via
+missing-column — see ``main()``.
 """
 
 import pandas as pd
@@ -83,7 +88,10 @@ def main() -> None:
 
     # CAUGHT: Passing WrongSchema to function expecting OrderSchema
     # Expected error: "Argument 1 to "process_orders" has incompatible type"
-    process_orders(wrong)  # <- pandera CATCHES this error
+    # pandera's mypy plugin catches this as a type mismatch. typedframes'
+    # standalone checker independently catches it too, via missing-column —
+    # no mypy required, since it recognizes DataFrameModel-annotated params.
+    process_orders(wrong)
 
     # MISSED: Typo in column name (custmer_name instead of customer_name)
     # pandera's mypy plugin does NOT catch this error

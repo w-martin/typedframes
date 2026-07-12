@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.2.2) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.3.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > schema validation over production-grade stability.
 >
@@ -406,13 +406,13 @@ Fast feedback reduces development time. The typedframes Rust binary provides nea
 
 | Tool | Version | What it does | typedframes (13 files) | great_expectations (485 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.2.2 | DataFrame column checker | 71ms ±4ms | 1.79s ±23ms |
-| ruff | 0.15.4 | Linter (no type checking) | 44ms ±16ms | 322ms ±21ms |
-| ty | 0.0.19 | Type checker | 105ms ±18ms | 1.13s ±182ms |
-| pyrefly | 0.54.0 | Type checker | 174ms ±15ms | 555ms ±93ms |
-| mypy | 1.19.1 | Type checker (no plugin) | 5.28s ±59ms | 8.70s ±847ms |
-| mypy + typedframes | 1.19.1 | Type checker + column checker | 5.23s ±36ms | 9.95s ±611ms |
-| pyright | 1.1.408 | Type checker | 1.37s ±41ms | 6.62s ±98ms |
+| typedframes | 0.3.0 | DataFrame column checker | 81ms ±6ms | 3.64s ±9ms |
+| ruff | 0.15.21 | Linter (no type checking) | 48ms ±13ms | 237ms ±31ms |
+| ty | 0.0.58 | Type checker | 119ms ±14ms | 287ms ±33ms |
+| pyrefly | 1.1.1 | Type checker | 162ms ±18ms | 390ms ±21ms |
+| mypy | 2.2.0 | Type checker (no plugin) | 4.56s ±22ms | 7.31s ±35ms |
+| mypy + typedframes | 2.2.0 | Type checker + column checker | 4.69s ±61ms | 10.89s ±356ms |
+| pyright | 1.1.411 | Type checker | 1.39s ±17ms | 8.06s ±193ms |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -625,7 +625,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.2.2                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
+| **Version tested**              | 0.3.0                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |

@@ -20,16 +20,17 @@ FILE: c_typedframes_comparison.py (WITH PLUGIN)
 COMMAND: uv run mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini 2>&1
 RESULT: 1 error detected
 
-c_typedframes_comparison.py:70: error: Column 'sku' does not exist in OrderSchema (defined at line 66)  [misc]
+c_typedframes_comparison.py:69: error: Column 'sku' does not exist in OrderSchema (defined at line 65)  [misc]
 
 ISSUES PRESENT IN CODE:
   - Line 47: orders_checked["custmer_name"] — NOT CAUGHT (plugin appears to have limits)
-  - Line 70: orders_checked["sku"] — ✓ CAUGHT by typedframes plugin
+  - Line 69: orders_checked["sku"] — ✓ CAUGHT by typedframes plugin
   - Line 83: orders_checked["qty"] — NOT CAUGHT (appears to be filtered out)
 
 ANALYSIS: typedframes plugin catches at least some column access errors statically.
           The plugin successfully identifies unknown columns in the OrderSchema.
           Some errors may be filtered or not caught due to plugin limitations.
+          Requires pandas-stubs to be installed for the plugin to resolve column types.
 
 ================================================================================
 

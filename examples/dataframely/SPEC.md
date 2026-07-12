@@ -14,10 +14,10 @@ This directory contains comparison examples showing the differences between **da
 
 ## Environment
 
-- **dataframely**: 2.10.1
-- **polars**: 1.41.2
-- **mypy**: 2.1.0
-- **typedframes**: 0.2.1
+- **dataframely**: 2.13.0
+- **polars**: 1.42.1
+- **mypy**: 2.2.0
+- **typedframes**: 0.2.2
 
 ## Files
 

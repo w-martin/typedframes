@@ -177,6 +177,86 @@ merged: Annotated[pd.DataFrame, ReportSchema] = orders.merge(
 )
 ```
 
+## Function parameter contracts (missing-column)
+
+Beyond validating column access at the point it happens, the checker infers a *contract*
+for any function's first parameter: every column the function needs, drawn either from
+what its body accesses or from a schema annotation on the parameter itself. Calling that
+function with a DataFrame that doesn't satisfy the contract is caught at the **call
+site** — across files, and through chains of helper functions.
+
+### Inferred from the function body
+
+```python
+# transforms.py
+def contact_label(customers):
+    return customers["name"] + customers["email"]
+```
+
+```python
+# pipeline.py
+from loaders import load_customers
+from transforms import contact_label
+
+customers = load_customers(path)  # inferred columns: {customer_id, name, region}
+contact_label(customers)
+```
+
+```
+pipeline.py:5:1: error[missing-column] 'customers' passed to contact_label
+  (transforms.py:2) is missing column(s) {email} — available: {customer_id, name,
+  region}, required: {email, name}
+```
+
+Column-list slices count too — `df[["a", "b"]]` requires both `a` and `b` on the caller.
+
+### Declared via a schema annotation
+
+Annotate the parameter and the schema's full column list becomes the contract, taking
+priority over body-scanning. This is more precise: it catches every column the function
+needs, not just the ones its body happens to subscript directly.
+
+```python
+from typedframes.pandas import PandasFrame
+
+def contact_label(customers: PandasFrame[CustomerSchema]):
+    print(customers["name"])
+    # 'email' is declared on CustomerSchema but never subscripted here directly —
+    # it's still part of the contract, and accessing it inside the function is
+    # also validated against CustomerSchema like any other schema-annotated variable.
+```
+
+### Transitive through delegate calls
+
+If a function only forwards its own parameter to other functions, the checker follows
+the chain and unions their requirements — even when no single function in the chain
+touches every required column itself:
+
+```python
+def preprocess(df):
+    x = df["a"]
+    return df
+
+def enrich(df):
+    y = df["b"]
+    return df
+
+def finalize(df):
+    z = df["c"]
+    return df
+
+def transform(df):
+    step1 = preprocess(df)
+    step2 = enrich(step1)
+    step3 = finalize(step2)
+    return step3
+```
+
+`transform` itself never subscripts `df` — but the checker resolves its contract to
+`{a, b, c}`, the union of everything `preprocess`, `enrich`, and `finalize` need, so a
+caller supplying only `{a, b}` is still flagged at the `transform(df)` call site, even
+though `c` is only ever referenced two calls deep, inside `finalize`.
+
 ## Exploration mode (untracked-dataframe)
 
 By default, bare DataFrame loads (no `usecols=` / `columns=` / schema annotation) are

@@ -1,25 +1,45 @@
-"""Illustrates the cross-file blind spot when no schema is defined.
+"""Cross-file schema inference — loader column sets propagate into this file.
 
-``load_orders`` returns a plain ``pd.DataFrame``.  The checker has no way to
-know which columns that DataFrame holds once the call crosses a file boundary,
-so it cannot validate subscript access here — bad column names pass silently.
+typedframes builds a project index before checking a directory. Indexing
+loaders.py records the inferred column set of every load-and-return
+function (load_orders, load_customers) against that function's name, and
+indexing transforms.py records the column *requirements* each transform
+function has on its first parameter (e.g. contact_label needs "email").
 
-Compare with ``examples/multi_file_with_schema/pipeline.py``, where the same
-call pattern produces a caught unknown-column error because the return type annotation
-carries ``OrderSchema`` into the project index.
+Checking this file resolves the imports and attaches each loader's
+inferred schema to the variable it's assigned to. Two kinds of errors
+follow, both real bugs this file intentionally contains:
+
+  1. `orders["revenue"]` — direct access to a column not in load_orders'
+     inferred set {order_id, customer_id, amount, status}.
+
+  2. `contact_label(customers)` — passes a {customer_id, name, region}
+     frame to a function that requires {email, name}. This is exactly the
+     kind of bug mypy/ty miss: both sides type-check as plain DataFrames,
+     but the columns don't line up, and it would KeyError at runtime.
+
+This file is a static-analysis fixture, not meant to be executed — leave
+both errors in place and run `typedframes check examples/multi_file_inference/`
+to see them caught.
 """
 
 from __future__ import annotations
 
-from loaders import load_orders
+from loaders import load_customers, load_orders
+from transforms import contact_label, normalise_orders, slim_for_report
 
 
 def process(path: str) -> None:
-    """Access columns after a cross-file load — checker is blind here."""
     orders = load_orders(path)
+    customers = load_customers(path)
 
-    # load_orders returns pd.DataFrame — the checker has no column information
-    # at this call site.  The accesses below are not validated.
-    print(orders["order_id"])  # no error — but also: no validation
-    print(orders["revenue"])  # no error — 'revenue' does not exist, but the
-    #                             checker cannot see that from this file alone
+    print(orders["order_id"])  # OK - in {order_id, customer_id, amount, status}
+    print(orders["revenue"])  # unknown-column - not in load_orders' inferred set
+
+    enriched = normalise_orders(orders)
+    report = slim_for_report(orders)
+    labeled = contact_label(customers)  # missing-column - customers lacks "email"
+
+    print(enriched)
+    print(report)
+    print(labeled)

@@ -512,3 +512,315 @@ _ = b["baz"]
             self.assertGreater(len(b_baz_errors), 0)
         finally:
             Path(temp_file).unlink()
+
+    def test_should_detect_missing_column_at_function_call_site(self) -> None:
+        """Test that calling a function with a DataFrame missing a column it needs is caught."""
+        # arrange
+        loaders_source = """
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"""
+        steps_source = """
+import pandas as pd
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+"""
+        pipeline_source = """
+from loaders import load
+from steps import postproc
+
+def process(path: str) -> None:
+    df = load(path)
+    result = postproc(df)
+    print(result)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "loaders.py").write_text(loaders_source)
+            (root / "steps.py").write_text(steps_source)
+            (root / "pipeline.py").write_text(pipeline_source)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\nenabled = true\n")
+
+            # act
+            index_bytes = build_project_index(tmpdir)
+            result = check_file(str(root / "pipeline.py"), index_bytes)
+            errors = json.loads(result)
+
+            # assert
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], "missing-column")
+            self.assertIn("missing column(s) {c}", errors[0]["message"])
+            self.assertIn("available: {a, b}", errors[0]["message"])
+
+    def test_should_resolve_missing_column_transitively_through_delegate_chain(self) -> None:
+        """Test that a missing column surfaces transitively through a chain of delegate calls."""
+        # arrange
+        loaders_source = """
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"""
+        steps_source = """
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    z = df["a"]
+    return df
+
+def infer(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["b"]
+    return df
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+
+def transform(df: pd.DataFrame) -> pd.DataFrame:
+    step1 = preproc(df)
+    step2 = infer(step1)
+    step3 = postproc(step2)
+    return step3
+"""
+        pipeline_source = """
+from loaders import load
+from steps import transform
+
+def process(path: str) -> None:
+    df = load(path)
+    result = transform(df)
+    print(result)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "loaders.py").write_text(loaders_source)
+            (root / "steps.py").write_text(steps_source)
+            (root / "pipeline.py").write_text(pipeline_source)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\nenabled = true\n")
+
+            # act
+            index_bytes = build_project_index(tmpdir)
+            result = check_file(str(root / "pipeline.py"), index_bytes)
+            errors = json.loads(result)
+
+            # assert — 'c' is only touched two calls deep, inside postproc
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], "missing-column")
+            self.assertIn("missing column(s) {c}", errors[0]["message"])
+            self.assertIn("required: {a, b, c}", errors[0]["message"])
+
+    def test_should_validate_schema_annotated_parameter_in_body(self) -> None:
+        """Test that a bad access on a schema-annotated parameter is caught inside the function body."""
+        # arrange
+        source = """
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=int)
+    name = Column(type=str)
+
+def contact_label(customers: PandasFrame[CustomerSchema]):
+    print(customers["name"])
+    print(customers["email"])
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)
+
+            # assert
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], "unknown-column")
+            self.assertIn("email", errors[0]["message"])
+            self.assertIn("CustomerSchema", errors[0]["message"])
+        finally:
+            Path(temp_file).unlink()
+
+    def test_should_use_schema_annotation_as_authoritative_call_site_contract(self) -> None:
+        """Test that a schema annotation's full column list becomes the call-site contract."""
+        # arrange
+        loaders_source = """
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["customer_id", "name"])
+    return df
+"""
+        transforms_source = """
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=int)
+    name = Column(type=str)
+    email = Column(type=str)
+
+def contact_label(customers: PandasFrame[CustomerSchema]):
+    print(customers["name"])
+    return customers
+"""
+        pipeline_source = """
+from loaders import load
+from transforms import contact_label
+
+def process(path: str) -> None:
+    customers = load(path)
+    contact_label(customers)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "loaders.py").write_text(loaders_source)
+            (root / "transforms.py").write_text(transforms_source)
+            (root / "pipeline.py").write_text(pipeline_source)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\nenabled = true\n")
+
+            # act
+            index_bytes = build_project_index(tmpdir)
+            result = check_file(str(root / "pipeline.py"), index_bytes)
+            errors = json.loads(result)
+
+            # assert — "email" is declared on CustomerSchema but never subscripted in
+            # contact_label's body; it must still be part of the contract
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], "missing-column")
+            self.assertIn("missing column(s) {email}", errors[0]["message"])
+            self.assertIn("required: {customer_id, email, name}", errors[0]["message"])
+
+    def test_should_track_column_list_slice_in_function_contract(self) -> None:
+        """Test that a list-slice (`df[["a", "b"]]`) registers both columns in the contract."""
+        # arrange
+        loaders_source = """
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a"])
+    return df
+"""
+        steps_source = """
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    slim = df[["a", "b"]]
+    return slim
+"""
+        pipeline_source = """
+from loaders import load
+from steps import preproc
+
+def process(path: str) -> None:
+    df = load(path)
+    result = preproc(df)
+    print(result)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "loaders.py").write_text(loaders_source)
+            (root / "steps.py").write_text(steps_source)
+            (root / "pipeline.py").write_text(pipeline_source)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\nenabled = true\n")
+
+            # act
+            index_bytes = build_project_index(tmpdir)
+            result = check_file(str(root / "pipeline.py"), index_bytes)
+            errors = json.loads(result)
+
+            # assert — loader only supplies 'a'; preproc's list-slice needs 'a' AND 'b'
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], "missing-column")
+            self.assertIn("missing column(s) {b}", errors[0]["message"])
+
+    def test_should_catch_narrowed_variable_misuse_locally_not_via_caller_contract(self) -> None:
+        """Test that misusing a narrowed variable is caught locally, not folded into the contract."""
+        # arrange
+        source = """
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    slim = df[["a", "b"]]
+    z = slim["c"]
+    return slim
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)
+
+            # assert — caught directly, as an unknown-column bug local to preproc
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], "unknown-column")
+            self.assertIn("'c'", errors[0]["message"])
+            self.assertIn("{a, b}", errors[0]["message"])
+        finally:
+            Path(temp_file).unlink()
+
+    def test_should_catch_column_access_nested_in_arithmetic_expression(self) -> None:
+        """Test that a bad column access nested inside a binary expression is still validated."""
+        # arrange
+        source = """
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class Schema(BaseSchema):
+    a = Column(type=int)
+    b = Column(type=int)
+
+def combine(df: PandasFrame[Schema]):
+    return df["a"] + df["bad"]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)
+
+            # assert
+            self.assertEqual(len(errors), 1)
+            self.assertIn("'bad'", errors[0]["message"])
+        finally:
+            Path(temp_file).unlink()
+
+    def test_should_catch_column_access_in_keyword_argument(self) -> None:
+        """Test that a bad column access passed as a keyword argument is still validated."""
+        # arrange
+        source = """
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class Schema(BaseSchema):
+    a = Column(type=int)
+
+def enrich(df: PandasFrame[Schema]):
+    return df.assign(doubled=df["bad"] * 2)
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)
+
+            # assert
+            self.assertEqual(len(errors), 1)
+            self.assertIn("'bad'", errors[0]["message"])
+        finally:
+            Path(temp_file).unlink()

@@ -263,12 +263,39 @@ trimmed = df.drop(columns=["nonexistent"])
 # ⚠ dropped-unknown-column: Dropped column 'nonexistent' does not exist in UserData
 ```
 
+### Function Parameter Contracts
+
+Beyond validating access at the point it happens, the checker infers a *contract* for any function's
+first parameter: every column the function needs, drawn from what its body accesses or — taking priority —
+from a schema annotation on the parameter itself. Calling that function with a DataFrame that doesn't
+satisfy the contract is caught at the **call site**, across files:
+
+```python
+# transforms.py
+def contact_label(customers):
+    return customers["name"] + customers["email"]
+```
+
+```python
+# pipeline.py
+customers = load_customers(path)  # inferred columns: {customer_id, name, region}
+contact_label(customers)
+# ✗ missing-column: 'customers' passed to contact_label (transforms.py:2) is missing
+#   column(s) {email} — available: {customer_id, name, region}, required: {email, name}
+```
+
+The contract is resolved *transitively*: if a function only forwards its parameter to other functions
+(`step1 = preprocess(df); step2 = enrich(step1)`), the checker follows the chain and unions their
+requirements, catching a missing column even when no single function in the chain touches it directly.
+Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
+
 ### See Also
 
 - [`examples/inference_example.py`](examples/inference_example.py) — single-file walkthrough of all four inference
   scenarios with annotated ✓/✗ comments.
 - [`examples/multi_file_inference/`](examples/multi_file_inference/) — multi-file project checked with
-  `typedframes check examples/multi_file_inference/`; no `BaseSchema` anywhere.
+  `typedframes check examples/multi_file_inference/`; no `BaseSchema` anywhere. Includes a function
+  parameter contract violation caught at the call site (`missing-column`).
 - [`examples/multi_file_with_schema/`](examples/multi_file_with_schema/) — same scenario with `BaseSchema`
   classes; the checker follows schemas across module boundaries via the project index.
 
@@ -293,6 +320,8 @@ typedframes check src/
 **Features:**
 - Catches column name errors
 - Validates schema mismatches between functions
+- Validates function parameter contracts across files, including transitively through chains of
+  helper functions (`missing-column`)
 - Checks both pandas and polars code
 - Significantly faster than mypy (see benchmarks below)
 
@@ -958,6 +987,8 @@ MIT License - see [LICENSE](LICENSE)
 - [x] Pandera integration (`to_pandera_schema()`)
 - [x] Cross-file schema inference (project-level index, `--no-index` flag)
 - [x] Aggressive column inference (untracked-dataframe/dropped-unknown-column warnings, method chain propagation)
+- [x] Function parameter contracts (`missing-column`), resolved transitively across chains of helper
+  functions and cross-file calls; schema-annotated parameters take priority over body-scanning
 
 **Planned:**
 

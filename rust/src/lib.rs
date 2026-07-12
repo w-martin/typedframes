@@ -188,11 +188,22 @@ pub fn find_project_root(start_path: &Path) -> PathBuf {
 
 // ── Index structs ──────────────────────────────────────────────────────────────
 
-// Return-type information extracted from an annotated function definition.
+// Return-type and parameter-contract information extracted from a function definition.
 #[derive(Serialize, Deserialize)]
 struct IndexFunction {
     returns_schema: String, // BaseSchema subclass name, e.g. "OrderSchema"; empty if none
     returns_frame: String,  // reserved for future use
+    // Columns required on the function's first parameter. Starts as the columns
+    // accessed *directly* in the function body; resolve_transitive_requires (run once,
+    // project-wide, in build_index_internal) folds in the requirements of every
+    // function this one delegates its own parameter to, so by the time an importer
+    // reads this field it already reflects the full transitive union.
+    requires: Vec<String>,
+    def_line: usize, // line the function is defined on, for origin messages
+    // Names of functions called with a tainted variable (the parameter itself, or a
+    // variable derived from it) as their first positional argument. Consumed only by
+    // resolve_transitive_requires; not needed once `requires` has been resolved.
+    delegates: Vec<String>,
 }
 
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
@@ -201,6 +212,7 @@ struct IndexEntry {
     schemas: HashMap<String, Vec<String>>, // schema name -> column list
     functions: HashMap<String, IndexFunction>, // function name -> return type info
     exports: Vec<String>,                  // names in __all__, for wildcard-import resolution
+    imports: HashMap<String, String>, // imported name -> dotted module it came from (`from X import Y`)
 }
 
 // In-memory cross-file symbol index.
@@ -243,7 +255,8 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
 
 // Parse one `.py` file and extract its symbols into an IndexEntry.
 // Runs the linter in index mode (diagnostics discarded) to collect schemas and
-// functions, then separately parses `__all__` assignments for wildcard-import support.
+// functions, then separately parses `__all__` assignments and `from X import Y`
+// statements for wildcard-import support and delegate-target resolution respectively.
 fn index_file(path: &Path) -> Option<IndexEntry> {
     let source = fs::read_to_string(path).ok()?;
 
@@ -251,54 +264,77 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
     let _ = linter.check_file_internal(&source, path);
 
     let schemas = linter.schemas;
-    let functions: HashMap<String, IndexFunction> = linter
-        .functions
+    // Union function names across the return-schema, requires, and delegates maps —
+    // a function may appear in any subset of the three.
+    let mut func_names: std::collections::BTreeSet<String> =
+        linter.functions.keys().cloned().collect();
+    func_names.extend(linter.requires.keys().cloned());
+    func_names.extend(linter.delegates.keys().cloned());
+    let functions: HashMap<String, IndexFunction> = func_names
         .into_iter()
-        .map(|(k, v)| {
+        .map(|name| {
+            let returns_schema = linter.functions.get(&name).cloned().unwrap_or_default();
+            let (requires, def_line) = linter
+                .requires
+                .get(&name)
+                .cloned()
+                .unwrap_or((Vec::new(), 0));
+            let delegates = linter.delegates.get(&name).cloned().unwrap_or_default();
             (
-                k,
+                name,
                 IndexFunction {
-                    returns_schema: v,
+                    returns_schema,
                     returns_frame: String::new(),
+                    requires,
+                    def_line,
+                    delegates,
                 },
             )
         })
         .collect();
 
-    let exports = parse_module(&source)
-        .ok()
-        .map(|parsed| {
-            let module = parsed.into_syntax();
-            let mut names = Vec::new();
-            for stmt in &module.body {
-                let Stmt::Assign(assign) = stmt else {
-                    continue;
-                };
-                for target in &assign.targets {
-                    let Expr::Name(name) = target else {
-                        continue;
-                    };
-                    if name.id.as_str() != "__all__" {
-                        continue;
-                    }
-                    let Expr::List(list) = &*assign.value else {
-                        continue;
-                    };
-                    for el in &list.elts {
-                        if let Expr::StringLiteral(s) = el {
-                            names.push(s.value.to_str().to_string());
+    let mut exports = Vec::new();
+    let mut imports: HashMap<String, String> = HashMap::new();
+    if let Ok(parsed) = parse_module(&source) {
+        let module = parsed.into_syntax();
+        for stmt in &module.body {
+            match stmt {
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        let Expr::Name(name) = target else {
+                            continue;
+                        };
+                        if name.id.as_str() != "__all__" {
+                            continue;
+                        }
+                        let Expr::List(list) = &*assign.value else {
+                            continue;
+                        };
+                        for el in &list.elts {
+                            if let Expr::StringLiteral(s) = el {
+                                exports.push(s.value.to_str().to_string());
+                            }
                         }
                     }
                 }
+                Stmt::ImportFrom(import_from) if import_from.level == 0 => {
+                    if let Some(module_ident) = &import_from.module {
+                        let module_name = module_ident.id.to_string();
+                        for alias in &import_from.names {
+                            imports.insert(alias.name.id.to_string(), module_name.clone());
+                        }
+                    }
+                }
+                _ => {}
             }
-            names
-        })
-        .unwrap_or_default();
+        }
+    }
 
     Some(IndexEntry {
         schemas,
         functions,
         exports,
+        imports,
     })
 }
 
@@ -313,7 +349,121 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
             }
         }
     }
+    resolve_transitive_requires(project_root, &mut files);
     ProjectIndex { version: 1, files }
+}
+
+// A function identified by the file that defines it and its name within that file.
+type FuncNode = (String, String);
+
+// Resolve a delegate call target (a bare name, as written at the call site) to the
+// node that actually defines it: a same-file function first, else a function
+// reached by following `from_file`'s own `from X import name` statements.
+fn resolve_delegate_target(
+    from_file: &str,
+    callee: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+) -> Option<FuncNode> {
+    let entry = files.get(from_file)?;
+    if entry.functions.contains_key(callee) {
+        return Some((from_file.to_string(), callee.to_string()));
+    }
+    let module_name = entry.imports.get(callee)?;
+    let mod_path = module_name.replace('.', "/");
+    let candidates = [
+        project_root.join(format!("{mod_path}.py")),
+        project_root.join("src").join(format!("{mod_path}.py")),
+    ];
+    let target_file = candidates
+        .iter()
+        .filter_map(|p| p.to_str())
+        .find(|p| files.contains_key(*p))?
+        .to_string();
+    if files.get(&target_file)?.functions.contains_key(callee) {
+        Some((target_file, callee.to_string()))
+    } else {
+        None
+    }
+}
+
+// Memoised DFS over the delegate graph: a function's fully resolved requirement set
+// is its own direct requirements plus the union of every delegate's (transitively)
+// resolved requirements. `visiting` guards against infinite recursion on a cycle
+// (mutually- or self-delegating functions) — a node caught in a cycle contributes
+// only its direct requirements to the cycle, rather than looping forever.
+fn resolve_node_requires(
+    node: &FuncNode,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    memo: &mut HashMap<FuncNode, Vec<String>>,
+    visiting: &mut std::collections::HashSet<FuncNode>,
+) -> Vec<String> {
+    if let Some(cached) = memo.get(node) {
+        return cached.clone();
+    }
+    if visiting.contains(node) {
+        return files
+            .get(&node.0)
+            .and_then(|e| e.functions.get(&node.1))
+            .map(|f| f.requires.clone())
+            .unwrap_or_default();
+    }
+    let Some(func) = files.get(&node.0).and_then(|e| e.functions.get(&node.1)) else {
+        return Vec::new();
+    };
+
+    visiting.insert(node.clone());
+    let mut result = func.requires.clone();
+    for delegate_name in &func.delegates {
+        if let Some(target) = resolve_delegate_target(&node.0, delegate_name, project_root, files) {
+            let target_reqs = resolve_node_requires(&target, project_root, files, memo, visiting);
+            for col in target_reqs {
+                if !result.contains(&col) {
+                    result.push(col);
+                }
+            }
+        }
+    }
+    visiting.remove(node);
+
+    result.sort();
+    result.dedup();
+    memo.insert(node.clone(), result.clone());
+    result
+}
+
+// Resolve every function's `requires` to the transitive union of everything it
+// (directly or indirectly) delegates its own parameter to. Runs once, project-wide,
+// after every file has been indexed independently — only then do we know, for every
+// file, which functions live where and what each one's direct requirements are.
+fn resolve_transitive_requires(project_root: &Path, files: &mut HashMap<String, IndexEntry>) {
+    let nodes: Vec<FuncNode> = files
+        .iter()
+        .flat_map(|(file, entry)| {
+            entry
+                .functions
+                .keys()
+                .map(move |f| (file.clone(), f.clone()))
+        })
+        .collect();
+
+    let mut memo: HashMap<FuncNode, Vec<String>> = HashMap::new();
+    let mut resolved: Vec<(FuncNode, Vec<String>)> = Vec::new();
+    for node in nodes {
+        let files_ref: &HashMap<String, IndexEntry> = files;
+        let mut visiting = std::collections::HashSet::new();
+        let r = resolve_node_requires(&node, project_root, files_ref, &mut memo, &mut visiting);
+        resolved.push((node, r));
+    }
+
+    for ((file, func), reqs) in resolved {
+        if let Some(entry) = files.get_mut(&file) {
+            if let Some(f) = entry.functions.get_mut(&func) {
+                f.requires = reqs;
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -324,6 +474,7 @@ const CODE_UNKNOWN_COLUMN: &str = "unknown-column";
 const CODE_RESERVED_NAME: &str = "reserved-name";
 const CODE_UNTRACKED_DATAFRAME: &str = "untracked-dataframe";
 const CODE_DROPPED_UNKNOWN_COLUMN: &str = "dropped-unknown-column";
+const CODE_MISSING_COLUMN: &str = "missing-column";
 
 // Return true if the source line at `line` (1-indexed) carries a
 // `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
@@ -611,8 +762,57 @@ pub struct Linter {
     schemas: HashMap<String, Vec<String>>,
     variables: HashMap<String, (String, usize)>, // var_name -> (schema_name, defined_at_line)
     functions: HashMap<String, String>,          // func_name -> schema_name (from return type)
+    schema_origins: HashMap<String, String>,     // inferred schema name -> "func (path:line)"
+    requires: HashMap<String, (Vec<String>, usize)>, // func_name -> (direct required cols on 1st param, def line)
+    delegates: HashMap<String, Vec<String>>, // func_name -> names called with its own (tainted) param forwarded
+    param_requires: HashMap<String, (Vec<String>, String)>, // func_name -> (required cols, origin "func (path:line)")
     line_index: Option<LineIndex>,
     source: String,
+    file_display: String, // absolute-ish path of the file currently being linted
+}
+
+// Walk `stmts` looking for the first `return <Name>` — handles top-level returns
+// and those nested inside `if`/`for`/`while`/`with` bodies.  Returns the variable
+// name as an owned String, or None if no bare-name return is found.
+fn find_returned_var(stmts: &[Stmt]) -> Option<String> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return(ret) => {
+                if let Some(value) = &ret.value {
+                    if let Expr::Name(name) = value.as_ref() {
+                        return Some(name.id.to_string());
+                    }
+                }
+            }
+            Stmt::If(if_stmt) => {
+                if let Some(var) = find_returned_var(&if_stmt.body) {
+                    return Some(var);
+                }
+                for clause in &if_stmt.elif_else_clauses {
+                    if let Some(var) = find_returned_var(&clause.body) {
+                        return Some(var);
+                    }
+                }
+            }
+            Stmt::For(for_stmt) => {
+                if let Some(var) = find_returned_var(&for_stmt.body) {
+                    return Some(var);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                if let Some(var) = find_returned_var(&while_stmt.body) {
+                    return Some(var);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                if let Some(var) = find_returned_var(&with_stmt.body) {
+                    return Some(var);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 impl Default for Linter {
@@ -627,8 +827,13 @@ impl Linter {
             schemas: HashMap::new(),
             variables: HashMap::new(),
             functions: HashMap::new(),
+            schema_origins: HashMap::new(),
+            requires: HashMap::new(),
+            delegates: HashMap::new(),
+            param_requires: HashMap::new(),
             line_index: None,
             source: String::new(),
+            file_display: String::new(),
         }
     }
 
@@ -646,14 +851,39 @@ impl Linter {
         (loc.line.get(), loc.column.get())
     }
 
+    // Format a schema name for use in an error message.
+    //
+    // For inferred schemas (those whose name starts with `__inferred_`):
+    //   - includes the full column set so the user can see what IS available
+    //   - includes the origin function/file when recorded by load_cross_file_symbols
+    //   - reports the line in the current file where the variable was bound
+    //
+    // For named schemas (BaseSchema subclasses): returns the schema name + defined line.
+    fn schema_display(&self, schema_name: &str, defined_line: usize) -> String {
+        if schema_name.starts_with("__inferred_") {
+            let cols = self.schemas.get(schema_name).cloned().unwrap_or_default();
+            let cols_str = cols.join(", ");
+            if let Some(origin) = self.schema_origins.get(schema_name) {
+                format!(
+                    "inferred column set {{{cols_str}}} — fix: add column to usecols/columns in {origin}"
+                )
+            } else {
+                format!("inferred column set {{{cols_str}}} (defined at line {defined_line})")
+            }
+        } else {
+            format!("{schema_name} (defined at line {defined_line})")
+        }
+    }
+
     // Parse `source`, walk the AST, then filter out any diagnostic whose line carries a
     // `# typedframes: ignore` comment.  Returns the surviving errors.
     pub fn check_file_internal(
         &mut self,
         source: &str,
-        _path: &Path,
+        path: &Path,
     ) -> Result<Vec<LintError>, anyhow::Error> {
         self.source = source.to_string();
+        self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
         let parsed = parse_module(source).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut errors = Vec::new();
@@ -707,17 +937,47 @@ impl Linter {
             let Some(entry) = index.files.get(resolved_str) else {
                 continue;
             };
+            // Use the full resolved path (not just the basename) so error messages
+            // contain an openable `file:line` reference regardless of cwd.
+            let file_path_display = resolved_path.display().to_string();
             for alias in &import_from.names {
                 let name = alias.name.id.as_str();
                 if let Some(cols) = entry.schemas.get(name) {
                     self.schemas.insert(name.to_string(), cols.clone());
                 }
                 if let Some(func) = entry.functions.get(name) {
-                    self.functions
-                        .insert(name.to_string(), func.returns_schema.clone());
+                    if !func.returns_schema.is_empty() {
+                        self.functions
+                            .insert(name.to_string(), func.returns_schema.clone());
+                    }
                     if let Some(schema_cols) = entry.schemas.get(&func.returns_schema) {
                         self.schemas
                             .insert(func.returns_schema.clone(), schema_cols.clone());
+                        // Record origin so error messages point back to the source function/file.
+                        // The inferred schema name encodes the definition line as
+                        // `__inferred_<var>_at_<line>`, so we can surface the exact
+                        // location without storing extra metadata.
+                        if func.returns_schema.starts_with("__inferred_") {
+                            let line_suffix = func
+                                .returns_schema
+                                .strip_prefix("__inferred_")
+                                .and_then(|s| s.rsplit_once("_at_"))
+                                .and_then(|(_, l)| l.parse::<usize>().ok())
+                                .map(|l| format!(":{l}"))
+                                .unwrap_or_default();
+                            self.schema_origins.insert(
+                                func.returns_schema.clone(),
+                                format!("{name} ({file_path_display}{line_suffix})"),
+                            );
+                        }
+                    }
+                    // Record the parameter-column contract so calls to this function
+                    // (e.g. `trim(customers)`) can be validated at the call site,
+                    // where the actual argument's inferred schema is known.
+                    if !func.requires.is_empty() {
+                        let origin = format!("{name} ({file_path_display}:{})", func.def_line);
+                        self.param_requires
+                            .insert(name.to_string(), (func.requires.clone(), origin));
                     }
                 }
             }
@@ -1006,6 +1266,241 @@ impl Linter {
         }
     }
 
+    // Does `expr` produce a value derived from a tainted variable — i.e. should its
+    // assignment target also be considered tainted?  Two forms: a plain alias
+    // (`x = df`) and a delegate call forwarding a tainted variable as the first
+    // positional argument (`x = preproc(df)`, `x = infer(step1)`, …). This is what
+    // lets taint follow a `step1 = preproc(df); step2 = infer(step1)` chain.
+    //
+    // Deliberately does NOT treat `x = df[["a", "b"]]` (a literal list/string slice)
+    // as tainting `x`: that expression already produces a *fully known* schema for
+    // `x` via the existing multi-column-subscript tracking in the Assign handler
+    // above (make_inferred_schema), independent of this heuristic. A later
+    // `x["bad_col"]` is therefore an outright, certain unknown-column bug local to
+    // this function — caught directly by visit_expr against that inferred schema —
+    // not an ambiguous "maybe missing from the caller" requirement to add to `df`'s
+    // contract. Folding it in here would double-report the same bug two ways.
+    fn expr_forwards_tainted(tainted: &std::collections::HashSet<String>, expr: &Expr) -> bool {
+        match expr {
+            Expr::Name(n) => tainted.contains(n.id.as_str()),
+            Expr::Call(call) => call
+                .arguments
+                .args
+                .first()
+                .is_some_and(|a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str()))),
+            _ => false,
+        }
+    }
+
+    // Recursively scan `expr` for two things, given the current set of variable names
+    // considered aliases of the function's own first parameter:
+    //   - `direct`: columns subscripted directly off a tainted variable, both a single
+    //     string (`tainted["col"]`) and a list (`tainted[["a", "b"]]`)
+    //   - `delegates`: names of functions called with a tainted variable as their first
+    //     positional argument — candidates for transitive requirement resolution
+    //     (see resolve_transitive_requires), since the parameter itself carries no
+    //     schema here and we can't validate the access ourselves, only record it.
+    fn scan_expr_for_contract(
+        tainted: &std::collections::HashSet<String>,
+        expr: &Expr,
+        direct: &mut Vec<String>,
+        delegates: &mut Vec<String>,
+    ) {
+        match expr {
+            Expr::Subscript(subscript) => {
+                if let Expr::Name(base) = &*subscript.value {
+                    if tainted.contains(base.id.as_str()) {
+                        if let Some(cols) = Self::extract_string_list_or_single(&subscript.slice) {
+                            direct.extend(cols);
+                        }
+                    }
+                }
+                Self::scan_expr_for_contract(tainted, &subscript.value, direct, delegates);
+                Self::scan_expr_for_contract(tainted, &subscript.slice, direct, delegates);
+            }
+            Expr::Attribute(attr) => {
+                Self::scan_expr_for_contract(tainted, &attr.value, direct, delegates);
+            }
+            Expr::Call(call) => {
+                if let Expr::Name(func_name) = &*call.func {
+                    if call.arguments.args.first().is_some_and(
+                        |a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str())),
+                    ) {
+                        delegates.push(func_name.id.to_string());
+                    }
+                }
+                Self::scan_expr_for_contract(tainted, &call.func, direct, delegates);
+                for arg in &call.arguments.args {
+                    Self::scan_expr_for_contract(tainted, arg, direct, delegates);
+                }
+                for kw in &call.arguments.keywords {
+                    Self::scan_expr_for_contract(tainted, &kw.value, direct, delegates);
+                }
+            }
+            Expr::BinOp(binop) => {
+                Self::scan_expr_for_contract(tainted, &binop.left, direct, delegates);
+                Self::scan_expr_for_contract(tainted, &binop.right, direct, delegates);
+            }
+            Expr::BoolOp(boolop) => {
+                for v in &boolop.values {
+                    Self::scan_expr_for_contract(tainted, v, direct, delegates);
+                }
+            }
+            Expr::UnaryOp(unary) => {
+                Self::scan_expr_for_contract(tainted, &unary.operand, direct, delegates);
+            }
+            Expr::Compare(compare) => {
+                Self::scan_expr_for_contract(tainted, &compare.left, direct, delegates);
+                for comp in compare.comparators.iter() {
+                    Self::scan_expr_for_contract(tainted, comp, direct, delegates);
+                }
+            }
+            Expr::List(list) => {
+                for el in &list.elts {
+                    Self::scan_expr_for_contract(tainted, el, direct, delegates);
+                }
+            }
+            Expr::Tuple(tuple) => {
+                for el in &tuple.elts {
+                    Self::scan_expr_for_contract(tainted, el, direct, delegates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Statement-level counterpart to scan_expr_for_contract — covers the handful of
+    // statement shapes that appear in typical single-purpose transform functions
+    // (return, bare expr, assign, if/for/while/with). Not an exhaustive AST walk;
+    // deeply nested control flow may under-report requirements/delegates. `tainted`
+    // grows as assignments are discovered, so later statements in the same body see
+    // earlier aliasing — this is a single top-to-bottom pass, not full control-flow
+    // analysis: taint picked up inside an `if`/`for` body is visible afterwards, and
+    // both branches of an `if` contribute to the same taint set (conservative).
+    fn analyze_stmt_for_contract(
+        stmt: &Stmt,
+        tainted: &mut std::collections::HashSet<String>,
+        direct: &mut Vec<String>,
+        delegates: &mut Vec<String>,
+    ) {
+        match stmt {
+            Stmt::Return(ret) => {
+                if let Some(value) = &ret.value {
+                    Self::scan_expr_for_contract(tainted, value, direct, delegates);
+                }
+            }
+            Stmt::Expr(expr_stmt) => {
+                Self::scan_expr_for_contract(tainted, &expr_stmt.value, direct, delegates);
+            }
+            Stmt::Assign(assign) => {
+                Self::scan_expr_for_contract(tainted, &assign.value, direct, delegates);
+                if Self::expr_forwards_tainted(tainted, &assign.value) {
+                    for target in &assign.targets {
+                        if let Expr::Name(t) = target {
+                            tainted.insert(t.id.to_string());
+                        }
+                    }
+                }
+            }
+            Stmt::AnnAssign(ann_assign) => {
+                if let Some(value) = &ann_assign.value {
+                    Self::scan_expr_for_contract(tainted, value, direct, delegates);
+                    if Self::expr_forwards_tainted(tainted, value) {
+                        if let Expr::Name(t) = &*ann_assign.target {
+                            tainted.insert(t.id.to_string());
+                        }
+                    }
+                }
+            }
+            Stmt::If(if_stmt) => {
+                Self::scan_expr_for_contract(tainted, &if_stmt.test, direct, delegates);
+                for s in &if_stmt.body {
+                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
+                }
+                for clause in &if_stmt.elif_else_clauses {
+                    for s in &clause.body {
+                        Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
+                    }
+                }
+            }
+            Stmt::For(for_stmt) => {
+                Self::scan_expr_for_contract(tainted, &for_stmt.iter, direct, delegates);
+                for s in &for_stmt.body {
+                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                Self::scan_expr_for_contract(tainted, &while_stmt.test, direct, delegates);
+                for s in &while_stmt.body {
+                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                for item in &with_stmt.items {
+                    Self::scan_expr_for_contract(tainted, &item.context_expr, direct, delegates);
+                }
+                for s in &with_stmt.body {
+                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Validate a call to a function with a known parameter contract (`self.param_requires`)
+    // against the tracked schema of its first positional argument.  Fires at the call
+    // site — pipeline.py, not inside the function itself — because that's where the
+    // argument's actual inferred schema is known.
+    fn check_call_requirements(
+        &self,
+        func_name: &str,
+        call: &ast::ExprCall,
+        line: usize,
+        col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Some((required, origin)) = self.param_requires.get(func_name) else {
+            return;
+        };
+        let Some(first_arg) = call.arguments.args.first() else {
+            return;
+        };
+        let Expr::Name(arg_name) = first_arg else {
+            return;
+        };
+        let Some((schema_name, _)) = self.variables.get(arg_name.id.as_str()) else {
+            return;
+        };
+        let Some(available) = self.schemas.get(schema_name) else {
+            return;
+        };
+        let missing: Vec<&String> = required.iter().filter(|c| !available.contains(c)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        let missing_str = missing
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let available_str = available.join(", ");
+        let required_str = required.join(", ");
+        errors.push(LintError {
+            line,
+            col,
+            code: CODE_MISSING_COLUMN.to_string(),
+            message: format!(
+                "'{}' passed to {} is missing column(s) {{{}}} — available: {{{}}}, required: {{{}}}",
+                arg_name.id.as_str(),
+                origin,
+                missing_str,
+                available_str,
+                required_str
+            ),
+            severity: "error".to_string(),
+        });
+    }
+
     // Validate any `pl.col("name")` / `col("name")` references in a call's arguments
     // against the schema of a tracked receiver variable.
     fn validate_pl_col_args_on_receiver(
@@ -1038,11 +1533,7 @@ impl Linter {
             .collect();
         for col_name in col_names {
             if !columns.contains(&col_name) {
-                let schema_display = if schema_name.starts_with("__inferred_") {
-                    format!("inferred column set (defined at line {})", defined_line)
-                } else {
-                    format!("{} (defined at line {})", schema_name, defined_line)
-                };
+                let schema_display = self.schema_display(&schema_name, defined_line);
                 let mut message =
                     format!("Column '{}' does not exist in {}", col_name, schema_display);
                 if let Some(suggestion) = find_best_match(&col_name, &columns) {
@@ -1073,11 +1564,7 @@ impl Linter {
         let Some((schema_name, def_line)) = base_info else {
             return;
         };
-        let schema_display = if schema_name.starts_with("__inferred_") {
-            format!("inferred column set (defined at line {})", def_line)
-        } else {
-            format!("{} (defined at line {})", schema_name, def_line)
-        };
+        let schema_display = self.schema_display(&schema_name, def_line);
         let Some(cols) = self.schemas.get(&schema_name).cloned() else {
             return;
         };
@@ -1302,6 +1789,8 @@ impl Linter {
                 }
             }
             Stmt::FunctionDef(func_def) => {
+                let (fn_def_line, _) = self.source_location(func_def.range().start());
+
                 // Track return type annotations like -> PandasFrame[Schema]
                 if let Some(returns) = &func_def.returns {
                     if let Some(schema_name) = Self::extract_schema_from_annotation(returns) {
@@ -1309,8 +1798,120 @@ impl Linter {
                             .insert(func_def.name.to_string(), schema_name.to_string());
                     }
                 }
+
+                // Schema-annotated parameters (`def f(df: PandasFrame[Schema])`,
+                // `Annotated[pd.DataFrame, Schema]`, or a quoted equivalent) get tracked
+                // in self.variables exactly like a local `df: PandasFrame[Schema] = ...`
+                // assignment would — so accesses inside the body are validated against
+                // the declared schema, the same as anywhere else in the file, rather
+                // than left unchecked just because the binding came from a parameter.
+                for p in func_def
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(func_def.parameters.args.iter())
+                    .chain(func_def.parameters.kwonlyargs.iter())
+                {
+                    if let Some(annotation) = &p.parameter.annotation {
+                        if let Some(schema_name) = Self::extract_schema_from_annotation(annotation)
+                        {
+                            self.variables.insert(
+                                p.parameter.name.id.to_string(),
+                                (schema_name.to_string(), fn_def_line),
+                            );
+                        }
+                    }
+                }
+
                 for body_stmt in &func_def.body {
                     self.visit_stmt(body_stmt, errors);
+                }
+                // If no annotation-based mapping, infer from `return <var>`.
+                // After visiting the body, self.variables holds the schema of every
+                // local variable; look up the returned one and register the function.
+                if !self.functions.contains_key(func_def.name.as_str()) {
+                    if let Some(var_name) = find_returned_var(&func_def.body) {
+                        if let Some((schema_name, _)) = self.variables.get(&var_name) {
+                            let schema_name = schema_name.clone();
+                            if self.schemas.contains_key(&schema_name) {
+                                self.functions
+                                    .insert(func_def.name.to_string(), schema_name);
+                            }
+                        }
+                    }
+                }
+                // Infer a column *contract* for the function's first parameter: every
+                // column subscripted directly off that parameter or a variable derived
+                // from it (`param["col"]`, or `x["col"]` where `x = param` / `x = f(param)`),
+                // plus every function this one delegates its own parameter to. The
+                // parameter itself carries no schema here — the caller's variable does —
+                // so this is only a requirement to check against later, not something we
+                // can validate inside the function body itself. Delegate targets are
+                // resolved to a *transitive* union only at the project-index level (see
+                // resolve_transitive_requires) — this pass records only the direct
+                // requirements and the raw delegate names.
+                //
+                // If the first parameter carries a schema annotation, its declared column
+                // list replaces the heuristic body-scan as the *direct* requirement — the
+                // annotation is an explicit, complete contract, whereas the body-scan is
+                // only a best-effort proxy used when no such contract exists. Delegates are
+                // still collected and unioned in as usual: columns a forwarded call needs
+                // only make the contract stricter, never wrong.
+                if let Some(first_param) = func_def
+                    .parameters
+                    .posonlyargs
+                    .first()
+                    .or_else(|| func_def.parameters.args.first())
+                {
+                    let param_name = first_param.parameter.name.id.as_str();
+                    let mut tainted = std::collections::HashSet::new();
+                    tainted.insert(param_name.to_string());
+                    let mut required = Vec::new();
+                    let mut delegates = Vec::new();
+                    for body_stmt in &func_def.body {
+                        Self::analyze_stmt_for_contract(
+                            body_stmt,
+                            &mut tainted,
+                            &mut required,
+                            &mut delegates,
+                        );
+                    }
+
+                    let annotated_cols = first_param
+                        .parameter
+                        .annotation
+                        .as_ref()
+                        .and_then(|a| Self::extract_schema_from_annotation(a))
+                        .and_then(|schema_name| self.schemas.get(schema_name).cloned());
+                    if let Some(cols) = annotated_cols {
+                        required = cols;
+                    }
+
+                    required.sort();
+                    required.dedup();
+                    delegates.sort();
+                    delegates.dedup();
+                    if !required.is_empty() || !delegates.is_empty() {
+                        self.requires
+                            .insert(func_def.name.to_string(), (required.clone(), fn_def_line));
+                        if !delegates.is_empty() {
+                            self.delegates.insert(func_def.name.to_string(), delegates);
+                        }
+                        // Local (same-file) callers only ever see the *direct* set here —
+                        // the transitive union (via delegates) is resolved once, project-wide,
+                        // in build_index_internal, and reaches other files' callers through
+                        // the cross-file entry (see load_cross_file_symbols).
+                        if !required.is_empty() {
+                            let origin = format!(
+                                "{} ({}:{})",
+                                func_def.name.as_str(),
+                                self.file_display,
+                                fn_def_line
+                            );
+                            self.param_requires
+                                .insert(func_def.name.to_string(), (required, origin));
+                        }
+                    }
                 }
             }
             Stmt::Assign(assign) => {
@@ -1357,18 +1958,8 @@ impl Linter {
                                     if !base_cols.is_empty() {
                                         for col in &cols {
                                             if !base_cols.contains(col) {
-                                                let schema_display =
-                                                    if base_schema.starts_with("__inferred_") {
-                                                        format!(
-                                                        "inferred column set (defined at line {})",
-                                                        base_def_line
-                                                    )
-                                                    } else {
-                                                        format!(
-                                                            "{} (defined at line {})",
-                                                            base_schema, base_def_line
-                                                        )
-                                                    };
+                                                let schema_display = self
+                                                    .schema_display(base_schema, *base_def_line);
                                                 errors.push(LintError {
                                                     line: current_line,
                                                     col: current_col,
@@ -1608,13 +2199,11 @@ impl Linter {
                                                         let schema_display = base_info
                                                             .as_ref()
                                                             .map(|(s, l)| {
-                                                                if s.starts_with("__inferred_") {
-                                                                    format!("inferred column set (defined at line {})", l)
-                                                                } else {
-                                                                    format!("{} (defined at line {})", s, l)
-                                                                }
+                                                                self.schema_display(s, *l)
                                                             })
-                                                            .unwrap_or_else(|| "unknown".to_string());
+                                                            .unwrap_or_else(|| {
+                                                                "unknown".to_string()
+                                                            });
                                                         errors.push(LintError {
                                                             line: current_line,
                                                             col: current_col,
@@ -1684,13 +2273,7 @@ impl Linter {
                                                 if !base_cols.contains(col) {
                                                     let schema_display = base_info
                                                         .as_ref()
-                                                        .map(|(s, l)| {
-                                                            if s.starts_with("__inferred_") {
-                                                                format!("inferred column set (defined at line {})", l)
-                                                            } else {
-                                                                format!("{} (defined at line {})", s, l)
-                                                            }
-                                                        })
+                                                        .map(|(s, l)| self.schema_display(s, *l))
                                                         .unwrap_or_else(|| "unknown".to_string());
                                                     errors.push(LintError {
                                                         line: current_line,
@@ -1763,16 +2346,7 @@ impl Linter {
                                         (Some(base_cols), Some(mapping)) => {
                                             let schema_display = base_info
                                                 .as_ref()
-                                                .map(|(s, l)| {
-                                                    if s.starts_with("__inferred_") {
-                                                        format!(
-                                                            "inferred column set (defined at line {})",
-                                                            l
-                                                        )
-                                                    } else {
-                                                        format!("{} (defined at line {})", s, l)
-                                                    }
-                                                })
+                                                .map(|(s, l)| self.schema_display(s, *l))
                                                 .unwrap_or_else(|| "unknown".to_string());
                                             for old_col in mapping.keys() {
                                                 if !base_cols.contains(old_col) {
@@ -2054,6 +2628,15 @@ impl Linter {
                                 }
                             }
                         }
+                        // Validate the call's first argument against the callee's
+                        // parameter contract, e.g. `trimmed = trim_customers(customers)`.
+                        self.check_call_requirements(
+                            func_name.id.as_str(),
+                            call,
+                            current_line,
+                            current_col,
+                            errors,
+                        );
                     }
                 }
                 for target in &assign.targets {
@@ -2214,6 +2797,17 @@ impl Linter {
                                 errors,
                             );
                         }
+                    } else if let Expr::Name(func_name) = &*call.func {
+                        // Bare call statement, e.g. `trim_customers(customers)` with no
+                        // assignment — still validate against the callee's parameter contract.
+                        let (line, col) = self.source_location(call.range().start());
+                        self.check_call_requirements(
+                            func_name.id.as_str(),
+                            call,
+                            line,
+                            col,
+                            errors,
+                        );
                     }
                 }
                 self.visit_expr(&expr_stmt.value, errors);
@@ -2235,6 +2829,16 @@ impl Linter {
                             }
                         }
                     }
+                }
+            }
+            // `return <expr>` was never dispatched to visit_expr at all — a completely
+            // separate gap from the BinOp/keyword-arg recursion fixed in visit_expr itself.
+            // Any column access whose only appearance is in a return statement (extremely
+            // common for small helper functions, e.g. `return df["a"] + df["bad"]`) was
+            // silently invisible to validation.
+            Stmt::Return(ret) => {
+                if let Some(value) = &ret.value {
+                    self.visit_expr(value, errors);
                 }
             }
             _ => {}
@@ -2321,14 +2925,8 @@ impl Linter {
                                 && !RESERVED_METHODS.contains(&attr_name)
                             {
                                 let (line, col) = self.source_location(attr.range().start());
-                                let schema_display = if schema_name.starts_with("__inferred_") {
-                                    format!(
-                                        "inferred column set (defined at line {})",
-                                        defined_line
-                                    )
-                                } else {
-                                    format!("{} (defined at line {})", schema_name, defined_line)
-                                };
+                                let schema_display =
+                                    self.schema_display(schema_name, *defined_line);
                                 let mut message = format!(
                                     "Column '{}' does not exist in {}",
                                     attr_name, schema_display
@@ -2358,17 +2956,8 @@ impl Linter {
                                 if !columns.iter().any(|c| c == col_name) {
                                     let (line, col) =
                                         self.source_location(subscript.range().start());
-                                    let schema_display = if schema_name.starts_with("__inferred_") {
-                                        format!(
-                                            "inferred column set (defined at line {})",
-                                            defined_line
-                                        )
-                                    } else {
-                                        format!(
-                                            "{} (defined at line {})",
-                                            schema_name, defined_line
-                                        )
-                                    };
+                                    let schema_display =
+                                        self.schema_display(schema_name, *defined_line);
                                     let mut message = format!(
                                         "Column '{}' does not exist in {}",
                                         col_name, schema_display
@@ -2398,6 +2987,12 @@ impl Linter {
                 for arg in call.arguments.args.iter() {
                     self.visit_expr(arg, errors);
                 }
+                // Keyword arguments (e.g. `.assign(amount_vat=public["amount"] * 1.2)`)
+                // carry column accesses just as often as positional ones — must be
+                // checked too, not just skipped as "the method name".
+                for kw in call.arguments.keywords.iter() {
+                    self.visit_expr(&kw.value, errors);
+                }
                 // When the callee is `receiver.method(...)`, do not check the method name
                 // as a column access — only recurse into the receiver so that any column
                 // accesses nested there (e.g. `df.col.method()`) are still found.
@@ -2405,6 +3000,39 @@ impl Linter {
                     self.visit_expr(&attr.value, errors);
                 } else {
                     self.visit_expr(&call.func, errors);
+                }
+            }
+            // Column accesses nested inside arithmetic, boolean, comparison, or
+            // literal-collection expressions (`df["a"] + df["b"]`, `df["x"] > 0`,
+            // `[df["a"], df["b"]]`, …) must still be recursed into — otherwise any
+            // access wrapped in one of these silently escapes validation entirely,
+            // regardless of whether it's schema-based, inferred, or contract-based.
+            Expr::BinOp(binop) => {
+                self.visit_expr(&binop.left, errors);
+                self.visit_expr(&binop.right, errors);
+            }
+            Expr::BoolOp(boolop) => {
+                for v in &boolop.values {
+                    self.visit_expr(v, errors);
+                }
+            }
+            Expr::UnaryOp(unary) => {
+                self.visit_expr(&unary.operand, errors);
+            }
+            Expr::Compare(compare) => {
+                self.visit_expr(&compare.left, errors);
+                for comp in compare.comparators.iter() {
+                    self.visit_expr(comp, errors);
+                }
+            }
+            Expr::List(list) => {
+                for el in &list.elts {
+                    self.visit_expr(el, errors);
+                }
+            }
+            Expr::Tuple(tuple) => {
+                for el in &tuple.elts {
+                    self.visit_expr(el, errors);
                 }
             }
             _ => {}
@@ -2540,6 +3168,517 @@ print(df["emai"])
         assert!(errors[0].message.contains("UserSchema"));
         assert!(errors[1].message.contains("emai"));
         assert!(errors[1].message.contains("did you mean 'email'"));
+    }
+
+    #[test]
+    fn test_should_detect_missing_column_at_direct_call_site() {
+        // arrange: postproc requires "c" directly off its own parameter; the caller's
+        // loader only provides {a, b}.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load
+from steps import postproc
+
+def process(path: str) -> None:
+    df = load(path)
+    result = postproc(df)
+    print(result)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("missing column(s) {c}"));
+        assert!(errors[0].message.contains("available: {a, b}"));
+        assert!(errors[0].message.contains("required: {c}"));
+        assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    #[test]
+    fn test_should_resolve_transitive_requires_through_delegate_chain() {
+        // arrange: transform has no direct subscript access of its own — it only
+        // delegates df through preproc -> infer -> postproc, which together need
+        // {a, b, c}. The loader only supplies {a, b}, so 'c' should surface as a
+        // missing-column error at the `transform(df)` call site in pipeline.py,
+        // even though 'c' is only referenced two hops down, inside postproc.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    z = df["a"]
+    return df
+
+def infer(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["b"]
+    return df
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+
+def transform(df: pd.DataFrame) -> pd.DataFrame:
+    step1 = preproc(df)
+    step2 = infer(step1)
+    step3 = postproc(step2)
+    return step3
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load
+from steps import transform
+
+def process(path: str) -> None:
+    df = load(path)
+    result = transform(df)
+    print(result)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("missing column(s) {c}"));
+        assert!(errors[0].message.contains("required: {a, b, c}"));
+        assert!(errors[0].message.contains("passed to transform"));
+    }
+
+    #[test]
+    fn test_should_not_flag_call_when_all_required_columns_present() {
+        // arrange: same delegate chain as above, but the loader supplies {a, b, c} —
+        // a strict superset of everything preproc/infer/postproc need.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b", "c"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    z = df["a"]
+    return df
+
+def infer(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["b"]
+    return df
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+
+def transform(df: pd.DataFrame) -> pd.DataFrame:
+    step1 = preproc(df)
+    step2 = infer(step1)
+    step3 = postproc(step2)
+    return step3
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load
+from steps import transform
+
+def process(path: str) -> None:
+    df = load(path)
+    result = transform(df)
+    print(result)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_hang_on_mutually_delegating_functions() {
+        // arrange: f and g delegate to each other — a cycle in the delegate graph.
+        // Resolution must terminate (cycle guard) rather than recursing forever.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def f(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["a"]
+    return g(df)
+
+def g(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["b"]
+    return f(df)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: both functions resolved without hanging, each contributing at
+        // least its own direct requirement.
+        let steps_path = root.join("steps.py").to_str().unwrap().to_string();
+        let entry = index.files.get(&steps_path).expect("steps.py indexed");
+        let f_requires = &entry.functions.get("f").expect("f indexed").requires;
+        let g_requires = &entry.functions.get("g").expect("g indexed").requires;
+        assert!(f_requires.contains(&"a".to_string()));
+        assert!(g_requires.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_should_validate_schema_annotated_parameter_in_body() {
+        // arrange: contact_label's parameter is explicitly annotated with
+        // CustomerSchema, which does not declare "email" — the bad access should
+        // be caught inside the function body itself, standalone, no caller or
+        // project index involved.
+        let source = r#"
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=int)
+    name = Column(type=str)
+
+def contact_label(customers: PandasFrame[CustomerSchema]):
+    print(customers["name"])
+    print(customers["email"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert!(errors[0].message.contains("email"));
+        assert!(errors[0].message.contains("CustomerSchema"));
+    }
+
+    #[test]
+    fn test_should_use_schema_annotation_as_call_site_requirement() {
+        // arrange: contact_label's parameter is annotated with CustomerSchema, which
+        // declares {customer_id, name, email} — but the body only ever subscripts
+        // "name". The call-site contract must still require all three columns (the
+        // annotation is authoritative), not just the one the body happens to touch,
+        // so a caller missing "email" is flagged even though nothing in
+        // contact_label's body literally writes customers["email"].
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["customer_id", "name"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("transforms.py"),
+            r#"
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=int)
+    name = Column(type=str)
+    email = Column(type=str)
+
+def contact_label(customers: PandasFrame[CustomerSchema]):
+    print(customers["name"])
+    return customers
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load
+from transforms import contact_label
+
+def process(path: str) -> None:
+    customers = load(path)
+    contact_label(customers)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("missing column(s) {email}"));
+        assert!(errors[0]
+            .message
+            .contains("required: {customer_id, email, name}"));
+    }
+
+    #[test]
+    fn test_should_validate_cross_file_schema_annotated_parameter_in_body() {
+        // arrange: CustomerSchema lives in its own schemas.py, imported into
+        // transforms.py and used as a parameter annotation there — confirms that
+        // in-body validation (fix a) works across a file boundary too, not just
+        // when the schema is defined in the same file as the function using it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=int)
+    name = Column(type=str)
+    email = Column(type=str)
+"#,
+        )
+        .unwrap();
+        let transforms_source = r#"
+from typedframes.pandas import PandasFrame
+from schemas import CustomerSchema
+
+def contact_label(customers: PandasFrame[CustomerSchema]):
+    print(customers["name"])
+    print(customers["not_a_real_column"])
+    return customers
+"#;
+        fs::write(root.join("transforms.py"), transforms_source).unwrap();
+
+        // act: check transforms.py itself, as part of a directory scan (with index)
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let transforms_path = root.join("transforms.py");
+        linter.load_cross_file_symbols(&index, transforms_source, &transforms_path, root);
+        let errors = linter
+            .check_file_internal(transforms_source, &transforms_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "unknown-column");
+        assert!(errors[0].message.contains("not_a_real_column"));
+        assert!(errors[0].message.contains("CustomerSchema"));
+    }
+
+    #[test]
+    fn test_should_track_column_list_slice_as_requirement() {
+        // arrange: preproc narrows df to {a, b} via a list-slice. That narrowing
+        // itself is a genuine requirement on df's caller (a, b must be present).
+        let source = r#"
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    slim = df[["a", "b"]]
+    return slim
+"#;
+        let mut linter = Linter::new();
+        let _ = linter.check_file_internal(source, Path::new("preproc.py"));
+
+        // assert
+        let (required, _) = linter
+            .requires
+            .get("preproc")
+            .expect("preproc should have a recorded requirement");
+        assert_eq!(required, &vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_should_not_leak_narrowed_variable_misuse_into_caller_requirement() {
+        // arrange: `slim = df[["a", "b"]]` gives slim a fully known schema {a, b}
+        // (via the existing multi-column-subscript tracking) — a later `slim["c"]`
+        // is therefore a certain, local bug in preproc itself, not an ambiguous
+        // "maybe missing from the caller" requirement. It must be caught as a
+        // direct unknown-column error, and must NOT also inflate preproc's
+        // caller-facing contract to {a, b, c} — df's caller only ever needs to
+        // supply {a, b}; 'c' is preproc's own mistake in how it uses slim.
+        let source = r#"
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    slim = df[["a", "b"]]
+    z = slim["c"]
+    return slim
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("preproc.py"))
+            .unwrap();
+
+        // assert: caught locally as a certain bug ...
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "unknown-column");
+        assert!(errors[0].message.contains("'c'"));
+        assert!(errors[0].message.contains("{a, b}"));
+
+        // ... and NOT folded into the ambiguous caller-facing contract.
+        let (required, _) = linter
+            .requires
+            .get("preproc")
+            .expect("preproc should have a recorded requirement");
+        assert_eq!(required, &vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_should_resolve_transitive_requires_with_list_slice_delegate() {
+        // arrange: same delegate chain as
+        // test_should_resolve_transitive_requires_through_delegate_chain, but
+        // preproc uses a list-slice (`df[["a"]]`) instead of a single-string
+        // subscript — this is the exact pattern that originally slipped through
+        // the direct-requirement scan.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def preproc(df: pd.DataFrame) -> pd.DataFrame:
+    return df[["a"]]
+
+def infer(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["b"]
+    return df
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+
+def transform(df: pd.DataFrame) -> pd.DataFrame:
+    step1 = preproc(df)
+    step2 = infer(step1)
+    step3 = postproc(step2)
+    return step3
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load
+from steps import transform
+
+def process(path: str) -> None:
+    df = load(path)
+    result = transform(df)
+    print(result)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: 'a' now correctly contributes via preproc's list-slice, alongside
+        // 'b' and 'c' from infer/postproc.
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("required: {a, b, c}"));
     }
 
     #[test]

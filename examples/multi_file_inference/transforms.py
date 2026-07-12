@@ -1,111 +1,53 @@
-"""Data transformations — column sets propagate through method chains.
+"""Data transformations that operate on pre-loaded DataFrames.
 
-The checker tracks how each structural operation modifies the inferred column
-set and validates every downstream access against the updated set.
+Functions here accept plain ``pd.DataFrame`` / ``pl.DataFrame`` parameters —
+there is no schema attached to a bare parameter type, so the checker cannot
+validate column accesses on ``orders`` or ``customers`` *inside* these
+functions.
 
-Structural operations and their effect on the inferred column set:
+But typedframes still infers a *contract*: every column a function
+subscripts directly off its first parameter (``param["col"]``) becomes a
+requirement. When pipeline.py calls one of these functions with a variable
+whose inferred schema is known, the checker checks that schema against the
+function's requirements — and reports a mismatch at the call site, since
+that's where the actual columns are known.
 
-    Operation                        Effect
-    ─────────────────────────────────────────────────────────────
-    df[["a", "b"]]                   narrowed to {a, b}
-    df.rename(columns={"a": "z"})    "a" removed, "z" added
-    df.drop(columns=["a"])           "a" removed
-    df.assign(x=...)                 "x" added
-    df.select(["a"])            (pl) narrowed to {a}
-    df.drop(["a"])              (pl) "a" removed
-
-Row-preserving operations (filter, query, sort_values, head, tail, dropna, …)
-pass the column set through unchanged.
+``contact_label`` below requires "email", which loaders.py's
+``load_customers`` never selects — see pipeline.py for the resulting error.
 """
 
 from __future__ import annotations
 
-import pandas as pd
-import polars as pl
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import polars as pl
 
 AMOUNT_THRESHOLD = 500
 
 
-# ---------------------------------------------------------------------------
-# rename / drop / assign chain (pandas)
-# ---------------------------------------------------------------------------
-
-
-def normalise_orders(path: str) -> pd.DataFrame:
-    """Rename, drop, and enrich an orders frame — checker follows every step."""
-    # Checker infers {order_id, customer_id, amount, status}
-    orders = pd.read_csv(path, usecols=["order_id", "customer_id", "amount", "status"])
-
-    # rename: customer_id → user_id  (checker removes "customer_id", adds "user_id")
+def normalise_orders(orders: pd.DataFrame) -> pd.DataFrame:
+    """Rename customer_id → user_id, drop status, add amount_vat."""
     renamed = orders.rename(columns={"customer_id": "user_id"})
-    print(renamed["user_id"])  # ✓ OK — new name
-    # Accessing renamed["customer_id"] would error: 'customer_id' renamed to 'user_id'
-
-    # drop: remove status — not needed downstream
     public = renamed.drop(columns=["status"])
-    print(public["order_id"])  # ✓ OK
-    # Accessing public["status"] would error: 'status' was dropped
-
-    # assign: add a derived column — checker adds it to the inferred set
-    enriched = public.assign(amount_vat=public["amount"] * 1.2)
-    print(enriched["amount_vat"])  # ✓ OK — newly added
-    # Accessing enriched["discount"] would error: 'discount' not in inferred set
-
-    return enriched
+    return public.assign(amount_vat=public["amount"] * 1.2)
 
 
-# ---------------------------------------------------------------------------
-# Multi-column subscript narrowing (pandas)
-# ---------------------------------------------------------------------------
-
-
-def slim_for_report(path: str) -> pd.DataFrame:
-    """Slice to a subset of columns — inferred set narrows accordingly."""
-    orders = pd.read_csv(path, usecols=["order_id", "customer_id", "amount", "status"])
-
-    # Subscript with a list — inferred set narrows to {order_id, amount}
+def slim_for_report(orders: pd.DataFrame) -> pd.DataFrame:
+    """Narrow to {order_id, amount} and filter by threshold."""
     slim = orders[["order_id", "amount"]]
-    print(slim["order_id"])  # ✓ OK
-    # Accessing slim["customer_id"] would error: 'customer_id' not in sliced set
-
-    # Row filter — column set passes through unchanged
-    big = slim[slim["amount"] > AMOUNT_THRESHOLD]
-    print(big["amount"])  # ✓ OK — still {order_id, amount}
-    # Accessing big["status"] would error: 'status' not in sliced set
-
-    return big
+    return slim[slim["amount"] > AMOUNT_THRESHOLD]
 
 
-# ---------------------------------------------------------------------------
-# select / drop chain (polars)
-# ---------------------------------------------------------------------------
+def contact_label(customers: pl.DataFrame) -> pl.DataFrame:
+    """Build a display label from name + email.
 
-
-def polars_pipeline(path: str) -> pl.DataFrame:
-    """Polars: select() narrows, drop() removes — checker tracks both."""
-    customers = pl.read_csv(path, columns=["customer_id", "name", "region", "tier"])
-
-    # select() — inferred set narrows to {customer_id, name}
-    small = customers.select(["customer_id", "name"])
-    print(small["customer_id"])  # ✓ OK
-    # Accessing small["region"] would error: 'region' not in selected set
-
-    # drop() on the original — inferred set becomes {customer_id, name, region}
-    trimmed = customers.drop(["tier"])
-    print(trimmed["region"])  # ✓ OK
-    # Accessing trimmed["tier"] would error: 'tier' was dropped
-
-    return trimmed
-
-
-def drop_then_reuse(path: str) -> pd.DataFrame:
-    """Accesses a column that was dropped earlier in the chain — mutation tracking.
-
-    mypy and ty see each intermediate variable as ``pd.DataFrame`` and accept
-    any ``str`` subscript.  typedframes tracks the drop and reports unknown-column on the
-    stale access.
+    Requires {name, email} on the frame passed in. loaders.py's
+    load_customers only selects {customer_id, name, region} — no email —
+    so this raises a KeyError at runtime when called from pipeline.py.
+    typedframes' function-contract check catches the mismatch at the
+    call site instead.
     """
-    orders = pd.read_csv(path, usecols=["order_id", "customer_id", "amount"])
-    trimmed = orders.drop(columns=["customer_id"])
-    print(trimmed["customer_id"])  # ✗ unknown-column — 'customer_id' was dropped
-    return trimmed
+    labels = customers["name"] + " <" + customers["email"] + ">"
+    return customers.with_columns(labels.alias("contact_label"))

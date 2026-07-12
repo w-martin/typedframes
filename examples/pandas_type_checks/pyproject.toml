@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "mypy>=2.1.0",
     "pandas>=3.0.3",
+    "pandas-stubs>=3.0.0",
     "pandas-type-checks>=1.1.0",
     "typedframes[mypy]>=0.2.1",
 ]

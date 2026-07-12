@@ -745,7 +745,7 @@ impl Linter {
         matches!(name, "DataFrame" | "PandasFrame" | "PolarsFrame")
     }
 
-    // Extract schema name from a type annotation like PandasFrame[Schema]
+    // Extract schema name from a type annotation like PandasFrame[Schema] or Annotated[pd.DataFrame, Schema]
     fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Subscript(subscript) => {
@@ -758,6 +758,16 @@ impl Linter {
                     if Self::is_frame_type(name) {
                         if let Expr::Name(schema_name) = &*subscript.slice {
                             return Some(schema_name.id.as_str());
+                        }
+                    }
+                    // Handle Annotated[pd.DataFrame, Schema] — schema is second tuple element
+                    if name == "Annotated" {
+                        if let Expr::Tuple(tuple) = &*subscript.slice {
+                            if tuple.elts.len() >= 2 {
+                                if let Expr::Name(schema_name) = &tuple.elts[1] {
+                                    return Some(schema_name.id.as_str());
+                                }
+                            }
                         }
                     }
                 }

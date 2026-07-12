@@ -159,7 +159,7 @@ typedframes check test_plugin.py --strict
 
 ## Actual Test Results
 
-### StaticFrame v4.1.0
+### StaticFrame v5.0.0
 
 **Question:** Does mypy catch `df['custmer_name']` typo with StaticFrame?
 

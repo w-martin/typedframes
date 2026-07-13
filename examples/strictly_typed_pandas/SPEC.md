@@ -3,7 +3,7 @@
 ## Setup
 
 - **stp version**: 0.3.7
-- **typedframes version**: 0.3.0
+- **typedframes version**: 0.3.1
 - **pandas**: 2.2.3
 - **polars**: 1.41.2
 - **mypy**: 2.1.0

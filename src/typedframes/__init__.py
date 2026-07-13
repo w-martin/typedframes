@@ -37,7 +37,7 @@ Usage:
     df.filter(UserSchema.user_id.col > 10)  # ✓ Refactor-safe polars expression
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 from .base_schema import BaseSchema as BaseSchema
 from .column import Column as Column

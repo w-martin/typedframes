@@ -34,17 +34,12 @@ class CustomerSchema(BaseSchema):
     region = Column(type=str)
 
 
-class ReportSchema(BaseSchema):
+class ReportSchema(OrderSchema, CustomerSchema):
     """Schema for the joined reporting view.
 
     Composes OrderSchema and CustomerSchema via multiple inheritance — the
-    checker inherits all columns from both parents automatically.
+    checker inherits all columns from both parents automatically, so only
+    the new column needs to be declared here.
     """
 
-    order_id = Column(type=int)
-    customer_id = Column(type=int)
-    amount = Column(type=float)
-    status = Column(type=str)
-    name = Column(type=str)
-    region = Column(type=str)
     amount_vat = Column(type=float)

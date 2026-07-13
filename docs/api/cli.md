@@ -49,6 +49,8 @@ which columns are available, regardless of file format.
 src/pipeline.py:42:8: error[unknown-column] Column 'revenue' not in OrderSchema
 src/pipeline.py:57:8: error[reserved-name] Column 'user_id' renamed to 'customer_id', use 'customer_id'
 src/pipeline.py:10:1: warning[untracked-dataframe] columns unknown at lint time; specify usecols= or annotate
+src/pipeline.py:12:5: error[missing-column] 'customers' passed to contact_label (transforms.py:2) is missing
+  column(s) {email} — available: {customer_id, name, region}, required: {email, name}
 ```
 
 The format matches ty and ruff: `file:line:col: severity[code] message`. Most editors,
@@ -63,6 +65,7 @@ is a terminal (TTY); piping or redirecting strips them.
 | `reserved-name` | Column was renamed — use the new name | Always shown |
 | `untracked-dataframe` | Bare DataFrame load — no column info for checker | Off (use `--strict-ingest`) |
 | `dropped-unknown-column` | Dropped column doesn't exist in schema | Off (use `--strict-ingest`) |
+| `missing-column` | Argument's columns don't satisfy the called function's parameter contract | Always shown |
 
 ## Project-level configuration
 

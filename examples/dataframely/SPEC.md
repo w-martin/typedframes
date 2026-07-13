@@ -17,7 +17,7 @@ This directory contains comparison examples showing the differences between **da
 - **dataframely**: 2.13.0
 - **polars**: 1.42.1
 - **mypy**: 2.2.0
-- **typedframes**: 0.2.2
+- **typedframes**: 0.3.0
 
 ## Files
 

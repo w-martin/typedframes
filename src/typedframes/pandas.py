@@ -61,7 +61,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
             **kwargs: Additional arguments passed to pd.DataFrame.
 
         """
-        super().__init__(data, **kwargs)
+        super().__init__(data, **kwargs)  # ty: ignore[too-many-positional-arguments]
         self._schema_class = schema
         self._column_consumed_map = column_consumed_map or {}
 
@@ -246,7 +246,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
                 **kwargs,
             )
 
-        return constructor  # type: ignore[return-value]
+        return constructor  # ty: ignore[invalid-return-type]
 
     @property
     def _constructor_sliced(self) -> type[pd.Series]:

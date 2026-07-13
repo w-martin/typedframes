@@ -68,6 +68,11 @@ def load_orders(path: str) -> Annotated[pd.DataFrame, OrderSchema]:
 Now every file that calls `load_orders()` has its column access validated against `OrderSchema` —
 without any annotation in the calling file.
 
+**Across function boundaries** — the checker also infers a *contract* for any function's first
+parameter (the columns it needs) and validates it at every call site, even through chains of helper
+functions that only forward the parameter along. See [Usage Guide § Function parameter
+contracts](usage.md#function-parameter-contracts-missing-column) for the full picture.
+
 ## Installation
 
 ```shell

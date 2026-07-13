@@ -100,7 +100,7 @@ def get_age(df: Annotated[pd.DataFrame, AgeSchema]) -> pd.Series:
 ## Versions
 
 - Great Expectations: 1.18.0 (installed: v1.4.0+ requirement matches)
-- typedframes: 0.2.1
+- typedframes: 0.3.0
 - pandas: 3.0.3
 - mypy: 2.1.0
 

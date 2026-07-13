@@ -34,7 +34,11 @@ def main() -> None:
     # Passing wrong schema to function
     # We load users (UserSchema) but pass to function expecting orders (OrderSchema)
     users = load_users()
-    process_orders(users)  # mypy catches this as DataFrame type mismatch
+    process_orders(users)
+    # mypy catches this as a DataFrame type mismatch. typedframes' standalone
+    # checker independently catches it too, via missing-column: process_orders'
+    # OrderSchema-annotated parameter requires {order_id, amount}, but 'users'
+    # only carries {user_id, email} — no type checker needed for this one.
 
     # Issue 1: Accessing non-existent column
     users = load_users()

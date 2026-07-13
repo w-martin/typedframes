@@ -204,6 +204,13 @@ struct IndexFunction {
     // variable derived from it) as their first positional argument. Consumed only by
     // resolve_transitive_requires; not needed once `requires` has been resolved.
     delegates: Vec<String>,
+    // Schema name from the first parameter's annotation, e.g. "ReportSchema" from
+    // `Annotated[pl.DataFrame, ReportSchema]`; empty if the parameter isn't
+    // schema-annotated. Captured at index time regardless of whether the schema is
+    // resolvable yet (it may be defined in a third file) — resolve_transitive_requires
+    // resolves it project-wide and overrides `requires` with the authoritative column
+    // list once every file's schemas are known, superseding the heuristic body-scan.
+    param_schema_name: String,
 }
 
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
@@ -264,12 +271,13 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
     let _ = linter.check_file_internal(&source, path);
 
     let schemas = linter.schemas;
-    // Union function names across the return-schema, requires, and delegates maps —
-    // a function may appear in any subset of the three.
+    // Union function names across the return-schema, requires, delegates, and
+    // param-schema-name maps — a function may appear in any subset of the four.
     let mut func_names: std::collections::BTreeSet<String> =
         linter.functions.keys().cloned().collect();
     func_names.extend(linter.requires.keys().cloned());
     func_names.extend(linter.delegates.keys().cloned());
+    func_names.extend(linter.param_schema_names.keys().cloned());
     let functions: HashMap<String, IndexFunction> = func_names
         .into_iter()
         .map(|name| {
@@ -280,6 +288,18 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
                 .cloned()
                 .unwrap_or((Vec::new(), 0));
             let delegates = linter.delegates.get(&name).cloned().unwrap_or_default();
+            let (param_schema_name, param_def_line) = linter
+                .param_schema_names
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            // def_line may only be known via param_schema_names if this function had
+            // no direct requires/delegates of its own (see the gate in visit_stmt).
+            let def_line = if def_line == 0 {
+                param_def_line
+            } else {
+                def_line
+            };
             (
                 name,
                 IndexFunction {
@@ -288,6 +308,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
                     requires,
                     def_line,
                     delegates,
+                    param_schema_name,
                 },
             )
         })
@@ -349,8 +370,43 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
             }
         }
     }
+    resolve_param_schema_requires(&mut files);
     resolve_transitive_requires(project_root, &mut files);
     ProjectIndex { version: 1, files }
+}
+
+// Resolve each function's `param_schema_name` (the schema its first parameter is
+// annotated with, e.g. `Annotated[pl.DataFrame, ReportSchema]`) to that schema's
+// actual column list, overriding the heuristic body-scan `requires` with the
+// authoritative one. Must run project-wide, after every file is indexed: the schema
+// may be defined in a THIRD file — neither the one containing the function nor the
+// one importing it — so a single file's own Linter pass (see visit_stmt) often can't
+// resolve it locally. Runs before resolve_transitive_requires so that functions
+// delegating to a schema-annotated one inherit the authoritative set, not the
+// heuristic fallback.
+fn resolve_param_schema_requires(files: &mut HashMap<String, IndexEntry>) {
+    let mut all_schemas: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in files.values() {
+        for (name, cols) in &entry.schemas {
+            all_schemas
+                .entry(name.clone())
+                .or_insert_with(|| cols.clone());
+        }
+    }
+
+    for entry in files.values_mut() {
+        for func in entry.functions.values_mut() {
+            if func.param_schema_name.is_empty() {
+                continue;
+            }
+            if let Some(cols) = all_schemas.get(&func.param_schema_name) {
+                let mut cols = cols.clone();
+                cols.sort();
+                cols.dedup();
+                func.requires = cols;
+            }
+        }
+    }
 }
 
 // A function identified by the file that defines it and its name within that file.
@@ -766,6 +822,7 @@ pub struct Linter {
     requires: HashMap<String, (Vec<String>, usize)>, // func_name -> (direct required cols on 1st param, def line)
     delegates: HashMap<String, Vec<String>>, // func_name -> names called with its own (tainted) param forwarded
     param_requires: HashMap<String, (Vec<String>, String)>, // func_name -> (required cols, origin "func (path:line)")
+    param_schema_names: HashMap<String, (String, usize)>, // func_name -> (first-param schema annotation name, def line)
     line_index: Option<LineIndex>,
     source: String,
     file_display: String, // absolute-ish path of the file currently being linted
@@ -831,6 +888,7 @@ impl Linter {
             requires: HashMap::new(),
             delegates: HashMap::new(),
             param_requires: HashMap::new(),
+            param_schema_names: HashMap::new(),
             line_index: None,
             source: String::new(),
             file_display: String::new(),
@@ -905,6 +963,23 @@ impl Linter {
         _file_path: &Path,
         project_root: &Path,
     ) {
+        // A function's return-type schema (or a parameter's schema annotation) may be
+        // defined in a THIRD file — neither the function's own file nor the file
+        // importing the function. E.g. schemas.py defines CustomerSchema, loaders.py's
+        // load_customers() returns Annotated[pd.DataFrame, CustomerSchema], and
+        // pipeline.py imports only load_customers, not CustomerSchema directly. Looking
+        // the schema up only in the function's own file's entry (as opposed to
+        // project-wide) would silently fail in that case — no error, but no validation
+        // either, since self.schemas would never learn CustomerSchema's columns. Build
+        // a project-wide name -> columns registry once so every schema resolves
+        // regardless of which file happens to define it.
+        let mut all_schemas: HashMap<&str, &Vec<String>> = HashMap::new();
+        for entry in index.files.values() {
+            for (name, cols) in &entry.schemas {
+                all_schemas.entry(name.as_str()).or_insert(cols);
+            }
+        }
+
         let Ok(parsed) = parse_module(source) else {
             return;
         };
@@ -950,9 +1025,9 @@ impl Linter {
                         self.functions
                             .insert(name.to_string(), func.returns_schema.clone());
                     }
-                    if let Some(schema_cols) = entry.schemas.get(&func.returns_schema) {
+                    if let Some(schema_cols) = all_schemas.get(func.returns_schema.as_str()) {
                         self.schemas
-                            .insert(func.returns_schema.clone(), schema_cols.clone());
+                            .insert(func.returns_schema.clone(), (*schema_cols).clone());
                         // Record origin so error messages point back to the source function/file.
                         // The inferred schema name encodes the definition line as
                         // `__inferred_<var>_at_<line>`, so we can surface the exact
@@ -1877,11 +1952,23 @@ impl Linter {
                         );
                     }
 
-                    let annotated_cols = first_param
+                    // Capture the annotation's schema *name* unconditionally, even when
+                    // it can't be resolved to columns yet (the schema may live in a
+                    // third file, not yet visible to this single-file Linter pass).
+                    // resolve_transitive_requires resolves it project-wide once every
+                    // file's schemas are known — see param_schema_name on IndexFunction.
+                    let annotation_schema_name: Option<String> = first_param
                         .parameter
                         .annotation
                         .as_ref()
                         .and_then(|a| Self::extract_schema_from_annotation(a))
+                        .map(|s| s.to_string());
+                    if let Some(name) = &annotation_schema_name {
+                        self.param_schema_names
+                            .insert(func_def.name.to_string(), (name.clone(), fn_def_line));
+                    }
+                    let annotated_cols = annotation_schema_name
+                        .as_deref()
                         .and_then(|schema_name| self.schemas.get(schema_name).cloned());
                     if let Some(cols) = annotated_cols {
                         required = cols;
@@ -3549,6 +3636,130 @@ def contact_label(customers: PandasFrame[CustomerSchema]):
         assert_eq!(errors[0].code, "unknown-column");
         assert!(errors[0].message.contains("not_a_real_column"));
         assert!(errors[0].message.contains("CustomerSchema"));
+    }
+
+    #[test]
+    fn test_should_validate_variable_whose_schema_is_defined_in_a_third_file() {
+        // arrange: schemas.py defines CustomerSchema; loaders.py's load_customers()
+        // returns Annotated[pd.DataFrame, CustomerSchema] but does NOT itself define
+        // or re-export CustomerSchema; pipeline.py imports only load_customers, never
+        // CustomerSchema directly. Before the fix, self.schemas never learned
+        // CustomerSchema's columns in pipeline.py's context (load_cross_file_symbols
+        // only looked in load_customers' OWN file's entry, which doesn't have it), so
+        // ANY access on `customers` silently skipped validation — no false positives,
+        // but also no true positives. This must now be caught.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=int)
+    name = Column(type=str)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+from typing import Annotated
+import pandas as pd
+from schemas import CustomerSchema
+
+def load_customers(path: str) -> Annotated[pd.DataFrame, CustomerSchema]:
+    return pd.read_csv(path, usecols=["customer_id", "name"])
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load_customers
+
+def process(path: str) -> None:
+    customers = load_customers(path)
+    print(customers["not_a_real_column"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "unknown-column");
+        assert!(errors[0].message.contains("not_a_real_column"));
+        assert!(errors[0].message.contains("CustomerSchema"));
+    }
+
+    #[test]
+    fn test_should_resolve_param_schema_defined_in_a_third_file_as_call_site_contract() {
+        // arrange: schemas.py defines ReportSchema; reports.py's build_report() takes
+        // a parameter annotated Annotated[pd.DataFrame, ReportSchema] but does not
+        // itself define ReportSchema; pipeline.py calls build_report with a frame
+        // that's missing columns ReportSchema declares but build_report's own body
+        // never literally subscripts (so the heuristic body-scan fallback alone
+        // would under-report the contract). The schema-authoritative override must
+        // resolve project-wide, not just when the schema happens to be local.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class ReportSchema(BaseSchema):
+    a = Column(type=int)
+    b = Column(type=int)
+    c = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("reports.py"),
+            r#"
+from typing import Annotated
+import pandas as pd
+from schemas import ReportSchema
+
+def build_report(df: Annotated[pd.DataFrame, ReportSchema]) -> None:
+    print(df["a"])
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+import pandas as pd
+from reports import build_report
+
+def process(path: str) -> None:
+    df = pd.read_csv(path, usecols=["a"])
+    build_report(df)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: 'b' and 'c' are declared on ReportSchema but never subscripted in
+        // build_report's own body — only the authoritative schema override catches this.
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("missing column(s) {b, c}"));
+        assert!(errors[0].message.contains("required: {a, b, c}"));
     }
 
     #[test]

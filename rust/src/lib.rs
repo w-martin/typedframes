@@ -38,7 +38,9 @@ use ruff_text_size::Ranged;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 /// Check a single Python file for DataFrame column errors.
 ///
 /// Accepts an optional MessagePack-serialised [`ProjectIndex`] (produced by
@@ -62,7 +64,7 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
     let mut linter = Linter::new();
 
     if let Some(bytes) = index_bytes {
-        if let Ok(index) = rmp_serde::from_slice::<ProjectIndex>(&bytes) {
+        if let Some(index) = get_cached_index(&bytes) {
             linter.load_cross_file_symbols(&index, &source, path, &project_root);
         }
     }
@@ -77,6 +79,35 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
 
     serde_json::to_string(&errors)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+}
+
+// The CLI calls check_file once per file in a project, passing the SAME serialised
+// index_bytes on every call (see `_check_files` in cli.py, and mypy.py's per-file
+// hook, which does the same across a single mypy run). Deserialising a project-wide
+// index — which can be hundreds of KB for a large project, since it must carry every
+// candidate delegate-target function, not just DataFrame-relevant ones — on every
+// single file turns an O(1)-per-file operation into an O(project size)-per-file one,
+// i.e. O(files^2) for a whole-project check. Cache the deserialised index keyed by a
+// hash of its bytes (hashing is far cheaper than re-deserialising nested
+// Strings/Vecs/HashMaps) so repeat calls with the same index are a cache hit; a
+// different hash (e.g. a different project root between calls) correctly replaces
+// the cached entry rather than silently reusing stale data.
+static INDEX_CACHE: Mutex<Option<(u64, Arc<ProjectIndex>)>> = Mutex::new(None);
+
+fn get_cached_index(bytes: &[u8]) -> Option<Arc<ProjectIndex>> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let mut cache = INDEX_CACHE.lock().ok()?;
+    if let Some((cached_hash, index)) = cache.as_ref() {
+        if *cached_hash == hash {
+            return Some(index.clone());
+        }
+    }
+    let index = Arc::new(rmp_serde::from_slice::<ProjectIndex>(bytes).ok()?);
+    *cache = Some((hash, index.clone()));
+    Some(index)
 }
 
 /// Build a cross-file symbol index for an entire project.
@@ -203,6 +234,15 @@ struct IndexFunction {
     // Names of functions called with a tainted variable (the parameter itself, or a
     // variable derived from it) as their first positional argument. Consumed only by
     // resolve_transitive_requires; not needed once `requires` has been resolved.
+    // `#[serde(skip)]`: this is pure intermediate state, dead the moment
+    // build_index_internal finishes — it must never reach the serialised
+    // ProjectIndex that check_file deserialises once per file. On a large,
+    // delegate-heavy project (helper functions that just forward their first
+    // argument are extremely common Python, whether or not they touch a
+    // DataFrame) these lists dominate the index's serialised size, and paying
+    // that deserialisation cost once per file turns "more thorough analysis"
+    // into an O(files) cost repeated per file, i.e. O(files^2) overall.
+    #[serde(skip)]
     delegates: Vec<String>,
     // Schema name from the first parameter's annotation, e.g. "ReportSchema" from
     // `Annotated[pl.DataFrame, ReportSchema]`; empty if the parameter isn't
@@ -210,6 +250,9 @@ struct IndexFunction {
     // resolvable yet (it may be defined in a third file) — resolve_transitive_requires
     // resolves it project-wide and overrides `requires` with the authoritative column
     // list once every file's schemas are known, superseding the heuristic body-scan.
+    // `#[serde(skip)]`: same reasoning as `delegates` above — dead weight past
+    // resolve_param_schema_requires, must not be serialised into ProjectIndex.
+    #[serde(skip)]
     param_schema_name: String,
 }
 
@@ -220,6 +263,11 @@ struct IndexEntry {
     functions: HashMap<String, IndexFunction>, // function name -> return type info
     exports: Vec<String>,                  // names in __all__, for wildcard-import resolution
     imports: HashMap<String, String>, // imported name -> dotted module it came from (`from X import Y`)
+    // Local alias -> dotted module name, from plain `import module [as alias]`
+    // statements. Lets resolve_delegate_target and load_cross_file_symbols follow
+    // attribute-style calls (`transforms.enrich(df)`) back to the module they came
+    // from, the same way `imports` does for `from transforms import enrich`.
+    module_aliases: HashMap<String, String>,
 }
 
 // In-memory cross-file symbol index.
@@ -229,6 +277,30 @@ struct IndexEntry {
 struct ProjectIndex {
     version: u32,                       // format version, currently always 1
     files: HashMap<String, IndexEntry>, // absolute file path -> IndexEntry
+    // Project-wide schema name -> column list, unioned across every file's `schemas`
+    // map. Computed once here in build_index_internal so that per-file lookups (see
+    // Linter::load_cross_file_symbols, called once per file by `check_file`) are a
+    // single field read instead of a rebuild-by-iterating-every-file — the latter
+    // turned a per-file O(1) lookup into an O(files) one, i.e. O(files^2) for a whole
+    // project check. A schema may be defined in a THIRD file — neither the function's
+    // own file nor the one importing it — so this must stay project-wide rather than
+    // scoped to a single IndexEntry.
+    all_schemas: HashMap<String, Vec<String>>,
+}
+
+// Union schema name -> column list across every file's `schemas` map. First
+// definition wins on name collision (matches the prior per-call behaviour in both
+// resolve_param_schema_requires and load_cross_file_symbols).
+fn compute_all_schemas(files: &HashMap<String, IndexEntry>) -> HashMap<String, Vec<String>> {
+    let mut all_schemas: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in files.values() {
+        for (name, cols) in &entry.schemas {
+            all_schemas
+                .entry(name.clone())
+                .or_insert_with(|| cols.clone());
+        }
+    }
+    all_schemas
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
@@ -316,6 +388,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
 
     let mut exports = Vec::new();
     let mut imports: HashMap<String, String> = HashMap::new();
+    let mut module_aliases: HashMap<String, String> = HashMap::new();
     if let Ok(parsed) = parse_module(&source) {
         let module = parsed.into_syntax();
         for stmt in &module.body {
@@ -346,6 +419,23 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
                         }
                     }
                 }
+                // Plain `import module [as alias]` / `import a.b.c [as alias]`. Without
+                // an alias, Python binds the FIRST segment of a dotted import (`import
+                // a.b.c` binds `a`), so a dotted single-segment module (the common case
+                // for a flat project: `import transforms`) binds cleanly; a genuinely
+                // nested `a.b.c` accessed as `a.b.c.func()` without an alias is not
+                // tracked here (`a.func()` wouldn't resolve to `a.b.c` anyway) — same
+                // conservative-not-exhaustive trade-off as the rest of this heuristic.
+                Stmt::Import(import_stmt) => {
+                    for alias in &import_stmt.names {
+                        let dotted = alias.name.id.to_string();
+                        let local_name = match &alias.asname {
+                            Some(asname) => asname.id.to_string(),
+                            None => dotted.split('.').next().unwrap_or(&dotted).to_string(),
+                        };
+                        module_aliases.insert(local_name, dotted);
+                    }
+                }
                 _ => {}
             }
         }
@@ -356,6 +446,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
         functions,
         exports,
         imports,
+        module_aliases,
     })
 }
 
@@ -370,9 +461,14 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
             }
         }
     }
-    resolve_param_schema_requires(&mut files);
+    let all_schemas = compute_all_schemas(&files);
+    resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
-    ProjectIndex { version: 1, files }
+    ProjectIndex {
+        version: 1,
+        files,
+        all_schemas,
+    }
 }
 
 // Resolve each function's `param_schema_name` (the schema its first parameter is
@@ -384,16 +480,10 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
 // resolve it locally. Runs before resolve_transitive_requires so that functions
 // delegating to a schema-annotated one inherit the authoritative set, not the
 // heuristic fallback.
-fn resolve_param_schema_requires(files: &mut HashMap<String, IndexEntry>) {
-    let mut all_schemas: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in files.values() {
-        for (name, cols) in &entry.schemas {
-            all_schemas
-                .entry(name.clone())
-                .or_insert_with(|| cols.clone());
-        }
-    }
-
+fn resolve_param_schema_requires(
+    files: &mut HashMap<String, IndexEntry>,
+    all_schemas: &HashMap<String, Vec<String>>,
+) {
     for entry in files.values_mut() {
         for func in entry.functions.values_mut() {
             if func.param_schema_name.is_empty() {
@@ -415,6 +505,35 @@ type FuncNode = (String, String);
 // Resolve a delegate call target (a bare name, as written at the call site) to the
 // node that actually defines it: a same-file function first, else a function
 // reached by following `from_file`'s own `from X import name` statements.
+// Resolve a dotted module name (e.g. "pkg.transforms") to the project file that
+// defines it, trying both the project root and a `src/` layout — same candidate
+// paths used throughout this module for cross-file resolution.
+fn resolve_module_file(
+    module_name: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+) -> Option<String> {
+    let mod_path = module_name.replace('.', "/");
+    let candidates = [
+        project_root.join(format!("{mod_path}.py")),
+        project_root.join("src").join(format!("{mod_path}.py")),
+    ];
+    candidates
+        .iter()
+        .filter_map(|p| p.to_str())
+        .find(|p| files.contains_key(*p))
+        .map(str::to_string)
+}
+
+// Resolve a delegate call target (a bare name, as written at the call site) to the
+// node that actually defines it: a same-file function first, else a function
+// reached by following `from_file`'s own `from X import name` statements, else —
+// since attribute-style calls (`transforms.enrich(df)`) are recorded as the bare
+// attribute name `enrich` with no module prefix (see scan_expr_for_contract) — a
+// function by that name in any module `from_file` plainly `import`s. That last
+// step can't distinguish which plainly-imported module a given call actually used
+// if more than one defines a same-named function; same conservative trade-off as
+// the rest of this heuristic (see the cycle-handling note on resolve_node_requires).
 fn resolve_delegate_target(
     from_file: &str,
     callee: &str,
@@ -425,22 +544,21 @@ fn resolve_delegate_target(
     if entry.functions.contains_key(callee) {
         return Some((from_file.to_string(), callee.to_string()));
     }
-    let module_name = entry.imports.get(callee)?;
-    let mod_path = module_name.replace('.', "/");
-    let candidates = [
-        project_root.join(format!("{mod_path}.py")),
-        project_root.join("src").join(format!("{mod_path}.py")),
-    ];
-    let target_file = candidates
-        .iter()
-        .filter_map(|p| p.to_str())
-        .find(|p| files.contains_key(*p))?
-        .to_string();
-    if files.get(&target_file)?.functions.contains_key(callee) {
-        Some((target_file, callee.to_string()))
-    } else {
-        None
+    if let Some(module_name) = entry.imports.get(callee) {
+        let target_file = resolve_module_file(module_name, project_root, files)?;
+        if files.get(&target_file)?.functions.contains_key(callee) {
+            return Some((target_file, callee.to_string()));
+        }
     }
+    for module_name in entry.module_aliases.values() {
+        let Some(target_file) = resolve_module_file(module_name, project_root, files) else {
+            continue;
+        };
+        if files.get(&target_file)?.functions.contains_key(callee) {
+            return Some((target_file, callee.to_string()));
+        }
+    }
+    None
 }
 
 // Memoised DFS over the delegate graph: a function's fully resolved requirement set
@@ -970,15 +1088,12 @@ impl Linter {
         // pipeline.py imports only load_customers, not CustomerSchema directly. Looking
         // the schema up only in the function's own file's entry (as opposed to
         // project-wide) would silently fail in that case — no error, but no validation
-        // either, since self.schemas would never learn CustomerSchema's columns. Build
-        // a project-wide name -> columns registry once so every schema resolves
-        // regardless of which file happens to define it.
-        let mut all_schemas: HashMap<&str, &Vec<String>> = HashMap::new();
-        for entry in index.files.values() {
-            for (name, cols) in &entry.schemas {
-                all_schemas.entry(name.as_str()).or_insert(cols);
-            }
-        }
+        // either, since self.schemas would never learn CustomerSchema's columns.
+        // `index.all_schemas` is this project-wide name -> columns registry — computed
+        // ONCE in build_index_internal, not rebuilt here. This function runs once per
+        // file checked (see `check_file`), so rebuilding a project-wide map in here
+        // would cost O(files) per file, i.e. O(files^2) for a whole-project check.
+        let all_schemas = &index.all_schemas;
 
         let Ok(parsed) = parse_module(source) else {
             return;
@@ -1015,47 +1130,121 @@ impl Linter {
             // Use the full resolved path (not just the basename) so error messages
             // contain an openable `file:line` reference regardless of cwd.
             let file_path_display = resolved_path.display().to_string();
+            // `from X import *`: ruff represents the wildcard as a single alias named
+            // "*". Expand to the module's declared __all__, or — matching real Python
+            // semantics for a module with no __all__ — every public (non-`_`-prefixed)
+            // function/schema name, since we can't tell which of those the file
+            // actually goes on to use.
+            let is_wildcard =
+                import_from.names.len() == 1 && import_from.names[0].name.as_str() == "*";
+            if is_wildcard {
+                let names: Vec<String> = if !entry.exports.is_empty() {
+                    entry.exports.clone()
+                } else {
+                    entry
+                        .functions
+                        .keys()
+                        .chain(entry.schemas.keys())
+                        .filter(|n| !n.starts_with('_'))
+                        .cloned()
+                        .collect()
+                };
+                for name in &names {
+                    self.import_name(entry, name, &file_path_display, all_schemas);
+                }
+                continue;
+            }
             for alias in &import_from.names {
                 let name = alias.name.id.as_str();
-                if let Some(cols) = entry.schemas.get(name) {
-                    self.schemas.insert(name.to_string(), cols.clone());
+                self.import_name(entry, name, &file_path_display, all_schemas);
+            }
+        }
+
+        // Plain `import module [as alias]`: everything reachable via `module.name`
+        // attribute access. Unlike `from X import name`, there's no explicit name
+        // list to narrow to, so pull in every function this module defines — a call
+        // site written as `module.func(df)` is resolved by check_call_requirements
+        // looking up the bare name `func`, the same key space `from X import func`
+        // would have populated (see visit_stmt's Expr::Attribute call-site handling).
+        for stmt in &module.body {
+            let Stmt::Import(import_stmt) = stmt else {
+                continue;
+            };
+            for alias in &import_stmt.names {
+                let dotted = alias.name.id.as_str();
+                if dotted.starts_with("typedframes") {
+                    continue;
                 }
-                if let Some(func) = entry.functions.get(name) {
-                    if !func.returns_schema.is_empty() {
-                        self.functions
-                            .insert(name.to_string(), func.returns_schema.clone());
-                    }
-                    if let Some(schema_cols) = all_schemas.get(func.returns_schema.as_str()) {
-                        self.schemas
-                            .insert(func.returns_schema.clone(), (*schema_cols).clone());
-                        // Record origin so error messages point back to the source function/file.
-                        // The inferred schema name encodes the definition line as
-                        // `__inferred_<var>_at_<line>`, so we can surface the exact
-                        // location without storing extra metadata.
-                        if func.returns_schema.starts_with("__inferred_") {
-                            let line_suffix = func
-                                .returns_schema
-                                .strip_prefix("__inferred_")
-                                .and_then(|s| s.rsplit_once("_at_"))
-                                .and_then(|(_, l)| l.parse::<usize>().ok())
-                                .map(|l| format!(":{l}"))
-                                .unwrap_or_default();
-                            self.schema_origins.insert(
-                                func.returns_schema.clone(),
-                                format!("{name} ({file_path_display}{line_suffix})"),
-                            );
-                        }
-                    }
-                    // Record the parameter-column contract so calls to this function
-                    // (e.g. `trim(customers)`) can be validated at the call site,
-                    // where the actual argument's inferred schema is known.
-                    if !func.requires.is_empty() {
-                        let origin = format!("{name} ({file_path_display}:{})", func.def_line);
-                        self.param_requires
-                            .insert(name.to_string(), (func.requires.clone(), origin));
-                    }
+                let Some(resolved_path) =
+                    resolve_module_file(dotted, project_root, &index.files).map(PathBuf::from)
+                else {
+                    continue;
+                };
+                let Some(resolved_str) = resolved_path.to_str() else {
+                    continue;
+                };
+                let Some(entry) = index.files.get(resolved_str) else {
+                    continue;
+                };
+                let file_path_display = resolved_path.display().to_string();
+                let names: Vec<String> = entry.functions.keys().cloned().collect();
+                for name in &names {
+                    self.import_name(entry, name, &file_path_display, all_schemas);
                 }
             }
+        }
+    }
+
+    // Pull a single name's schema/function/param-contract info from a resolved
+    // cross-file IndexEntry into this Linter's own local state. Shared by
+    // `from X import name`, `from X import *`, and plain `import module` handling
+    // in load_cross_file_symbols — all three ultimately need to do the same thing
+    // for each name they bring into scope.
+    fn import_name(
+        &mut self,
+        entry: &IndexEntry,
+        name: &str,
+        file_path_display: &str,
+        all_schemas: &HashMap<String, Vec<String>>,
+    ) {
+        if let Some(cols) = entry.schemas.get(name) {
+            self.schemas.insert(name.to_string(), cols.clone());
+        }
+        let Some(func) = entry.functions.get(name) else {
+            return;
+        };
+        if !func.returns_schema.is_empty() {
+            self.functions
+                .insert(name.to_string(), func.returns_schema.clone());
+        }
+        if let Some(schema_cols) = all_schemas.get(func.returns_schema.as_str()) {
+            self.schemas
+                .insert(func.returns_schema.clone(), schema_cols.clone());
+            // Record origin so error messages point back to the source function/file.
+            // The inferred schema name encodes the definition line as
+            // `__inferred_<var>_at_<line>`, so we can surface the exact
+            // location without storing extra metadata.
+            if func.returns_schema.starts_with("__inferred_") {
+                let line_suffix = func
+                    .returns_schema
+                    .strip_prefix("__inferred_")
+                    .and_then(|s| s.rsplit_once("_at_"))
+                    .and_then(|(_, l)| l.parse::<usize>().ok())
+                    .map(|l| format!(":{l}"))
+                    .unwrap_or_default();
+                self.schema_origins.insert(
+                    func.returns_schema.clone(),
+                    format!("{name} ({file_path_display}{line_suffix})"),
+                );
+            }
+        }
+        // Record the parameter-column contract so calls to this function
+        // (e.g. `trim(customers)`) can be validated at the call site,
+        // where the actual argument's inferred schema is known.
+        if !func.requires.is_empty() {
+            let origin = format!("{name} ({file_path_display}:{})", func.def_line);
+            self.param_requires
+                .insert(name.to_string(), (func.requires.clone(), origin));
         }
     }
 
@@ -1397,12 +1586,28 @@ impl Linter {
                 Self::scan_expr_for_contract(tainted, &attr.value, direct, delegates);
             }
             Expr::Call(call) => {
-                if let Expr::Name(func_name) = &*call.func {
-                    if call.arguments.args.first().is_some_and(
+                let first_arg_tainted =
+                    call.arguments.args.first().is_some_and(
                         |a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str())),
-                    ) {
+                    );
+                match &*call.func {
+                    Expr::Name(func_name) if first_arg_tainted => {
                         delegates.push(func_name.id.to_string());
                     }
+                    // `module.func(df)` via a plain `import module` — record the bare
+                    // attribute name as a delegate candidate the same way a bare-name
+                    // call would be (resolve_delegate_target follows it back to the
+                    // module). Guarded on `base` not itself being tainted so an actual
+                    // DataFrame method call (`df.merge(df)`) is never misread as a
+                    // delegate to a function literally named `merge`.
+                    Expr::Attribute(attr) if first_arg_tainted => {
+                        if let Expr::Name(base) = &*attr.value {
+                            if !tainted.contains(base.id.as_str()) {
+                                delegates.push(attr.attr.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 Self::scan_expr_for_contract(tainted, &call.func, direct, delegates);
                 for arg in &call.arguments.args {
@@ -2701,6 +2906,24 @@ impl Linter {
                                     }
                                 }
                             }
+                        } else if let Expr::Name(base) = current_expr {
+                            // Handle result = module.trim_customers(customers) — an
+                            // attribute-style call to a delegate reached via a plain
+                            // `import module` (see load_cross_file_symbols, which
+                            // populates self.param_requires by bare function name
+                            // regardless of how it's called at the use site). Guarded
+                            // on `base` not being a tracked DataFrame variable so a
+                            // genuine method call (`df.merge(other)`) is never treated
+                            // as a call to a same-named cross-file delegate function.
+                            if !self.variables.contains_key(base.id.as_str()) {
+                                self.check_call_requirements(
+                                    attr.attr.as_str(),
+                                    call,
+                                    current_line,
+                                    current_col,
+                                    errors,
+                                );
+                            }
                         }
                     } else if let Expr::Name(func_name) = &*call.func {
                         // Handle df = load_users() where load_users() -> PandasFrame[Schema]
@@ -2883,6 +3106,13 @@ impl Linter {
                                 col,
                                 errors,
                             );
+                            // Bare call statement via a plain `import module`, e.g.
+                            // `transforms.trim_customers(customers)` — guarded on `recv`
+                            // not being a tracked DataFrame variable so a genuine method
+                            // call is never treated as a call to a same-named delegate.
+                            if !self.variables.contains_key(recv.id.as_str()) {
+                                self.check_call_requirements(func_name, call, line, col, errors);
+                            }
                         }
                     } else if let Expr::Name(func_name) = &*call.func {
                         // Bare call statement, e.g. `trim_customers(customers)` with no
@@ -4281,5 +4511,159 @@ print(df["revenue"])  # typedframes: ignore[unknown-column, dropped-unknown-colu
 
         // assert — unknown-column is in the comma-separated list, so suppressed
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_detect_missing_column_through_plain_module_import_attribute_call() {
+        // arrange: same shape as test_should_detect_missing_column_at_direct_call_site,
+        // but pipeline.py calls `steps.postproc(df)` via a plain `import steps` rather
+        // than `from steps import postproc` — the blind spot this test guards against.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+import steps
+from loaders import load
+
+def process(path: str) -> None:
+    df = load(path)
+    result = steps.postproc(df)
+    print(result)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("missing column(s) {c}"));
+        assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    #[test]
+    fn test_should_resolve_transitive_requires_through_plain_import_delegate() {
+        // arrange: transform() only forwards df to steps.postproc(df) via a plain
+        // `import steps` — the delegate-detection blind spot for attribute calls.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("transforms.py"),
+            r#"
+import steps
+
+def transform(df):
+    return steps.postproc(df)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let transforms_path = root.join("transforms.py").to_str().unwrap().to_string();
+        let func = &index.files[&transforms_path].functions["transform"];
+
+        // assert: transform's own requires is the transitive union through the
+        // attribute-style delegate call, i.e. {c} — not empty, which is what it
+        // would be if the `steps.postproc(df)` call were never recognised as a
+        // delegate at all.
+        assert_eq!(func.requires, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn test_should_detect_missing_column_through_wildcard_import() {
+        // arrange: pipeline.py brings postproc into scope via `from steps import *`
+        // rather than naming it explicitly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from steps import *
+from loaders import load
+
+def process(path: str) -> None:
+    df = load(path)
+    result = postproc(df)
+    print(result)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("missing column(s) {c}"));
+        assert!(errors[0].message.contains("passed to postproc"));
     }
 }

@@ -5,7 +5,7 @@
 - **pandas-stubs version**: 3.0.3.260530
 - **pandas version**: 3.0.3
 - **mypy version**: 2.1.0
-- **typedframes version**: 0.3.0
+- **typedframes version**: 0.3.1
 - **Python**: ≥3.11
 
 ## Summary

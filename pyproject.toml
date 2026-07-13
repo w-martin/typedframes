@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typedframes"
-version = "0.3.0"
+version = "0.3.1"
 description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
 keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"

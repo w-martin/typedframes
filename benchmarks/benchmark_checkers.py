@@ -22,24 +22,36 @@ All targets are copied to /tmp before benchmarking to avoid filesystem effects.
 """
 
 import argparse
+import datetime
+import platform
 import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Number of timed runs per tool
-RUNS = 10
+# Number of timed runs per tool. 10 was too few to characterise high-variance
+# tools (pyrefly on the small corpus has been observed at CV > 100%, i.e.
+# statistically meaningless) -- see GH issue #10.
+RUNS = 20
 # Number of warmup runs (discarded)
 WARMUP = 3
 
 BENCH_DIR = Path(tempfile.gettempdir()) / "typedframes_bench"
 
 GE_REPO_URL = "https://github.com/great-expectations/great_expectations.git"
+# Pinned so every run benchmarks the same corpus. Previously cloned at HEAD on
+# every invocation, so a machine benchmarked today could get a meaningfully
+# different (larger/smaller, differently-structured) codebase than the one
+# that produced the committed README numbers -- part of why the v0.2.1->v0.2.2
+# README jump (285ms -> 1.79s) turned out not to correspond to any code change
+# at all. Bump deliberately when GE ships a new release, not silently.
+GE_COMMIT = "1.9.3"
 
 
 @dataclass
@@ -103,9 +115,9 @@ def clone_great_expectations(ge_path: str | None) -> Path | None:
 
     clone_dir = Path(tempfile.mkdtemp(prefix="typedframes_ge_"))
     try:
-        print("Cloning Great Expectations (shallow)...", flush=True)
+        print(f"Cloning Great Expectations @ {GE_COMMIT} (shallow)...", flush=True)
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", GE_REPO_URL, str(clone_dir)],
+            ["git", "clone", "--depth", "1", "--branch", GE_COMMIT, GE_REPO_URL, str(clone_dir)],
             capture_output=True,
             text=True,
             timeout=120,
@@ -181,6 +193,39 @@ def get_tool_version(cmd: list[str], tool_name_override: str | None = None) -> s
         return "unknown"
 
 
+def _get_ram_gb() -> str:
+    """Best-effort total RAM in GiB, without adding a dependency. 'unknown' if undeterminable."""
+    try:
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5, check=False
+            )
+            return f"{int(result.stdout.strip()) / (1024**3):.0f}GiB"
+        if sys.platform.startswith("linux"):
+            meminfo = Path("/proc/meminfo").read_text()
+            for line in meminfo.splitlines():
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return f"{kb / (1024**2):.0f}GiB"
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return "unknown"
+
+
+def get_machine_info() -> str:
+    """One-line machine spec + date.
+
+    So benchmark numbers are only ever compared to other numbers recorded under a
+    documented environment (see GH issue #10: the v0.2.1->v0.2.2 README jump had
+    no corresponding code change, and lacking this context made it impossible to
+    rule out "different machine" after the fact).
+    """
+    date = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
+    cpu = platform.processor() or platform.machine()
+    py = f"{platform.python_implementation()} {platform.python_version()}"
+    return f"{date} · {platform.system()} {platform.release()} · {cpu} · {py} · {_get_ram_gb()} RAM"
+
+
 def clear_caches(target_dir: Path) -> None:
     """Clear type checker caches to ensure fair comparison.
 
@@ -238,11 +283,18 @@ def run_benchmark(
     version_tool = tool.name.split()[0] if " " in tool.name else tool.name
     version = get_tool_version(tool.cmd, version_tool)
 
-    # Warmup runs (results discarded, but warms up any internal caches)
-    for _ in range(warmup):
-        if clear_cache_func:
-            clear_cache_func()
-        subprocess.run(full_cmd, capture_output=True, check=False)
+    # Warmup runs (results discarded). For tools we don't cache-clear, this warms
+    # up the OS page cache / tool-internal caches as intended. For tools we DO
+    # cache-clear before every timed run, warming up here would be pointless (the
+    # clear before each timed run wipes it right back out) -- so skip warmup for
+    # those entirely rather than burn time clearing-then-immediately-discarding a
+    # cache on every warmup iteration too (see GH issue #10). Every timed run for
+    # a cache-clearing tool is therefore consistently cold (OS-cold, tool-cold);
+    # tools without needs_cache_clear measure whatever their own natural warm
+    # state is after `warmup` prior invocations.
+    if not clear_cache_func:
+        for _ in range(warmup):
+            subprocess.run(full_cmd, capture_output=True, check=False)
 
     # Timed runs - clear cache before each to ensure fair comparison
     times: list[int] = []
@@ -301,6 +353,7 @@ def generate_markdown_table(
 
     lines = [
         f"**Benchmark results** ({RUNS} runs, {WARMUP} warmup, caches cleared between runs):",
+        f"*{get_machine_info()} · Great Expectations pinned @ {GE_COMMIT}*",
         "",
         header,
         sep_parts,
@@ -328,9 +381,13 @@ def update_readme(
     readme_path = project_root / "README.md"
     content = readme_path.read_text()
 
-    # Match old or new table format
+    # Match old or new table format. The machine-info/GE-pin caption line
+    # (`*...*`) directly under "**Benchmark results**" is optional so this still
+    # matches tables generated before that line existed.
     pattern = (
-        r"\*\*Benchmark results\*\*[^\n]*\n\n"
+        r"\*\*Benchmark results\*\*[^\n]*\n"
+        r"(?:\*[^\n]*\*\n)?"
+        r"\n"
         r"\|[^\n]*\n"
         r"\|[-| ]+\n"
         r"(?:\|[^\n]*\n)*"
@@ -341,7 +398,9 @@ def update_readme(
 
     new_table = generate_markdown_table(tool_results, tool_meta, codebase_labels)
 
-    new_content, count = re.subn(pattern, new_table, content)
+    # Lambda replacement so literal backslashes in new_table (unlikely, but e.g. a
+    # stray `\d` in a version string) are never misread as regex backreferences.
+    new_content, count = re.subn(pattern, lambda _match: new_table, content)
 
     if count == 0:
         print("Warning: Could not find benchmark table pattern in README.md")
@@ -471,15 +530,52 @@ def print_summary(
     print(generate_markdown_table(tool_results, tool_meta, codebase_labels))
 
 
+def ensure_release_build(project_root: Path) -> None:
+    """Rebuild the typedframes Rust extension in release mode before benchmarking.
+
+    `maturin develop` (the documented dev workflow in DEVELOPING.md, also what
+    `inv build` runs) builds a DEBUG binary by default -- unoptimized, no LTO, no
+    dead-code stripping. Debug and release builds of this checker have been
+    measured 5-10x apart on a realistic corpus. Benchmarking whatever happens to
+    already be installed silently measures debug performance if a contributor's
+    last local build was a plain `maturin develop` -- which is indistinguishable
+    from a real regression when comparing against a prior README table. Always
+    rebuild in release mode here unless explicitly skipped.
+    """
+    print("Building typedframes Rust extension in release mode...", flush=True)
+    result = subprocess.run(
+        ["uv", "run", "maturin", "develop", "--release", "--manifest-path", str(project_root / "rust" / "Cargo.toml")],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if result.returncode != 0:
+        print("Warning: release build failed, benchmarking whatever is currently installed:")
+        print(result.stderr.strip())
+    else:
+        print("Release build OK.")
+
+
 def main() -> None:
     """Run all benchmarks and print results."""
     parser = argparse.ArgumentParser(description="Benchmark type checkers")
     parser.add_argument("--update-readme", action="store_true", help="Update the benchmark table in README.md")
     parser.add_argument("--skip-external", action="store_true", help="Skip external codebase (Great Expectations)")
     parser.add_argument("--ge-path", type=str, default=None, help="Path to pre-cloned Great Expectations repo")
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip rebuilding the typedframes extension in release mode; benchmark whatever is installed as-is.",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
+
+    if not args.skip_build:
+        ensure_release_build(project_root)
+
     tools = build_tools()
 
     # Copy typedframes src/ to /tmp

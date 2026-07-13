@@ -132,7 +132,7 @@ uv add --dev "typedframes[mypy]>=0.2.1"
 ### Installed Version
 
 - **pandas-type-checks**: 1.1.3
-- **typedframes**: 0.3.0
+- **typedframes**: 0.3.1
 - **pandas**: 2.3.3
 - **mypy**: 2.1.0
 

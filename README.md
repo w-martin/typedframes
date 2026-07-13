@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.3.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.3.1) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > schema validation over production-grade stability.
 >
@@ -289,6 +289,20 @@ The contract is resolved *transitively*: if a function only forwards its paramet
 requirements, catching a missing column even when no single function in the chain touches it directly.
 Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
 
+**Known limitations:**
+- Cross-file delegate/schema resolution follows `from module import name`, plain `import module` +
+  `module.helper(df)` attribute access, and `from module import *` wildcard imports. A dotted import with no
+  alias (`import a.b.c`) only binds the first segment (`a`), matching Python's own binding rules, so a
+  deeply nested submodule accessed without an alias is not tracked.
+- Contract inference is a single top-to-bottom pass over a function body, not full control-flow analysis.
+  Deeply nested control flow (nested `try`/`except`, `match`, comprehensions) may under-report a function's
+  true requirements.
+- A cycle in the delegate graph (mutually- or self-delegating helpers) contributes only each function's own
+  direct requirements to the cycle, not the full transitive union — conservative rather than exhaustive.
+- If two plainly-imported modules both define a same-named function, an attribute-style delegate call
+  (`module.helper(df)`) resolves to whichever one is found first — the checker doesn't disambiguate by which
+  module the call site actually used.
+
 ### See Also
 
 - [`examples/inference_example.py`](examples/inference_example.py) — single-file walkthrough of all four inference
@@ -402,17 +416,18 @@ code reference.
 
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
-**Benchmark results** (10 runs, 3 warmup, caches cleared between runs):
+**Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
+*2026-07-13 · Darwin 25.5.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
 
-| Tool | Version | What it does | typedframes (13 files) | great_expectations (485 files) |
+| Tool | Version | What it does | typedframes (13 files) | great_expectations (482 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.3.0 | DataFrame column checker | 81ms ±6ms | 3.64s ±9ms |
-| ruff | 0.15.21 | Linter (no type checking) | 48ms ±13ms | 237ms ±31ms |
-| ty | 0.0.58 | Type checker | 119ms ±14ms | 287ms ±33ms |
-| pyrefly | 1.1.1 | Type checker | 162ms ±18ms | 390ms ±21ms |
-| mypy | 2.2.0 | Type checker (no plugin) | 4.56s ±22ms | 7.31s ±35ms |
-| mypy + typedframes | 2.2.0 | Type checker + column checker | 4.69s ±61ms | 10.89s ±356ms |
-| pyright | 1.1.411 | Type checker | 1.39s ±17ms | 8.06s ±193ms |
+| typedframes | 0.3.1 | DataFrame column checker | 43ms ±668µs | 213ms ±4ms |
+| ruff | 0.15.21 | Linter (no type checking) | 26ms ±1ms | 193ms ±2ms |
+| ty | 0.0.58 | Type checker | 72ms ±3ms | 181ms ±9ms |
+| pyrefly | 1.1.1 | Type checker | 107ms ±4ms | 557ms ±16ms |
+| mypy | 2.2.0 | Type checker (no plugin) | 2.77s ±41ms | 4.21s ±71ms |
+| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.78s ±34ms | 4.48s ±63ms |
+| pyright | 1.1.411 | Type checker | 743ms ±8ms | 3.34s ±43ms |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -625,7 +640,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.3.0                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
+| **Version tested**              | 0.3.1                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |

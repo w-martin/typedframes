@@ -6,6 +6,18 @@
 - [uv](https://github.com/astral-sh/uv) - Python package manager
 - Rust toolchain (for building the linter extension)
 
+> **macOS note:** If you installed Rust via `brew install rustup` and `rustc`/`cargo`
+> are not found even after `rustup toolchain install stable`, it's because Homebrew's
+> `rustup` formula is keg-only (it conflicts with the `rust` formula) and only symlinks
+> the `rustup` binary itself into your PATH. The actual `rustc`/`cargo`/etc. shims live
+> in `$(brew --prefix rustup)/bin` but are never added to PATH automatically, unlike the
+> official rustup.rs installer. Fix by adding that directory to your shell profile:
+>
+> ```shell
+> echo 'export PATH="'"$(brew --prefix rustup)"'/bin:$PATH"' >> ~/.zshrc
+> source ~/.zshrc
+> ```
+
 ## Setup
 
 1. Clone the repository:

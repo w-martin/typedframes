@@ -1135,7 +1135,8 @@ impl Linter {
             // semantics for a module with no __all__ — every public (non-`_`-prefixed)
             // function/schema name, since we can't tell which of those the file
             // actually goes on to use.
-            let is_wildcard = import_from.names.len() == 1 && import_from.names[0].name.as_str() == "*";
+            let is_wildcard =
+                import_from.names.len() == 1 && import_from.names[0].name.as_str() == "*";
             if is_wildcard {
                 let names: Vec<String> = if !entry.exports.is_empty() {
                     entry.exports.clone()
@@ -1174,8 +1175,8 @@ impl Linter {
                 if dotted.starts_with("typedframes") {
                     continue;
                 }
-                let Some(resolved_path) = resolve_module_file(dotted, project_root, &index.files)
-                    .map(PathBuf::from)
+                let Some(resolved_path) =
+                    resolve_module_file(dotted, project_root, &index.files).map(PathBuf::from)
                 else {
                     continue;
                 };
@@ -1585,9 +1586,10 @@ impl Linter {
                 Self::scan_expr_for_contract(tainted, &attr.value, direct, delegates);
             }
             Expr::Call(call) => {
-                let first_arg_tainted = call.arguments.args.first().is_some_and(
-                    |a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str())),
-                );
+                let first_arg_tainted =
+                    call.arguments.args.first().is_some_and(
+                        |a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str())),
+                    );
                 match &*call.func {
                     Expr::Name(func_name) if first_arg_tainted => {
                         delegates.push(func_name.id.to_string());

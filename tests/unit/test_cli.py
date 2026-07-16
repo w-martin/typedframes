@@ -246,7 +246,9 @@ class TestCli(unittest.TestCase):
             # assert
             output = captured.getvalue()
             parsed = json.loads(output)
-            self.assertIsInstance(parsed, list)
+            self.assertIsInstance(parsed["errors"], list)
+            self.assertIn("dataframes_total", parsed["stats"])
+            self.assertIn("dataframes_typed", parsed["stats"])
 
     def test_should_output_json_when_output_format_json(self) -> None:
         """Test JSON output mode via --output-format json."""
@@ -264,7 +266,9 @@ class TestCli(unittest.TestCase):
             # assert
             output = captured.getvalue()
             parsed = json.loads(output)
-            self.assertIsInstance(parsed, list)
+            self.assertIsInstance(parsed["errors"], list)
+            self.assertIn("dataframes_total", parsed["stats"])
+            self.assertIn("dataframes_typed", parsed["stats"])
 
     def test_should_output_github_format(self) -> None:
         """Test GitHub Actions annotation output via --output-format github."""
@@ -285,7 +289,10 @@ class TestCli(unittest.TestCase):
 
             # act
             with (
-                patch("typedframes.cli._check_files", return_value=[error]),
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([error], {"dataframes_total": 0, "dataframes_typed": 0}),
+                ),
                 patch("sys.stdout", captured),
             ):
                 main(["check", str(py_file), "--output-format", "github"])
@@ -295,7 +302,7 @@ class TestCli(unittest.TestCase):
             self.assertIn("::error file=f.py,line=5,col=4,title=unknown-column::Column 'x' not found", output)
 
     def test_should_output_github_format_clean_file(self) -> None:
-        """Test GitHub Actions format with no errors produces no annotation output."""
+        """Test GitHub Actions format with no errors produces no error/warning annotations."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             py_file = Path(tmpdir) / "clean.py"
@@ -307,9 +314,30 @@ class TestCli(unittest.TestCase):
             with patch("sys.stdout", captured):
                 main(["check", str(py_file), "--output-format", "github"])
 
-            # assert — no annotation lines emitted for clean file
+            # assert — no error/warning annotations for a clean file, but the coverage
+            # summary still prints as a "notice" (GitHub's closest tier to typedframes'
+            # own low-key "info" severity)
             output = captured.getvalue()
-            self.assertNotIn("::", output)
+            self.assertNotIn("::error", output)
+            self.assertNotIn("::warning", output)
+            self.assertIn("::notice title=typedframes coverage::", output)
+
+    def test_should_suppress_github_notice_with_no_info_flag(self) -> None:
+        """Test that --no-info suppresses the GitHub coverage notice annotation."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "clean.py"
+            py_file.write_text("x = 1\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--output-format", "github", "--no-info"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertNotIn("::notice", output)
 
     def test_should_exit_0_when_strict_and_no_errors(self) -> None:
         """Test that --strict exits 0 when there are no errors."""
@@ -507,7 +535,10 @@ class TestCli(unittest.TestCase):
 
             # act
             with (
-                patch("typedframes.cli._check_files", return_value=[warning_error, actual_error]),
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([warning_error, actual_error], {"dataframes_total": 0, "dataframes_typed": 0}),
+                ),
                 patch("sys.stdout", captured),
             ):
                 main(["check", str(py_file), "--no-warnings"])
@@ -518,8 +549,8 @@ class TestCli(unittest.TestCase):
             self.assertIn("Column 'wrong'", output)
             self.assertIn("1 error", output)
 
-    def test_should_suppress_untracked_dataframe_by_default(self) -> None:
-        """Test that untracked-dataframe warnings are suppressed by default."""
+    def test_should_show_untracked_dataframe_as_info_by_default(self) -> None:
+        """Test that untracked-dataframe surfaces as a non-blocking info diagnostic by default."""
         # arrange
         w = {
             "file": "f.py",
@@ -536,18 +567,23 @@ class TestCli(unittest.TestCase):
 
             # act
             with (
-                patch("typedframes.cli._check_files", return_value=[w]),
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([w], {"dataframes_total": 1, "dataframes_typed": 0}),
+                ),
                 patch("sys.stdout", captured),
             ):
                 main(["check", str(py_file)])
 
-            # assert
+            # assert \u2014 shown, but as a quiet "info" diagnostic, not a warning, and it
+            # does not turn the pass/fail headline into a failure
             output = captured.getvalue()
-            self.assertNotIn("columns unknown at lint time", output)
+            self.assertIn("columns unknown at lint time", output)
+            self.assertIn("info[untracked-dataframe]", output)
             self.assertIn("\u2713 Checked 1 file", output)
 
-    def test_should_show_untracked_dataframe_with_strict_ingest_flag(self) -> None:
-        """Test that --strict-ingest enables untracked-dataframe warnings."""
+    def test_should_escalate_untracked_dataframe_to_warning_with_strict_ingest_flag(self) -> None:
+        """Test that --strict-ingest escalates untracked-dataframe from info to warning."""
         # arrange
         w = {
             "file": "f.py",
@@ -564,7 +600,10 @@ class TestCli(unittest.TestCase):
 
             # act
             with (
-                patch("typedframes.cli._check_files", return_value=[w]),
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([w], {"dataframes_total": 1, "dataframes_typed": 0}),
+                ),
                 patch("sys.stdout", captured),
             ):
                 main(["check", str(py_file), "--strict-ingest"])
@@ -572,6 +611,61 @@ class TestCli(unittest.TestCase):
             # assert
             output = captured.getvalue()
             self.assertIn("columns unknown at lint time", output)
+            self.assertIn("warning[untracked-dataframe]", output)
+            self.assertIn("1 warning", output)
+
+    def test_should_show_dataframe_coverage_info_by_default(self) -> None:
+        """Test that the DataFrame coverage summary line appears by default for a fully typed load."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "typed.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv', usecols=['a', 'b'])\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file)])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("1/1 DataFrames had column info (100%)", output)
+
+    def test_should_show_low_dataframe_coverage_for_untyped_load(self) -> None:
+        """Test that a bare load without usecols/columns is reflected as 0% coverage."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "untyped.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv')\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file)])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("0/1 DataFrames had column info (0%)", output)
+
+    def test_should_suppress_info_output_with_no_info_flag(self) -> None:
+        """Test that --no-info suppresses both the coverage line and info-level diagnostics."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "untyped.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv')\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--no-info"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertNotIn("DataFrames had column info", output)
+            self.assertNotIn("columns unknown at lint time", output)
+            self.assertIn("✓ Checked 1 file", output)
 
     def test_should_not_crash_when_checker_not_installed_on_directory(self) -> None:
         """Test that a missing Rust extension when checking a directory exits with code 1."""

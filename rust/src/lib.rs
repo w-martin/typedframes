@@ -55,7 +55,12 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
     let config = load_linter_config(&project_root);
 
     if !config.enabled.unwrap_or(true) {
-        return Ok("[]".to_string());
+        let empty = CheckFileResult {
+            errors: Vec::new(),
+            stats: FileStats::default(),
+        };
+        return serde_json::to_string(&empty)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)));
     }
 
     let source = fs::read_to_string(path)
@@ -77,7 +82,15 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
         errors.retain(|e| e.severity != "warning");
     }
 
-    serde_json::to_string(&errors)
+    let result = CheckFileResult {
+        errors,
+        stats: FileStats {
+            dataframes_total: linter.dataframes_total,
+            dataframes_typed: linter.dataframes_typed,
+        },
+    };
+
+    serde_json::to_string(&result)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
 }
 
@@ -892,6 +905,24 @@ fn find_best_match<'a>(name: &str, candidates: &'a [String]) -> Option<&'a str> 
 /// Serialises to JSON for the Python API and to the text/GitHub formats in the CLI.
 /// Line and column numbers are 1-indexed to match editor conventions and the output
 /// of `ruff_source_file::SourceCode::line_column` via `OneIndexed::get()`.
+/// Coverage stats for a single checked file: how many DataFrame origins the
+/// linter recognized (`dataframes_total`) and how many of those resolved to a
+/// known column set (`dataframes_typed`). This is informational — a low ratio
+/// means the check had little to validate, not that the file has fewer
+/// problems. See [`Linter::dataframes_total`] for exactly what is counted.
+#[derive(Debug, Serialize, Default)]
+pub struct FileStats {
+    pub dataframes_total: usize,
+    pub dataframes_typed: usize,
+}
+
+/// The JSON payload returned by [`check_file`]: the diagnostics plus coverage stats.
+#[derive(Debug, Serialize)]
+struct CheckFileResult {
+    errors: Vec<LintError>,
+    stats: FileStats,
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 pub struct LintError {
     /// 1-indexed source line.
@@ -944,6 +975,17 @@ pub struct Linter {
     line_index: Option<LineIndex>,
     source: String,
     file_display: String, // absolute-ish path of the file currently being linted
+    // Coverage counters: how many DataFrame origins the linter positively
+    // identified (a recognized load call, `Schema.from_pandas`, or an
+    // assignment from a function known to return a schema) vs. how many of
+    // those origins resolved to a known column set. This is a "did we have
+    // enough information" signal for the user, not a validation result — a
+    // plain, unresolved function call assigned to a variable is deliberately
+    // NOT counted here, since the linter has no way to tell whether it
+    // returns a DataFrame at all; counting it would inflate the denominator
+    // with unrelated calls.
+    pub dataframes_total: usize,
+    pub dataframes_typed: usize,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1010,6 +1052,8 @@ impl Linter {
             line_index: None,
             source: String::new(),
             file_display: String::new(),
+            dataframes_total: 0,
+            dataframes_typed: 0,
         }
     }
 
@@ -2396,6 +2440,8 @@ impl Linter {
                                     let class_str = class_name.id.as_str();
                                     if self.schemas.contains_key(class_str) {
                                         // Schema.from_pandas(df) style
+                                        self.dataframes_total += 1;
+                                        self.dataframes_typed += 1;
                                         for target in &assign.targets {
                                             if let Expr::Name(target_name) = target {
                                                 self.variables.insert(
@@ -2408,8 +2454,10 @@ impl Linter {
                                         && LOAD_FUNCTIONS.contains(&func_name)
                                     {
                                         // pd.read_csv() / pl.scan_parquet() etc.
+                                        self.dataframes_total += 1;
                                         match Self::extract_load_columns(call) {
                                             Some(cols) => {
+                                                self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
                                                     .targets
                                                     .iter()
@@ -2929,6 +2977,8 @@ impl Linter {
                         // Handle df = load_users() where load_users() -> PandasFrame[Schema]
                         if let Some(schema_name) = self.functions.get(func_name.id.as_str()) {
                             let schema_name = schema_name.clone();
+                            self.dataframes_total += 1;
+                            self.dataframes_typed += 1;
                             for target in &assign.targets {
                                 if let Expr::Name(target_name) = target {
                                     self.variables.insert(
@@ -3485,6 +3535,129 @@ print(df["emai"])
         assert!(errors[0].message.contains("UserSchema"));
         assert!(errors[1].message.contains("emai"));
         assert!(errors[1].message.contains("did you mean 'email'"));
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_with_usecols() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("data.csv", usecols=["a", "b"])
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_untyped_dataframe_for_bare_load_call() {
+        // arrange: no usecols/columns, so the checker has no column information
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("data.csv")
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: counted as seen, but not typed — and still raises the existing warning
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "untracked-dataframe");
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_schema_from_pandas() {
+        // arrange
+        let source = r#"
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+raw = pd.read_csv("users.csv")
+df = UserSchema.from_pandas(raw)
+print(df["user_id"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the bare `raw = pd.read_csv(...)` load call is untyped, but the
+        // `UserSchema.from_pandas(raw)` assignment is a second, typed DataFrame origin
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_function_return_schema() {
+        // arrange
+        let source = r#"
+from typedframes import BaseSchema, Column
+from typedframes.pandas import PandasFrame
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+def load_users() -> PandasFrame[UserSchema]:
+    return PandasFrame.from_schema(pd.read_csv("users.csv"), UserSchema)
+
+df = load_users()
+print(df["user_id"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: `df = load_users()` resolves via the known return schema
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_not_count_unresolved_function_call_assignment() {
+        // arrange: `compute()` is not known to return a DataFrame at all, so it must
+        // not inflate the coverage denominator
+        let source = r#"
+def compute():
+    return 42
+
+x = compute()
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 0);
+        assert_eq!(linter.dataframes_typed, 0);
     }
 
     #[test]

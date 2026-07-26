@@ -76,15 +76,53 @@ class BenchmarkResult:
     success: bool = True
     error: str | None = None
 
+    def _filtered_times(self) -> list[int]:
+        """Timed samples with outliers beyond 2 standard deviations discarded.
+
+        `.mean`/`.std`/`.iqr` are computed over this filtered set so a single
+        pathological run (OS scheduling hiccup, background process, etc.) doesn't
+        skew the headline numbers -- see GH issue #10. `.times` itself is left
+        untouched so the raw samples remain available for transparency/debugging.
+        """
+        if len(self.times) <= 1:
+            # Too few points for stdev-based filtering to be meaningful.
+            return list(self.times)
+        mean = statistics.mean(self.times)
+        stdev = statistics.stdev(self.times)
+        if stdev == 0:
+            return list(self.times)
+        filtered = [t for t in self.times if abs(t - mean) <= 2 * stdev]
+        # Should never be empty (a symmetric 2-stdev band around the mean of the
+        # same data always contains the mean-nearest points), but fall back to
+        # the raw times rather than reporting stats over nothing.
+        return filtered or list(self.times)
+
     @property
     def mean(self) -> float:
-        """Mean execution time in nanoseconds."""
-        return statistics.mean(self.times) if self.times else 0.0
+        """Mean execution time in nanoseconds, with outliers beyond 2 stdev discarded."""
+        filtered = self._filtered_times()
+        return statistics.mean(filtered) if filtered else 0.0
 
     @property
     def std(self) -> float:
-        """Standard deviation in nanoseconds."""
-        return statistics.stdev(self.times) if len(self.times) > 1 else 0.0
+        """Standard deviation in nanoseconds, with outliers beyond 2 stdev discarded."""
+        filtered = self._filtered_times()
+        return statistics.stdev(filtered) if len(filtered) > 1 else 0.0
+
+    @property
+    def iqr(self) -> float:
+        """Interquartile range (Q3 - Q1) in nanoseconds, with outliers beyond 2 stdev discarded.
+
+        Falls back to 0.0 for fewer than 2 samples, matching the `.std` guard --
+        `statistics.quantiles` technically tolerates a single data point (it just
+        returns that point three times, for an IQR of 0), but there's no
+        meaningful spread to report below 2 samples.
+        """
+        filtered = self._filtered_times()
+        if len(filtered) < 2:
+            return 0.0
+        q1, _, q3 = statistics.quantiles(filtered, n=4)
+        return q3 - q1
 
 
 def copy_to_tmp(source: Path, label: str) -> Path:
@@ -332,7 +370,7 @@ def _format_cell(result: BenchmarkResult | None) -> str:
         return "-"
     if not result.success:
         return result.error or "N/A"
-    return f"{format_time(result.mean)} \u00b1{format_time(result.std)}"
+    return f"{format_time(result.mean)} \u00b1{format_time(result.std)} (IQR {format_time(result.iqr)})"
 
 
 def generate_markdown_table(
@@ -444,7 +482,10 @@ def run_codebase_benchmarks(
         results.append(result)
 
         if result.success:
-            print(f"{format_time(result.mean)} (\u00b1{format_time(result.std)}) [{result.version}]")
+            print(
+                f"{format_time(result.mean)} (\u00b1{format_time(result.std)}, "
+                f"IQR {format_time(result.iqr)}) [{result.version}]"
+            )
         else:
             print(f"SKIPPED: {result.error}")
 

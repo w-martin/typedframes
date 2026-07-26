@@ -707,6 +707,102 @@ class TestCli(unittest.TestCase):
             self.assertNotIn("columns unknown at lint time", output)
             self.assertIn("✓ Checked 1 file", output)
 
+    def test_should_skip_excluded_vendor_directories_when_collecting(self) -> None:
+        """Test that .venv/.git/__pycache__/node_modules subtrees are never descended into."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            venv_dir = root / ".venv" / "lib"
+            venv_dir.mkdir(parents=True)
+            (venv_dir / "fake.py").write_text("x = 1\n")
+
+            git_dir = root / ".git" / "hooks"
+            git_dir.mkdir(parents=True)
+            (git_dir / "fake.py").write_text("x = 1\n")
+
+            pycache_dir = root / "__pycache__"
+            pycache_dir.mkdir(parents=True)
+            (pycache_dir / "fake.py").write_text("x = 1\n")
+
+            node_modules_dir = root / "node_modules" / "some-pkg"
+            node_modules_dir.mkdir(parents=True)
+            (node_modules_dir / "fake.py").write_text("x = 1\n")
+
+            real_dir = root / "real"
+            real_dir.mkdir()
+            (real_dir / "app.py").write_text("x = 1\n")
+
+            # act
+            result = _collect_python_files(root)
+
+            # assert
+            names = [f.name for f in result]
+            self.assertEqual(names, ["app.py"])
+
+    def test_should_skip_file_that_raises_oserror_and_continue(self) -> None:
+        """Test that a per-file OSError from check_file is skipped, not fatal.
+
+        Covers e.g. non-UTF-8 content; the run should continue and report a stderr message.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_file = Path(tmpdir) / "bad.py"
+            bad_file.write_bytes(b"\xff\xfe# not utf8\n")
+
+            good_file = Path(tmpdir) / "good.py"
+            good_file.write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stderr", captured):
+                all_errors, _stats = _check_files([bad_file, good_file])
+
+            # assert
+            self.assertTrue(any(e["file"] == str(good_file) for e in all_errors))
+            self.assertIn(f"{bad_file}: skipped,", captured.getvalue())
+
+    def test_should_skip_file_with_invalid_syntax_and_continue(self) -> None:
+        """Test that a per-file RuntimeError (parse failure) from check_file is skipped, not fatal.
+
+        Covers e.g. unresolved git merge-conflict markers left in a .py file; the run
+        should continue and report a stderr message rather than crash the whole scan.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_file = Path(tmpdir) / "bad.py"
+            bad_file.write_text("<<<<<<< Updated upstream\nimport foo\n=======\nimport bar\n>>>>>>> Stashed changes\n")
+
+            good_file = Path(tmpdir) / "good.py"
+            good_file.write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stderr", captured):
+                all_errors, _stats = _check_files([bad_file, good_file])
+
+            # assert
+            self.assertTrue(any(e["file"] == str(good_file) for e in all_errors))
+            self.assertIn(f"{bad_file}: skipped,", captured.getvalue())
+
     def test_should_not_crash_when_checker_not_installed_on_directory(self) -> None:
         """Test that a missing Rust extension when checking a directory exits with code 1."""
         # arrange

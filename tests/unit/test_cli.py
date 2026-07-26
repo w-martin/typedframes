@@ -771,6 +771,38 @@ class TestCli(unittest.TestCase):
             self.assertTrue(any(e["file"] == str(good_file) for e in all_errors))
             self.assertIn(f"{bad_file}: skipped,", captured.getvalue())
 
+    def test_should_skip_file_with_invalid_syntax_and_continue(self) -> None:
+        """Test that a per-file RuntimeError (parse failure) from check_file is skipped, not fatal.
+
+        Covers e.g. unresolved git merge-conflict markers left in a .py file; the run
+        should continue and report a stderr message rather than crash the whole scan.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_file = Path(tmpdir) / "bad.py"
+            bad_file.write_text("<<<<<<< Updated upstream\nimport foo\n=======\nimport bar\n>>>>>>> Stashed changes\n")
+
+            good_file = Path(tmpdir) / "good.py"
+            good_file.write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stderr", captured):
+                all_errors, _stats = _check_files([bad_file, good_file])
+
+            # assert
+            self.assertTrue(any(e["file"] == str(good_file) for e in all_errors))
+            self.assertIn(f"{bad_file}: skipped,", captured.getvalue())
+
     def test_should_not_crash_when_checker_not_installed_on_directory(self) -> None:
         """Test that a missing Rust extension when checking a directory exits with code 1."""
         # arrange

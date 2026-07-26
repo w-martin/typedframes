@@ -96,6 +96,13 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         except OSError as e:
             print(f"{file_path}: skipped, {e}", file=sys.stderr)
             continue
+        except RuntimeError as e:
+            # check_file_internal's only failure path is a parse_module() error (see
+            # rust/src/lib.rs), i.e. this file's source isn't valid Python syntax --
+            # not an internal linter bug -- so it's safe to skip and keep going, same
+            # as the OSError case above.
+            print(f"{file_path}: skipped, {e}", file=sys.stderr)
+            continue
         result = json.loads(result_json)
         errors = result["errors"]
         for error in errors:

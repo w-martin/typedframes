@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -17,14 +18,58 @@ _BOLD_GREEN = "\033[1;32m"
 _BOLD_YELLOW = "\033[1;33m"
 _DIM = "\033[2m"  # low-key informational text: coverage summary, non-actionable suggestions
 
+# Directories that should never be descended into when collecting .py files: VCS
+# metadata, virtualenvs, caches, and vendored/build trees. Mirrors ruff's default
+# exclude list, a well-established precedent for "directories no linter should scan".
+_EXCLUDED_DIRS = frozenset(
+    {
+        ".bzr",
+        ".direnv",
+        ".eggs",
+        ".git",
+        ".git-rewrite",
+        ".hg",
+        ".ipynb_checkpoints",
+        ".mypy_cache",
+        ".nox",
+        ".pants.d",
+        ".pytest_cache",
+        ".pytype",
+        ".ruff_cache",
+        ".svn",
+        ".tox",
+        ".venv",
+        ".vscode",
+        ".idea",
+        "__pycache__",
+        "_build",
+        "buck-out",
+        "build",
+        "dist",
+        "node_modules",
+        "site-packages",
+        "venv",
+    }
+)
+
 
 def _collect_python_files(path: Path) -> list[Path]:
-    """Collect all .py files from a path (file or directory)."""
+    """Collect all .py files from a path (file or directory).
+
+    Prunes descent into vendored/VCS/cache directories (see ``_EXCLUDED_DIRS``) so
+    that pointing the checker at a real project root doesn't walk into `.venv`,
+    `node_modules`, `.git`, build caches, etc.
+    """
     if path.is_file():
         if path.suffix == ".py":
             return [path]
         return []
-    return sorted(path.rglob("*.py"))
+
+    found = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+        found.extend(Path(dirpath) / filename for filename in filenames if filename.endswith(".py"))
+    return sorted(found)
 
 
 def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tuple[list[dict], dict]:
@@ -46,7 +91,11 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     all_errors = []
     stats = {"dataframes_total": 0, "dataframes_typed": 0}
     for file_path in files:
-        result_json = check_file(str(file_path), index_bytes)
+        try:
+            result_json = check_file(str(file_path), index_bytes)
+        except OSError as e:
+            print(f"{file_path}: skipped, {e}", file=sys.stderr)
+            continue
         result = json.loads(result_json)
         errors = result["errors"]
         for error in errors:

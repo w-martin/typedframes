@@ -72,7 +72,7 @@ class BadSchema(BaseSchema):
 
         # act
         result = check_file(temp_file)
-        errors = json.loads(result)
+        errors = json.loads(result)["errors"]
 
         # assert
         self.assertEqual(len(errors), 1)
@@ -105,7 +105,7 @@ class ProductSchema(BaseSchema):
             self.assertGreater(len(index_bytes), 0)
             # functional check: schema file itself has no column-access errors
             result = check_file(str(schema_path), index_bytes)
-            self.assertEqual(json.loads(result), [])
+            self.assertEqual(json.loads(result)["errors"], [])
 
     def test_should_catch_cross_file_column_error(self) -> None:
         """Test that the checker catches column errors when the schema is defined in another file."""
@@ -137,7 +137,7 @@ print(df["wrong_column"])
             # act
             index_bytes = build_project_index(tmpdir)
             result = check_file(str(root / "pipeline.py"), index_bytes)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             messages = [e["message"] for e in errors]
@@ -168,7 +168,7 @@ _ = a["foo"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "baz" not in slice, "foo" is fine
             messages = [e["message"] for e in errors]
@@ -198,7 +198,7 @@ a = df[["foo", "missing"]]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             messages = [e["message"] for e in errors]
@@ -227,7 +227,7 @@ _ = filtered["nonexistent"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             messages = [e["message"] for e in errors]
@@ -258,7 +258,7 @@ _ = small["bar"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "bar" not in select, "foo" is fine
             messages = [e["message"] for e in errors]
@@ -291,7 +291,7 @@ _ = trimmed["foo"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "baz" dropped, "foo" ok
             messages = [e["message"] for e in errors]
@@ -321,7 +321,7 @@ trimmed = df.drop(columns=["nonexistent"])
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             warnings = [e for e in errors if e.get("severity") == "warning"]
@@ -352,7 +352,7 @@ _ = renamed["bar"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "foo" renamed to "bar", so "foo" should error
             messages = [e["message"] for e in errors]
@@ -384,7 +384,7 @@ _ = augmented["missing"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — new_col and old are fine; missing errors
             messages = [e["message"] for e in errors]
@@ -411,7 +411,7 @@ _ = df["c"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "c" not in usecols, "a" is fine
             messages = [e["message"] for e in errors]
@@ -435,7 +435,7 @@ df = pd.read_csv("x.csv")
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             self.assertEqual(len(errors), 1)
@@ -467,7 +467,7 @@ _ = df["c"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — no untracked-dataframe; "c" errors from schema; no warning for "a"
             warnings = [e for e in errors if e.get("severity") == "warning"]
@@ -502,7 +502,7 @@ _ = b["baz"]
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "foo" ok through chain; "baz" not in slice so errors
             messages = [e["message"] for e in errors]
@@ -549,7 +549,7 @@ def process(path: str) -> None:
             # act
             index_bytes = build_project_index(tmpdir)
             result = check_file(str(root / "pipeline.py"), index_bytes)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             self.assertEqual(len(errors), 1)
@@ -607,7 +607,7 @@ def process(path: str) -> None:
             # act
             index_bytes = build_project_index(tmpdir)
             result = check_file(str(root / "pipeline.py"), index_bytes)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — 'c' is only touched two calls deep, inside postproc
             self.assertEqual(len(errors), 1)
@@ -637,7 +637,7 @@ def contact_label(customers: PandasFrame[CustomerSchema]):
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             self.assertEqual(len(errors), 1)
@@ -688,7 +688,7 @@ def process(path: str) -> None:
             # act
             index_bytes = build_project_index(tmpdir)
             result = check_file(str(root / "pipeline.py"), index_bytes)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — "email" is declared on CustomerSchema but never subscripted in
             # contact_label's body; it must still be part of the contract
@@ -733,7 +733,7 @@ def process(path: str) -> None:
             # act
             index_bytes = build_project_index(tmpdir)
             result = check_file(str(root / "pipeline.py"), index_bytes)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — loader only supplies 'a'; preproc's list-slice needs 'a' AND 'b'
             self.assertEqual(len(errors), 1)
@@ -758,7 +758,7 @@ def preproc(df: pd.DataFrame) -> pd.DataFrame:
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert — caught directly, as an unknown-column bug local to preproc
             self.assertEqual(len(errors), 1)
@@ -789,7 +789,7 @@ def combine(df: PandasFrame[Schema]):
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             self.assertEqual(len(errors), 1)
@@ -817,7 +817,7 @@ def enrich(df: PandasFrame[Schema]):
         try:
             # act
             result = check_file(temp_file, None)
-            errors = json.loads(result)
+            errors = json.loads(result)["errors"]
 
             # assert
             self.assertEqual(len(errors), 1)

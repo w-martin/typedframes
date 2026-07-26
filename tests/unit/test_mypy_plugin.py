@@ -20,11 +20,12 @@ class TestTypedFramesPluginUnit(unittest.TestCase):
         self.plugin = TypedFramesPlugin(Options())
         self.test_file = "test.py"
         self.error_data = [{"line": 10, "message": "Column 'foo' does not exist"}]
+        self.empty_stats = {"dataframes_total": 0, "dataframes_typed": 0}
 
     def test_should_report_error_on_exact_line_match(self) -> None:
         """Test that errors are reported on exact line matches."""
         # arrange - mock the rust extension
-        mock_check_file = MagicMock(return_value=json.dumps(self.error_data))
+        mock_check_file = MagicMock(return_value=json.dumps({"errors": self.error_data, "stats": self.empty_stats}))
 
         with (
             patch("typedframes.mypy.get_project_root") as mock_root,
@@ -49,7 +50,7 @@ class TestTypedFramesPluginUnit(unittest.TestCase):
 
         # Test non-match branch
         new_plugin = TypedFramesPlugin(Options())  # New plugin to avoid cache
-        mock_check_file_empty = MagicMock(return_value=json.dumps([]))
+        mock_check_file_empty = MagicMock(return_value=json.dumps({"errors": [], "stats": self.empty_stats}))
 
         with (
             patch("typedframes.mypy.get_project_root") as mock_root,
@@ -73,7 +74,7 @@ class TestTypedFramesPluginUnit(unittest.TestCase):
     def test_should_report_error_on_fuzzy_line_match(self) -> None:
         """Test that errors are reported on fuzzy line matches within tolerance."""
         # arrange - mock the rust extension
-        mock_check_file = MagicMock(return_value=json.dumps(self.error_data))
+        mock_check_file = MagicMock(return_value=json.dumps({"errors": self.error_data, "stats": self.empty_stats}))
 
         with (
             patch("typedframes.mypy.get_project_root") as mock_root,
@@ -163,7 +164,7 @@ class TestTypedFramesPluginUnit(unittest.TestCase):
         """Test that no error is reported when access line is far from all error lines."""
         # arrange
         far_error_data = [{"line": 100, "message": "Column 'bar' does not exist"}]
-        mock_check_file = MagicMock(return_value=json.dumps(far_error_data))
+        mock_check_file = MagicMock(return_value=json.dumps({"errors": far_error_data, "stats": self.empty_stats}))
         new_plugin = TypedFramesPlugin(Options())
 
         with (

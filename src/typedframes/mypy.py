@@ -67,7 +67,8 @@ class TypedFramesPlugin(Plugin):
         from typedframes._rust_checker import check_file  # ty: ignore[unresolved-import]
 
         result_json = str(check_file(file_path, index_bytes))
-        return json.loads(result_json)
+        result: dict[str, Any] = json.loads(result_json)
+        return result["errors"]
 
     def _run_checker(self, file_path: str) -> list[dict[str, Any]]:
         """Run the Rust checker on the given file."""

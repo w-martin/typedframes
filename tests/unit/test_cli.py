@@ -199,6 +199,46 @@ class TestCli(unittest.TestCase):
         self.assertIn("\033[", result)
         self.assertIn("bad column", result)
 
+    def test_should_color_warning_severity_distinctly_from_error(self) -> None:
+        """Test that color=True renders a warning severity with its own ANSI code."""
+        # arrange
+        errors = [
+            {
+                "file": "f.py",
+                "line": 1,
+                "col": 1,
+                "code": "untracked-dataframe",
+                "message": "columns unknown",
+                "severity": "warning",
+            },
+        ]
+
+        # act
+        result = _format_text(errors, color=True)
+
+        # assert
+        self.assertIn("\033[1;33mwarning\033[0m", result)
+
+    def test_should_color_info_severity_as_dim(self) -> None:
+        """Test that color=True renders an info severity using the dim escape code."""
+        # arrange
+        errors = [
+            {
+                "file": "f.py",
+                "line": 1,
+                "col": 1,
+                "code": "untracked-dataframe",
+                "message": "columns unknown",
+                "severity": "info",
+            },
+        ]
+
+        # act
+        result = _format_text(errors, color=True)
+
+        # assert
+        self.assertIn("\033[2minfo\033[0m", result)
+
     def test_should_format_github_annotations(self) -> None:
         """Test GitHub Actions annotation format."""
         # arrange

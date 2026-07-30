@@ -33,6 +33,7 @@
 mod sql;
 
 use pyo3::prelude::*;
+use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, SourceCode};
@@ -1025,6 +1026,15 @@ pub struct Linter {
     // a load call (see `read_sql_file`). `None` for standalone/no-config invocations,
     // in which case file-based SQL tracing is skipped entirely rather than guessed at.
     project_root: Option<PathBuf>,
+    // Names bound to a plain string literal (or a resolvable `.sql`/text file read —
+    // see `resolve_literal_rhs`) exactly once anywhere in the module. Populated by a
+    // `StringBindingCollector` pre-pass in `check_file_internal`, before the main
+    // statement walk, so that e.g. a module-level `QUERY = "..."` constant is visible
+    // no matter where in the file it's used. A name reassigned, conditionally assigned,
+    // augmented-assigned, or bound by anything other than a plain literal/file-read is
+    // absent from this map entirely — see `StringBindingCollector::record` for the
+    // poison-on-any-second-binding policy this relies on.
+    string_var_candidates: HashMap<String, String>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1071,6 +1081,178 @@ fn find_returned_var(stmts: &[Stmt]) -> Option<String> {
     None
 }
 
+// A candidate `string_var_candidates` entry: either resolved to a stable literal value,
+// or excluded because more than one binding (of any kind) touched the name. See
+// `StringBindingCollector::record`.
+enum StringBinding {
+    Literal(String),
+    Poisoned,
+}
+
+// AST visitor that finds every binding site of every name in a module and resolves
+// single-binding, string-literal-valued ones. Implements `Visitor` (rather than
+// hand-rolling recursion into every statement/expression variant) so that binding forms
+// buried inside nested bodies — `if`/`for`/`while`/`with`/`try`/comprehensions/nested
+// functions — are covered by the trait's default `walk_*` recursion instead of needing
+// to be threaded through by hand.
+struct StringBindingCollector<'a> {
+    linter: &'a Linter,
+    current_file: &'a Path,
+    reads_used: u32,
+    bindings: HashMap<String, StringBinding>,
+}
+
+impl<'a> StringBindingCollector<'a> {
+    // Record a binding of `name`. Any name already present (regardless of what it was
+    // previously recorded as) is poisoned by this second binding — reassignment,
+    // conditional assignment, and augmented assignment all resolve to "exclude" this
+    // way without needing to reason about control flow. `resolved: None` means "this
+    // binding exists but isn't a literal we can use" (e.g. a for-loop variable, a
+    // function parameter, an import) — poisons on first sight too.
+    fn record(&mut self, name: &str, resolved: Option<String>) {
+        if self.bindings.contains_key(name) {
+            self.bindings
+                .insert(name.to_string(), StringBinding::Poisoned);
+            return;
+        }
+        self.bindings.insert(
+            name.to_string(),
+            match resolved {
+                Some(s) => StringBinding::Literal(s),
+                None => StringBinding::Poisoned,
+            },
+        );
+    }
+
+    // Poison every bare `Name` reachable inside an assignment-target expression —
+    // handles tuple/list unpacking and starred targets. Attribute (`obj.x = ...`) and
+    // subscript (`d["x"] = ...`) targets don't bind a plain name at all, so they're
+    // left alone entirely (neither recorded nor poisoned).
+    fn record_target_names(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(n) => self.record(n.id.as_str(), None),
+            Expr::Tuple(t) => {
+                for elt in &t.elts {
+                    self.record_target_names(elt);
+                }
+            }
+            Expr::List(l) => {
+                for elt in &l.elts {
+                    self.record_target_names(elt);
+                }
+            }
+            Expr::Starred(s) => self.record_target_names(&s.value),
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visitor<'a> for StringBindingCollector<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::Assign(assign) => {
+                // Only a single bare-Name target is treated as a literal candidate;
+                // multi-target assignment (`a = b = "x"`) and destructuring targets
+                // poison every name they touch instead of guessing which one "owns"
+                // the literal.
+                if let [Expr::Name(n)] = assign.targets.as_slice() {
+                    let resolved = self.linter.resolve_literal_rhs(
+                        &assign.value,
+                        self.current_file,
+                        &mut self.reads_used,
+                    );
+                    self.record(n.id.as_str(), resolved);
+                } else {
+                    for target in &assign.targets {
+                        self.record_target_names(target);
+                    }
+                }
+            }
+            Stmt::AnnAssign(ann) => {
+                // A bare `x: str` with no value binds nothing at runtime — not a
+                // binding site at all, so neither recorded nor poisoned.
+                if let (Expr::Name(n), Some(value)) = (&*ann.target, &ann.value) {
+                    let resolved = self.linter.resolve_literal_rhs(
+                        value,
+                        self.current_file,
+                        &mut self.reads_used,
+                    );
+                    self.record(n.id.as_str(), resolved);
+                }
+            }
+            Stmt::AugAssign(aug) => self.record_target_names(&aug.target),
+            Stmt::For(for_stmt) => self.record_target_names(&for_stmt.target),
+            Stmt::Global(g) => {
+                for name in &g.names {
+                    self.record(name.as_str(), None);
+                }
+            }
+            Stmt::Nonlocal(nl) => {
+                for name in &nl.names {
+                    self.record(name.as_str(), None);
+                }
+            }
+            Stmt::Delete(del) => {
+                for target in &del.targets {
+                    self.record_target_names(target);
+                }
+            }
+            Stmt::Import(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.record(bound.as_str(), None);
+                }
+            }
+            Stmt::ImportFrom(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.record(bound.as_str(), None);
+                }
+            }
+            _ => {}
+        }
+        ast_visitor::walk_stmt(self, stmt);
+    }
+
+    fn visit_except_handler(&mut self, handler: &'a ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(h) = handler;
+        if let Some(name) = &h.name {
+            self.record(name.as_str(), None);
+        }
+        ast_visitor::walk_except_handler(self, handler);
+    }
+
+    fn visit_parameter(&mut self, parameter: &'a ast::Parameter) {
+        self.record(parameter.name.as_str(), None);
+        ast_visitor::walk_parameter(self, parameter);
+    }
+
+    fn visit_with_item(&mut self, item: &'a ast::WithItem) {
+        if let Some(vars) = &item.optional_vars {
+            self.record_target_names(vars);
+        }
+        ast_visitor::walk_with_item(self, item);
+    }
+
+    fn visit_comprehension(&mut self, comp: &'a ast::Comprehension) {
+        self.record_target_names(&comp.target);
+        ast_visitor::walk_comprehension(self, comp);
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        // Walrus (`q := "..."`) always poisons rather than being resolved: it's almost
+        // always used for control flow (`if (q := f()):`), and a containing expression
+        // that runs more than once (a loop, a comprehension) would make "the" value of
+        // `q` not actually stable the way a single top-level assignment's is.
+        if let Expr::Named(named) = expr {
+            if let Expr::Name(n) = &*named.target {
+                self.record(n.id.as_str(), None);
+            }
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
+}
+
 impl Default for Linter {
     fn default() -> Self {
         Self::new()
@@ -1095,6 +1277,7 @@ impl Linter {
             dataframes_typed: 0,
             sql_dialect: sql::SqlDialect::Generic,
             project_root: None,
+            string_var_candidates: HashMap::new(),
         }
     }
 
@@ -1160,10 +1343,12 @@ impl Linter {
         self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
         let parsed = parse_module(source).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let module = parsed.into_syntax();
+        self.string_var_candidates = self.collect_string_var_candidates(&module.body, path);
         let mut errors = Vec::new();
 
-        for stmt in parsed.into_syntax().body {
-            self.visit_stmt(&stmt, &mut errors);
+        for stmt in &module.body {
+            self.visit_stmt(stmt, &mut errors);
         }
 
         errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
@@ -1494,7 +1679,7 @@ impl Linter {
             return (None, LoadKind::Sql);
         }
 
-        let Some(sql_text) = Self::extract_sql_literal(call) else {
+        let Some(sql_text) = self.extract_sql_literal(call) else {
             return (None, LoadKind::Sql);
         };
 
@@ -1510,21 +1695,34 @@ impl Linter {
     // SQLAlchemy engine. Returns `None` for f-strings, variables, or anything else that
     // isn't a literal — those cases fall through to the existing untracked-dataframe
     // nudge rather than being (wrongly) treated as unresolvable SQL.
-    fn extract_sql_literal(call: &ast::ExprCall) -> Option<String> {
+    fn extract_sql_literal(&self, call: &ast::ExprCall) -> Option<String> {
         for keyword in &call.arguments.keywords {
             if matches!(
                 keyword.arg.as_ref().map(|s| s.as_str()),
                 Some("sql") | Some("query")
             ) {
-                return Self::extract_sql_expr(&keyword.value);
+                return self.extract_sql_expr(&keyword.value);
             }
         }
-        call.arguments.args.first().and_then(Self::extract_sql_expr)
+        call.arguments
+            .args
+            .first()
+            .and_then(|expr| self.extract_sql_expr(expr))
     }
 
-    fn extract_sql_expr(expr: &Expr) -> Option<String> {
+    // Resolve a SQL-shaped argument expression to its text: a literal string, a
+    // `text(...)`/`sqlalchemy.text(...)`-wrapped literal, or a `Name` bound (per
+    // `string_var_candidates`) to a literal or a resolvable `.sql` file read. Deliberately
+    // does NOT resolve f-strings, `.format()`, string concatenation, or any variable
+    // reassigned more than once — see `StringBindingCollector` for why, and
+    // `check_file_internal`'s `LoadKind::Sql` untracked-dataframe hint for how that's
+    // surfaced to the user instead of silently guessing.
+    fn extract_sql_expr(&self, expr: &Expr) -> Option<String> {
         if let Some(s) = Self::extract_string_literal(expr) {
             return Some(s.to_string());
+        }
+        if let Expr::Name(name) = expr {
+            return self.string_var_candidates.get(name.id.as_str()).cloned();
         }
         if let Expr::Call(inner) = expr {
             let fn_name = match &*inner.func {
@@ -1537,10 +1735,202 @@ impl Linter {
                     .arguments
                     .args
                     .first()
-                    .and_then(Self::extract_sql_expr);
+                    .and_then(|expr| self.extract_sql_expr(expr));
             }
         }
         None
+    }
+
+    // Resolve the right-hand side of a candidate string-variable binding: a plain
+    // string literal, or a recognized `.sql` file read (`open(p).read()`,
+    // `Path(p).read_text()`/`pathlib.Path(p).read_text()`). Called only from
+    // `StringBindingCollector` while building `string_var_candidates` — NOT from
+    // `extract_sql_expr` directly, since by the time a load call is checked, any file
+    // read has already been resolved once (and budget-capped) during the pre-pass.
+    fn resolve_literal_rhs(
+        &self,
+        expr: &Expr,
+        current_file: &Path,
+        reads_used: &mut u32,
+    ) -> Option<String> {
+        if let Some(s) = Self::extract_string_literal(expr) {
+            return Some(s.to_string());
+        }
+        if let Expr::Call(call) = expr {
+            return self.resolve_file_read_call(call, current_file, reads_used);
+        }
+        None
+    }
+
+    // Match `open(p).read()` and `Path(p).read_text()`/`pathlib.Path(p).read_text()`,
+    // resolve `p` via `resolve_path_arg`, and read the file through `read_sql_file`'s
+    // safety checks. The split `with open(p) as f: ... sql = f.read()` form is
+    // deliberately not handled — it would need a second traced-binding namespace for
+    // file handles, and the direct chained form covers the common case.
+    fn resolve_file_read_call(
+        &self,
+        call: &ast::ExprCall,
+        current_file: &Path,
+        reads_used: &mut u32,
+    ) -> Option<String> {
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        let Expr::Call(inner) = &*attr.value else {
+            return None;
+        };
+
+        match attr.attr.as_str() {
+            "read" => {
+                let is_open = matches!(&*inner.func, Expr::Name(n) if n.id.as_str() == "open");
+                if !is_open {
+                    return None;
+                }
+                // Reject a binary-mode open ("rb" etc.) rather than reading raw bytes
+                // as if they were UTF-8 SQL text.
+                let binary_mode = inner
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(inner.arguments.keywords.iter().map(|k| &k.value))
+                    .any(|a| matches!(Self::extract_string_literal(a), Some(m) if m.contains('b')));
+                if binary_mode {
+                    return None;
+                }
+                let path_arg = inner.arguments.args.first()?;
+                let path = self.resolve_path_arg(path_arg, current_file)?;
+                self.read_sql_file(&path, reads_used)
+            }
+            "read_text" => {
+                let is_path_ctor = match &*inner.func {
+                    Expr::Name(n) => n.id.as_str() == "Path",
+                    Expr::Attribute(a) => a.attr.as_str() == "Path",
+                    _ => false,
+                };
+                if !is_path_ctor {
+                    return None;
+                }
+                let path_arg = inner.arguments.args.first()?;
+                let path = self.resolve_path_arg(path_arg, current_file)?;
+                self.read_sql_file(&path, reads_used)
+            }
+            _ => None,
+        }
+    }
+
+    // Resolve a path-shaped argument to a filesystem path: a string literal, or
+    // `Path(__file__).parent / "literal.sql"` anchored to the file currently being
+    // checked. Deliberately does NOT resolve a `Name` through `string_var_candidates` —
+    // path variables and SQL-text variables share no ordering guarantee within a single
+    // linear pre-pass, so doing that safely would need a fixed-point resolution loop;
+    // out of scope while call sites overwhelmingly pass the path inline.
+    fn resolve_path_arg(&self, expr: &Expr, current_file: &Path) -> Option<PathBuf> {
+        if let Some(s) = Self::extract_string_literal(expr) {
+            return Some(PathBuf::from(s));
+        }
+        if let Expr::BinOp(binop) = expr {
+            if binop.op == ast::Operator::Div && Self::is_file_parent_expr(&binop.left) {
+                if let Some(s) = Self::extract_string_literal(&binop.right) {
+                    return current_file.parent().map(|dir| dir.join(s));
+                }
+            }
+        }
+        None
+    }
+
+    // Matches `Path(__file__).parent` (with or without a `pathlib.` prefix on `Path`).
+    fn is_file_parent_expr(expr: &Expr) -> bool {
+        let Expr::Attribute(attr) = expr else {
+            return false;
+        };
+        if attr.attr.as_str() != "parent" {
+            return false;
+        }
+        let Expr::Call(call) = &*attr.value else {
+            return false;
+        };
+        let is_path_ctor = match &*call.func {
+            Expr::Name(n) => n.id.as_str() == "Path",
+            Expr::Attribute(a) => a.attr.as_str() == "Path",
+            _ => false,
+        };
+        is_path_ctor
+            && matches!(
+                call.arguments.args.first(),
+                Some(Expr::Name(n)) if n.id.as_str() == "__file__"
+            )
+    }
+
+    // Safety-checked read of a `.sql` file traced back from a load call. Refuses:
+    // absolute paths (only project-relative reads are traced); paths that escape the
+    // project root once both sides are canonicalized (also catches symlink escapes,
+    // since canonicalization follows symlinks); any extension other than `.sql`; a
+    // budget of more than `MAX_SQL_FILE_READS_PER_FILE` reads per file checked; files
+    // over `MAX_SQL_FILE_BYTES`; and anything that isn't a plain file (a FIFO under the
+    // project root would otherwise hang the linter, since reading one blocks until a
+    // writer opens it).
+    fn read_sql_file(&self, path: &Path, reads_used: &mut u32) -> Option<String> {
+        const MAX_SQL_FILE_BYTES: u64 = 256 * 1024;
+        const MAX_SQL_FILE_READS_PER_FILE: u32 = 32;
+
+        if path.is_absolute() {
+            return None;
+        }
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+        {
+            return None;
+        }
+        let root = self.project_root.as_ref()?;
+        if *reads_used >= MAX_SQL_FILE_READS_PER_FILE {
+            return None;
+        }
+
+        let canonical_root = fs::canonicalize(root).ok()?;
+        let canonical_target = fs::canonicalize(root.join(path)).ok()?;
+        if !canonical_target.starts_with(&canonical_root) {
+            return None;
+        }
+
+        let metadata = fs::metadata(&canonical_target).ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_SQL_FILE_BYTES {
+            return None;
+        }
+
+        *reads_used += 1;
+        fs::read_to_string(&canonical_target).ok()
+    }
+
+    // Build `string_var_candidates`: names bound to a plain string literal (or a
+    // resolvable `.sql` file read) exactly once anywhere in the module. Runs once, as a
+    // pre-pass over the whole module before `visit_stmt`'s single top-to-bottom walk —
+    // NOT incrementally during that walk. Two reasons: (1) `visit_stmt` recurses into a
+    // function body at its `def` site, so a module-level constant defined *after* the
+    // function using it would otherwise be invisible; (2) `self.variables` already
+    // tracks names flatly with no scope stack (see its own docs), so a bare pre-pass
+    // over every binding site inherits that same simplicity for free — a name assigned
+    // once in each of two different functions is two bindings of one flat name, and is
+    // correctly excluded as ambiguous, rather than requiring real scope resolution.
+    fn collect_string_var_candidates(&self, body: &[Stmt], path: &Path) -> HashMap<String, String> {
+        let mut collector = StringBindingCollector {
+            linter: self,
+            current_file: path,
+            reads_used: 0,
+            bindings: HashMap::new(),
+        };
+        for stmt in body {
+            collector.visit_stmt(stmt);
+        }
+        collector
+            .bindings
+            .into_iter()
+            .filter_map(|(name, binding)| match binding {
+                StringBinding::Literal(s) => Some((name, s)),
+                StringBinding::Poisoned => None,
+            })
+            .collect()
     }
 
     // Extract dropped column names from a drop() call.
@@ -4592,6 +4982,150 @@ print(df["order_id"])
             .unwrap();
 
         assert_eq!(errors.len(), 0, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_traces_sql_through_a_single_assigned_variable() {
+        // A module-level (or function-local — the checker doesn't distinguish, see
+        // StringBindingCollector) constant assigned exactly once should resolve just
+        // like an inline literal.
+        let source = r#"
+import pandas as pd
+
+QUERY = "SELECT order_id, amount FROM orders"
+df = pd.read_sql(QUERY, conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_reassigned_sql_variable_is_not_traced() {
+        // A second binding of QUERY poisons it — the checker must not guess which
+        // assignment was actually in effect at the read_sql call, so the load falls
+        // through to the untracked-dataframe hint instead of inferring a (possibly
+        // wrong) column set.
+        let source = r#"
+import pandas as pd
+
+QUERY = "SELECT order_id FROM orders"
+QUERY = "SELECT customer_id FROM customers"
+df = pd.read_sql(QUERY, conn)
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_traces_sql_from_a_file_under_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("orders.sql"),
+            "SELECT order_id, amount FROM orders",
+        )
+        .unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("orders.sql").read_text()
+df = pd.read_sql(sql, conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_file_read_refuses_path_escaping_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outside = temp.path().parent().unwrap();
+        fs::write(outside.join("secret.sql"), "SELECT * FROM secrets").unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("../secret.sql").read_text()
+df = pd.read_sql(sql, conn)
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        // Unresolved -> falls through to untracked-dataframe, never a fabricated
+        // column set from a file outside the project.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_file_read_refuses_non_sql_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("orders.txt"), "SELECT order_id FROM orders").unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("orders.txt").read_text()
+df = pd.read_sql(sql, conn)
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_fstring_sql_is_silently_untracked_not_a_new_diagnostic() {
+        // f-string SQL is refused (it's the injection anti-pattern parameterized
+        // queries exist to avoid), but the checker doesn't have taint analysis to tell
+        // a safe interpolation from a real vulnerability, so it stays silent rather
+        // than emitting an unactionable injection warning — just the same
+        // untracked-dataframe hint as any other unresolvable load.
+        let source = r#"
+import pandas as pd
+
+cols = "order_id, amount"
+df = pd.read_sql(f"SELECT {cols} FROM orders", conn)
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
     }
 
     #[test]

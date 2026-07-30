@@ -867,6 +867,28 @@ const SQL_LOAD_FUNCTIONS: &[&str] = &[
 // be bound to.
 const FEAST_RETRIEVAL_METHODS: &[&str] = &["get_historical_features", "get_online_features"];
 
+// The `connectorx` package (conventionally imported `as cx`) exposes a `read_sql`
+// function with the SQL text as its SECOND positional argument
+// (`cx.read_sql(conn_uri, sql)`) — the reverse of pandas' `pd.read_sql(sql, conn)` —
+// so it needs its own argument-position handling rather than reusing
+// `extract_sql_literal`. Its own module list, separate from `LOAD_MODULES`
+// (pd/pl), since it isn't a DataFrame-library namespace itself.
+const CONNECTORX_MODULES: &[&str] = &["connectorx", "cx"];
+
+// DataFrame-materializing method that finalizes a connector call chain into an actual
+// DataFrame: google-cloud-bigquery's `.to_dataframe()`, PySpark/Databricks Connect's
+// `.toPandas()`, DuckDB's `.df()`/`.pl()`. Only dispatches when the call it's chained
+// onto is confirmed to be one of `SQL_PRODUCING_METHODS` — see
+// `sql_producing_call_args`, and its call sites for why "any receiver's `.df()`" isn't
+// enough on its own (that name in particular is common and unrelated most of the time).
+const SQL_FINALIZE_METHODS: &[&str] = &["to_dataframe", "toPandas", "df", "pl"];
+
+// Methods/bare functions whose first positional (or `sql=`/`query=` keyword) argument
+// is SQL text, chained into one of `SQL_FINALIZE_METHODS`: `client.query(sql)`
+// (BigQuery), `spark.sql(sql)`/`session.sql(sql)` (PySpark/Databricks Connect),
+// `duckdb.sql(sql)`/`duckdb.query(sql)`.
+const SQL_PRODUCING_METHODS: &[&str] = &["query", "sql"];
+
 // Which family of load a call belongs to — used only to phrase the
 // `untracked-dataframe` hint appropriately when extraction fails. Not persisted anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1070,6 +1092,13 @@ pub struct Linter {
     // membership against these as always `true`, so `unknown-column` can never
     // false-positive on a real column this checker just doesn't know about.
     open_schemas: std::collections::HashSet<String>,
+    // Cursor variable name -> the SQL text most recently passed to `cursor.execute(sql)`
+    // (the PEP 249 pattern used by Snowflake, Redshift, and similar connectors), until
+    // a later `cursor.fetch_pandas_all()` materializes it into a DataFrame. A second
+    // `execute()` on the same cursor overwrites (or, if its argument doesn't resolve,
+    // removes) the previous entry — matching real PEP 249 semantics, where a cursor
+    // holds exactly one most-recently-executed query at a time.
+    cursor_sql: HashMap<String, String>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1316,6 +1345,7 @@ impl Linter {
             stmt_var_candidates: HashMap::new(),
             retrieval_jobs: HashMap::new(),
             open_schemas: std::collections::HashSet::new(),
+            cursor_sql: HashMap::new(),
         }
     }
 
@@ -2182,6 +2212,69 @@ impl Linter {
                     message: "columns unknown at lint time; pass a literal \
                               `features=[\"view:feature\", ...]` list to resolve the \
                               retrieved columns"
+                        .to_string(),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
+    }
+
+    // If `expr` is a call to one of `SQL_PRODUCING_METHODS` (`client.query(...)`,
+    // `spark.sql(...)`, `duckdb.sql(...)`/`duckdb.query(...)`), return it so its SQL
+    // argument can be resolved — otherwise `None`. Kept as a separate check (rather than
+    // folding straight into column extraction) so the chained-finalize dispatch below
+    // can tell "not our pattern at all" (stay silent) apart from "our pattern, but the
+    // SQL didn't resolve" (worth an untracked-dataframe hint) — see its call site.
+    fn sql_producing_call(expr: &Expr) -> Option<&ast::ExprCall> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let fn_name = match &*call.func {
+            Expr::Name(n) => n.id.as_str(),
+            Expr::Attribute(a) => a.attr.as_str(),
+            _ => return None,
+        };
+        SQL_PRODUCING_METHODS.contains(&fn_name).then_some(call)
+    }
+
+    // Register `target_names` as a DataFrame with an ordinary (exact-match) schema
+    // inferred from a literal SQL string, or an untracked-dataframe warning if `sql`
+    // couldn't be resolved to one. Shared by the chained-finalize
+    // (`client.query(sql).to_dataframe()`) and cursor (`cursor.fetch_pandas_all()`)
+    // connector patterns, which differ only in how they locate the SQL text.
+    fn register_sql_dataframe(
+        &mut self,
+        sql: Option<&str>,
+        target_names: &[String],
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        self.dataframes_total += 1;
+        let cols = sql.and_then(
+            |sql| match sql::columns_from_select(sql, self.sql_dialect) {
+                sql::SqlOutcome::Columns(cols) => Some(cols),
+                sql::SqlOutcome::Wildcard | sql::SqlOutcome::Unparsed => None,
+            },
+        );
+        match cols {
+            Some(cols) => {
+                self.dataframes_typed += 1;
+                let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
+                for name in target_names {
+                    self.variables
+                        .insert(name.clone(), (schema_name.clone(), current_line));
+                }
+            }
+            None => {
+                errors.push(LintError {
+                    line: current_line,
+                    col: current_col,
+                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                    message: "columns unknown at lint time; name the columns in the \
+                              `SELECT` list (avoid `SELECT *`) or annotate: \
+                              `df: Annotated[pd.DataFrame, MySchema] = ...`"
                         .to_string(),
                     severity: "warning".to_string(),
                 });
@@ -3545,6 +3638,76 @@ impl Linter {
                                                 });
                                             }
                                         }
+                                    } else if CONNECTORX_MODULES.contains(&class_str)
+                                        && func_name == "read_sql"
+                                    {
+                                        // connectorx.read_sql(conn_uri, sql) — SQL is
+                                        // the second positional argument, the reverse of
+                                        // pandas' convention, so this can't reuse
+                                        // extract_load_columns/extract_sql_literal.
+                                        self.dataframes_total += 1;
+                                        let sql = call
+                                            .arguments
+                                            .args
+                                            .get(1)
+                                            .and_then(|a| self.extract_sql_expr(a));
+                                        let cols =
+                                            sql.and_then(|sql| {
+                                                match sql::columns_from_select(
+                                                    &sql,
+                                                    self.sql_dialect,
+                                                ) {
+                                                    sql::SqlOutcome::Columns(cols) => Some(cols),
+                                                    sql::SqlOutcome::Wildcard
+                                                    | sql::SqlOutcome::Unparsed => None,
+                                                }
+                                            });
+                                        match cols {
+                                            Some(cols) => {
+                                                self.dataframes_typed += 1;
+                                                let target_names: Vec<String> = assign
+                                                    .targets
+                                                    .iter()
+                                                    .filter_map(|t| {
+                                                        if let Expr::Name(n) = t {
+                                                            Some(n.id.to_string())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .collect();
+                                                let var_name = target_names
+                                                    .first()
+                                                    .map(|s| s.as_str())
+                                                    .unwrap_or("df");
+                                                let schema_name = self.make_inferred_schema(
+                                                    cols,
+                                                    var_name,
+                                                    current_line,
+                                                );
+                                                for name in &target_names {
+                                                    self.variables.insert(
+                                                        name.clone(),
+                                                        (schema_name.clone(), current_line),
+                                                    );
+                                                }
+                                            }
+                                            None => {
+                                                errors.push(LintError {
+                                                    line: current_line,
+                                                    col: current_col,
+                                                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                                                    message: "columns unknown at lint \
+                                                              time; name the columns in \
+                                                              the `SELECT` list (avoid \
+                                                              `SELECT *`) or annotate: \
+                                                              `df: Annotated[pd.DataFrame, \
+                                                              MySchema] = ...`"
+                                                        .to_string(),
+                                                    severity: "warning".to_string(),
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             } else if ROW_PASSTHROUGH_METHODS.contains(&func_name) {
@@ -3700,6 +3863,72 @@ impl Linter {
                                         target_names.first().map(|s| s.as_str()).unwrap_or("df");
                                     self.register_feast_dataframe(
                                         cols,
+                                        &target_names,
+                                        var_name,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
+                                }
+                            } else if SQL_FINALIZE_METHODS.contains(&func_name) {
+                                // client.query(sql).to_dataframe() / spark.sql(sql)
+                                // .toPandas() / duckdb.sql(sql).df()/.pl() — only
+                                // dispatched once the call this is chained onto is
+                                // confirmed to be one of SQL_PRODUCING_METHODS with a
+                                // resolvable SQL argument; `.df()`/`.pl()`/`.toPandas()`
+                                // alone are too generic a signal (plenty of unrelated
+                                // code has methods by those names) to count or warn on
+                                // by name alone.
+                                if let Some(inner_call) = Self::sql_producing_call(&attr.value) {
+                                    let sql = self.extract_sql_literal(inner_call);
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_name =
+                                        target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                    self.register_sql_dataframe(
+                                        sql.as_deref(),
+                                        &target_names,
+                                        var_name,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
+                                }
+                            } else if func_name == "fetch_pandas_all" {
+                                // cursor.fetch_pandas_all() — the second half of the
+                                // Snowflake/Redshift cursor pattern; the SQL text was
+                                // recorded by the `cursor.execute(sql)` bare-statement
+                                // handling above. Unlike the finalize methods above,
+                                // this name is specific enough that dispatching on it
+                                // alone (even with no prior tracked `execute()`) is
+                                // safe — it isn't a generic accessor name plausibly
+                                // used for something unrelated.
+                                if let Expr::Name(recv) = &*attr.value {
+                                    let sql = self.cursor_sql.get(recv.id.as_str()).cloned();
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_name =
+                                        target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                    self.register_sql_dataframe(
+                                        sql.as_deref(),
                                         &target_names,
                                         var_name,
                                         current_line,
@@ -4260,6 +4489,28 @@ impl Linter {
                                     .and_then(|a| Self::extract_string_literal(a))
                                 {
                                     self.add_column_inplace(recv.id.as_str(), col_name, line);
+                                }
+                            }
+                        } else if func_name == "execute" {
+                            // cursor.execute(sql) — the PEP 249 pattern used by
+                            // Snowflake, Redshift, and similar DB-API connectors. The
+                            // SQL text is bound to the cursor, not returned, so it's
+                            // tracked in `cursor_sql` until a later
+                            // `cursor.fetch_pandas_all()` (see the Assign arm) turns it
+                            // into a DataFrame.
+                            if let Expr::Name(recv) = &*attr.value {
+                                let sql = call
+                                    .arguments
+                                    .args
+                                    .first()
+                                    .and_then(|a| self.extract_sql_expr(a));
+                                match sql {
+                                    Some(sql) => {
+                                        self.cursor_sql.insert(recv.id.to_string(), sql);
+                                    }
+                                    None => {
+                                        self.cursor_sql.remove(recv.id.as_str());
+                                    }
                                 }
                             }
                         }
@@ -5967,6 +6218,125 @@ df = some_other_object.to_df()
 
         assert_eq!(errors.len(), 0, "errors: {errors:?}");
         assert!(!linter.variables.contains_key("df"));
+    }
+
+    #[test]
+    fn test_bigquery_chained_query_to_dataframe_resolves_columns() {
+        let source = r#"
+df = client.query("SELECT user_id, total_spent FROM analytics.customers").to_dataframe()
+print(df["user_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_pyspark_chained_sql_to_pandas_resolves_columns() {
+        let source = r#"
+df = spark.sql("SELECT order_id, amount FROM orders").toPandas()
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_duckdb_chained_sql_df_resolves_columns() {
+        let source = r#"
+df = duckdb.sql("SELECT order_id, amount FROM 'orders.parquet'").df()
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_unrelated_df_method_is_left_alone_not_treated_as_sql() {
+        // `.df()` chained onto something that ISN'T one of SQL_PRODUCING_METHODS must
+        // not be treated as a SQL-producing call at all — no dataframes_total bump, no
+        // untracked-dataframe warning, since plenty of unrelated code has a `.df()`
+        // accessor for something else entirely.
+        let source = r#"
+df = some_relation.transform().df()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert_eq!(linter.dataframes_total, 0);
+    }
+
+    #[test]
+    fn test_snowflake_cursor_execute_then_fetch_pandas_all_resolves_columns() {
+        let source = r#"
+cursor.execute("SELECT order_id, amount FROM orders")
+df = cursor.fetch_pandas_all()
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_cursor_reexecute_with_unresolvable_query_poisons_previous_entry() {
+        // A second execute() with an unresolvable (variable) query must not leave the
+        // first execute()'s columns silently in effect for the next fetch.
+        let source = r#"
+cursor.execute("SELECT order_id FROM orders")
+cursor.execute(dynamic_query)
+df = cursor.fetch_pandas_all()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_connectorx_read_sql_uses_second_positional_argument() {
+        let source = r#"
+import connectorx as cx
+
+df = cx.read_sql(conn_uri, "SELECT order_id, amount FROM orders")
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
     }
 
     #[test]

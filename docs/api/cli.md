@@ -124,8 +124,13 @@ to no folding (columns keep the exact case written in the query).
 ```toml
 [tool.typedframes]
 sql_dialect = "snowflake"  # one of: bigquery, snowflake, redshift, databricks,
-                           # duckdb, postgres, mysql, hive, spark
+                           # duckdb, postgres, mysql, hive, spark, mssql
+                           # (mssql aliases: sqlserver, synapse, fabric)
 ```
+
+SQL parsing also accepts T-SQL's `[bracket-quoted]` identifiers (SQL Server, Azure SQL,
+Synapse, Fabric Warehouse) alongside standard `"double-quoted"` ones, regardless of
+`sql_dialect`.
 
 ---
 

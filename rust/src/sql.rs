@@ -8,13 +8,320 @@
 //! short, wrongly-inferred column set) is not.
 
 use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
+
+/// The grammar every query is parsed with, regardless of `SqlDialect` — see
+/// [`columns_from_select`]. Identical to [`sqlparser::dialect::GenericDialect`] (its
+/// permissive superset of accepted syntax) with one addition: `[bracket-quoted]`
+/// identifiers, T-SQL's convention (SQL Server, Azure SQL, Synapse, Fabric Warehouse),
+/// which `GenericDialect` doesn't accept — verified directly:
+/// `columns_from_select("SELECT [OrderID] FROM [dbo].[Orders]", ...)` returns
+/// `Unparsed` under plain `GenericDialect`, since it only treats `"` and `` ` `` as
+/// quote characters.
+///
+/// `sqlparser` has no dialect-composition mechanism (a `Dialect` impl can't "inherit"
+/// another's overrides), so this duplicates `GenericDialect`'s method bodies verbatim
+/// rather than picking a stricter single-engine dialect — keep it in sync with
+/// `GenericDialect` if upgrading the `sqlparser` dependency changes those defaults.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PermissiveDialect;
+
+impl Dialect for PermissiveDialect {
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        ch == '"' || ch == '`' || ch == '['
+    }
+
+    fn is_identifier_start(&self, ch: char) -> bool {
+        ch.is_alphabetic() || ch == '_' || ch == '#' || ch == '@'
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        ch.is_alphabetic()
+            || ch.is_ascii_digit()
+            || ch == '@'
+            || ch == '$'
+            || ch == '#'
+            || ch == '_'
+    }
+
+    fn supports_unicode_string_literal(&self) -> bool {
+        true
+    }
+
+    fn supports_partition_by_after_order_by(&self) -> bool {
+        true
+    }
+
+    fn supports_array_join_syntax(&self) -> bool {
+        true
+    }
+
+    fn supports_group_by_expr(&self) -> bool {
+        true
+    }
+
+    fn supports_group_by_with_modifier(&self) -> bool {
+        true
+    }
+
+    fn supports_left_associative_joins_without_parens(&self) -> bool {
+        true
+    }
+
+    fn supports_connect_by(&self) -> bool {
+        true
+    }
+
+    fn supports_match_recognize(&self) -> bool {
+        true
+    }
+
+    fn supports_pipe_operator(&self) -> bool {
+        true
+    }
+
+    fn supports_start_transaction_modifier(&self) -> bool {
+        true
+    }
+
+    fn supports_window_function_null_treatment_arg(&self) -> bool {
+        true
+    }
+
+    fn supports_dictionary_syntax(&self) -> bool {
+        true
+    }
+
+    fn supports_window_clause_named_window_reference(&self) -> bool {
+        true
+    }
+
+    fn supports_parenthesized_set_variables(&self) -> bool {
+        true
+    }
+
+    fn supports_select_wildcard_except(&self) -> bool {
+        true
+    }
+
+    fn support_map_literal_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_extract_custom(&self) -> bool {
+        true
+    }
+
+    fn allow_extract_single_quotes(&self) -> bool {
+        true
+    }
+
+    fn supports_extract_comma_syntax(&self) -> bool {
+        true
+    }
+
+    fn supports_create_view_comment_syntax(&self) -> bool {
+        true
+    }
+
+    fn supports_parens_around_table_factor(&self) -> bool {
+        true
+    }
+
+    fn supports_values_as_table_factor(&self) -> bool {
+        true
+    }
+
+    fn supports_create_index_with_clause(&self) -> bool {
+        true
+    }
+
+    fn supports_explain_with_utility_options(&self) -> bool {
+        true
+    }
+
+    fn supports_limit_comma(&self) -> bool {
+        true
+    }
+
+    fn supports_update_order_by(&self) -> bool {
+        true
+    }
+
+    fn supports_from_first_select(&self) -> bool {
+        true
+    }
+
+    fn supports_projection_trailing_commas(&self) -> bool {
+        true
+    }
+
+    fn supports_asc_desc_in_column_definition(&self) -> bool {
+        true
+    }
+
+    fn supports_try_convert(&self) -> bool {
+        true
+    }
+
+    fn supports_bitwise_shift_operators(&self) -> bool {
+        true
+    }
+
+    fn supports_comment_on(&self) -> bool {
+        true
+    }
+
+    fn supports_load_extension(&self) -> bool {
+        true
+    }
+
+    fn supports_named_fn_args_with_assignment_operator(&self) -> bool {
+        true
+    }
+
+    fn supports_struct_literal(&self) -> bool {
+        true
+    }
+
+    fn supports_empty_projections(&self) -> bool {
+        true
+    }
+
+    fn supports_nested_comments(&self) -> bool {
+        true
+    }
+
+    fn supports_multiline_comment_hints(&self) -> bool {
+        true
+    }
+
+    fn supports_user_host_grantee(&self) -> bool {
+        true
+    }
+
+    fn supports_string_escape_constant(&self) -> bool {
+        true
+    }
+
+    fn supports_array_typedef_with_brackets(&self) -> bool {
+        true
+    }
+
+    fn supports_match_against(&self) -> bool {
+        true
+    }
+
+    fn supports_set_names(&self) -> bool {
+        true
+    }
+
+    fn supports_comma_separated_set_assignments(&self) -> bool {
+        true
+    }
+
+    fn supports_filter_during_aggregation(&self) -> bool {
+        true
+    }
+
+    fn supports_select_wildcard_exclude(&self) -> bool {
+        true
+    }
+
+    fn supports_data_type_signed_suffix(&self) -> bool {
+        true
+    }
+
+    fn supports_interval_options(&self) -> bool {
+        true
+    }
+
+    fn supports_quote_delimited_string(&self) -> bool {
+        true
+    }
+
+    fn supports_select_wildcard_replace(&self) -> bool {
+        true
+    }
+
+    fn supports_select_wildcard_ilike(&self) -> bool {
+        true
+    }
+
+    fn supports_select_wildcard_rename(&self) -> bool {
+        true
+    }
+
+    fn supports_optimize_table(&self) -> bool {
+        true
+    }
+
+    fn supports_install(&self) -> bool {
+        true
+    }
+
+    fn supports_detach(&self) -> bool {
+        true
+    }
+
+    fn supports_prewhere(&self) -> bool {
+        true
+    }
+
+    fn supports_with_fill(&self) -> bool {
+        true
+    }
+
+    fn supports_limit_by(&self) -> bool {
+        true
+    }
+
+    fn supports_interpolate(&self) -> bool {
+        true
+    }
+
+    fn supports_settings(&self) -> bool {
+        true
+    }
+
+    fn supports_select_format(&self) -> bool {
+        true
+    }
+
+    fn supports_comment_optimizer_hint(&self) -> bool {
+        true
+    }
+
+    fn supports_constraint_keyword_without_name(&self) -> bool {
+        true
+    }
+
+    fn supports_key_column_option(&self) -> bool {
+        true
+    }
+
+    fn supports_comma_separated_trim(&self) -> bool {
+        true
+    }
+
+    fn supports_cte_without_as(&self) -> bool {
+        true
+    }
+
+    fn supports_select_item_multi_column_alias(&self) -> bool {
+        true
+    }
+
+    fn supports_xml_expressions(&self) -> bool {
+        true
+    }
+}
 
 /// The SQL dialect to parse with, keyed to the connector the query came from.
 ///
 /// Only affects unquoted-identifier case folding (see [`fold_case`]) — the grammar
-/// accepted is deliberately the permissive [`GenericDialect`] superset in all cases,
+/// accepted is deliberately the permissive [`PermissiveDialect`] superset in all cases,
 /// since a query written for one engine parsing successfully under another dialect's
 /// grammar is not a correctness problem here: we only ever read identifier names out of
 /// a successfully parsed `SELECT` list.
@@ -30,6 +337,14 @@ pub(crate) enum SqlDialect {
     MySql,
     Hive,
     Spark,
+    // SQL Server / Azure SQL Database / Azure Synapse (dedicated and serverless SQL
+    // pools) / Microsoft Fabric Warehouse. Behaves identically to `Generic` in
+    // `fold_case` — SQL Server preserves the case an unquoted identifier was declared
+    // with rather than rewriting it, so there's nothing to fold — but is its own named
+    // variant (rather than relying on `from_config_str`'s Generic fallback) so
+    // `sql_dialect = "synapse"` is a deliberate, documented choice instead of a
+    // silent coincidence.
+    MsSql,
 }
 
 impl SqlDialect {
@@ -47,6 +362,7 @@ impl SqlDialect {
             "mysql" => Self::MySql,
             "hive" => Self::Hive,
             "spark" | "sparksql" => Self::Spark,
+            "mssql" | "sqlserver" | "synapse" | "fabric" => Self::MsSql,
             _ => Self::Generic,
         }
     }
@@ -62,15 +378,17 @@ impl SqlDialect {
             Self::Snowflake => ident.to_ascii_uppercase(),
             // Postgres/Redshift lowercase unquoted identifiers.
             Self::Postgres | Self::Redshift => ident.to_ascii_lowercase(),
-            // BigQuery, DuckDB, Databricks/Spark/Hive, MySQL, and the generic fallback
-            // preserve source case for unquoted identifiers.
+            // BigQuery, DuckDB, Databricks/Spark/Hive, MySQL, SQL Server/Synapse/
+            // Fabric, and the generic fallback preserve source case for unquoted
+            // identifiers.
             Self::Generic
             | Self::BigQuery
             | Self::Databricks
             | Self::DuckDb
             | Self::MySql
             | Self::Hive
-            | Self::Spark => ident.to_string(),
+            | Self::Spark
+            | Self::MsSql => ident.to_string(),
         }
     }
 }
@@ -97,15 +415,16 @@ pub(crate) enum SqlOutcome {
 /// A short inferred column set is worse than no inference at all — it manufactures false
 /// `unknown-column` errors on real columns that happen not to have been resolved.
 pub(crate) fn columns_from_select(sql: &str, dialect: SqlDialect) -> SqlOutcome {
-    // Grammar is always the permissive GenericDialect superset, regardless of
+    // Grammar is always the permissive PermissiveDialect superset, regardless of
     // `dialect` — `dialect` only controls identifier case folding (`fold_case`) once
     // parsing has already succeeded. A query written for one engine failing to parse
     // under another engine's *stricter* grammar (e.g. Redshift's dialect rejecting a
-    // `?` placeholder that's perfectly valid SQL text) would otherwise cost real
+    // `?` placeholder, or plain GenericDialect rejecting T-SQL's `[bracket]`
+    // identifiers — both perfectly valid SQL text) would otherwise cost real
     // inferences for no correctness benefit — we only ever read identifier names out
     // of a successfully parsed `SELECT` list, never validate engine-specific syntax.
     let statements =
-        match Parser::new(&GenericDialect {})
+        match Parser::new(&PermissiveDialect)
             .try_with_sql(sql)
             .and_then(|mut parser| {
                 parser = parser.with_recursion_limit(50);
@@ -370,17 +689,49 @@ mod tests {
 
     #[test]
     fn qmark_placeholder_still_parses_under_a_non_generic_dialect() {
-        // Regression test: grammar must always be GenericDialect regardless of which
-        // SqlDialect is passed — dialect only controls case folding. This previously
-        // used the specific engine's (stricter) grammar for parsing too, so a query
-        // that's perfectly valid SQL text failed to parse under e.g. Redshift's
-        // dialect even though it parses fine under Generic.
+        // Regression test: grammar must always be PermissiveDialect regardless of
+        // which SqlDialect is passed — dialect only controls case folding. This
+        // previously used the specific engine's (stricter) grammar for parsing too, so
+        // a query that's perfectly valid SQL text failed to parse under e.g.
+        // Redshift's dialect even though it parses fine under the shared grammar.
         assert_eq!(
             cols_d(
                 "SELECT order_id FROM orders WHERE customer_id = ?",
                 SqlDialect::Redshift
             ),
             SqlOutcome::Columns(vec!["order_id".to_string()])
+        );
+    }
+
+    #[test]
+    fn bracket_quoted_identifiers_parse() {
+        // Regression test: T-SQL's [bracket] quoting (SQL Server / Azure SQL /
+        // Synapse / Fabric Warehouse) — sqlparser's plain GenericDialect only accepts
+        // `"` and `` ` `` as quote characters, so this failed to parse (Unparsed)
+        // before PermissiveDialect added `[` support.
+        assert_eq!(
+            cols("SELECT [OrderID], [CustomerID] FROM [dbo].[Orders]"),
+            SqlOutcome::Columns(vec!["OrderID".to_string(), "CustomerID".to_string()])
+        );
+    }
+
+    #[test]
+    fn bracket_quoted_identifier_preserves_case_verbatim() {
+        // Quoting (bracket or double-quote) is the escape hatch that preserves case on
+        // every engine in this list — a case-folding dialect must not touch it.
+        assert_eq!(
+            cols_d("SELECT [OrderId] FROM orders", SqlDialect::Postgres),
+            SqlOutcome::Columns(vec!["OrderId".to_string()])
+        );
+    }
+
+    #[test]
+    fn mssql_dialect_does_not_fold_unquoted_identifiers() {
+        // SQL Server preserves the case an unquoted identifier was declared with
+        // rather than rewriting it — same "preserve" bucket as Generic/BigQuery/etc.
+        assert_eq!(
+            cols_d("SELECT OrderId FROM orders", SqlDialect::MsSql),
+            SqlOutcome::Columns(vec!["OrderId".to_string()])
         );
     }
 
@@ -408,5 +759,16 @@ mod tests {
             SqlDialect::from_config_str("SNOWFLAKE"),
             SqlDialect::Snowflake
         );
+    }
+
+    #[test]
+    fn from_config_str_recognizes_azure_sql_server_family_aliases() {
+        for alias in ["mssql", "sqlserver", "synapse", "fabric", "SYNAPSE"] {
+            assert_eq!(
+                SqlDialect::from_config_str(alias),
+                SqlDialect::MsSql,
+                "alias: {alias}"
+            );
+        }
     }
 }

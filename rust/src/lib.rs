@@ -2303,11 +2303,14 @@ impl Linter {
         None
     }
 
-    // Match `open(p).read()` and `Path(p).read_text()`/`pathlib.Path(p).read_text()`,
-    // resolve `p` via `resolve_path_arg`, and read the file through `read_sql_file`'s
-    // safety checks. The split `with open(p) as f: ... sql = f.read()` form is
-    // deliberately not handled — it would need a second traced-binding namespace for
-    // file handles, and the direct chained form covers the common case.
+    // Match `open(p).read()` and `p.read_text()` (where `p` is itself a path
+    // expression — `Path(p)`/`pathlib.Path(p)`, or `Path(__file__).parent / "x.sql"`
+    // with no further `Path(...)` wrapper, since nobody writes
+    // `Path(Path(__file__).parent / "x.sql")`), resolve the path via
+    // `resolve_path_expr`, and read the file through `read_sql_file`'s safety checks.
+    // The split `with open(p) as f: ... sql = f.read()` form is deliberately not
+    // handled — it would need a second traced-binding namespace for file handles, and
+    // the direct chained form covers the common case.
     fn resolve_file_read_call(
         &self,
         call: &ast::ExprCall,
@@ -2317,12 +2320,13 @@ impl Linter {
         let Expr::Attribute(attr) = &*call.func else {
             return None;
         };
-        let Expr::Call(inner) = &*attr.value else {
-            return None;
-        };
 
         match attr.attr.as_str() {
             "read" => {
+                // open(p).read()
+                let Expr::Call(inner) = &*attr.value else {
+                    return None;
+                };
                 let is_open = matches!(&*inner.func, Expr::Name(n) if n.id.as_str() == "open");
                 if !is_open {
                     return None;
@@ -2339,35 +2343,44 @@ impl Linter {
                     return None;
                 }
                 let path_arg = inner.arguments.args.first()?;
-                let path = self.resolve_path_arg(path_arg, current_file)?;
+                let path = self.resolve_path_expr(path_arg, current_file)?;
                 self.read_sql_file(&path, reads_used)
             }
             "read_text" => {
-                let is_path_ctor = match &*inner.func {
-                    Expr::Name(n) => n.id.as_str() == "Path",
-                    Expr::Attribute(a) => a.attr.as_str() == "Path",
-                    _ => false,
-                };
-                if !is_path_ctor {
-                    return None;
-                }
-                let path_arg = inner.arguments.args.first()?;
-                let path = self.resolve_path_arg(path_arg, current_file)?;
+                // The receiver of `.read_text()` IS the path expression itself —
+                // `Path(p).read_text()` or `(Path(__file__).parent / "x.sql").read_text()`.
+                let path = self.resolve_path_expr(&attr.value, current_file)?;
                 self.read_sql_file(&path, reads_used)
             }
             _ => None,
         }
     }
 
-    // Resolve a path-shaped argument to a filesystem path: a string literal, or
+    // Resolve a path-shaped expression to a filesystem path: a `Path(p)`/
+    // `pathlib.Path(p)` call over a string literal, or
     // `Path(__file__).parent / "literal.sql"` anchored to the file currently being
     // checked. Deliberately does NOT resolve a `Name` through `string_var_candidates` —
     // path variables and SQL-text variables share no ordering guarantee within a single
     // linear pre-pass, so doing that safely would need a fixed-point resolution loop;
     // out of scope while call sites overwhelmingly pass the path inline.
-    fn resolve_path_arg(&self, expr: &Expr, current_file: &Path) -> Option<PathBuf> {
+    fn resolve_path_expr(&self, expr: &Expr, current_file: &Path) -> Option<PathBuf> {
         if let Some(s) = Self::extract_string_literal(expr) {
             return Some(PathBuf::from(s));
+        }
+        if let Expr::Call(call) = expr {
+            let is_path_ctor = match &*call.func {
+                Expr::Name(n) => n.id.as_str() == "Path",
+                Expr::Attribute(a) => a.attr.as_str() == "Path",
+                _ => false,
+            };
+            if is_path_ctor {
+                return call
+                    .arguments
+                    .args
+                    .first()
+                    .and_then(Self::extract_string_literal)
+                    .map(PathBuf::from);
+            }
         }
         if let Expr::BinOp(binop) = expr {
             if binop.op == ast::Operator::Div && Self::is_file_parent_expr(&binop.left) {
@@ -2402,21 +2415,23 @@ impl Linter {
             )
     }
 
-    // Safety-checked read of a `.sql` file traced back from a load call. Refuses:
-    // absolute paths (only project-relative reads are traced); paths that escape the
-    // project root once both sides are canonicalized (also catches symlink escapes,
-    // since canonicalization follows symlinks); any extension other than `.sql`; a
-    // budget of more than `MAX_SQL_FILE_READS_PER_FILE` reads per file checked; files
-    // over `MAX_SQL_FILE_BYTES`; and anything that isn't a plain file (a FIFO under the
-    // project root would otherwise hang the linter, since reading one blocks until a
-    // writer opens it).
+    // Safety-checked read of a `.sql` file traced back from a load call. The real
+    // security boundary is project-root containment, checked below AFTER
+    // canonicalizing both sides (which also catches symlink escapes, since
+    // canonicalization follows symlinks) — NOT rejecting absolute paths outright, since
+    // `resolve_path_arg`'s `Path(__file__).parent / "x.sql"` case legitimately produces
+    // an absolute path whenever the file being checked was itself passed in as an
+    // absolute path (the normal case for every real caller). An absolute path a user
+    // wrote directly, e.g. `Path("/etc/passwd")`, still gets rejected: it canonicalizes
+    // to itself, which isn't under the project root. Also refuses: any extension other
+    // than `.sql`; a budget of more than `MAX_SQL_FILE_READS_PER_FILE` reads per file
+    // checked; files over `MAX_SQL_FILE_BYTES`; and anything that isn't a plain file (a
+    // FIFO under the project root would otherwise hang the linter, since reading one
+    // blocks until a writer opens it).
     fn read_sql_file(&self, path: &Path, reads_used: &mut u32) -> Option<String> {
         const MAX_SQL_FILE_BYTES: u64 = 256 * 1024;
         const MAX_SQL_FILE_READS_PER_FILE: u32 = 32;
 
-        if path.is_absolute() {
-            return None;
-        }
         if !path
             .extension()
             .and_then(|e| e.to_str())
@@ -2429,8 +2444,13 @@ impl Linter {
             return None;
         }
 
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
         let canonical_root = fs::canonicalize(root).ok()?;
-        let canonical_target = fs::canonicalize(root.join(path)).ok()?;
+        let canonical_target = fs::canonicalize(&candidate).ok()?;
         if !canonical_target.starts_with(&canonical_root) {
             return None;
         }
@@ -5924,6 +5944,67 @@ df = pd.read_sql(sql, conn)
         linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
         let errors = linter
             .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_traces_sql_from_file_via_path_file_parent() {
+        // Path(__file__).parent / "orders.sql" resolves to an ABSOLUTE path (since the
+        // file being checked is passed in as an absolute path by every real caller) —
+        // regression test for a bug where read_sql_file unconditionally refused
+        // absolute paths and could never actually accept this legitimate idiom.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("orders.sql"),
+            "SELECT order_id, amount FROM orders",
+        )
+        .unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = (Path(__file__).parent / "orders.sql").read_text()
+df = pd.read_sql(sql, conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_file_read_refuses_absolute_path_outside_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outside = temp.path().parent().unwrap();
+        let secret_path = outside.join("secret.sql");
+        fs::write(&secret_path, "SELECT * FROM secrets").unwrap();
+
+        let source = format!(
+            r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("{}").read_text()
+df = pd.read_sql(sql, conn)
+"#,
+            secret_path.display()
+        );
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(&source, &root.join("pipeline.py"))
             .unwrap();
 
         assert_eq!(errors.len(), 1, "errors: {errors:?}");

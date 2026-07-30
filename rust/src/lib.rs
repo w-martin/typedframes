@@ -860,12 +860,14 @@ const SQL_LOAD_FUNCTIONS: &[&str] = &[
 ];
 
 // Which family of load a call belongs to — used only to phrase the
-// `untracked-dataframe` hint appropriately and to mark a resulting inferred schema as
-// SQL-derived (for case-insensitive column matching). Not persisted anywhere.
+// `untracked-dataframe` hint appropriately when extraction fails. Not persisted anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadKind {
     File,
     Sql,
+    // A SQLAlchemy Core `select(...)` statement (or a `Name` bound to one) rather than
+    // SQL text — see `extract_orm_select_columns`.
+    Orm,
 }
 
 const ROW_PASSTHROUGH_METHODS: &[&str] = &[
@@ -1035,6 +1037,16 @@ pub struct Linter {
     // absent from this map entirely — see `StringBindingCollector::record` for the
     // poison-on-any-second-binding policy this relies on.
     string_var_candidates: HashMap<String, String>,
+    // Names bound to a resolved SQLAlchemy Core `select(...)` column list — e.g.
+    // `stmt = select(Order.id, Order.amount)`. Populated inline during the main
+    // top-to-bottom statement walk (unlike `string_var_candidates`, which needs a
+    // whole-module pre-pass): resolving a `select(...)` call requires the referenced
+    // model's columns to already be in `self.schemas`, which — like every other
+    // variable/schema binding this checker tracks — is only guaranteed for a class
+    // defined earlier in the same file (or in another file, via the project index).
+    // A later reassignment simply overwrites the entry, consistent with how
+    // `self.variables` already behaves elsewhere in this checker.
+    stmt_var_candidates: HashMap<String, Vec<String>>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1278,6 +1290,7 @@ impl Linter {
             sql_dialect: sql::SqlDialect::Generic,
             project_root: None,
             string_var_candidates: HashMap::new(),
+            stmt_var_candidates: HashMap::new(),
         }
     }
 
@@ -1547,6 +1560,197 @@ impl Linter {
         }
     }
 
+    // `__tablename__ = "orders"` (or `__tablename__: str = "orders"`) in a class's own
+    // body — the structural signature of a SQLAlchemy declarative model, checked
+    // instead of base-class name since the declarative base is normally imported from a
+    // project-local module. Deliberately does not walk inherited/mixin base classes for
+    // this — an abstract mixin that itself has no `__tablename__` isn't recognized.
+    fn class_body_has_tablename(class_def: &ast::StmtClassDef) -> bool {
+        class_def.body.iter().any(|stmt| {
+            let (target, value) = match stmt {
+                Stmt::Assign(assign) => match assign.targets.as_slice() {
+                    [Expr::Name(n)] => (n.id.as_str(), Some(assign.value.as_ref())),
+                    _ => return false,
+                },
+                Stmt::AnnAssign(ann) => match ann.target.as_ref() {
+                    Expr::Name(n) => (n.id.as_str(), ann.value.as_deref()),
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            target == "__tablename__" && value.and_then(Self::extract_string_literal).is_some()
+        })
+    }
+
+    // Class attribute names that never denote a mapped column, whatever they're
+    // assigned to.
+    const ORM_NON_COLUMN_ATTRS: &[&str] = &[
+        "__tablename__",
+        "__table_args__",
+        "__mapper_args__",
+        "__table__",
+        "metadata",
+        "registry",
+        "query",
+    ];
+
+    // Calls that construct a legitimate class attribute with no corresponding database
+    // column — excluded rather than swept in as a column the way the permissive
+    // typedframes-schema extractor's fallback (used for `is_schema_base` classes) would.
+    const ORM_NON_COLUMN_CALLS: &[&str] = &[
+        "relationship",
+        "column_property",
+        "association_proxy",
+        "declared_attr",
+        "query_expression",
+        "synonym",
+    ];
+
+    // Column extractor for a SQLAlchemy declarative model (see `class_body_has_tablename`).
+    // Deliberately separate from the typedframes-schema extractor above rather than
+    // sharing it: that extractor's fallback treats *any* annotated or assigned class
+    // attribute as a column, which on a real model would sweep in `__tablename__`,
+    // `__table_args__`, `relationship(...)` attributes, and `Mapped[list[...]]`
+    // to-many-relationship annotations. This one uses an allowlist instead: an
+    // attribute is a column only if it's a `Column(...)`/`mapped_column(...)` call
+    // (optionally wrapped in `deferred(...)`), or a bare `x: Mapped[T]` with no value
+    // where `T` isn't itself a relationship shape.
+    fn extract_orm_columns(class_def: &ast::StmtClassDef) -> Vec<String> {
+        let mut columns = Vec::new();
+        for body_stmt in &class_def.body {
+            match body_stmt {
+                Stmt::AnnAssign(ann) => {
+                    let Expr::Name(name) = ann.target.as_ref() else {
+                        continue;
+                    };
+                    let attr_name = name.id.as_str();
+                    if attr_name.starts_with('_') || Self::ORM_NON_COLUMN_ATTRS.contains(&attr_name)
+                    {
+                        continue;
+                    }
+                    match &ann.value {
+                        Some(value) => {
+                            if let Some(cols) = Self::orm_column_from_call(value, attr_name) {
+                                columns.extend(cols);
+                            }
+                        }
+                        None => {
+                            if !Self::is_relationship_annotation(&ann.annotation) {
+                                columns.push(attr_name.to_string());
+                            }
+                        }
+                    }
+                }
+                Stmt::Assign(assign) => {
+                    let [Expr::Name(name)] = assign.targets.as_slice() else {
+                        continue;
+                    };
+                    let attr_name = name.id.as_str();
+                    if attr_name.starts_with('_') || Self::ORM_NON_COLUMN_ATTRS.contains(&attr_name)
+                    {
+                        continue;
+                    }
+                    if let Some(cols) = Self::orm_column_from_call(&assign.value, attr_name) {
+                        columns.extend(cols);
+                    }
+                }
+                _ => {}
+            }
+        }
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
+    // `Column(...)` / `mapped_column(...)` / `deferred(Column(...))` → the resulting
+    // column name(s): the attribute name, plus a DB-name override from a leading
+    // positional string literal or a `name=` keyword when it differs from the
+    // attribute name — SQLAlchemy allows code to reference either spelling
+    // (`mapped_column("db_name", ...)` puts the real DB name in the first positional
+    // arg), so registering both avoids a spurious unknown-column on whichever one a
+    // caller writes. `relationship(...)` and friends (`ORM_NON_COLUMN_CALLS`) return
+    // `None` — excluded rather than swept in, unlike the permissive fallback the
+    // non-ORM schema extractor above uses.
+    fn orm_column_from_call(value: &Expr, attr_name: &str) -> Option<Vec<String>> {
+        let Expr::Call(call) = value else {
+            return None;
+        };
+        let fn_name = match &*call.func {
+            Expr::Name(n) => n.id.as_str(),
+            Expr::Attribute(a) => a.attr.as_str(),
+            _ => return None,
+        };
+        if fn_name == "deferred" {
+            return call
+                .arguments
+                .args
+                .first()
+                .and_then(|inner| Self::orm_column_from_call(inner, attr_name));
+        }
+        if Self::ORM_NON_COLUMN_CALLS.contains(&fn_name) {
+            return None;
+        }
+        if fn_name != "Column" && fn_name != "mapped_column" {
+            return None;
+        }
+
+        let mut names = vec![attr_name.to_string()];
+        if let Some(db_name) = call
+            .arguments
+            .args
+            .first()
+            .and_then(Self::extract_string_literal)
+        {
+            if db_name != attr_name {
+                names.push(db_name.to_string());
+            }
+        }
+        for keyword in &call.arguments.keywords {
+            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("name") {
+                if let Some(db_name) = Self::extract_string_literal(&keyword.value) {
+                    if db_name != attr_name && !names.iter().any(|n| n == db_name) {
+                        names.push(db_name.to_string());
+                    }
+                }
+            }
+        }
+        Some(names)
+    }
+
+    // `Mapped[list[...]]` / `Mapped[List[...]]` / `Mapped[Set[...]]` (a to-many
+    // relationship's typing shape) or `Mapped["OtherModel"]` (a quoted forward
+    // reference — the idiom for a to-one relationship typed without importing the
+    // referenced class) — never a real column, whatever the bare-annotation fallback
+    // in `extract_orm_columns` would otherwise assume.
+    fn is_relationship_annotation(annotation: &Expr) -> bool {
+        let Expr::Subscript(sub) = annotation else {
+            return false;
+        };
+        let is_mapped = match &*sub.value {
+            Expr::Name(n) => n.id.as_str() == "Mapped",
+            Expr::Attribute(a) => a.attr.as_str() == "Mapped",
+            _ => false,
+        };
+        if !is_mapped {
+            return false;
+        }
+        match &*sub.slice {
+            Expr::StringLiteral(_) => true,
+            Expr::Subscript(inner) => {
+                let collection_name = match &*inner.value {
+                    Expr::Name(n) => Some(n.id.as_str()),
+                    Expr::Attribute(a) => Some(a.attr.as_str()),
+                    _ => None,
+                };
+                matches!(
+                    collection_name,
+                    Some("list" | "List" | "set" | "Set" | "Sequence")
+                )
+            }
+            _ => false,
+        }
+    }
+
     // Check if a type name is a DataFrame/Frame type
     fn is_frame_type(name: &str) -> bool {
         matches!(name, "DataFrame" | "PandasFrame" | "PolarsFrame")
@@ -1679,6 +1883,15 @@ impl Linter {
             return (None, LoadKind::Sql);
         }
 
+        // A SQLAlchemy Core statement (`pd.read_sql(select(Order.id, ...), engine)`, or
+        // a `Name` bound to one) takes priority over SQL-text parsing — it isn't a
+        // string at all, so `extract_sql_literal` would never match it anyway, but
+        // checking first keeps the two paths clearly separate rather than relying on
+        // that fallthrough.
+        if let Some(cols) = self.extract_orm_select_columns(call) {
+            return (Some(cols), LoadKind::Orm);
+        }
+
         let Some(sql_text) = self.extract_sql_literal(call) else {
             return (None, LoadKind::Sql);
         };
@@ -1739,6 +1952,117 @@ impl Linter {
             }
         }
         None
+    }
+
+    // Column-preserving Core statement methods: chaining any of these onto a
+    // `select(...)` doesn't change which columns are projected, so `extract_select_columns`
+    // sees through them to the underlying `select(...)` call. Anything else chained
+    // (`.subquery()`, `.cte()`, `.union(...)`, `.add_columns(...)`, ...) isn't
+    // recognized, and the whole expression is left unresolved rather than guessed at.
+    const SELECT_CHAIN_METHODS: &[&str] = &[
+        "where", "filter", "join", "order_by", "limit", "offset", "group_by", "having", "distinct",
+    ];
+
+    // Locate the SQL-shaped argument (`sql=`/`query=` keyword, else first positional)
+    // the same way `extract_sql_literal` does, but resolve it as a SQLAlchemy Core
+    // statement's column list instead of as SQL text.
+    fn extract_orm_select_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        for keyword in &call.arguments.keywords {
+            if matches!(
+                keyword.arg.as_ref().map(|s| s.as_str()),
+                Some("sql") | Some("query")
+            ) {
+                return self.extract_select_columns(&keyword.value);
+            }
+        }
+        call.arguments
+            .args
+            .first()
+            .and_then(|expr| self.extract_select_columns(expr))
+    }
+
+    // Resolve a SQLAlchemy Core statement expression to its projected column list: a
+    // `select(...)` call, a chain of `SELECT_CHAIN_METHODS` on one, or a `Name` bound
+    // (via `stmt_var_candidates`) to an already-resolved one.
+    fn extract_select_columns(&self, expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Name(n) => self.stmt_var_candidates.get(n.id.as_str()).cloned(),
+            Expr::Call(call) => {
+                let fn_name = match &*call.func {
+                    Expr::Name(n) => n.id.as_str(),
+                    Expr::Attribute(a) => a.attr.as_str(),
+                    _ => return None,
+                };
+                if fn_name == "select" {
+                    return self.extract_select_args(&call.arguments.args);
+                }
+                if Self::SELECT_CHAIN_METHODS.contains(&fn_name) {
+                    if let Expr::Attribute(attr) = &*call.func {
+                        return self.extract_select_columns(&attr.value);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    // The column list for `select(arg1, arg2, ...)`: every argument must resolve to a
+    // single, unambiguous column name (see `extract_select_arg_column`), or the whole
+    // select is left unresolved — never a partial list, since a silently-dropped
+    // argument would understate the real projection and risk a false unknown-column
+    // later on a column that's actually there. In particular a bare `select(Model)`
+    // (all of a model's columns) is deliberately NOT supported: `extract_orm_columns`
+    // is allowlist-based and can under-extract on an unusual declarative pattern, and
+    // treating its output as "the complete column set" here would compound that.
+    fn extract_select_args(&self, args: &[Expr]) -> Option<Vec<String>> {
+        if args.is_empty() {
+            return None;
+        }
+        args.iter()
+            .map(|arg| self.extract_select_arg_column(arg))
+            .collect()
+    }
+
+    // A single `select(...)` argument's resulting column name: `Model.col` (an
+    // attribute referencing a registered model's known column), or
+    // `Model.col.label("alias")`. Anything else — a bare model, `func.count(...)`,
+    // `text(...)`, a literal, a starred arg — bails the whole select rather than
+    // guessing.
+    fn extract_select_arg_column(&self, arg: &Expr) -> Option<String> {
+        if let Expr::Call(call) = arg {
+            if let Expr::Attribute(outer) = &*call.func {
+                if outer.attr.as_str() == "label" {
+                    self.validate_model_attribute(&outer.value)?;
+                    let alias = call
+                        .arguments
+                        .args
+                        .first()
+                        .and_then(Self::extract_string_literal)?;
+                    return Some(alias.to_string());
+                }
+            }
+            return None;
+        }
+        self.validate_model_attribute(arg)
+    }
+
+    // `Model.col` where `Model` is a registered schema (declarative model or otherwise)
+    // and `col` is one of its known columns. Returns `None` — bailing the containing
+    // select entirely — if `Model` isn't registered or `col` isn't one of its columns:
+    // hybrid properties, synonyms, and association proxies are all legal SQLAlchemy
+    // attributes with no static column mapping, so treating an unrecognized attribute
+    // as an error would be wrong at least as often as it would be right.
+    fn validate_model_attribute(&self, expr: &Expr) -> Option<String> {
+        let Expr::Attribute(attr) = expr else {
+            return None;
+        };
+        let Expr::Name(model) = &*attr.value else {
+            return None;
+        };
+        let columns = self.schemas.get(model.id.as_str())?;
+        let col = attr.attr.as_str();
+        columns.iter().any(|c| c == col).then(|| col.to_string())
     }
 
     // Resolve the right-hand side of a candidate string-variable binding: a plain
@@ -2638,6 +2962,23 @@ impl Linter {
                         }
                     }
                     self.schemas.insert(class_def.name.to_string(), columns);
+                } else if Self::class_body_has_tablename(class_def) {
+                    // SQLAlchemy declarative model: `class Order(Base): __tablename__ =
+                    // "orders"; ...`. Detected structurally, via `__tablename__` in the
+                    // class's own body, rather than by base-class name — the declarative
+                    // base is normally imported from a project-local module
+                    // (`class Order(Base)`), so it's never one of the fixed names
+                    // `is_schema_base` recognizes. Uses a separate, allowlist-based
+                    // extractor rather than the permissive one above: see
+                    // `extract_orm_columns` for why (its "any annotated attribute is a
+                    // column" fallback would sweep in `relationship(...)` attributes,
+                    // `__table_args__`, etc., which aren't real database columns).
+                    let columns = Self::extract_orm_columns(class_def);
+                    // Deliberately no RESERVED_METHODS conflict check here: that
+                    // warning is authoring advice for typedframes-native schemas
+                    // ("rename the column"), but a mapped class's column names come
+                    // from an external database schema the user doesn't control.
+                    self.schemas.insert(class_def.name.to_string(), columns);
                 }
             }
             Stmt::FunctionDef(func_def) => {
@@ -2891,6 +3232,26 @@ impl Linter {
                 }
 
                 if let Expr::Call(call) = &*assign.value {
+                    // Handle stmt = select(Order.id, Order.amount) — and the same
+                    // chained onto .where(...)/.order_by(...)/etc, see
+                    // SELECT_CHAIN_METHODS — so a later pd.read_sql(stmt, engine) can
+                    // resolve `stmt` via `stmt_var_candidates`. Checked unconditionally
+                    // here (rather than inside the match below) since the outermost
+                    // call in the chained form is a `.where(...)` *method* call, not a
+                    // bare `select(...)` name call, and would otherwise never reach the
+                    // `Expr::Name(func_name)` arm at all. A later reassignment of the
+                    // same name simply overwrites this entry (consistent with how
+                    // `self.variables` already behaves) rather than needing the
+                    // whole-module poisoning discipline `string_var_candidates` relies
+                    // on — this only has to be correct in top-to-bottom order, like
+                    // every other variable binding this checker tracks.
+                    if let [Expr::Name(target_name)] = assign.targets.as_slice() {
+                        if let Some(cols) = self.extract_select_columns(&assign.value) {
+                            self.stmt_var_candidates
+                                .insert(target_name.id.to_string(), cols);
+                        }
+                    }
+
                     let mut is_merge_or_concat = false;
                     let mut merge_schema = None;
 
@@ -3029,6 +3390,14 @@ impl Linter {
                                                         "specify `usecols`/`columns` or \
                                                          annotate: `df: Annotated[pd.DataFrame, \
                                                          MySchema] = pd.read_csv(...)`"
+                                                    }
+                                                    LoadKind::Orm => {
+                                                        "pass select(Model.col1, Model.col2, ...) \
+                                                         referencing a registered model's known \
+                                                         columns (a bare `select(Model)` isn't \
+                                                         supported), or annotate: \
+                                                         `df: Annotated[pd.DataFrame, MySchema] \
+                                                         = pd.read_sql(...)`"
                                                     }
                                                 };
                                                 errors.push(LintError {
@@ -5118,6 +5487,175 @@ import pandas as pd
 
 cols = "order_id, amount"
 df = pd.read_sql(f"SELECT {cols} FROM orders", conn)
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_declarative_model_20_style_registers_mapped_columns() {
+        let source = r#"
+from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase
+
+class Base(DeclarativeBase):
+    pass
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    amount: Mapped[float]
+    customer_items: Mapped[list["Item"]]
+"#;
+        let mut linter = Linter::new();
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        let cols = linter
+            .schemas
+            .get("Order")
+            .expect("Order should be registered");
+        assert!(cols.contains(&"id".to_string()), "cols: {cols:?}");
+        assert!(cols.contains(&"amount".to_string()), "cols: {cols:?}");
+        assert!(
+            !cols.contains(&"customer_items".to_string()),
+            "relationship attribute should be excluded: {cols:?}"
+        );
+        assert!(
+            !cols.contains(&"__tablename__".to_string()),
+            "dunder should be excluded: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_declarative_model_legacy_column_style_and_positional_db_name() {
+        let source = r#"
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column("order_id", Integer, primary_key=True)
+    amount = Column(Integer)
+    customer = relationship("Customer")
+"#;
+        let mut linter = Linter::new();
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        let cols = linter
+            .schemas
+            .get("Order")
+            .expect("Order should be registered");
+        // Both the attribute name and the positional DB-name override are registered.
+        assert!(cols.contains(&"id".to_string()), "cols: {cols:?}");
+        assert!(cols.contains(&"order_id".to_string()), "cols: {cols:?}");
+        assert!(cols.contains(&"amount".to_string()), "cols: {cols:?}");
+        assert!(
+            !cols.contains(&"customer".to_string()),
+            "relationship() should be excluded: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_orm_model_skips_reserved_method_name_check() {
+        // "count" would trip CODE_RESERVED_NAME on a typedframes-native BaseSchema, but
+        // an ORM model's column names come from an external database the user doesn't
+        // control renaming — the check must not fire here.
+        let source = r#"
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    count: Mapped[int]
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert!(
+            errors.iter().all(|e| e.code != CODE_RESERVED_NAME),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_columns_resolve_inline_in_read_sql() {
+        let source = r#"
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    amount: Mapped[float]
+
+df = pd.read_sql(select(Order.id, Order.amount), engine)
+print(df["id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_select_columns_resolve_through_a_bound_variable_and_label() {
+        let source = r#"
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    amount: Mapped[float]
+
+stmt = select(Order.id, Order.amount.label("total")).where(Order.amount > 0)
+df = pd.read_sql(stmt, engine)
+print(df["total"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_bare_select_of_model_is_unresolved() {
+        // select(Order) — pulling "all" of a model's columns — is deliberately not
+        // supported: the ORM extractor is allowlist-based and can under-extract on an
+        // unusual declarative pattern, so treating its output as "the complete column
+        // set" here would risk a false unknown-column later.
+        let source = r#"
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+df = pd.read_sql(select(Order), engine)
 "#;
         let mut linter = Linter::new();
         let errors = linter

@@ -859,6 +859,14 @@ const SQL_LOAD_FUNCTIONS: &[&str] = &[
     "read_gbq",
 ];
 
+// Feast FeatureStore methods whose result eventually becomes a DataFrame via `.to_df()`
+// — either chained directly, or via an intermediate RetrievalJob/OnlineResponse
+// variable (the split form; see `retrieval_jobs`). Not gated on any particular receiver
+// name (e.g. `store`) — matched structurally by method name plus a literal `features=`
+// keyword, since the receiver is whatever variable the caller's FeatureStore happens to
+// be bound to.
+const FEAST_RETRIEVAL_METHODS: &[&str] = &["get_historical_features", "get_online_features"];
+
 // Which family of load a call belongs to — used only to phrase the
 // `untracked-dataframe` hint appropriately when extraction fails. Not persisted anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1047,6 +1055,21 @@ pub struct Linter {
     // A later reassignment simply overwrites the entry, consistent with how
     // `self.variables` already behaves elsewhere in this checker.
     stmt_var_candidates: HashMap<String, Vec<String>>,
+    // Names bound to a Feast `store.get_historical_features(...)`/
+    // `get_online_features(...)` result's resolved feature-name columns, BEFORE
+    // `.to_df()` is called on it (the split form: `job = store.get_...(...)`, then
+    // `df = job.to_df()`). Kept separate from `self.variables`/`self.schemas` — a
+    // RetrievalJob/OnlineResponse isn't a DataFrame, so `job["x"]` shouldn't be
+    // validated as a column access the way it would be if `job` were registered there.
+    // See `register_feast_dataframe` for where this becomes an actual tracked frame.
+    retrieval_jobs: HashMap<String, Vec<String>>,
+    // Schema names (from `self.schemas`) whose known column list is deliberately
+    // incomplete — currently only Feast retrieval results (see
+    // `register_feast_dataframe`), whose real output also includes entity_df's join
+    // keys and timestamp column, not resolvable in general. `schema_has_column` treats
+    // membership against these as always `true`, so `unknown-column` can never
+    // false-positive on a real column this checker just doesn't know about.
+    open_schemas: std::collections::HashSet<String>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1291,6 +1314,8 @@ impl Linter {
             project_root: None,
             string_var_candidates: HashMap::new(),
             stmt_var_candidates: HashMap::new(),
+            retrieval_jobs: HashMap::new(),
+            open_schemas: std::collections::HashSet::new(),
         }
     }
 
@@ -2065,6 +2090,105 @@ impl Linter {
         columns.iter().any(|c| c == col).then(|| col.to_string())
     }
 
+    // Column set for a Feast `features=["view:feature", ...]` list: each element must
+    // be a `"view:feature"` string literal (the ref format Feast documents), and the
+    // resulting column is the part after the colon — or, when `full_feature_names=True`,
+    // `"view__feature"` (double underscore, per Feast's own docstring). Bails entirely
+    // (`None`) on: no `features=` keyword at all (so a plain method-name match alone
+    // never dispatches — see `FEAST_RETRIEVAL_METHODS`'s call sites), a non-literal
+    // list element (a `Name`, a comprehension, a `FeatureService` member projection
+    // like `fv[["conv_rate"]]`), an element without exactly one `:`, or a non-literal
+    // `full_feature_names`. Never a partial column set for the same reason as
+    // `extract_select_args`: a silently-dropped element would understate the real
+    // projection.
+    //
+    // Note this can NEVER be the complete output column set regardless — Feast's real
+    // output also includes entity_df's join keys and timestamp column, which aren't
+    // resolvable in general. That's handled at the call site by registering the result
+    // as an *open* schema (`register_feast_dataframe`), not by trying to enumerate
+    // those columns here.
+    fn extract_feast_feature_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        let features_list = call
+            .arguments
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("features"))
+            .map(|k| &k.value)?;
+        let Expr::List(list) = features_list else {
+            return None;
+        };
+
+        let full_feature_names = match call
+            .arguments
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("full_feature_names"))
+        {
+            Some(kw) => match &kw.value {
+                Expr::BooleanLiteral(b) => b.value,
+                _ => return None,
+            },
+            None => false,
+        };
+
+        let mut columns = Vec::with_capacity(list.elts.len());
+        for elt in &list.elts {
+            let literal = Self::extract_string_literal(elt)?;
+            let (view, feature) = literal.split_once(':')?;
+            // `feature` still contains any colon after the first (split_once only
+            // splits on the first match), so this rejects anything but exactly one `:`
+            // in the whole ref.
+            if view.is_empty() || feature.is_empty() || feature.contains(':') {
+                return None;
+            }
+            columns.push(if full_feature_names {
+                format!("{view}__{feature}")
+            } else {
+                feature.to_string()
+            });
+        }
+        Some(columns)
+    }
+
+    // Register `target_names` as a DataFrame materialized from a Feast retrieval
+    // (`.to_df()` on a `get_historical_features`/`get_online_features` result), with an
+    // *open* schema over `cols` when resolved. See `open_schemas`'s docs for why exact
+    // matching would be wrong here regardless of how well `features=` parsed.
+    fn register_feast_dataframe(
+        &mut self,
+        cols: Option<Vec<String>>,
+        target_names: &[String],
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        self.dataframes_total += 1;
+        match cols {
+            Some(cols) => {
+                self.dataframes_typed += 1;
+                let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
+                self.open_schemas.insert(schema_name.clone());
+                for name in target_names {
+                    self.variables
+                        .insert(name.clone(), (schema_name.clone(), current_line));
+                }
+            }
+            None => {
+                errors.push(LintError {
+                    line: current_line,
+                    col: current_col,
+                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                    message: "columns unknown at lint time; pass a literal \
+                              `features=[\"view:feature\", ...]` list to resolve the \
+                              retrieved columns"
+                        .to_string(),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
+    }
+
     // Resolve the right-hand side of a candidate string-variable binding: a plain
     // string literal, or a recognized `.sql` file read (`open(p).read()`,
     // `Path(p).read_text()`/`pathlib.Path(p).read_text()`). Called only from
@@ -2338,14 +2462,24 @@ impl Linter {
     }
 
     // Column membership check used by every column-access validator (see
-    // `schema_has_column`'s call sites). Always an exact match: SQL-derived schemas
-    // already have `self.sql_dialect`'s case-folding baked into their column names by
+    // `schema_has_column`'s call sites). Exact match: SQL-derived schemas already have
+    // `self.sql_dialect`'s case-folding baked into their column names by
     // `sql::columns_from_select` at inference time, so e.g. a Snowflake query genuinely
     // produces `ORDER_ID`, and `df["order_id"]` is a real bug worth reporting, not a
     // false positive to suppress. Kept as a named helper (rather than inlining
     // `cols.iter().any(|c| c == col)` at each call site) so every validator agrees by
     // construction if this ever needs to change again.
+    //
+    // The one exception is an *open* schema (`self.open_schemas`, e.g. a Feast
+    // retrieval result — see `register_feast_dataframe`): membership is unconditionally
+    // `true` there, because the known column list is deliberately incomplete (Feast's
+    // real output also includes entity_df's join keys and timestamp column, which
+    // aren't resolvable in general) and treating it as exhaustive would manufacture
+    // false unknown-column errors on real columns this checker just doesn't know about.
     fn schema_has_column(&self, schema_name: &str, col: &str) -> bool {
+        if self.open_schemas.contains(schema_name) {
+            return true;
+        }
         self.schemas
             .get(schema_name)
             .is_some_and(|cols| cols.iter().any(|c| c == col))
@@ -3510,6 +3644,69 @@ impl Linter {
                                         }
                                     }
                                 }
+                            } else if FEAST_RETRIEVAL_METHODS.contains(&func_name) {
+                                // job = store.get_historical_features(entity_df=..., features=[...])
+                                // — the split form's first half. Not yet a DataFrame (a
+                                // RetrievalJob/OnlineResponse), so tracked in the
+                                // separate `retrieval_jobs` map rather than
+                                // `self.variables` — otherwise `job["x"]` before
+                                // `.to_df()` would be (wrongly) validated as a column
+                                // access. See `register_feast_dataframe` for where this
+                                // actually becomes a tracked DataFrame.
+                                if let Some(cols) = self.extract_feast_feature_columns(call) {
+                                    if let [Expr::Name(target_name)] = assign.targets.as_slice() {
+                                        self.retrieval_jobs
+                                            .insert(target_name.id.to_string(), cols);
+                                    }
+                                }
+                            } else if func_name == "to_df" {
+                                // Either half of Feast's two DataFrame-materializing
+                                // shapes: the split form's second half
+                                // (`df = job.to_df()`, `job` resolved via
+                                // `retrieval_jobs` above), or the chained form
+                                // (`df = store.get_historical_features(...).to_df()`)
+                                // in one statement. Anything else calling `.to_df()`
+                                // (unrelated to Feast) is deliberately left alone —
+                                // matched only once one of these two specific shapes is
+                                // confirmed, not on the method name alone.
+                                let feast_cols = match &*attr.value {
+                                    Expr::Name(recv) => {
+                                        self.retrieval_jobs.get(recv.id.as_str()).cloned().map(Some)
+                                    }
+                                    Expr::Call(inner_call) => match &*inner_call.func {
+                                        Expr::Attribute(inner_attr)
+                                            if FEAST_RETRIEVAL_METHODS
+                                                .contains(&inner_attr.attr.as_str()) =>
+                                        {
+                                            Some(self.extract_feast_feature_columns(inner_call))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                };
+                                if let Some(cols) = feast_cols {
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_name =
+                                        target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                    self.register_feast_dataframe(
+                                        cols,
+                                        &target_names,
+                                        var_name,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
+                                }
                             } else if func_name == "drop" {
                                 if let Expr::Name(recv) = &*attr.value {
                                     let recv_str = recv.id.as_str();
@@ -3817,6 +4014,13 @@ impl Linter {
                             combined_cols.dedup();
 
                             let combined_schema_name = format!("{}_{}", s1, s2);
+                            // An open schema (see `register_feast_dataframe`) stays open
+                            // after a merge/concat: its column list was already known to
+                            // be incomplete before the join, and combining it with
+                            // another frame's columns doesn't make it any more complete.
+                            if self.open_schemas.contains(&s1) || self.open_schemas.contains(&s2) {
+                                self.open_schemas.insert(combined_schema_name.clone());
+                            }
                             self.schemas
                                 .insert(combined_schema_name.clone(), combined_cols);
                             for target in &assign.targets {
@@ -5664,6 +5868,105 @@ df = pd.read_sql(select(Order), engine)
 
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_feast_chained_form_registers_open_schema_over_feature_columns() {
+        // The critical case: df["driver_id"] is an entity join key, NOT one of the
+        // features= names, and is the first line of the canonical Feast tutorial. If
+        // this were an exact-match schema it would be a false unknown-column — the
+        // whole reason register_feast_dataframe marks it open instead.
+        let source = r#"
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate", "driver_stats:acc_rate"],
+).to_df()
+print(df["conv_rate"])
+print(df["driver_id"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        let schema_name = &linter.variables.get("df").unwrap().0;
+        assert!(linter.open_schemas.contains(schema_name));
+    }
+
+    #[test]
+    fn test_feast_split_form_job_not_treated_as_dataframe_before_to_df() {
+        let source = r#"
+job = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+)
+df = job.to_df()
+print(df["conv_rate"])
+print(df["driver_id"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert!(
+            !linter.variables.contains_key("job"),
+            "job (a RetrievalJob, not a DataFrame) should not be tracked in self.variables"
+        );
+    }
+
+    #[test]
+    fn test_feast_full_feature_names_uses_double_underscore() {
+        let source = r#"
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+    full_feature_names=True,
+).to_df()
+print(df["driver_stats__conv_rate"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_feast_unresolvable_features_falls_through_to_untracked_dataframe() {
+        let source = r#"
+feature_names = get_feature_list()
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=feature_names,
+).to_df()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_unrelated_to_df_call_is_left_alone() {
+        // `.to_df()` on something that never went through a recognized Feast
+        // retrieval call must not be treated as a Feast result at all.
+        let source = r#"
+df = some_other_object.to_df()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert!(!linter.variables.contains_key("df"));
     }
 
     #[test]

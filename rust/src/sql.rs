@@ -8,10 +8,7 @@
 //! short, wrongly-inferred column set) is not.
 
 use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::{
-    BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, HiveDialect,
-    MySqlDialect, PostgreSqlDialect, RedshiftSqlDialect, SnowflakeDialect, SparkSqlDialect,
-};
+use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 /// The SQL dialect to parse with, keyed to the connector the query came from.
@@ -51,21 +48,6 @@ impl SqlDialect {
             "hive" => Self::Hive,
             "spark" | "sparksql" => Self::Spark,
             _ => Self::Generic,
-        }
-    }
-
-    fn as_dialect(self) -> Box<dyn Dialect> {
-        match self {
-            Self::Generic => Box::new(GenericDialect {}),
-            Self::BigQuery => Box::new(BigQueryDialect {}),
-            Self::Snowflake => Box::new(SnowflakeDialect {}),
-            Self::Redshift => Box::new(RedshiftSqlDialect {}),
-            Self::Databricks => Box::new(DatabricksDialect {}),
-            Self::DuckDb => Box::new(DuckDbDialect {}),
-            Self::Postgres => Box::new(PostgreSqlDialect {}),
-            Self::MySql => Box::new(MySqlDialect {}),
-            Self::Hive => Box::new(HiveDialect {}),
-            Self::Spark => Box::new(SparkSqlDialect {}),
         }
     }
 
@@ -115,16 +97,23 @@ pub(crate) enum SqlOutcome {
 /// A short inferred column set is worse than no inference at all — it manufactures false
 /// `unknown-column` errors on real columns that happen not to have been resolved.
 pub(crate) fn columns_from_select(sql: &str, dialect: SqlDialect) -> SqlOutcome {
-    let dialect_impl = dialect.as_dialect();
-    let statements = match Parser::new(dialect_impl.as_ref())
-        .try_with_sql(sql)
-        .and_then(|mut parser| {
-            parser = parser.with_recursion_limit(50);
-            parser.parse_statements()
-        }) {
-        Ok(stmts) => stmts,
-        Err(_) => return SqlOutcome::Unparsed,
-    };
+    // Grammar is always the permissive GenericDialect superset, regardless of
+    // `dialect` — `dialect` only controls identifier case folding (`fold_case`) once
+    // parsing has already succeeded. A query written for one engine failing to parse
+    // under another engine's *stricter* grammar (e.g. Redshift's dialect rejecting a
+    // `?` placeholder that's perfectly valid SQL text) would otherwise cost real
+    // inferences for no correctness benefit — we only ever read identifier names out
+    // of a successfully parsed `SELECT` list, never validate engine-specific syntax.
+    let statements =
+        match Parser::new(&GenericDialect {})
+            .try_with_sql(sql)
+            .and_then(|mut parser| {
+                parser = parser.with_recursion_limit(50);
+                parser.parse_statements()
+            }) {
+            Ok(stmts) => stmts,
+            Err(_) => return SqlOutcome::Unparsed,
+        };
 
     let [statement] = statements.as_slice() else {
         return SqlOutcome::Unparsed;
@@ -375,6 +364,22 @@ mod tests {
     fn qmark_placeholder_still_parses() {
         assert_eq!(
             cols("SELECT order_id FROM orders WHERE customer_id = ?"),
+            SqlOutcome::Columns(vec!["order_id".to_string()])
+        );
+    }
+
+    #[test]
+    fn qmark_placeholder_still_parses_under_a_non_generic_dialect() {
+        // Regression test: grammar must always be GenericDialect regardless of which
+        // SqlDialect is passed — dialect only controls case folding. This previously
+        // used the specific engine's (stricter) grammar for parsing too, so a query
+        // that's perfectly valid SQL text failed to parse under e.g. Redshift's
+        // dialect even though it parses fine under Generic.
+        assert_eq!(
+            cols_d(
+                "SELECT order_id FROM orders WHERE customer_id = ?",
+                SqlDialect::Redshift
+            ),
             SqlOutcome::Columns(vec!["order_id".to_string()])
         );
     }

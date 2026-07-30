@@ -30,6 +30,8 @@
 //! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
 //! after all errors have been collected.
 
+mod sql;
+
 use pyo3::prelude::*;
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
@@ -67,6 +69,7 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
 
     let mut linter = Linter::new();
+    linter.with_context(project_root.clone(), &config);
 
     if let Some(bytes) = index_bytes {
         if let Some(index) = get_cached_index(&bytes) {
@@ -158,11 +161,24 @@ struct ToolConfig {
 }
 
 // `[tool.typedframes]` configuration block.
-// All fields are optional; absent keys default to `true`.
+// All fields are optional; absent keys default as documented on each field.
 #[derive(serde::Deserialize)]
-struct LinterConfig {
+pub struct LinterConfig {
     enabled: Option<bool>,  // default: true
     warnings: Option<bool>, // default: true
+    // Dialect name used to fold unquoted SQL identifier case when inferring columns
+    // from a literal SELECT list (e.g. "snowflake", "postgres", "bigquery"). Unknown or
+    // absent values fall back to `SqlDialect::Generic` (no folding) — see
+    // `SqlDialect::from_config_str`.
+    sql_dialect: Option<String>,
+}
+
+impl LinterConfig {
+    const EMPTY: Self = Self {
+        enabled: None,
+        warnings: None,
+        sql_dialect: None,
+    };
 }
 
 // Read `[tool.typedframes]` from `pyproject.toml` at `project_root`.
@@ -171,39 +187,23 @@ struct LinterConfig {
 fn load_linter_config(project_root: &Path) -> LinterConfig {
     let config_path = project_root.join("pyproject.toml");
     if !config_path.exists() {
-        return LinterConfig {
-            enabled: None,
-            warnings: None,
-        };
+        return LinterConfig::EMPTY;
     }
 
     let content = match fs::read_to_string(config_path) {
         Ok(c) => c,
-        Err(_) => {
-            return LinterConfig {
-                enabled: None,
-                warnings: None,
-            }
-        }
+        Err(_) => return LinterConfig::EMPTY,
     };
 
     let config: Config = match toml::from_str(&content) {
         Ok(c) => c,
-        Err(_) => {
-            return LinterConfig {
-                enabled: None,
-                warnings: None,
-            }
-        }
+        Err(_) => return LinterConfig::EMPTY,
     };
 
     config
         .tool
         .and_then(|t| t.typedframes)
-        .unwrap_or(LinterConfig {
-            enabled: None,
-            warnings: None,
-        })
+        .unwrap_or(LinterConfig::EMPTY)
 }
 
 /// Return `true` if the linter is enabled for `project_root` (default: `true`).
@@ -349,10 +349,11 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
 // Runs the linter in index mode (diagnostics discarded) to collect schemas and
 // functions, then separately parses `__all__` assignments and `from X import Y`
 // statements for wildcard-import support and delegate-target resolution respectively.
-fn index_file(path: &Path) -> Option<IndexEntry> {
+fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option<IndexEntry> {
     let source = fs::read_to_string(path).ok()?;
 
     let mut linter = Linter::new();
+    linter.with_context(project_root.to_path_buf(), config);
     let _ = linter.check_file_internal(&source, path);
 
     let schemas = linter.schemas;
@@ -465,10 +466,15 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
 
 // Build a ProjectIndex by indexing every `.py` file under `project_root`.
 fn build_index_internal(project_root: &Path) -> ProjectIndex {
+    // Loaded once and threaded into every per-file `Linter`, so index-time inference
+    // (this function) and check-time inference (`check_file`) agree on `sql_dialect` —
+    // a mismatch here would make a SQL-derived schema's columns differ depending on
+    // whether they were read from the cached project index or inferred fresh.
+    let config = load_linter_config(project_root);
     let py_files = collect_py_files(project_root);
     let mut files = HashMap::new();
     for file_path in py_files {
-        if let Some(entry) = index_file(&file_path) {
+        if let Some(entry) = index_file(&file_path, project_root, &config) {
             if let Some(path_str) = file_path.to_str() {
                 files.insert(path_str.to_string(), entry);
             }
@@ -832,9 +838,34 @@ const LOAD_FUNCTIONS: &[&str] = &[
     "scan_json",
     "scan_ndjson",
     "scan_ipc",
+    "read_database",
+    "read_database_uri",
+    "read_gbq",
 ];
 
 const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars"];
+
+// Load functions whose column set lives in a SQL SELECT list rather than a
+// usecols/columns/dtype/schema kwarg. `read_sql_table` is deliberately excluded: its
+// first positional argument is a table name, not SQL, so attempting to parse it as SQL
+// would just fail (harmlessly, but for the wrong reason) rather than being skipped
+// because we know better.
+const SQL_LOAD_FUNCTIONS: &[&str] = &[
+    "read_sql",
+    "read_sql_query",
+    "read_database",
+    "read_database_uri",
+    "read_gbq",
+];
+
+// Which family of load a call belongs to — used only to phrase the
+// `untracked-dataframe` hint appropriately and to mark a resulting inferred schema as
+// SQL-derived (for case-insensitive column matching). Not persisted anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    File,
+    Sql,
+}
 
 const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "filter",
@@ -986,6 +1017,14 @@ pub struct Linter {
     // with unrelated calls.
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    // Dialect used to fold unquoted SQL identifier case when inferring columns from a
+    // literal SELECT list. Defaults to `Generic` (no folding); set from
+    // `[tool.typedframes] sql_dialect` in pyproject.toml via `with_context`.
+    sql_dialect: sql::SqlDialect,
+    // Project root, used to resolve and safety-check `.sql` file reads traced back from
+    // a load call (see `read_sql_file`). `None` for standalone/no-config invocations,
+    // in which case file-based SQL tracing is skipped entirely rather than guessed at.
+    project_root: Option<PathBuf>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1054,6 +1093,21 @@ impl Linter {
             file_display: String::new(),
             dataframes_total: 0,
             dataframes_typed: 0,
+            sql_dialect: sql::SqlDialect::Generic,
+            project_root: None,
+        }
+    }
+
+    // Apply project-level context resolved by the caller: the project root (for
+    // resolving `.sql` file reads traced back from a load call) and the configured SQL
+    // dialect (for identifier case folding — see `sql::SqlDialect`). Kept as a
+    // post-construction setter rather than a `new()` parameter so the 35+ existing
+    // `Linter::new()` call sites (mostly tests, which don't care about either) are
+    // undisturbed.
+    pub fn with_context(&mut self, root: PathBuf, config: &LinterConfig) {
+        self.project_root = Some(root);
+        if let Some(dialect) = &config.sql_dialect {
+            self.sql_dialect = sql::SqlDialect::from_config_str(dialect);
         }
     }
 
@@ -1085,7 +1139,7 @@ impl Linter {
             let cols_str = cols.join(", ");
             if let Some(origin) = self.schema_origins.get(schema_name) {
                 format!(
-                    "inferred column set {{{cols_str}}} — fix: add column to usecols/columns in {origin}"
+                    "inferred column set {{{cols_str}}} — fix: add the column at its source in {origin}"
                 )
             } else {
                 format!("inferred column set {{{cols_str}}} (defined at line {defined_line})")
@@ -1389,14 +1443,22 @@ impl Linter {
         }
     }
 
-    // Extract column names from a load function call (usecols/columns kwarg or dtype/schema dict keys).
-    fn extract_load_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
+    // Extract column names from a load function call: `usecols`/`columns` kwarg,
+    // `dtype`/`schema` dict keys, or — for SQL-shaped load functions — the SELECT list
+    // of a literal SQL string. Returns the columns alongside which family satisfied the
+    // extraction, so the caller can phrase a kind-appropriate `untracked-dataframe` hint
+    // when extraction fails.
+    fn extract_load_columns(
+        &self,
+        func_name: &str,
+        call: &ast::ExprCall,
+    ) -> (Option<Vec<String>>, LoadKind) {
         for keyword in &call.arguments.keywords {
             let kw_name = keyword.arg.as_ref().map(|s| s.as_str());
             match kw_name {
                 Some("usecols") | Some("columns") => {
                     if let Some(cols) = Self::extract_string_list(&keyword.value) {
-                        return Some(cols);
+                        return (Some(cols), LoadKind::File);
                     }
                 }
                 Some("dtype") | Some("schema") => {
@@ -1409,11 +1471,73 @@ impl Linter {
                             .map(|s| s.to_string())
                             .collect();
                         if !keys.is_empty() {
-                            return Some(keys);
+                            return (Some(keys), LoadKind::File);
                         }
                     }
                 }
                 _ => {}
+            }
+        }
+
+        if !SQL_LOAD_FUNCTIONS.contains(&func_name) {
+            return (None, LoadKind::File);
+        }
+
+        // chunksize= makes the call return an iterator of frames, not a single frame —
+        // there is no one column set to attach to the assigned variable.
+        let has_chunksize = call
+            .arguments
+            .keywords
+            .iter()
+            .any(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("chunksize"));
+        if has_chunksize {
+            return (None, LoadKind::Sql);
+        }
+
+        let Some(sql_text) = Self::extract_sql_literal(call) else {
+            return (None, LoadKind::Sql);
+        };
+
+        match sql::columns_from_select(&sql_text, self.sql_dialect) {
+            sql::SqlOutcome::Columns(cols) => (Some(cols), LoadKind::Sql),
+            sql::SqlOutcome::Wildcard | sql::SqlOutcome::Unparsed => (None, LoadKind::Sql),
+        }
+    }
+
+    // Locate a literal SQL string passed to a SQL-shaped load call: the `sql=`/`query=`
+    // keyword if present, else the first positional argument. Unwraps one layer of
+    // `text(...)` / `sqlalchemy.text(...)`, the idiomatic way to pass raw SQL through a
+    // SQLAlchemy engine. Returns `None` for f-strings, variables, or anything else that
+    // isn't a literal — those cases fall through to the existing untracked-dataframe
+    // nudge rather than being (wrongly) treated as unresolvable SQL.
+    fn extract_sql_literal(call: &ast::ExprCall) -> Option<String> {
+        for keyword in &call.arguments.keywords {
+            if matches!(
+                keyword.arg.as_ref().map(|s| s.as_str()),
+                Some("sql") | Some("query")
+            ) {
+                return Self::extract_sql_expr(&keyword.value);
+            }
+        }
+        call.arguments.args.first().and_then(Self::extract_sql_expr)
+    }
+
+    fn extract_sql_expr(expr: &Expr) -> Option<String> {
+        if let Some(s) = Self::extract_string_literal(expr) {
+            return Some(s.to_string());
+        }
+        if let Expr::Call(inner) = expr {
+            let fn_name = match &*inner.func {
+                Expr::Name(n) => n.id.as_str(),
+                Expr::Attribute(a) => a.attr.as_str(),
+                _ => return None,
+            };
+            if fn_name == "text" {
+                return inner
+                    .arguments
+                    .args
+                    .first()
+                    .and_then(Self::extract_sql_expr);
             }
         }
         None
@@ -1497,6 +1621,20 @@ impl Linter {
         let name = format!("__inferred_{}_at_{}", var, line);
         self.schemas.insert(name.clone(), cols);
         name
+    }
+
+    // Column membership check used by every column-access validator (see
+    // `schema_has_column`'s call sites). Always an exact match: SQL-derived schemas
+    // already have `self.sql_dialect`'s case-folding baked into their column names by
+    // `sql::columns_from_select` at inference time, so e.g. a Snowflake query genuinely
+    // produces `ORDER_ID`, and `df["order_id"]` is a real bug worth reporting, not a
+    // false positive to suppress. Kept as a named helper (rather than inlining
+    // `cols.iter().any(|c| c == col)` at each call site) so every validator agrees by
+    // construction if this ever needs to change again.
+    fn schema_has_column(&self, schema_name: &str, col: &str) -> bool {
+        self.schemas
+            .get(schema_name)
+            .is_some_and(|cols| cols.iter().any(|c| c == col))
     }
 
     // Extract a column name from a `pl.col("name")` or `col("name")` call expression.
@@ -2262,8 +2400,10 @@ impl Linter {
                                     Self::extract_string_literal(&subscript.slice)
                                 {
                                     let schema_name = schema_name.clone();
+                                    let already_has_col =
+                                        self.schema_has_column(&schema_name, col_name);
                                     if let Some(columns) = self.schemas.get_mut(&schema_name) {
-                                        if !columns.iter().any(|c| c == col_name) {
+                                        if !already_has_col {
                                             errors.push(LintError {
                                                 line: current_line,
                                                 col: current_col,
@@ -2453,9 +2593,11 @@ impl Linter {
                                     } else if LOAD_MODULES.contains(&class_str)
                                         && LOAD_FUNCTIONS.contains(&func_name)
                                     {
-                                        // pd.read_csv() / pl.scan_parquet() etc.
+                                        // pd.read_csv() / pl.scan_parquet() / pd.read_sql() etc.
                                         self.dataframes_total += 1;
-                                        match Self::extract_load_columns(call) {
+                                        let (extracted, load_kind) =
+                                            self.extract_load_columns(func_name, call);
+                                        match extracted {
                                             Some(cols) => {
                                                 self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
@@ -2486,15 +2628,26 @@ impl Linter {
                                                 }
                                             }
                                             None => {
+                                                let hint = match load_kind {
+                                                    LoadKind::Sql => {
+                                                        "name the columns in the `SELECT` list \
+                                                         (avoid `SELECT *`) or annotate: \
+                                                         `df: Annotated[pd.DataFrame, MySchema] \
+                                                         = pd.read_sql(...)`"
+                                                    }
+                                                    LoadKind::File => {
+                                                        "specify `usecols`/`columns` or \
+                                                         annotate: `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.read_csv(...)`"
+                                                    }
+                                                };
                                                 errors.push(LintError {
                                                     line: current_line,
                                                     col: current_col,
                                                     code: CODE_UNTRACKED_DATAFRAME.to_string(),
-                                                    message: "columns unknown at lint time; \
-                                                              specify `usecols`/`columns` or \
-                                                              annotate: `df: Annotated[pd.DataFrame, MySchema] \
-                                                              = pd.read_csv(...)`"
-                                                        .to_string(),
+                                                    message: format!(
+                                                        "columns unknown at lint time; {hint}"
+                                                    ),
                                                     severity: "warning".to_string(),
                                                 });
                                             }
@@ -3288,7 +3441,7 @@ impl Linter {
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             let attr_name = attr.attr.as_str();
-                            if !columns.contains(&attr_name.to_string())
+                            if !self.schema_has_column(schema_name, attr_name)
                                 && !RESERVED_METHODS.contains(&attr_name)
                             {
                                 let (line, col) = self.source_location(attr.range().start());
@@ -3320,7 +3473,7 @@ impl Linter {
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             if let Some(col_name) = Self::extract_string_literal(&subscript.slice) {
-                                if !columns.iter().any(|c| c == col_name) {
+                                if !self.schema_has_column(schema_name, col_name) {
                                     let (line, col) =
                                         self.source_location(subscript.range().start());
                                     let schema_display =
@@ -4338,6 +4491,107 @@ def process(path: str) -> None:
         )
         .unwrap();
         assert!(is_enabled(root));
+    }
+
+    #[test]
+    fn test_load_linter_config_reads_sql_dialect() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Absent entirely -> None, so `with_context` leaves the dialect at its
+        // Generic default rather than overwriting it.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = true",
+        )
+        .unwrap();
+        assert_eq!(load_linter_config(root).sql_dialect, None);
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(root).sql_dialect,
+            Some("snowflake".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_context_sets_dialect_from_config() {
+        let mut linter = Linter::new();
+        assert_eq!(linter.sql_dialect, sql::SqlDialect::Generic);
+
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: Some("snowflake".to_string()),
+        };
+        linter.with_context(PathBuf::from("/project"), &config);
+        assert_eq!(linter.sql_dialect, sql::SqlDialect::Snowflake);
+        assert_eq!(linter.project_root, Some(PathBuf::from("/project")));
+    }
+
+    #[test]
+    fn test_snowflake_dialect_folds_read_sql_columns_to_uppercase_and_flags_lowercase_access() {
+        // A Snowflake connection genuinely returns ORDER_ID (uppercase) for an unquoted
+        // `order_id` in the SELECT list — see sql::SqlDialect::fold_case. Once
+        // sql_dialect is wired to "snowflake", the checker should infer the schema with
+        // that real casing, so reading it back with the lowercase spelling actually
+        // used in the query text is flagged as unknown-column (a real bug: it would be
+        // a KeyError at runtime), while the correctly-cased access passes clean. This
+        // is the exact-match-plus-folding behavior chosen over silently accepting both
+        // cases.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+print(df["order_id"])
+print(df["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("order_id"));
+        assert!(
+            errors[0].message.contains("ORDER_ID"),
+            "expected a case-corrected suggestion, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_generic_dialect_does_not_fold_read_sql_columns() {
+        // Without an explicit sql_dialect, columns keep the exact spelling from the
+        // query text (SqlDialect::Generic preserves case) — the default, safest
+        // behavior for engines the checker hasn't been told about.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+print(df["order_id"])
+"#;
+        let mut linter = Linter::new();
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
     }
 
     #[test]

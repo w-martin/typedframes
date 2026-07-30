@@ -312,6 +312,17 @@ Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
   parameter contract violation caught at the call site (`missing-column`).
 - [`examples/multi_file_with_schema/`](examples/multi_file_with_schema/) — same scenario with `BaseSchema`
   classes; the checker follows schemas across module boundaries via the project index.
+- SQL / data-warehouse column inference — the column set is inferred from a query's `SELECT` list instead of
+  `usecols=`/`columns=`, including tracing the query back through a single-assignment variable or a `.sql` file,
+  and dialect-aware identifier case folding (`sql_dialect` in `pyproject.toml` — see [Project-level
+  configuration](docs/api/cli.md#project-level-configuration)):
+  [`examples/snowflake/`](examples/snowflake/), [`examples/bigquery/`](examples/bigquery/),
+  [`examples/athena/`](examples/athena/), [`examples/redshift/`](examples/redshift/),
+  [`examples/databricks/`](examples/databricks/), [`examples/pyspark/`](examples/pyspark/),
+  [`examples/duckdb/`](examples/duckdb/), [`examples/connectorx/`](examples/connectorx/),
+  [`examples/sqlalchemy/`](examples/sqlalchemy/) (Core `select()` and declarative models, not just raw SQL text),
+  and [`examples/feast/`](examples/feast/) (feature-store retrieval, registered as an *open* schema since
+  `entity_df`'s own columns aren't enumerable in general).
 
 ---
 

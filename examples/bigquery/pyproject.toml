@@ -1,0 +1,3 @@
+[tool.typedframes]
+enabled = true
+sql_dialect = "bigquery"

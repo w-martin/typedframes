@@ -43,6 +43,45 @@ pl.read_json("data.json", schema={"a": int, "b": str})
 Any `usecols=` (pandas) or `columns=` / `schema=` (polars) argument teaches the checker
 which columns are available, regardless of file format.
 
+## SQL and warehouse column inference
+
+For database/warehouse loads, the checker infers columns from the query's `SELECT`
+list instead of a kwarg:
+
+```python
+pd.read_sql("SELECT a, b FROM t", conn)
+pd.read_sql_query("SELECT a, b FROM t", conn)
+pl.read_database("SELECT a, b FROM t", connection)
+pl.read_database_uri("SELECT a, b FROM t", uri)
+pd.read_gbq("SELECT a, b FROM t", project_id=...)
+```
+
+This also traces the query text back through:
+
+- a **single-assignment variable** (`QUERY = "SELECT a, b FROM t"`, used later) — a
+  variable assigned more than once anywhere in the file is not resolved, since the
+  checker can't know which assignment was in effect at the call site;
+- a **`.sql` file** (`Path("query.sql").read_text()`, `open("query.sql").read()`,
+  project-root-relative only);
+- SQLAlchemy's `text(...)` wrapper, `select(Model.col1, Model.col2, ...)` (Core, against
+  a declarative model's columns), and connector-specific shapes like
+  `client.query(sql).to_dataframe()` (BigQuery), `spark.sql(sql).toPandas()`
+  (PySpark/Databricks), `duckdb.sql(sql).df()`, and the `cursor.execute(sql)` /
+  `cursor.fetch_pandas_all()` pattern (Snowflake, Redshift).
+
+An f-string or `.format()`-built query is deliberately **not** resolved — that's the SQL
+injection anti-pattern parameterized queries exist to avoid — and falls through to
+`untracked-dataframe` like any other unresolvable load, without a separate injection
+warning (the checker has no taint analysis to distinguish a safe interpolation from a
+real vulnerability).
+
+Set `sql_dialect` in `pyproject.toml` to fold identifier case the way a specific engine
+does (e.g. Snowflake upper-cases unquoted identifiers, Postgres/Redshift lower-case
+them) — see [Project-level configuration](#project-level-configuration). Full examples
+for ten connectors, including Feast and SQLAlchemy, live in the repo's `examples/`
+directory (`snowflake/`, `bigquery/`, `athena/`, `redshift/`, `databricks/`, `pyspark/`,
+`duckdb/`, `connectorx/`, `sqlalchemy/`, `feast/`).
+
 ## Output format
 
 ```
@@ -75,6 +114,17 @@ Add to `pyproject.toml` to disable all warnings project-wide:
 [tool.typedframes]
 enabled  = true
 warnings = false
+```
+
+Set `sql_dialect` to fold unquoted SQL identifier case the way a specific engine does
+when inferring columns from a `SELECT` list (see [SQL and warehouse column
+inference](#sql-and-warehouse-column-inference)). Unset or unrecognized values default
+to no folding (columns keep the exact case written in the query).
+
+```toml
+[tool.typedframes]
+sql_dialect = "snowflake"  # one of: bigquery, snowflake, redshift, databricks,
+                           # duckdb, postgres, mysql, hive, spark
 ```
 
 ---

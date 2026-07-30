@@ -276,6 +276,46 @@ Suppress all warnings project-wide via `pyproject.toml`:
 warnings = false
 ```
 
+## SQL and warehouse column inference
+
+Loads from a database or warehouse infer columns from the query's `SELECT` list rather
+than a `usecols=`/`columns=` kwarg:
+
+```python
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+print(df["order_id"])  # OK
+print(df["revenue"])   # unknown-column: not in {order_id, amount}
+```
+
+The query text is also traced back through a variable assigned exactly once
+(`QUERY = "SELECT ..."`, used later — a variable assigned more than once anywhere in
+the file is left unresolved, since the checker can't know which assignment was in
+effect at the call site) and through a `.sql` file
+(`Path("query.sql").read_text()`, project-root-relative only). SQLAlchemy's `text(...)`
+and Core `select(Model.col1, Model.col2, ...)` (against a declarative model's columns)
+are both recognized too, as are several connector-specific shapes — see
+[`docs/api/cli.md`](api/cli.md#sql-and-warehouse-column-inference) for the full list.
+
+An f-string or otherwise dynamically-built query is deliberately left unresolved — the
+checker has no taint analysis to tell a safe interpolation from a real SQL-injection
+risk, so it falls through to `untracked-dataframe` rather than guessing (or warning
+about something it can't actually verify).
+
+Set the target engine's identifier case-folding behavior via `sql_dialect` in
+`pyproject.toml` — e.g. Snowflake genuinely upper-cases unquoted identifiers, so
+`SELECT order_id FROM orders` really does return a column named `ORDER_ID`, and
+`df["order_id"]` against it is a real bug worth catching, not a false positive to
+suppress:
+
+```toml
+[tool.typedframes]
+sql_dialect = "snowflake"
+```
+
+Full worked examples for ten connectors — Snowflake, BigQuery, Athena, Redshift,
+Databricks, PySpark, DuckDB, connectorx, SQLAlchemy, and Feast — live under
+`examples/` in the repo.
+
 ## Pandera integration
 
 Convert a `BaseSchema` to a Pandera schema for runtime value validation:

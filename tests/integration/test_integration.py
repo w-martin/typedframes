@@ -444,6 +444,82 @@ df = pd.read_csv("x.csv")
         finally:
             Path(temp_file).unlink()
 
+    def test_should_infer_columns_from_read_sql_select_list(self) -> None:
+        """Test that pd.read_sql infers columns from a literal SELECT list."""
+        # arrange
+        source = """
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+_ = df["order_id"]
+_ = df["revenue"]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)["errors"]
+
+            # assert — "revenue" not in the SELECT list, "order_id" is fine
+            messages = [e["message"] for e in errors]
+            self.assertTrue(any("revenue" in m for m in messages))
+            self.assertFalse(any("'order_id' does not exist" in m for m in messages))
+        finally:
+            Path(temp_file).unlink()
+
+    def test_should_fold_sql_column_case_per_configured_dialect(self) -> None:
+        """Test that sql_dialect in pyproject.toml folds identifier case for read_sql."""
+        # arrange
+        pipeline_source = """
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id FROM orders", conn)
+_ = df["order_id"]
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pipeline.py").write_text(pipeline_source)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nsql_dialect = "snowflake"\n')
+
+            # act
+            result = check_file(str(root / "pipeline.py"), None)
+            errors = json.loads(result)["errors"]
+
+            # assert — Snowflake upper-cases unquoted identifiers, so the query's own
+            # lowercase spelling is a real bug, not a false positive to suppress
+            messages = [e["message"] for e in errors]
+            self.assertTrue(any("order_id" in m and "ORDER_ID" in m for m in messages))
+
+    def test_should_trace_sql_through_a_single_assigned_variable(self) -> None:
+        """Test that a query kept in a constant resolves the same as an inline literal."""
+        # arrange
+        source = """
+import pandas as pd
+
+QUERY = "SELECT order_id, amount FROM orders"
+df = pd.read_sql(QUERY, conn)
+_ = df["order_id"]
+_ = df["revenue"]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)["errors"]
+
+            # assert
+            messages = [e["message"] for e in errors]
+            self.assertTrue(any("revenue" in m for m in messages))
+            self.assertFalse(any("'order_id' does not exist" in m for m in messages))
+        finally:
+            Path(temp_file).unlink()
+
     def test_should_not_warn_when_load_has_schema_annotation(self) -> None:
         """Test that df: PandasFrame[MySchema] = pd.read_csv(...) does not emit untracked-dataframe."""
         # arrange

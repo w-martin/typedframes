@@ -321,8 +321,10 @@ Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
   [`examples/databricks/`](examples/databricks/), [`examples/pyspark/`](examples/pyspark/),
   [`examples/duckdb/`](examples/duckdb/), [`examples/connectorx/`](examples/connectorx/),
   [`examples/sqlalchemy/`](examples/sqlalchemy/) (Core `select()` and declarative models, not just raw SQL text),
-  and [`examples/feast/`](examples/feast/) (feature-store retrieval, registered as an *open* schema since
-  `entity_df`'s own columns aren't enumerable in general).
+  [`examples/feast/`](examples/feast/) (feature-store retrieval, registered as an *open* schema since
+  `entity_df`'s own columns aren't enumerable in general), and
+  [`examples/azure_synapse/`](examples/azure_synapse/) (Azure's closest analog to Athena, including T-SQL's
+  `[bracket-quoted]` identifier convention).
 
 ---
 

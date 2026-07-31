@@ -4,8 +4,8 @@ use std::path::Path;
 use _rust_checker::Linter;
 
 fn bench_check_file(c: &mut Criterion) {
-    let source = include_str!("../../../examples/typedframes_example.py");
-    let path = Path::new("examples/typedframes_example.py");
+    let source = include_str!("../../../examples/features/typedframes_example.py");
+    let path = Path::new("examples/features/typedframes_example.py");
 
     c.bench_function("check_file_internal", |b| {
         b.iter(|| {

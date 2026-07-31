@@ -364,7 +364,30 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
 // convention this project's own examples use (a `uv`-managed `.venv`); a project using
 // a differently-named or externally-managed environment simply won't resolve anything,
 // same as any other candidate path that doesn't exist.
+// Memoized because `resolve_module_file` — which calls this — runs once per import
+// statement across an entire project check, and the answer can never change within a
+// single process's lifetime (see INDEX_CACHE above for the same reasoning). Without
+// this, a large project with a real `.venv` would re-`read_dir` the same `lib/`
+// directory on every single import resolution, turning one cheap directory listing
+// into one per import statement in the whole project.
+static SITE_PACKAGES_CACHE: Mutex<Option<(PathBuf, Option<PathBuf>)>> = Mutex::new(None);
+
 fn find_site_packages_dir(project_root: &Path) -> Option<PathBuf> {
+    if let Ok(cache) = SITE_PACKAGES_CACHE.lock() {
+        if let Some((cached_root, result)) = cache.as_ref() {
+            if cached_root == project_root {
+                return result.clone();
+            }
+        }
+    }
+    let result = find_site_packages_dir_uncached(project_root);
+    if let Ok(mut cache) = SITE_PACKAGES_CACHE.lock() {
+        *cache = Some((project_root.to_path_buf(), result.clone()));
+    }
+    result
+}
+
+fn find_site_packages_dir_uncached(project_root: &Path) -> Option<PathBuf> {
     let venv = project_root.join(".venv");
     if !venv.is_dir() {
         return None;
@@ -7441,5 +7464,191 @@ def process(path: str) -> None:
         assert_eq!(errors[0].code, "missing-column");
         assert!(errors[0].message.contains("missing column(s) {c}"));
         assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    // ── Benchmark: site-packages resolution overhead ────────────────────────────
+    //
+    // `cargo bench` (criterion) can't link in this environment -- pyo3's
+    // "extension-module" feature deliberately omits libpython, which is fine for the
+    // cdylib actually loaded by Python but breaks any standalone executable built from
+    // this crate (the criterion harness's own `main()`, same as the `typedframes_checker`
+    // `[[bin]]` target). `cargo test --lib` reliably links (nothing here calls into the
+    // pyo3-macro-generated FFI glue), so these are ordinary #[test]s used as a timing
+    // vehicle, not correctness assertions -- run explicitly with:
+    //   cargo test --lib bench_ -- --ignored --nocapture
+
+    fn write_import_heavy_project(root: &Path, num_files: usize) {
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        for hub in 0..5 {
+            fs::write(
+                root.join(format!("hub{hub}.py")),
+                format!(
+                    r#"
+import pandas as pd
+
+def load_hub{hub}(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, usecols=["a", "b", "c"])
+"#
+                ),
+            )
+            .unwrap();
+        }
+        for i in 0..num_files {
+            let hub = i % 5;
+            fs::write(
+                root.join(format!("mod_{i}.py")),
+                format!(
+                    r#"
+from hub{hub} import load_hub{hub}
+
+def process_{i}(path: str) -> None:
+    df = load_hub{hub}(path)
+    print(df["a"])
+"#
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_without_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, no .venv: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_with_venv_present_but_unused() {
+        // Same project, but with a real (populated-looking) .venv present --
+        // trace_external_packages is NOT set, so no external package should actually
+        // be indexed, but every import resolution still probes for a site-packages
+        // dir (cached after the first call -- this measures whether that caching
+        // actually keeps the cost negligible for the common case where the feature
+        // isn't in use at all).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        // A handful of unrelated installed packages, so the directory listing this
+        // benchmark exercises isn't unrealistically empty.
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+            fs::write(site_packages.join(pkg).join("__init__.py"), "").unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, .venv present (unused): {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_with_venv_and_allowlisted_package() {
+        // Same as above, but trace_external_packages actually names one of the fake
+        // installed packages -- measures the added cost of actually indexing an
+        // external package's files, not just probing for the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+            fs::write(site_packages.join(pkg).join("__init__.py"), "").unwrap();
+        }
+        let internal_pkg = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&internal_pkg).unwrap();
+        fs::write(
+            internal_pkg.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    return pd.read_csv(query, usecols=["order_id", "amount"])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\ntrace_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, .venv + allowlisted package: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_find_site_packages_dir_repeated_calls_uncached() {
+        // Directly measures what EVERY resolve_module_file call used to pay before
+        // SITE_PACKAGES_CACHE was added -- one read_dir per call, simulating roughly
+        // one import statement's worth of resolution per iteration.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+        }
+
+        let iterations = 1000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = find_site_packages_dir_uncached(root);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "find_site_packages_dir_uncached x{iterations}: {:?} total, {:?}/call",
+            elapsed,
+            elapsed / iterations
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = find_site_packages_dir(root);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "find_site_packages_dir (cached) x{iterations}: {:?} total, {:?}/call",
+            elapsed,
+            elapsed / iterations
+        );
     }
 }

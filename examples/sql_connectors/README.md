@@ -220,7 +220,9 @@ hand-rolled `connect()` (stands in for `snowflake.connector.connect`) and
 `create_engine()` (stands in for SQLAlchemy's) that parse just enough of a `SELECT`
 list to fabricate a small, correctly upper-cased result — the one behavior this example
 is actually about. Not a SQL engine; clearly labeled as a stand-in in both the module
-docstring and inline.
+docstring and inline. `load_via_lowercasing_wrapper` demonstrates the common
+internal-package pattern of case-folding a connector's result before returning it — see
+[docs/usage.md's "Supported column-set transforms"](../../../docs/usage.md#supported-column-set-transforms).
 
 ```shell
 cd examples/sql_connectors/snowflake

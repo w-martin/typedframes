@@ -115,6 +115,33 @@ def load_with_dynamic_filter(customer_id: str) -> None:
     print(df)
 
 
+def load_via_lowercasing_wrapper() -> None:
+    """A common real-world pattern: an internal package wraps Snowflake access and
+    lower-cases every column before returning, so callers don't have to deal with
+    Snowflake's upper-casing at all.
+
+    typedframes recognizes this fold -- `.rename(columns=str.lower)` and
+    `df.columns = df.columns.str.lower()` are both recognized, and propagate cross-file
+    the same way any other inferred return schema does (see docs/usage.md's "Supported
+    column-set transforms"). Only these specific, enumerated shapes are recognized --
+    an arbitrary custom function (`df.rename(columns=my_pkg.normalize)`) is invisible
+    to the checker and passes the pre-fold schema through unchanged.
+    """
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+
+    print(df["order_id"])  # OK -- folded to lower case, matches the query text's spelling
+    # print(df["ORDER_ID"])  -- unknown-column: that was the pre-fold (Snowflake-real) spelling
+
+
 def load_with_unknown_column() -> None:
     """A real bug: 'order_id' is the query text's own spelling, not what Snowflake
     actually returns (it's uppercased to 'ORDER_ID').
@@ -143,4 +170,5 @@ if __name__ == "__main__":
     load_via_traced_variable()
     load_via_query_file()
     load_with_dynamic_filter(customer_id="C123")
+    load_via_lowercasing_wrapper()
     # load_with_unknown_column() intentionally not run -- see its docstring.

@@ -900,6 +900,31 @@ enum LoadKind {
     Orm,
 }
 
+// A recognized case-fold of an *already-known* column set — e.g. a connector-specific
+// package that queries Snowflake (columns come back upper-cased, per `sql_dialect`
+// folding) and then lower-cases them all before returning. Deliberately narrow: this
+// matches two specific, literal AST shapes (`.rename(columns=str.lower)` /
+// `df.columns = df.columns.str.lower()`, and their `.upper()` counterparts) rather
+// than attempting to evaluate arbitrary user-defined transform functions, which is not
+// possible in general for a static checker — any custom function (`my_pkg.normalize`,
+// a lambda, anything data-dependent) is invisible to this and passes the base schema
+// through unchanged, neither erroring nor folding it. See docs/usage.md's "Supported
+// column-set transforms" section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseFold {
+    Lower,
+    Upper,
+}
+
+impl CaseFold {
+    fn apply(self, s: &str) -> String {
+        match self {
+            CaseFold::Lower => s.to_lowercase(),
+            CaseFold::Upper => s.to_uppercase(),
+        }
+    }
+}
+
 const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "filter",
     "query",
@@ -2549,6 +2574,72 @@ impl Linter {
         None
     }
 
+    // `str.lower` / `str.upper` referenced bare (not called) — the shape `rename(...)`
+    // takes as its `columns=`/first-positional argument to case-fold every column,
+    // rather than remap specific ones by name.
+    fn expr_as_str_case_fold(expr: &Expr) -> Option<CaseFold> {
+        if let Expr::Attribute(attr) = expr {
+            if let Expr::Name(name) = &*attr.value {
+                if name.id.as_str() == "str" {
+                    return match attr.attr.as_str() {
+                        "lower" => Some(CaseFold::Lower),
+                        "upper" => Some(CaseFold::Upper),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    // Extract a case-fold from a rename() call: `.rename(columns=str.lower)` (pandas)
+    // or `.rename(str.lower)` (polars' first-positional convention, mirroring
+    // extract_rename_mapping's dict handling above).
+    fn extract_rename_case_fold(call: &ast::ExprCall) -> Option<CaseFold> {
+        for keyword in &call.arguments.keywords {
+            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("columns") {
+                return Self::expr_as_str_case_fold(&keyword.value);
+            }
+        }
+        if let Some(first_arg) = call.arguments.args.first() {
+            return Self::expr_as_str_case_fold(first_arg);
+        }
+        None
+    }
+
+    // `df.columns.str.lower()` / `.str.upper()` — the RHS shape of
+    // `df.columns = df.columns.str.lower()`. Returns the receiver's variable name
+    // (so the caller can confirm it matches the assignment target) and the fold.
+    fn extract_columns_str_fold(value: &Expr) -> Option<(String, CaseFold)> {
+        let Expr::Call(call) = value else {
+            return None;
+        };
+        let Expr::Attribute(fold_attr) = &*call.func else {
+            return None;
+        };
+        let fold = match fold_attr.attr.as_str() {
+            "lower" => CaseFold::Lower,
+            "upper" => CaseFold::Upper,
+            _ => return None,
+        };
+        let Expr::Attribute(str_attr) = &*fold_attr.value else {
+            return None;
+        };
+        if str_attr.attr.as_str() != "str" {
+            return None;
+        }
+        let Expr::Attribute(columns_attr) = &*str_attr.value else {
+            return None;
+        };
+        if columns_attr.attr.as_str() != "columns" {
+            return None;
+        }
+        let Expr::Name(recv) = &*columns_attr.value else {
+            return None;
+        };
+        Some((recv.id.to_string(), fold))
+    }
+
     fn extract_string_dict(dict: &ast::ExprDict) -> Option<HashMap<String, String>> {
         let mut map = HashMap::new();
         for item in &dict.items {
@@ -3398,6 +3489,45 @@ impl Linter {
                     }
                 }
 
+                // df.columns = df.columns.str.lower() / .str.upper() -- a recognized
+                // case-fold of an already-known column set (see CaseFold's doc comment
+                // for why this is a fixed, narrow pattern rather than general support
+                // for arbitrary transform functions).
+                for target in &assign.targets {
+                    if let Expr::Attribute(target_attr) = target {
+                        if target_attr.attr.as_str() != "columns" {
+                            continue;
+                        }
+                        let Expr::Name(target_recv) = &*target_attr.value else {
+                            continue;
+                        };
+                        let Some((rhs_recv, fold)) = Self::extract_columns_str_fold(&assign.value)
+                        else {
+                            continue;
+                        };
+                        if rhs_recv != target_recv.id.as_str() {
+                            continue;
+                        }
+                        if let Some((schema_name, _)) =
+                            self.variables.get(target_recv.id.as_str()).cloned()
+                        {
+                            if let Some(base_cols) = self.schemas.get(&schema_name).cloned() {
+                                let new_cols: Vec<String> =
+                                    base_cols.iter().map(|c| fold.apply(c)).collect();
+                                let new_schema = self.make_inferred_schema(
+                                    new_cols,
+                                    target_recv.id.as_str(),
+                                    current_line,
+                                );
+                                self.variables.insert(
+                                    target_recv.id.to_string(),
+                                    (new_schema, current_line),
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // A. Multi-column subscript: a = b[["foo", "bar"]]
                 if let Expr::Subscript(sub) = &*assign.value {
                     if let Expr::Name(base_name) = &*sub.value {
@@ -4040,7 +4170,45 @@ impl Linter {
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
                                     let mapping = Self::extract_rename_mapping(call);
+                                    let case_fold = if mapping.is_none() {
+                                        Self::extract_rename_case_fold(call)
+                                    } else {
+                                        None
+                                    };
                                     match (base_cols, mapping) {
+                                        (Some(base_cols), None) if case_fold.is_some() => {
+                                            let fold = case_fold.unwrap();
+                                            let new_cols: Vec<String> = base_cols
+                                                .iter()
+                                                .map(|c| fold.apply(c))
+                                                .collect();
+                                            let target_names: Vec<String> = assign
+                                                .targets
+                                                .iter()
+                                                .filter_map(|t| {
+                                                    if let Expr::Name(n) = t {
+                                                        Some(n.id.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect();
+                                            let var_name = target_names
+                                                .first()
+                                                .map(|s| s.as_str())
+                                                .unwrap_or("unknown");
+                                            let schema_name = self.make_inferred_schema(
+                                                new_cols,
+                                                var_name,
+                                                current_line,
+                                            );
+                                            for name in &target_names {
+                                                self.variables.insert(
+                                                    name.clone(),
+                                                    (schema_name.clone(), current_line),
+                                                );
+                                            }
+                                        }
                                         (Some(base_cols), Some(mapping)) => {
                                             let schema_display = base_info
                                                 .as_ref()
@@ -5490,6 +5658,71 @@ def process(path: str) -> None:
     }
 
     #[test]
+    fn test_should_propagate_case_folded_schema_from_an_unannotated_cross_file_helper() {
+        // arrange: an internal-package-style helper in loaders.py queries Snowflake
+        // (columns come back upper-cased under sql_dialect="snowflake"), then
+        // lower-cases them all before returning -- no BaseSchema/Annotated return type
+        // anywhere. pipeline.py, in a different file, only sees the lower-cased names.
+        // The cross-file return-schema mechanism must pick up the POST-fold schema
+        // (not the raw upper-cased Snowflake one) when resolving load_orders' return
+        // type at pipeline.py's call site.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+import internal_snowflake_pkg
+
+def load_orders(query: str) -> pd.DataFrame:
+    conn = internal_snowflake_pkg.connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+    return df
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load_orders
+
+def process(query: str) -> None:
+    orders = load_orders(query)
+    print(orders["order_id"])
+    print(orders["ORDER_ID"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(
+            root.to_path_buf(),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+            },
+        );
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
     fn test_should_resolve_param_schema_defined_in_a_third_file_as_call_site_contract() {
         // arrange: schemas.py defines ReportSchema; reports.py's build_report() takes
         // a parameter annotated Annotated[pd.DataFrame, ReportSchema] but does not
@@ -5826,6 +6059,105 @@ print(df["order_id"])
             .unwrap();
 
         assert_eq!(errors.len(), 0, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_fold_columns_via_rename_with_str_lower() {
+        // A Snowflake result genuinely has upper-cased columns; .rename(columns=str.lower)
+        // -- a callable, not a literal dict -- should fold the whole known column set to
+        // lower case, not be silently treated as a no-op.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+lowered = df.rename(columns=str.lower)
+print(lowered["order_id"])
+print(lowered["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_fold_columns_via_columns_attribute_assignment() {
+        // df.columns = df.columns.str.lower() -- an attribute-assignment target, not a
+        // method-chain call -- should be recognized the same way as the rename() form.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+df.columns = df.columns.str.lower()
+print(df["order_id"])
+print(df["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_not_fold_columns_for_unrecognized_transform_function() {
+        // A custom/arbitrary transform function is NOT reverse-engineered -- the base
+        // schema passes through unchanged (neither folded nor flagged), same as any
+        // other unrecognized rename() argument shape.
+        let source = r#"
+import pandas as pd
+import my_internal_pkg
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+lowered = df.rename(columns=my_internal_pkg.normalize)
+print(lowered["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // The base schema passes through UNCHANGED (still upper-cased) -- not folded,
+        // but also not flagged as an error just for being an unrecognized call shape.
+        assert_eq!(
+            errors.len(),
+            0,
+            "unrecognized transform should pass the pre-fold base schema through untouched: {errors:?}"
+        );
     }
 
     #[test]

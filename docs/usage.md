@@ -115,6 +115,43 @@ enriched = df.assign(domain=df["email"].str.split("@").str[1])
 print(enriched["domain"])  # ✓ OK — newly added
 ```
 
+### Supported column-set transforms
+
+Beyond `rename`/`drop`/`assign`/`select` above, the checker recognizes a fixed,
+enumerated set of AST shapes that transform an *already-known* column set. Two are a
+case-fold of every column — useful for connectors like Snowflake that genuinely
+upper-case unquoted identifiers, when a wrapper function normalizes the case back
+before returning:
+
+```python
+# .rename(columns=str.lower) / .rename(columns=str.upper) — a callable, not a dict
+lowered = df.rename(columns=str.lower)
+print(lowered["order_id"])  # ✓ OK — folded
+print(lowered["ORDER_ID"])  # ✗ unknown-column — that was the pre-fold spelling
+
+# df.columns = df.columns.str.lower() / .str.upper() — attribute-assignment form
+df.columns = df.columns.str.lower()
+print(df["order_id"])  # ✓ OK
+```
+
+This propagates cross-file the same way any other inferred return schema does: a
+helper function that queries a SQL connector and then case-folds the result before
+`return`ing it gets its post-fold schema followed at every call site, with no
+annotation required.
+
+**Only these specific shapes are recognized — not arbitrary transform functions.**
+`df.rename(columns=my_company_pkg.normalize_columns)` or any other custom
+function/lambda is invisible to the checker: the base schema passes through
+*unchanged* (neither folded nor flagged as an error), the same as any other
+unrecognized `rename()` argument. This isn't a gap that's merely unimplemented yet —
+a static checker can't generally evaluate what an arbitrary Python function does to a
+list of strings (that's undecidable in general, per Rice's theorem: the function
+could do anything, including data-dependent logic) without actually running it. Only
+a finite, explicitly-coded set of well-known patterns can ever be recognized this way;
+if your organization's internal SQL wrapper does something not on this list, annotate
+its return type explicitly (`Annotated[pd.DataFrame, YourSchema]`) instead of relying
+on inference.
+
 ## Step 4 — Use with polars
 
 The checker validates both subscript access and `pl.col()` references:

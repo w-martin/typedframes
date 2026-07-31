@@ -324,7 +324,9 @@ Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
   [`examples/sql_connectors/feast/`](examples/sql_connectors/feast/) (feature-store retrieval, registered as an *open* schema since
   `entity_df`'s own columns aren't enumerable in general), and
   [`examples/sql_connectors/azure_synapse/`](examples/sql_connectors/azure_synapse/) (Azure's closest analog to Athena, including T-SQL's
-  `[bracket-quoted]` identifier convention).
+  `[bracket-quoted]` identifier convention). A wrapper function that case-folds a connector's result before
+  returning it (`.rename(columns=str.lower)`, `df.columns = df.columns.str.lower()`) is traced cross-file
+  too — see [docs/usage.md's "Supported column-set transforms"](docs/usage.md#supported-column-set-transforms).
 
 ---
 

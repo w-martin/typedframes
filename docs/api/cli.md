@@ -83,6 +83,14 @@ for eleven connectors, including Feast and SQLAlchemy, live in the repo's
 `databricks/`, `pyspark/`, `duckdb/`, `connectorx/`, `sqlalchemy/`, `feast/`,
 `azure_synapse/`).
 
+A wrapper function that queries one of these connectors and then case-folds the
+result (e.g. an internal package that queries Snowflake and lower-cases its
+genuinely-upper-cased columns before returning) is also traced, cross-file, via
+`.rename(columns=str.lower)` / `df.columns = df.columns.str.lower()` (and the
+`.upper()` equivalents) — see [usage.md's "Supported column-set
+transforms"](../usage.md#supported-column-set-transforms) for exactly what's
+recognized and why arbitrary custom transform functions aren't.
+
 ## Output format
 
 ```

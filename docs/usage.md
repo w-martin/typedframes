@@ -137,7 +137,10 @@ print(df["order_id"])  # ✓ OK
 This propagates cross-file the same way any other inferred return schema does: a
 helper function that queries a SQL connector and then case-folds the result before
 `return`ing it gets its post-fold schema followed at every call site, with no
-annotation required.
+annotation required. If that helper lives in a genuinely separate, installed package
+(a company-internal Snowflake wrapper, say) rather than your own project's source
+tree, it isn't indexed by default — see [`trace_external_packages`](api/cli.md#tracing-installed-non-project-packages)
+to opt a specific installed package in.
 
 **Only these specific shapes are recognized — not arbitrary transform functions.**
 `df.rename(columns=my_company_pkg.normalize_columns)` or any other custom

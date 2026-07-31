@@ -141,6 +141,33 @@ SQL parsing also accepts T-SQL's `[bracket-quoted]` identifiers (SQL Server, Azu
 Synapse, Fabric Warehouse) alongside standard `"double-quoted"` ones, regardless of
 `sql_dialect`.
 
+### Tracing installed (non-project) packages
+
+By default, only files under the project itself are indexed — nothing inside `.venv`
+or any other installed-dependency location. `trace_external_packages` is an explicit
+allowlist of installed package names whose `Annotated[...]`/`BaseSchema` declarations
+and recognized transform patterns (rename, drop, case-fold, etc. — the same fixed set
+already applied to first-party code) should also be indexed. This is the mechanism a
+company-internal package (e.g. one that wraps a SQL connector) needs for its callers'
+column access to be validated cross-file, the same as any project-local helper.
+
+```toml
+[tool.typedframes]
+trace_external_packages = ["internal_snowflake_pkg"]
+```
+
+- The package's install location is auto-detected from the project's own `.venv`
+  (`lib/pythonX.Y/site-packages` on Unix, `Lib/site-packages` on Windows) — there is no
+  path override in this version, and no other virtualenv-manager layout is searched.
+- Only the named packages' own directories are walked — never the whole
+  `site-packages` tree, which would be both expensive and a far larger, unbounded
+  trust surface than an explicit opt-in list.
+- **Editable installs are not supported in this version.** A package installed via
+  `pip install -e` (or `uv`'s equivalent) resolves through a `.pth`/`direct_url.json`
+  redirect rather than living directly under `site-packages`, and isn't found by the
+  current auto-detection. Install the package normally (a real, non-editable install)
+  for it to be traced.
+
 ---
 
 ::: typedframes.cli.main

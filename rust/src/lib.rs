@@ -172,6 +172,15 @@ pub struct LinterConfig {
     // absent values fall back to `SqlDialect::Generic` (no folding) — see
     // `SqlDialect::from_config_str`.
     sql_dialect: Option<String>,
+    // Explicit allowlist of installed (non-project) package names whose own
+    // Annotated[...]/BaseSchema declarations and recognized transform patterns should
+    // be indexed the same way first-party files are -- e.g. an internal company
+    // package that wraps a SQL connector. Resolved from the project's own auto-detected
+    // `.venv` site-packages directory (see `find_site_packages_dir`); no editable-install
+    // support and no path override in this version. Deliberately an explicit allowlist
+    // rather than indexing all of site-packages, which would be both expensive and a
+    // much larger, unbounded trust surface.
+    trace_external_packages: Option<Vec<String>>,
 }
 
 impl LinterConfig {
@@ -179,6 +188,7 @@ impl LinterConfig {
         enabled: None,
         warnings: None,
         sql_dialect: None,
+        trace_external_packages: None,
     };
 }
 
@@ -346,6 +356,75 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
     result
 }
 
+// Auto-detect a project's virtualenv site-packages directory, for resolving
+// explicitly allowlisted external packages (`trace_external_packages` config option).
+// Tries the conventional `.venv` layout on both Unix (`lib/pythonX.Y/site-packages`,
+// version-globbed since it depends on the interpreter the venv was created with) and
+// Windows (`Lib/site-packages`). No path override in this version — this is the
+// convention this project's own examples use (a `uv`-managed `.venv`); a project using
+// a differently-named or externally-managed environment simply won't resolve anything,
+// same as any other candidate path that doesn't exist.
+fn find_site_packages_dir(project_root: &Path) -> Option<PathBuf> {
+    let venv = project_root.join(".venv");
+    if !venv.is_dir() {
+        return None;
+    }
+    let windows_layout = venv.join("Lib").join("site-packages");
+    if windows_layout.is_dir() {
+        return Some(windows_layout);
+    }
+    let lib_dir = venv.join("lib");
+    let entries = fs::read_dir(&lib_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("python"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let candidate = path.join("site-packages");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// Collect `.py` files for each explicitly allowlisted external package (see
+// LinterConfig::trace_external_packages), resolved from the project's own
+// site-packages directory. Deliberately narrow: only the allowlisted packages' own
+// directories are walked — never the whole site-packages tree, which would be both
+// expensive and a far larger, unbounded trust surface than an explicit opt-in list.
+fn collect_external_package_files(project_root: &Path, config: &LinterConfig) -> Vec<PathBuf> {
+    let Some(packages) = config.trace_external_packages.as_ref() else {
+        return Vec::new();
+    };
+    if packages.is_empty() {
+        return Vec::new();
+    }
+    let Some(site_packages) = find_site_packages_dir(project_root) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for package in packages {
+        let package_dir = site_packages.join(package);
+        if package_dir.is_dir() {
+            result.extend(collect_py_files(&package_dir));
+            continue;
+        }
+        let single_module = site_packages.join(format!("{package}.py"));
+        if single_module.is_file() {
+            result.push(single_module);
+        }
+    }
+    result
+}
+
 // Parse one `.py` file and extract its symbols into an IndexEntry.
 // Runs the linter in index mode (diagnostics discarded) to collect schemas and
 // functions, then separately parses `__all__` assignments and `from X import Y`
@@ -472,7 +551,8 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
     // a mismatch here would make a SQL-derived schema's columns differ depending on
     // whether they were read from the cached project index or inferred fresh.
     let config = load_linter_config(project_root);
-    let py_files = collect_py_files(project_root);
+    let mut py_files = collect_py_files(project_root);
+    py_files.extend(collect_external_package_files(project_root, &config));
     let mut files = HashMap::new();
     for file_path in py_files {
         if let Some(entry) = index_file(&file_path, project_root, &config) {
@@ -534,10 +614,17 @@ fn resolve_module_file(
     files: &HashMap<String, IndexEntry>,
 ) -> Option<String> {
     let mod_path = module_name.replace('.', "/");
-    let candidates = [
+    let mut candidates = vec![
         project_root.join(format!("{mod_path}.py")),
         project_root.join("src").join(format!("{mod_path}.py")),
     ];
+    // An explicitly allowlisted external package (see collect_external_package_files)
+    // is indexed into the same `files` map under its real site-packages path — these
+    // two extra candidates are how an import of it actually gets found.
+    if let Some(site_packages) = find_site_packages_dir(project_root) {
+        candidates.push(site_packages.join(format!("{mod_path}.py")));
+        candidates.push(site_packages.join(&mod_path).join("__init__.py"));
+    }
     candidates
         .iter()
         .filter_map(|p| p.to_str())
@@ -1489,23 +1576,19 @@ impl Linter {
             if module_name.starts_with("typedframes") {
                 continue;
             }
-            let mod_path = module_name.replace('.', "/");
-            let candidates = [
-                project_root.join(format!("{mod_path}.py")),
-                project_root.join("src").join(format!("{mod_path}.py")),
-            ];
-            let Some(resolved_path) = candidates.iter().find(|p| p.exists()) else {
+            // resolve_module_file also tries an explicitly allowlisted external
+            // package's site-packages location (see collect_external_package_files),
+            // not just project_root/project_root/src.
+            let Some(resolved_str) = resolve_module_file(module_name, project_root, &index.files)
+            else {
                 continue;
             };
-            let Some(resolved_str) = resolved_path.to_str() else {
-                continue;
-            };
-            let Some(entry) = index.files.get(resolved_str) else {
+            let Some(entry) = index.files.get(&resolved_str) else {
                 continue;
             };
             // Use the full resolved path (not just the basename) so error messages
             // contain an openable `file:line` reference regardless of cwd.
-            let file_path_display = resolved_path.display().to_string();
+            let file_path_display = resolved_str.clone();
             // `from X import *`: ruff represents the wildcard as a single alias named
             // "*". Expand to the module's declared __all__, or — matching real Python
             // semantics for a module with no __all__ — every public (non-`_`-prefixed)
@@ -3519,10 +3602,8 @@ impl Linter {
                                     target_recv.id.as_str(),
                                     current_line,
                                 );
-                                self.variables.insert(
-                                    target_recv.id.to_string(),
-                                    (new_schema, current_line),
-                                );
+                                self.variables
+                                    .insert(target_recv.id.to_string(), (new_schema, current_line));
                             }
                         }
                     }
@@ -4175,13 +4256,10 @@ impl Linter {
                                     } else {
                                         None
                                     };
-                                    match (base_cols, mapping) {
-                                        (Some(base_cols), None) if case_fold.is_some() => {
-                                            let fold = case_fold.unwrap();
-                                            let new_cols: Vec<String> = base_cols
-                                                .iter()
-                                                .map(|c| fold.apply(c))
-                                                .collect();
+                                    match (base_cols, mapping, case_fold) {
+                                        (Some(base_cols), None, Some(fold)) => {
+                                            let new_cols: Vec<String> =
+                                                base_cols.iter().map(|c| fold.apply(c)).collect();
                                             let target_names: Vec<String> = assign
                                                 .targets
                                                 .iter()
@@ -4209,7 +4287,7 @@ impl Linter {
                                                 );
                                             }
                                         }
-                                        (Some(base_cols), Some(mapping)) => {
+                                        (Some(base_cols), Some(mapping), _) => {
                                             let schema_display = base_info
                                                 .as_ref()
                                                 .map(|(s, l)| self.schema_display(s, *l))
@@ -5708,6 +5786,7 @@ def process(query: str) -> None:
                 enabled: None,
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
             },
         );
         let pipeline_path = root.join("pipeline.py");
@@ -5720,6 +5799,113 @@ def process(query: str) -> None:
         assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
         assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
         assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_trace_an_allowlisted_package_installed_in_venv_site_packages() {
+        // arrange: same scenario as the cross-file case-fold test above, but this time
+        // the case-folding helper genuinely lives OUTSIDE the project tree, in a fake
+        // .venv/lib/pythonX.Y/site-packages/internal_snowflake_pkg/ -- simulating a real
+        // pip-installed internal package, not just another first-party file. Without
+        // `trace_external_packages` naming it, this must NOT be indexed at all (today's
+        // behavior: pipeline.py's call site is untraceable, load_orders' return type is
+        // simply unknown); with it, the same post-fold propagation must work across
+        // that install boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    conn = connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+    return df
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_snowflake_pkg import load_orders
+
+def process(query: str) -> None:
+    orders = load_orders(query)
+    print(orders["order_id"])
+    print(orders["ORDER_ID"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        let config_with_allowlist = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: Some("snowflake".to_string()),
+            trace_external_packages: Some(vec!["internal_snowflake_pkg".to_string()]),
+        };
+
+        // act: without the allowlist, nothing outside the project tree is indexed.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\n",
+        )
+        .unwrap();
+        let index_without_allowlist = build_index_internal(root);
+        let mut linter_without = Linter::new();
+        linter_without.with_context(root.to_path_buf(), &config_with_allowlist);
+        let pipeline_path = root.join("pipeline.py");
+        linter_without.load_cross_file_symbols(
+            &index_without_allowlist,
+            pipeline_source,
+            &pipeline_path,
+            root,
+        );
+        let errors_without = linter_without
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+        assert_eq!(
+            errors_without.len(),
+            0,
+            "load_orders' return type must be untraceable without the allowlist: {errors_without:?}"
+        );
+
+        // act: with the allowlist, the external package is indexed and its post-fold
+        // return schema is picked up at pipeline.py's call site.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\ntrace_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+        let index_with_allowlist = build_index_internal(root);
+        let mut linter_with = Linter::new();
+        linter_with.with_context(root.to_path_buf(), &config_with_allowlist);
+        linter_with.load_cross_file_symbols(
+            &index_with_allowlist,
+            pipeline_source,
+            &pipeline_path,
+            root,
+        );
+        let errors_with = linter_with
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(
+            errors_with.len(),
+            1,
+            "expected one error, got: {errors_with:?}"
+        );
+        assert_eq!(errors_with[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors_with[0].message.contains("ORDER_ID"));
     }
 
     #[test]
@@ -5994,6 +6180,7 @@ def process(path: str) -> None:
             enabled: None,
             warnings: None,
             sql_dialect: Some("snowflake".to_string()),
+            trace_external_packages: None,
         };
         linter.with_context(PathBuf::from("/project"), &config);
         assert_eq!(linter.sql_dialect, sql::SqlDialect::Snowflake);
@@ -6024,6 +6211,7 @@ print(df["ORDER_ID"])
                 enabled: None,
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
             },
         );
 
@@ -6081,6 +6269,7 @@ print(lowered["ORDER_ID"])
                 enabled: None,
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
             },
         );
 
@@ -6112,6 +6301,7 @@ print(df["ORDER_ID"])
                 enabled: None,
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
             },
         );
 
@@ -6144,6 +6334,7 @@ print(lowered["ORDER_ID"])
                 enabled: None,
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
             },
         );
 

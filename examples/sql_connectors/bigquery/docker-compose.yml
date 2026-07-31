@@ -1,0 +1,11 @@
+services:
+  bigquery-emulator:
+    image: ghcr.io/goccy/bigquery-emulator:latest
+    command:
+      - "--project=my-project"
+      - "--data-from-yaml=/data/seed-data.yaml"
+    ports:
+      - "9050:9050"
+      - "9060:9060"
+    volumes:
+      - ./seed-data.yaml:/data/seed-data.yaml:ro

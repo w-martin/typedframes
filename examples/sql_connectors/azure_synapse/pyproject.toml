@@ -1,0 +1,21 @@
+[project]
+name = "azure-synapse-connector-example"
+version = "0.1.0"
+description = "Runnable typedframes example: SQL column inference against Azure Synapse/Fabric"
+requires-python = ">=3.11"
+dependencies = [
+    "pyodbc>=5.1",
+    "pandas>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "typedframes[mypy]",
+]
+
+[tool.uv.sources]
+typedframes = { path = "../../..", editable = true }
+
+[tool.typedframes]
+enabled = true
+sql_dialect = "synapse"

@@ -211,4 +211,4 @@ groups = ["dev"]
 ignore_packages = ["mypy-extensions", "typedframes", "pyrefly"]
 
 [tool.uv.workspace]
-exclude = ["examples/*"]
+exclude = ["examples/*/*"]

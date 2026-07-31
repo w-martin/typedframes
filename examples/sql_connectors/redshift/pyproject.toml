@@ -1,0 +1,22 @@
+[project]
+name = "redshift-connector-example"
+version = "0.1.0"
+description = "Runnable typedframes example: SQL column inference against Redshift"
+requires-python = ">=3.11"
+dependencies = [
+    "redshift-connector>=2.1",
+    "psycopg2-binary>=2.9",
+    "pandas>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "typedframes[mypy]",
+]
+
+[tool.uv.sources]
+typedframes = { path = "../../..", editable = true }
+
+[tool.typedframes]
+enabled = true
+sql_dialect = "redshift"

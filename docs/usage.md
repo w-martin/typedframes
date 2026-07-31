@@ -312,9 +312,9 @@ suppress:
 sql_dialect = "snowflake"
 ```
 
-Full worked examples for ten connectors — Snowflake, BigQuery, Athena, Redshift,
-Databricks, PySpark, DuckDB, connectorx, SQLAlchemy, and Feast — live under
-`examples/` in the repo.
+Full worked examples for eleven connectors — Snowflake, BigQuery, Athena, Redshift,
+Databricks, PySpark, DuckDB, connectorx, SQLAlchemy, Feast, and Azure Synapse/Fabric —
+live under `examples/sql_connectors/` in the repo.
 
 ## Pandera integration
 

@@ -14,7 +14,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_detect_missing_column(self) -> None:
         """Test that the checker detects missing columns."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -25,7 +25,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_suggest_typo_correction(self) -> None:
         """Test that the checker suggests corrections for typos."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -36,7 +36,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_catch_polars_column_errors(self) -> None:
         """Test that the checker catches column errors in polars examples."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -47,7 +47,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_run_via_python_extension(self) -> None:
         """Test that the Rust checker works via Python extension."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)

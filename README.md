@@ -110,7 +110,7 @@ typedframes check src/
 # ✗ Found 1 error in 12 files (0.0s)
 ```
 
-See [`examples/multi_file_inference/`](examples/multi_file_inference/) for a multi-file example with no `BaseSchema`
+See [`examples/features/multi_file_inference/`](examples/features/multi_file_inference/) for a multi-file example with no `BaseSchema`
 classes at all.
 
 ### Define Your Schema (Once)
@@ -305,25 +305,25 @@ Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
 
 ### See Also
 
-- [`examples/inference_example.py`](examples/inference_example.py) — single-file walkthrough of all four inference
+- [`examples/features/inference_example.py`](examples/features/inference_example.py) — single-file walkthrough of all four inference
   scenarios with annotated ✓/✗ comments.
-- [`examples/multi_file_inference/`](examples/multi_file_inference/) — multi-file project checked with
-  `typedframes check examples/multi_file_inference/`; no `BaseSchema` anywhere. Includes a function
+- [`examples/features/multi_file_inference/`](examples/features/multi_file_inference/) — multi-file project checked with
+  `typedframes check examples/features/multi_file_inference/`; no `BaseSchema` anywhere. Includes a function
   parameter contract violation caught at the call site (`missing-column`).
-- [`examples/multi_file_with_schema/`](examples/multi_file_with_schema/) — same scenario with `BaseSchema`
+- [`examples/features/multi_file_with_schema/`](examples/features/multi_file_with_schema/) — same scenario with `BaseSchema`
   classes; the checker follows schemas across module boundaries via the project index.
 - SQL / data-warehouse column inference — the column set is inferred from a query's `SELECT` list instead of
   `usecols=`/`columns=`, including tracing the query back through a single-assignment variable or a `.sql` file,
   and dialect-aware identifier case folding (`sql_dialect` in `pyproject.toml` — see [Project-level
   configuration](docs/api/cli.md#project-level-configuration)):
-  [`examples/snowflake/`](examples/snowflake/), [`examples/bigquery/`](examples/bigquery/),
-  [`examples/athena/`](examples/athena/), [`examples/redshift/`](examples/redshift/),
-  [`examples/databricks/`](examples/databricks/), [`examples/pyspark/`](examples/pyspark/),
-  [`examples/duckdb/`](examples/duckdb/), [`examples/connectorx/`](examples/connectorx/),
-  [`examples/sqlalchemy/`](examples/sqlalchemy/) (Core `select()` and declarative models, not just raw SQL text),
-  [`examples/feast/`](examples/feast/) (feature-store retrieval, registered as an *open* schema since
+  [`examples/sql_connectors/snowflake/`](examples/sql_connectors/snowflake/), [`examples/sql_connectors/bigquery/`](examples/sql_connectors/bigquery/),
+  [`examples/sql_connectors/athena/`](examples/sql_connectors/athena/), [`examples/sql_connectors/redshift/`](examples/sql_connectors/redshift/),
+  [`examples/sql_connectors/databricks/`](examples/sql_connectors/databricks/), [`examples/sql_connectors/pyspark/`](examples/sql_connectors/pyspark/),
+  [`examples/sql_connectors/duckdb/`](examples/sql_connectors/duckdb/), [`examples/sql_connectors/connectorx/`](examples/sql_connectors/connectorx/),
+  [`examples/sql_connectors/sqlalchemy/`](examples/sql_connectors/sqlalchemy/) (Core `select()` and declarative models, not just raw SQL text),
+  [`examples/sql_connectors/feast/`](examples/sql_connectors/feast/) (feature-store retrieval, registered as an *open* schema since
   `entity_df`'s own columns aren't enumerable in general), and
-  [`examples/azure_synapse/`](examples/azure_synapse/) (Azure's closest analog to Athena, including T-SQL's
+  [`examples/sql_connectors/azure_synapse/`](examples/sql_connectors/azure_synapse/) (Azure's closest analog to Athena, including T-SQL's
   `[bracket-quoted]` identifier convention).
 
 ---
@@ -640,7 +640,7 @@ merged: Annotated[pd.DataFrame, UserOrders] = users.merge(orders, on=UserPublic.
 
 Overlapping columns with the same type are allowed (common after merges). Conflicting types raise `SchemaConflictError`.
 
-See [`examples/schema_algebra_example.py`](examples/schema_algebra_example.py) for a complete walkthrough.
+See [`examples/features/schema_algebra_example.py`](examples/features/schema_algebra_example.py) for a complete walkthrough.
 
 ---
 
@@ -1052,7 +1052,7 @@ calls give it enough information to validate column access and propagate that kn
 (`rename`, `drop`, `assign`, `select`, …). `BaseSchema` is a progressive enhancement that unlocks cross-file
 awareness (schemas travel with function return types across module boundaries) and IDE autocomplete via
 descriptors — but the checker catches real column errors from day one without it. See
-[`examples/multi_file_inference/`](examples/multi_file_inference/) for a complete demo with no schema classes.
+[`examples/features/multi_file_inference/`](examples/features/multi_file_inference/) for a complete demo with no schema classes.
 
 **Q: Does this work with existing pandas/polars code?**
 A: Yes. You can gradually adopt typedframes by adding schemas to new code. Existing code continues to work.

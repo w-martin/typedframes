@@ -78,9 +78,10 @@ real vulnerability).
 Set `sql_dialect` in `pyproject.toml` to fold identifier case the way a specific engine
 does (e.g. Snowflake upper-cases unquoted identifiers, Postgres/Redshift lower-case
 them) — see [Project-level configuration](#project-level-configuration). Full examples
-for ten connectors, including Feast and SQLAlchemy, live in the repo's `examples/`
-directory (`snowflake/`, `bigquery/`, `athena/`, `redshift/`, `databricks/`, `pyspark/`,
-`duckdb/`, `connectorx/`, `sqlalchemy/`, `feast/`).
+for eleven connectors, including Feast and SQLAlchemy, live in the repo's
+`examples/sql_connectors/` directory (`snowflake/`, `bigquery/`, `athena/`, `redshift/`,
+`databricks/`, `pyspark/`, `duckdb/`, `connectorx/`, `sqlalchemy/`, `feast/`,
+`azure_synapse/`).
 
 ## Output format
 

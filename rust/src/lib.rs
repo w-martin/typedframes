@@ -323,6 +323,35 @@ struct IndexFunction {
     // and `param_schema_name` above.
     #[serde(skip)]
     param_governed: Option<ParamGovernedTemplate>,
+    // This function's own `return` shape, if it's a simple literal Feast features
+    // list or a zero-arg forward to another function — see ReturnShape and
+    // resolve_returns_literal_list. `#[serde(skip)]`: raw material for
+    // resolve_all_returns_literal_lists, which runs entirely within
+    // build_index_internal before serialisation; only its OUTPUT
+    // (`returns_literal_list`) needs to persist that long, and only within the same
+    // pass, not into the final ProjectIndex.
+    #[serde(skip)]
+    return_shape: Option<ReturnShape>,
+    // The fully resolved literal features list this function returns, following
+    // `return <call to another zero-arg function>()` chains as deep as needed
+    // (cycle-protected) — see resolve_returns_literal_list. `#[serde(skip)]`:
+    // consumed entirely within build_index_internal by
+    // resolve_param_governed_call_sites, same lifecycle as `param_governed`.
+    #[serde(skip)]
+    returns_literal_list: Option<Vec<String>>,
+}
+
+// A function's `return` statement, if it has exactly the shape needed to resolve a
+// Feast features list passed as a call-site argument by reference rather than value:
+// either the list itself, spelled out as a literal, or a bare forward to another
+// zero-argument function (`return other_helper()`) — followed recursively by
+// resolve_returns_literal_list, with cycle protection, so a caller can pass
+// `helper_a()` where `helper_a` just calls `helper_b` which returns the literal, and
+// it still resolves.
+#[derive(Debug, Clone)]
+enum ReturnShape {
+    Literal(Vec<String>), // raw "view:feature" strings, not yet full_feature_names-formatted
+    Delegate(String),     // callee name, as written at the return site
 }
 
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
@@ -533,6 +562,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
     func_names.extend(linter.delegates.keys().cloned());
     func_names.extend(linter.param_schema_names.keys().cloned());
     func_names.extend(linter.param_governed_templates.keys().cloned());
+    func_names.extend(linter.return_shapes.keys().cloned());
     let functions: HashMap<String, IndexFunction> = func_names
         .into_iter()
         .map(|name| {
@@ -549,6 +579,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
                 .cloned()
                 .unwrap_or_default();
             let param_governed = linter.param_governed_templates.get(&name).cloned();
+            let return_shape = linter.return_shapes.get(&name).cloned();
             // def_line may only be known via param_schema_names if this function had
             // no direct requires/delegates of its own (see the gate in visit_stmt).
             let def_line = if def_line == 0 {
@@ -566,6 +597,8 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
                     delegates,
                     param_schema_name,
                     param_governed,
+                    return_shape,
+                    returns_literal_list: None,
                 },
             )
         })
@@ -655,6 +688,7 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
     let all_schemas = compute_all_schemas(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
+    resolve_all_returns_literal_lists(project_root, &mut files);
     let governed = resolve_param_governed_call_sites(project_root, &files);
     ProjectIndex {
         version: 1,
@@ -944,10 +978,41 @@ fn check_governed_call_site(
     let Some(arg_expr) = arg_expr else {
         return; // not passed at this call site (e.g. a default value) -- nothing to check
     };
-    // Not a literal (a variable, a dynamically-built list, ...) -- leave exactly as
-    // today's untracked-dataframe fallback inside the callee, unaffected.
+    // Try a direct literal first; if the argument is instead a zero-arg call to
+    // another function (`helper()`), follow its ALREADY-fully-resolved
+    // returns_literal_list (resolve_all_returns_literal_lists already chased any
+    // ReturnShape::Delegate hops, cycle-protected, project-wide, before this ever
+    // runs) — this is the "one level higher" / multi-hop case: a caller doesn't have
+    // to pass the literal directly, just something that resolves to it.
+    let raw_items = Linter::extract_string_list(arg_expr).or_else(|| {
+        let Expr::Call(inner_call) = arg_expr else {
+            return None;
+        };
+        if !inner_call.arguments.args.is_empty() || !inner_call.arguments.keywords.is_empty() {
+            return None; // only a zero-arg forward is followed -- see ReturnShape's doc comment
+        }
+        let inner_callee_name = match &*inner_call.func {
+            Expr::Name(n) => n.id.as_str(),
+            Expr::Attribute(a) => a.attr.as_str(),
+            _ => return None,
+        };
+        let (inner_file, inner_func) =
+            resolve_delegate_target(file_path, inner_callee_name, project_root, files)?;
+        files
+            .get(&inner_file)?
+            .functions
+            .get(&inner_func)?
+            .returns_literal_list
+            .clone()
+    });
+    // Not resolvable at all (a variable with no traceable origin, a dynamically-built
+    // list, a call with arguments, ...) -- leave exactly as today's untracked-dataframe
+    // fallback inside the callee, unaffected.
+    let Some(raw_items) = raw_items else {
+        return;
+    };
     let Some(resolved_cols) =
-        Linter::feast_columns_from_list_expr(arg_expr, template.full_feature_names)
+        Linter::feast_columns_from_raw_items(&raw_items, template.full_feature_names)
     else {
         return;
     };
@@ -1060,6 +1125,81 @@ fn resolve_transitive_requires(project_root: &Path, files: &mut HashMap<String, 
         if let Some(entry) = files.get_mut(&file) {
             if let Some(f) = entry.functions.get_mut(&func) {
                 f.requires = reqs;
+            }
+        }
+    }
+}
+
+// Memoised DFS over the return-shape graph, mirroring resolve_node_requires's exact
+// cycle-protection pattern: a function's resolved literal list is either its own
+// (Literal), or whatever its Delegate target resolves to, followed as many hops as
+// needed. `visiting` breaks a cycle (mutually- or self-delegating return chains) by
+// resolving to `None` there rather than recursing forever -- a cycle is exactly as
+// unresolvable as any other shape this checker declines to guess at.
+fn resolve_returns_literal_list(
+    node: &FuncNode,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    memo: &mut HashMap<FuncNode, Option<Vec<String>>>,
+    visiting: &mut std::collections::HashSet<FuncNode>,
+) -> Option<Vec<String>> {
+    if let Some(cached) = memo.get(node) {
+        return cached.clone();
+    }
+    if visiting.contains(node) {
+        return None;
+    }
+    let shape = files
+        .get(&node.0)
+        .and_then(|e| e.functions.get(&node.1))
+        .and_then(|f| f.return_shape.clone())?;
+
+    visiting.insert(node.clone());
+    let result = match shape {
+        ReturnShape::Literal(items) => Some(items),
+        ReturnShape::Delegate(callee_name) => {
+            resolve_delegate_target(&node.0, &callee_name, project_root, files).and_then(|target| {
+                resolve_returns_literal_list(&target, project_root, files, memo, visiting)
+            })
+        }
+    };
+    visiting.remove(node);
+
+    memo.insert(node.clone(), result.clone());
+    result
+}
+
+// Resolve every function's `returns_literal_list`, project-wide, following
+// ReturnShape::Delegate chains as deep as needed. Runs once, after every file is
+// indexed independently -- same reasoning as resolve_transitive_requires: a callee
+// several hops down the chain may live in a different file than the one whose call
+// site actually needs the answer.
+fn resolve_all_returns_literal_lists(project_root: &Path, files: &mut HashMap<String, IndexEntry>) {
+    let nodes: Vec<FuncNode> = files
+        .iter()
+        .flat_map(|(file, entry)| {
+            entry
+                .functions
+                .keys()
+                .map(move |f| (file.clone(), f.clone()))
+        })
+        .collect();
+
+    let mut memo: HashMap<FuncNode, Option<Vec<String>>> = HashMap::new();
+    let mut resolved: Vec<(FuncNode, Option<Vec<String>>)> = Vec::new();
+    for node in nodes {
+        let files_ref: &HashMap<String, IndexEntry> = files;
+        let mut visiting = std::collections::HashSet::new();
+        let r =
+            resolve_returns_literal_list(&node, project_root, files_ref, &mut memo, &mut visiting);
+        resolved.push((node, r));
+    }
+
+    for ((file, func), result) in resolved {
+        let Some(result) = result else { continue };
+        if let Some(entry) = files.get_mut(&file) {
+            if let Some(f) = entry.functions.get_mut(&func) {
+                f.returns_literal_list = Some(result);
             }
         }
     }
@@ -1576,6 +1716,10 @@ pub struct Linter {
     // Consumed once, project-wide, by resolve_param_governed_call_sites -- see
     // ParamGovernedTemplate's doc comment.
     param_governed_templates: HashMap<String, ParamGovernedTemplate>,
+    // func_name -> this function's own `return` shape (a literal Feast features list,
+    // or a zero-arg forward to another function) -- see ReturnShape and
+    // resolve_returns_literal_list.
+    return_shapes: HashMap<String, ReturnShape>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1824,6 +1968,7 @@ impl Linter {
             open_schemas: std::collections::HashSet::new(),
             cursor_sql: HashMap::new(),
             param_governed_templates: HashMap::new(),
+            return_shapes: HashMap::new(),
         }
     }
 
@@ -2647,9 +2792,24 @@ impl Linter {
         let Expr::List(list) = features_list else {
             return None;
         };
-        let mut columns = Vec::with_capacity(list.elts.len());
+        let mut raw = Vec::with_capacity(list.elts.len());
         for elt in &list.elts {
-            let literal = Self::extract_string_literal(elt)?;
+            raw.push(Self::extract_string_literal(elt)?.to_string());
+        }
+        Self::feast_columns_from_raw_items(&raw, full_feature_names)
+    }
+
+    // The "view:feature" splitting and full_feature_names formatting shared by
+    // feast_columns_from_list_expr (a literal AST list) and
+    // resolve_param_governed_call_sites' resolution through returns_literal_list (raw
+    // strings recovered from a callee's `return [...]`, possibly several
+    // ReturnShape::Delegate hops away — see resolve_returns_literal_list).
+    fn feast_columns_from_raw_items(
+        raw: &[String],
+        full_feature_names: bool,
+    ) -> Option<Vec<String>> {
+        let mut columns = Vec::with_capacity(raw.len());
+        for literal in raw {
             let (view, feature) = literal.split_once(':')?;
             // `feature` still contains any colon after the first (split_once only
             // splits on the first match), so this rejects anything but exactly one `:`
@@ -2664,6 +2824,74 @@ impl Linter {
             });
         }
         Some(columns)
+    }
+
+    // Finds the first `return <expr>` reachable from `stmts` (recursing into
+    // If/For/While/With, matching find_returned_var's exact nesting) whose value is
+    // either a literal list of strings or a zero-argument call to another function —
+    // the two shapes resolve_returns_literal_list knows how to follow. Any other
+    // return shape (a variable, a non-literal list, a call with arguments, string
+    // concatenation, ...) yields `None`: this is intentionally narrow, matching every
+    // other heuristic in this checker, not an attempt to evaluate arbitrary
+    // expressions.
+    fn find_return_shape(stmts: &[Stmt]) -> Option<ReturnShape> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Return(ret) => {
+                    let Some(value) = &ret.value else {
+                        continue; // bare `return` -- not a matching shape, keep scanning
+                    };
+                    if let Expr::List(_) = value.as_ref() {
+                        if let Some(items) = Self::extract_string_list(value) {
+                            return Some(ReturnShape::Literal(items));
+                        }
+                        continue;
+                    }
+                    if let Expr::Call(call) = value.as_ref() {
+                        if call.arguments.args.is_empty() && call.arguments.keywords.is_empty() {
+                            let name = match &*call.func {
+                                Expr::Name(n) => Some(n.id.to_string()),
+                                Expr::Attribute(a) => Some(a.attr.to_string()),
+                                _ => None,
+                            };
+                            if let Some(name) = name {
+                                return Some(ReturnShape::Delegate(name));
+                            }
+                        }
+                    }
+                    // Any other return shape (a variable, a non-literal expression, a
+                    // call with arguments, ...) -- not resolvable, keep scanning for a
+                    // later return that might still match.
+                }
+                Stmt::If(if_stmt) => {
+                    if let Some(shape) = Self::find_return_shape(&if_stmt.body) {
+                        return Some(shape);
+                    }
+                    for clause in &if_stmt.elif_else_clauses {
+                        if let Some(shape) = Self::find_return_shape(&clause.body) {
+                            return Some(shape);
+                        }
+                    }
+                }
+                Stmt::For(for_stmt) => {
+                    if let Some(shape) = Self::find_return_shape(&for_stmt.body) {
+                        return Some(shape);
+                    }
+                }
+                Stmt::While(while_stmt) => {
+                    if let Some(shape) = Self::find_return_shape(&while_stmt.body) {
+                        return Some(shape);
+                    }
+                }
+                Stmt::With(with_stmt) => {
+                    if let Some(shape) = Self::find_return_shape(&with_stmt.body) {
+                        return Some(shape);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     // Detects `df = <recv>.get_historical_features(..., features=<param>, ...).to_df()`
@@ -4084,6 +4312,13 @@ impl Linter {
                 if let Some(template) = self.find_param_governed_feast_template(func_def) {
                     self.param_governed_templates
                         .insert(func_def.name.to_string(), template);
+                }
+                // This function's own return shape -- a literal Feast features list,
+                // or a zero-arg forward to another function -- so a call site passing
+                // `this_function()` as a governed argument can resolve through it (see
+                // resolve_returns_literal_list, run project-wide in build_index_internal).
+                if let Some(shape) = Self::find_return_shape(&func_def.body) {
+                    self.return_shapes.insert(func_def.name.to_string(), shape);
                 }
                 // If no annotation-based mapping, infer from `return <var>`.
                 // After visiting the body, self.variables holds the schema of every
@@ -7632,6 +7867,105 @@ load_conv_rate(store, entity_df, dynamic_names)
         // assert
         assert_eq!(errors.len(), 1, "errors: {errors:#?}");
         assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_should_resolve_call_site_argument_through_a_multi_hop_delegate_chain() {
+        // A call site doesn't have to pass the literal directly -- it can pass a call
+        // to a zero-arg helper, which itself just forwards to ANOTHER helper, which
+        // finally returns the literal. resolve_returns_literal_list must follow that
+        // whole chain (helper_a -> helper_b -> literal), not just one hop.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def helper_b() -> list[str]:
+    return ["driver_stats:acc_rate"]
+
+
+def helper_a() -> list[str]:
+    return helper_b()
+
+
+load_conv_rate(store, entity_df, helper_a())
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: helper_a resolves (through helper_b) to {acc_rate}, which does NOT
+        // satisfy load_conv_rate's print(df["conv_rate"]) -- caught two hops away.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("conv_rate"));
+        assert!(
+            index
+                .resolved_governed
+                .contains(&(file_path_str, "load_conv_rate".to_string())),
+            "load_conv_rate should be resolved_governed via the multi-hop chain"
+        );
+    }
+
+    #[test]
+    fn test_should_not_hang_on_a_self_delegating_return_chain() {
+        // Recursion protection: a function whose `return` shape delegates to itself
+        // (or a cycle of functions delegating to each other) must resolve to
+        // unresolvable rather than looping forever -- mirrors
+        // test_should_not_hang_on_mutually_delegating_functions's existing coverage
+        // for the *requires* side of this same cycle-protection pattern.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def cyclic_a() -> list[str]:
+    return cyclic_b()
+
+
+def cyclic_b() -> list[str]:
+    return cyclic_a()
+
+
+load_conv_rate(store, entity_df, cyclic_a())
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act -- must terminate (this test itself hanging is the failure mode)
+        let index = build_index_internal(root);
+
+        // assert: unresolvable, so no call-site error and not in resolved_governed --
+        // the intra-function untracked-dataframe warning should stay in place.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        assert!(index.call_site_errors.get(&file_path_str).is_none());
+        assert!(!index
+            .resolved_governed
+            .contains(&(file_path_str, "load_conv_rate".to_string())));
     }
 
     #[test]

@@ -21,7 +21,11 @@ There IS a different, real error case, though: `load_feature_by_name` below take
 argument from each CALL SITE back through that parameter -- so two callers of the exact
 same function, passing two different literals, are validated completely independently
 against the exact same internal `print(df["conv_rate"])` line, with the diagnostic
-attributed to whichever call site actually got it wrong. See `__main__` below.
+attributed to whichever call site actually got it wrong. The literal doesn't have to be
+written out at the call site itself, either: `_forward_to_conv_rate_helper()` is a
+zero-arg function that just forwards to *another* zero-arg function that returns the
+literal, and typedframes follows that whole chain (as many hops as needed, with
+recursion protection against cycles) to resolve it. See `__main__` below.
 
 Run: `typedframes check examples/sql_connectors/feast/`
 Run for real: `cd examples/sql_connectors/feast && uv run python example.py`
@@ -120,9 +124,10 @@ def load_with_unresolvable_features(store: FeatureStore, entity_df: pd.DataFrame
 
     This function's `feature_names` parameter is call-site-governed exactly like
     load_feature_by_name's — but every caller in this file passes a runtime-computed
-    value, never a literal (see __main__: `_get_feature_names_dynamically()`, not an
-    inline `[...]`). No caller anywhere resolves it, so the checker has nothing to
-    fall back to.
+    value, never a literal or a resolvable zero-arg forward (see __main__:
+    `_get_feature_names_dynamically("driver_stats")`, which takes a real argument and
+    builds its return value with an f-string, not a literal list). No caller anywhere
+    resolves it, so the checker has nothing to fall back to.
     """
     df = store.get_historical_features(
         entity_df=entity_df, features=feature_names
@@ -130,11 +135,14 @@ def load_with_unresolvable_features(store: FeatureStore, entity_df: pd.DataFrame
     print(df)
 
 
-def _get_feature_names_dynamically() -> list[str]:
-    """Stands in for building a features list at runtime (e.g. from config, a
-    request body, ...) -- a real value, but not something the checker can trace back
-    to a literal at load_with_unresolvable_features's call site."""
-    return ["driver_stats:conv_rate"]
+def _get_feature_names_dynamically(prefix: str) -> list[str]:
+    """Stands in for building a features list at runtime from some real input (a
+    request parameter, a config value, ...) -- genuinely unresolvable, even with
+    multi-hop call-site tracing: it takes an argument (only zero-arg forwards are
+    followed — see ReturnShape's doc comment), and its return value is built with an
+    f-string at runtime, not a literal list.
+    """
+    return [f"{prefix}:conv_rate"]
 
 
 def load_feature_by_name(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list[str]) -> None:
@@ -152,6 +160,23 @@ def load_feature_by_name(store: FeatureStore, entity_df: pd.DataFrame, feature_n
     """
     df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
     print(df["conv_rate"])
+
+
+def _conv_rate_feature_list() -> list[str]:
+    """A zero-arg helper whose entire body is a literal return -- resolved directly."""
+    return ["driver_stats:conv_rate"]
+
+
+def _forward_to_conv_rate_helper() -> list[str]:
+    """Forwards to _conv_rate_feature_list() with no arguments of its own.
+
+    typedframes follows a `return <zero-arg call>()` chain as many hops as needed
+    (with cycle protection) to reach a literal — so a caller passing THIS function's
+    result resolves exactly as if it had passed the literal directly, even though
+    neither this function nor its own caller ever writes the literal out. See the
+    third call to load_feature_by_name in __main__.
+    """
+    return _conv_rate_feature_list()
 
 
 def to_df_on_unrelated_object_is_left_alone(some_other_result: Any) -> None:
@@ -181,11 +206,12 @@ if __name__ == "__main__":
     load_via_split_form(store, entity_df)
     load_with_full_feature_names(store, entity_df)
     load_online_features(store)
-    load_with_unresolvable_features(store, entity_df, _get_feature_names_dynamically())
+    load_with_unresolvable_features(store, entity_df, _get_feature_names_dynamically("driver_stats"))
     # load_with_full_feature_names_renamed_access() intentionally not run -- it really
     # does raise KeyError; see its docstring for why the checker doesn't catch it.
 
     load_feature_by_name(store, entity_df, ["driver_stats:conv_rate"])  # OK -- resolved cleanly at THIS call site
+    load_feature_by_name(store, entity_df, _forward_to_conv_rate_helper())  # OK -- resolved through a 2-hop chain
 
     if TYPE_CHECKING:
         # Never executes (TYPE_CHECKING is always False at runtime) -- this call site

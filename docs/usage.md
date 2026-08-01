@@ -353,8 +353,30 @@ dynamically-built value stays genuinely unresolved, and the checker keeps saying
 rather than silently going from "we tell you it's unknown" to reporting nothing at
 all just because the shape happens to be call-site-traceable in principle.
 
-Deliberately narrow scope, matching every other heuristic in this checker: only
-Feast's chained form (`store.get_historical_features(..., features=<param>).to_df()`)
+The literal doesn't have to be written out at the call site itself, either:
+
+```python
+def get_conv_rate_features():        # zero-arg, returns the literal directly
+    return ["driver_stats:conv_rate"]
+
+def get_conv_rate_features_via():    # zero-arg, just forwards to the one above
+    return get_conv_rate_features()
+
+load_feature(store, entity_df, get_conv_rate_features_via())  # ✓ OK -- resolved through 2 hops
+```
+
+A call site can pass a call to a zero-argument helper instead of a literal, and that
+helper's own `return` is followed — through as many further zero-arg forwards as
+needed — until a literal is found (or a cycle, or any other shape this checker
+declines to guess at, is hit; recursion is protected against, the same way the
+existing `requires`/delegate-graph resolution already guards against a
+self-referential contract). A helper that takes an argument, computes its return
+value at runtime, or has more than one possible `return` path isn't followed —
+matching this checker's general preference for explicit-shape recognition over
+attempting to evaluate arbitrary code.
+
+Deliberately narrow scope otherwise, matching every other heuristic in this checker:
+only Feast's chained form (`store.get_historical_features(..., features=<param>).to_df()`)
 as a direct statement in the function's own top-level body is recognized, and only call
 sites reachable at module level (or nested in `if`/`for`/`while`/`with`, not buried
 inside another function) are traced. SQL-text-argument governance (a parameter feeding

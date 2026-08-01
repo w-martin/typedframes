@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.3.1) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.4.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > schema validation over production-grade stability.
 >
@@ -432,17 +432,17 @@ code reference.
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-07-13 · Darwin 25.5.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
+*2026-08-01 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
 
 | Tool | Version | What it does | typedframes (13 files) | great_expectations (482 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.3.1 | DataFrame column checker | 43ms ±668µs | 213ms ±4ms |
-| ruff | 0.15.21 | Linter (no type checking) | 26ms ±1ms | 193ms ±2ms |
-| ty | 0.0.58 | Type checker | 72ms ±3ms | 181ms ±9ms |
-| pyrefly | 1.1.1 | Type checker | 107ms ±4ms | 557ms ±16ms |
-| mypy | 2.2.0 | Type checker (no plugin) | 2.77s ±41ms | 4.21s ±71ms |
-| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.78s ±34ms | 4.48s ±63ms |
-| pyright | 1.1.411 | Type checker | 743ms ±8ms | 3.34s ±43ms |
+| typedframes | 0.4.0 | DataFrame column checker | 45ms ±2ms (IQR 3ms) | 202ms ±1ms (IQR 2ms) |
+| ruff | 0.15.21 | Linter (no type checking) | 29ms ±2ms (IQR 3ms) | 193ms ±2ms (IQR 4ms) |
+| ty | 0.0.58 | Type checker | 73ms ±2ms (IQR 3ms) | 183ms ±9ms (IQR 17ms) |
+| pyrefly | 1.1.1 | Type checker | 108ms ±2ms (IQR 3ms) | 559ms ±15ms (IQR 25ms) |
+| mypy | 2.2.0 | Type checker (no plugin) | 2.85s ±51ms (IQR 58ms) | 4.23s ±65ms (IQR 95ms) |
+| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.86s ±35ms (IQR 38ms) | 4.41s ±48ms (IQR 54ms) |
+| pyright | 1.1.411 | Type checker | 714ms ±13ms (IQR 22ms) | 3.28s ±51ms (IQR 52ms) |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -655,7 +655,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.3.1                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
+| **Version tested**              | 0.4.0                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |

@@ -1300,6 +1300,14 @@ struct ParamGovernedTemplate {
     param_index: usize,
     full_feature_names: bool,
     accesses: Vec<ParamGovernedAccess>,
+    // Position of the governing `df = store.get_...(...).to_df()` statement itself —
+    // used only to remove the untracked-dataframe warning `register_feast_dataframe`
+    // already pushed for it during the normal body walk (which runs before this
+    // template is even detected). That local, in-isolation "columns unknown at lint
+    // time" framing is simply wrong once we know this call is resolvable by tracing
+    // callers — the real answer moved to the call sites, not "unknown".
+    governing_line: usize,
+    governing_col: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2621,7 +2629,7 @@ impl Linter {
             .map(|p| p.parameter.name.id.as_str())
             .collect();
 
-        let mut found: Option<(String, usize, bool, String, usize)> = None; // (param_name, param_index, full_feature_names, target_var, stmt_index)
+        let mut found: Option<(String, usize, bool, String, usize, usize, usize)> = None; // (param_name, param_index, full_feature_names, target_var, stmt_index, governing_line, governing_col)
 
         for (i, stmt) in func_def.body.iter().enumerate() {
             let Stmt::Assign(assign) = stmt else {
@@ -2677,17 +2685,28 @@ impl Linter {
                 },
                 None => false,
             };
+            let (governing_line, governing_col) = self.source_location(assign.range().start());
             found = Some((
                 features_name.id.to_string(),
                 param_index,
                 full_feature_names,
                 target_name.id.to_string(),
                 i,
+                governing_line,
+                governing_col,
             ));
             break;
         }
 
-        let (param_name, param_index, full_feature_names, target_var, found_at) = found?;
+        let (
+            param_name,
+            param_index,
+            full_feature_names,
+            target_var,
+            found_at,
+            governing_line,
+            governing_col,
+        ) = found?;
 
         let mut accesses = Vec::new();
         for stmt in &func_def.body[found_at + 1..] {
@@ -2702,6 +2721,8 @@ impl Linter {
             param_index,
             full_feature_names,
             accesses,
+            governing_line,
+            governing_col,
         })
     }
 
@@ -3991,8 +4012,18 @@ impl Linter {
                 }
                 // Detect a parameter feeding a Feast features= call whose result is
                 // subscripted in this same body — see ParamGovernedTemplate's doc
-                // comment and resolve_param_governed_call_sites.
+                // comment and resolve_param_governed_call_sites. The untracked-dataframe
+                // warning register_feast_dataframe already pushed for this exact
+                // statement (during the body walk just above) is now stale: "columns
+                // unknown at lint time" is simply wrong once we know this call is
+                // resolvable by tracing callers, so remove it rather than leave
+                // outdated, misleading noise alongside the real per-call-site answer.
                 if let Some(template) = self.find_param_governed_feast_template(func_def) {
+                    errors.retain(|e| {
+                        !(e.line == template.governing_line
+                            && e.col == template.governing_col
+                            && e.code == CODE_UNTRACKED_DATAFRAME)
+                    });
                     self.param_governed_templates
                         .insert(func_def.name.to_string(), template);
                 }
@@ -7408,18 +7439,18 @@ load_conv_rate(store, entity_df, dynamic_names)
         errors.sort_by_key(|e| (e.line, e.col));
 
         // assert
-        // 1 untracked-dataframe from the intra-function check (features=feature_names
-        // is an unresolved bare parameter there) + 1 call-site error for the SECOND
-        // call site only -- the first (valid) and third (non-literal) call sites
-        // produce nothing.
-        assert_eq!(errors.len(), 2, "errors: {errors:#?}");
-        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
-        assert_eq!(errors[1].code, CODE_UNKNOWN_COLUMN);
+        // The intra-function untracked-dataframe warning is suppressed: once the
+        // function is known to be call-site-governed, "columns unknown at lint time"
+        // is stale/wrong, not a real signal -- only the SECOND call site's error
+        // remains. The first (valid) and third (non-literal) call sites produce
+        // nothing.
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
         assert_eq!(
-            errors[1].line, 12,
+            errors[0].line, 12,
             "should be attributed to the SECOND call site's line, not the callee's access line"
         );
-        assert!(errors[1].message.contains("conv_rate"));
+        assert!(errors[0].message.contains("conv_rate"));
     }
 
     #[test]

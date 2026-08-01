@@ -75,20 +75,47 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
     // Diagnostics resolved at a call site in THIS file, targeting a function elsewhere
     // whose parameter governs a Feast features= call — see
     // resolve_param_governed_call_sites. Collected before check_file_internal runs so
-    // they can be merged into its own diagnostics below.
+    // they can be merged into its own diagnostics below. Kept across the whole
+    // function (not just this block) since resolved_governed is also needed AFTER
+    // check_file_internal runs, to decide which of THIS file's own intra-function
+    // warnings are now stale.
     let mut call_site_errors: Vec<LintError> = Vec::new();
+    let mut index: Option<Arc<ProjectIndex>> = None;
     if let Some(bytes) = index_bytes {
-        if let Some(index) = get_cached_index(&bytes) {
-            linter.load_cross_file_symbols(&index, &source, path, &project_root);
-            if let Some(extra) = index.call_site_errors.get(&file_path) {
+        if let Some(idx) = get_cached_index(&bytes) {
+            linter.load_cross_file_symbols(&idx, &source, path, &project_root);
+            if let Some(extra) = idx.call_site_errors.get(&file_path) {
                 call_site_errors = extra.clone();
             }
+            index = Some(idx);
         }
     }
 
     let mut errors = linter
         .check_file_internal(&source, path)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    // Retract THIS file's own intra-function untracked-dataframe warnings for any
+    // function that at least one call site anywhere in the project actually resolved
+    // — see ProjectIndex.resolved_governed's doc comment for why this can't just
+    // happen unconditionally whenever a function has the param-governed shape (a
+    // function every real caller invokes with a dynamic value is still genuinely
+    // unresolved, and it would be wrong to silently drop its only diagnostic).
+    if let Some(index) = &index {
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
+    }
+
     errors.extend(call_site_errors);
     errors.sort_by_key(|e| (e.line, e.col));
 
@@ -338,6 +365,16 @@ struct ProjectIndex {
     // different diagnoses at once.
     #[serde(default)]
     call_site_errors: HashMap<String, Vec<LintError>>,
+    // (file, func_name) pairs where at least one call site project-wide successfully
+    // resolved a literal argument for a param-governed Feast call — regardless of
+    // whether that resolution produced an error or not. Consulted by check_file to
+    // decide whether the intra-function untracked-dataframe warning
+    // register_feast_dataframe pushes for that same call is stale (retract it, the
+    // real answer lives at the call sites now) or still the only real signal (leave
+    // it — every actual caller passed something dynamic, so the call genuinely is
+    // unresolved and it would be wrong to silently report nothing at all).
+    #[serde(default)]
+    resolved_governed: std::collections::HashSet<(String, String)>,
 }
 
 // Union schema name -> column list across every file's `schemas` map. First
@@ -618,12 +655,13 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
     let all_schemas = compute_all_schemas(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
-    let call_site_errors = resolve_param_governed_call_sites(project_root, &files);
+    let governed = resolve_param_governed_call_sites(project_root, &files);
     ProjectIndex {
         version: 1,
         files,
         all_schemas,
-        call_site_errors,
+        call_site_errors: governed.call_site_errors,
+        resolved_governed: governed.resolved_governed,
     }
 }
 
@@ -749,11 +787,19 @@ fn compute_source_location(source: &str, offset: ruff_text_size::TextSize) -> (u
 // source line: the callee's own access line is one, single, caller-independent AST
 // location, and every different-per-caller outcome instead lives at that caller's own
 // (necessarily distinct) call-site location.
+struct GovernedCallSiteResult {
+    call_site_errors: HashMap<String, Vec<LintError>>,
+    resolved_governed: std::collections::HashSet<(String, String)>,
+}
+
 fn resolve_param_governed_call_sites(
     project_root: &Path,
     files: &HashMap<String, IndexEntry>,
-) -> HashMap<String, Vec<LintError>> {
-    let mut result: HashMap<String, Vec<LintError>> = HashMap::new();
+) -> GovernedCallSiteResult {
+    let mut result = GovernedCallSiteResult {
+        call_site_errors: HashMap::new(),
+        resolved_governed: std::collections::HashSet::new(),
+    };
     let has_any_governed = files
         .values()
         .any(|entry| entry.functions.values().any(|f| f.param_governed.is_some()));
@@ -787,7 +833,7 @@ fn scan_stmts_for_governed_calls(
     source: &str,
     project_root: &Path,
     files: &HashMap<String, IndexEntry>,
-    out: &mut HashMap<String, Vec<LintError>>,
+    result: &mut GovernedCallSiteResult,
 ) {
     for stmt in stmts {
         let call = match stmt {
@@ -802,7 +848,7 @@ fn scan_stmts_for_governed_calls(
             _ => None,
         };
         if let Some(call) = call {
-            check_governed_call_site(call, file_path, source, project_root, files, out);
+            check_governed_call_site(call, file_path, source, project_root, files, result);
         }
         match stmt {
             Stmt::If(if_stmt) => {
@@ -812,7 +858,7 @@ fn scan_stmts_for_governed_calls(
                     source,
                     project_root,
                     files,
-                    out,
+                    result,
                 );
                 for clause in &if_stmt.elif_else_clauses {
                     scan_stmts_for_governed_calls(
@@ -821,7 +867,7 @@ fn scan_stmts_for_governed_calls(
                         source,
                         project_root,
                         files,
-                        out,
+                        result,
                     );
                 }
             }
@@ -832,7 +878,7 @@ fn scan_stmts_for_governed_calls(
                     source,
                     project_root,
                     files,
-                    out,
+                    result,
                 );
             }
             Stmt::While(while_stmt) => {
@@ -842,7 +888,7 @@ fn scan_stmts_for_governed_calls(
                     source,
                     project_root,
                     files,
-                    out,
+                    result,
                 );
             }
             Stmt::With(with_stmt) => {
@@ -852,7 +898,7 @@ fn scan_stmts_for_governed_calls(
                     source,
                     project_root,
                     files,
-                    out,
+                    result,
                 );
             }
             _ => {}
@@ -866,7 +912,7 @@ fn check_governed_call_site(
     source: &str,
     project_root: &Path,
     files: &HashMap<String, IndexEntry>,
-    out: &mut HashMap<String, Vec<LintError>>,
+    result: &mut GovernedCallSiteResult,
 ) {
     let callee_name = match &*call.func {
         Expr::Name(n) => n.id.as_str(),
@@ -906,10 +952,19 @@ fn check_governed_call_site(
         return;
     };
 
+    // This call site DID resolve (whether or not it turns out to violate any recorded
+    // access) — the callee's own generic "columns unknown at lint time" framing is now
+    // stale for it, and check_file consults this to retract that warning.
+    result
+        .resolved_governed
+        .insert((target_file.clone(), target_func.clone()));
+
     let (line, col) = compute_source_location(source, call.range().start());
     for access in &template.accesses {
         if !resolved_cols.iter().any(|c| c == &access.column) {
-            out.entry(file_path.to_string())
+            result
+                .call_site_errors
+                .entry(file_path.to_string())
                 .or_default()
                 .push(LintError {
                     line,
@@ -2712,9 +2767,13 @@ impl Linter {
         for stmt in &func_def.body[found_at + 1..] {
             self.collect_subscript_accesses(stmt, &target_var, &mut accesses);
         }
-        if accesses.is_empty() {
-            return None;
-        }
+        // No `accesses.is_empty()` bailout here — a function with nothing to validate
+        // internally (e.g. `print(df)`, no subscript at all) is STILL param-governed
+        // and resolvable via call-site tracing; the intra-function untracked-dataframe
+        // warning is just as stale for it as for one with recorded accesses. Bailing
+        // out here would leave that warning uncorrected purely because there happens
+        // to be nothing to check, which is a different question from whether the call
+        // is resolvable at all.
 
         Some(ParamGovernedTemplate {
             param_name,
@@ -4012,18 +4071,17 @@ impl Linter {
                 }
                 // Detect a parameter feeding a Feast features= call whose result is
                 // subscripted in this same body — see ParamGovernedTemplate's doc
-                // comment and resolve_param_governed_call_sites. The untracked-dataframe
-                // warning register_feast_dataframe already pushed for this exact
-                // statement (during the body walk just above) is now stale: "columns
-                // unknown at lint time" is simply wrong once we know this call is
-                // resolvable by tracing callers, so remove it rather than leave
-                // outdated, misleading noise alongside the real per-call-site answer.
+                // comment and resolve_param_governed_call_sites. Whether the
+                // untracked-dataframe warning register_feast_dataframe already pushed
+                // for this exact statement should be retracted depends on whether any
+                // ACTUAL call site anywhere in the project resolves it — not just on
+                // this shape existing — so that decision is deferred to check_file,
+                // informed by ProjectIndex.resolved_governed (see its doc comment for
+                // why: a function every real caller invokes with a dynamic value is
+                // still genuinely unresolved, and retracting its warning regardless of
+                // that would silently go from "we tell you it's unknown" to "we tell
+                // you nothing at all").
                 if let Some(template) = self.find_param_governed_feast_template(func_def) {
-                    errors.retain(|e| {
-                        !(e.line == template.governing_line
-                            && e.col == template.governing_col
-                            && e.code == CODE_UNTRACKED_DATAFRAME)
-                    });
                     self.param_governed_templates
                         .insert(func_def.name.to_string(), template);
                 }
@@ -7433,17 +7491,32 @@ load_conv_rate(store, entity_df, dynamic_names)
         let file_path_str = file_path.to_str().unwrap().to_string();
         let mut linter = Linter::new();
         let mut errors = linter.check_file_internal(source, &file_path).unwrap();
+        // Mirrors check_file's own retraction step: at least one call site here DOES
+        // resolve (the first and second both pass literals), so load_conv_rate is in
+        // resolved_governed and its stale intra-function warning should be retracted.
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path_str.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
         if let Some(extra) = index.call_site_errors.get(&file_path_str) {
             errors.extend(extra.iter().cloned());
         }
         errors.sort_by_key(|e| (e.line, e.col));
 
         // assert
-        // The intra-function untracked-dataframe warning is suppressed: once the
-        // function is known to be call-site-governed, "columns unknown at lint time"
-        // is stale/wrong, not a real signal -- only the SECOND call site's error
-        // remains. The first (valid) and third (non-literal) call sites produce
-        // nothing.
+        // The intra-function untracked-dataframe warning is suppressed: since at
+        // least one call site (the first) DOES resolve, "columns unknown at lint
+        // time" is stale/wrong, not a real signal -- only the SECOND call site's
+        // error remains. The first (valid) and third (non-literal) call sites
+        // produce nothing.
         assert_eq!(errors.len(), 1, "errors: {errors:#?}");
         assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
         assert_eq!(
@@ -7498,6 +7571,67 @@ load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
         assert_eq!(errors[0].line, 5, "should be the SECOND call site only");
         assert!(errors[0].message.contains("conv_rate"));
         assert!(errors[0].message.contains("helpers.py"));
+    }
+
+    #[test]
+    fn test_should_keep_untracked_dataframe_warning_when_no_call_site_ever_resolves() {
+        // Regression test: a function with the exact same param-governed SHAPE as
+        // load_conv_rate above, but where EVERY real call site passes a dynamically
+        // built value, never a literal. resolved_governed must stay empty for it, so
+        // check_file's retraction step must NOT fire -- silently dropping the only
+        // diagnostic here (going from "we tell you it's unknown" to "we tell you
+        // nothing at all") would be a real regression, not an improvement, since
+        // nothing anywhere actually resolves this call.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+dynamic_names = build_feature_list()
+load_conv_rate(store, entity_df, dynamic_names)
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        assert!(
+            !index
+                .resolved_governed
+                .contains(&(file_path_str.clone(), "load_conv_rate".to_string())),
+            "no call site here passes a literal -- load_conv_rate must not be in resolved_governed"
+        );
+
+        let mut linter = Linter::new();
+        let mut errors = linter.check_file_internal(source, &file_path).unwrap();
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path_str.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
+        if let Some(extra) = index.call_site_errors.get(&file_path_str) {
+            errors.extend(extra.iter().cloned());
+        }
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
     }
 
     #[test]

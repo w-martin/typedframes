@@ -347,7 +347,11 @@ caller-independent AST location, so it can only ever be validated once — the
 per-caller variation lives entirely in *which literal each call site actually passed*.
 A call site passing a non-literal (a variable, a dynamically-built list) is left
 exactly as it always was: an `untracked-dataframe` warning inside the callee itself,
-unaffected by any of this.
+unaffected by any of this. That warning is only ever retracted once *some* real call
+site actually resolves the parameter — a function every caller invokes with a
+dynamically-built value stays genuinely unresolved, and the checker keeps saying so,
+rather than silently going from "we tell you it's unknown" to reporting nothing at
+all just because the shape happens to be call-site-traceable in principle.
 
 Deliberately narrow scope, matching every other heuristic in this checker: only
 Feast's chained form (`store.get_historical_features(..., features=<param>).to_df()`)

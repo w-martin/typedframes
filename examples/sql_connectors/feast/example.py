@@ -116,16 +116,25 @@ def load_online_features(store: FeatureStore) -> None:
 
 
 def load_with_unresolvable_features(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list[str]) -> None:
-    """A dynamically-built features list — deliberately unresolved.
+    """A features list that's STILL unresolved even with call-site tracing.
 
-    Unlike the open-schema cases above (which still know SOME columns), this one
-    knows NOTHING about the result, so it falls through to the ordinary
-    untracked-dataframe hint instead.
+    This function's `feature_names` parameter is call-site-governed exactly like
+    load_feature_by_name's — but every caller in this file passes a runtime-computed
+    value, never a literal (see __main__: `_get_feature_names_dynamically()`, not an
+    inline `[...]`). No caller anywhere resolves it, so the checker has nothing to
+    fall back to.
     """
     df = store.get_historical_features(
         entity_df=entity_df, features=feature_names
     ).to_df()  # untracked-dataframe: features= isn't a literal list
     print(df)
+
+
+def _get_feature_names_dynamically() -> list[str]:
+    """Stands in for building a features list at runtime (e.g. from config, a
+    request body, ...) -- a real value, but not something the checker can trace back
+    to a literal at load_with_unresolvable_features's call site."""
+    return ["driver_stats:conv_rate"]
 
 
 def load_feature_by_name(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list[str]) -> None:
@@ -172,7 +181,7 @@ if __name__ == "__main__":
     load_via_split_form(store, entity_df)
     load_with_full_feature_names(store, entity_df)
     load_online_features(store)
-    load_with_unresolvable_features(store, entity_df, ["driver_stats:conv_rate"])
+    load_with_unresolvable_features(store, entity_df, _get_feature_names_dynamically())
     # load_with_full_feature_names_renamed_access() intentionally not run -- it really
     # does raise KeyError; see its docstring for why the checker doesn't catch it.
 

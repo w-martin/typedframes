@@ -17,9 +17,12 @@ dynamic/f-string-built one, or a parameterized query the SQL grammar can't parse
 a dedicated `load_with_unknown_column()` function with a genuine, uncommented bug —
 left out of the `__main__` block (it would raise a real `KeyError` if actually run) so
 `uv run python example.py` stays runnable while `typedframes check .` still catches it.
-`feast/` is the one exception: Feast results are registered as an *open* schema, so no
-column access is ever flagged there, even a genuinely wrong one — see its module
-docstring for why an error case is structurally impossible for that connector.
+`feast/` is a partial exception: directly on a Feast result's own *open* schema, no
+column access is ever flagged, even a genuinely wrong one — see its module docstring
+for why. But it also demonstrates a different, real error case that only Feast's
+example currently exercises: call-site argument tracing, where a function's
+`features=` parameter is resolved independently per caller (see [docs/usage.md's
+"Call-site argument tracing"](../../../docs/usage.md#call-site-argument-tracing-feast-features)).
 
 | Directory | Backend | How it runs |
 |---|---|---|
@@ -54,7 +57,11 @@ Feast's own local mode: sqlite registry + sqlite online store + a file (parquet)
 offline source, all under `feature_repo/`. `feast_repo_setup.py` applies the
 `driver_stats` entity/feature-view definitions and materializes the online store —
 kept out of `example.py` so that file only shows the patterns typedframes actually
-recognizes.
+recognizes. `load_feature_by_name` demonstrates call-site argument tracing: two call
+sites in `__main__` pass different literal `features=` lists to the same function, and
+are validated completely independently against that function's own `print(df[...])`
+line — the bad one is guarded behind `if TYPE_CHECKING:` so it's visible to the checker
+without ever actually running.
 
 ```shell
 cd examples/sql_connectors/feast

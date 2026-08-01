@@ -9,12 +9,19 @@ columns a false unknown-column — so Feast results are registered as an *open* 
 instead: the known feature columns are recorded, but membership checks never fail for
 a column this checker simply doesn't know about.
 
-Unlike every other connector in this repo, there is no live unknown-column error case
-here -- open schemas never fail a membership check by design, so no column access on a
-Feast result is ever flagged, even a genuinely wrong one. `load_with_unresolvable_features`
-is the untracked-dataframe (info) case; `load_with_full_feature_names_renamed_access`
-demonstrates the false-negative tradeoff that makes an error case impossible here: a
+Directly *on a Feast result's own open schema*, there is no live unknown-column error
+case -- membership checks never fail by design, so no column access on a Feast result
+is ever flagged, even a genuinely wrong one. `load_with_unresolvable_features` is the
+untracked-dataframe (info) case; `load_with_full_feature_names_renamed_access`
+demonstrates the false-negative tradeoff that makes an open-schema error impossible: a
 real runtime KeyError that the checker stays silent on.
+
+There IS a different, real error case, though: `load_feature_by_name` below takes its
+`features=` list as a parameter rather than a literal. typedframes traces a *literal*
+argument from each CALL SITE back through that parameter -- so two callers of the exact
+same function, passing two different literals, are validated completely independently
+against the exact same internal `print(df["conv_rate"])` line, with the diagnostic
+attributed to whichever call site actually got it wrong. See `__main__` below.
 
 Run: `typedframes check examples/sql_connectors/feast/`
 Run for real: `cd examples/sql_connectors/feast && uv run python example.py`
@@ -23,7 +30,7 @@ Run for real: `cd examples/sql_connectors/feast && uv run python example.py`
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 from feast import FeatureStore
@@ -121,6 +128,23 @@ def load_with_unresolvable_features(store: FeatureStore, entity_df: pd.DataFrame
     print(df)
 
 
+def load_feature_by_name(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list[str]) -> None:
+    """A parameter-governed features= call — traced back through literal call-site
+    arguments, independently per caller.
+
+    Unlike load_with_unresolvable_features above (which the checker can never resolve,
+    since it never looks at HOW this function is called), typedframes traces a
+    *literal* argument from each call site back through this function's own
+    `feature_names` parameter. A caller passing `["driver_stats:conv_rate"]` makes
+    `print(df["conv_rate"])` below valid; a caller passing anything else makes it a
+    real unknown-column error — reported at THAT call site, not here, since this line
+    is one single, caller-independent location that different callers can validly
+    disagree about. See __main__.
+    """
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
 def to_df_on_unrelated_object_is_left_alone(some_other_result: Any) -> None:
     """`.to_df()` on something unrelated to a recognized Feast retrieval call.
 
@@ -151,6 +175,15 @@ if __name__ == "__main__":
     load_with_unresolvable_features(store, entity_df, ["driver_stats:conv_rate"])
     # load_with_full_feature_names_renamed_access() intentionally not run -- it really
     # does raise KeyError; see its docstring for why the checker doesn't catch it.
+
+    load_feature_by_name(store, entity_df, ["driver_stats:conv_rate"])  # OK -- resolved cleanly at THIS call site
+
+    if TYPE_CHECKING:
+        # Never executes (TYPE_CHECKING is always False at runtime) -- this call site
+        # passes the WRONG literal for load_feature_by_name's internal
+        # print(df["conv_rate"]), and typedframes catches it right here, without
+        # touching the clean call site above at all:
+        load_feature_by_name(store, entity_df, ["driver_stats:acc_rate"])  # unknown-column
 
     class _FakeRetrievalResult:
         def to_df(self) -> pd.DataFrame:

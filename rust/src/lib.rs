@@ -72,15 +72,25 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
     let mut linter = Linter::new();
     linter.with_context(project_root.clone(), &config);
 
+    // Diagnostics resolved at a call site in THIS file, targeting a function elsewhere
+    // whose parameter governs a Feast features= call — see
+    // resolve_param_governed_call_sites. Collected before check_file_internal runs so
+    // they can be merged into its own diagnostics below.
+    let mut call_site_errors: Vec<LintError> = Vec::new();
     if let Some(bytes) = index_bytes {
         if let Some(index) = get_cached_index(&bytes) {
             linter.load_cross_file_symbols(&index, &source, path, &project_root);
+            if let Some(extra) = index.call_site_errors.get(&file_path) {
+                call_site_errors = extra.clone();
+            }
         }
     }
 
     let mut errors = linter
         .check_file_internal(&source, path)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+    errors.extend(call_site_errors);
+    errors.sort_by_key(|e| (e.line, e.col));
 
     if !config.warnings.unwrap_or(true) {
         errors.retain(|e| e.severity != "warning");
@@ -278,6 +288,14 @@ struct IndexFunction {
     // resolve_param_schema_requires, must not be serialised into ProjectIndex.
     #[serde(skip)]
     param_schema_name: String,
+    // A parameter that governs a recognized Feast features= call inside this function's
+    // body — see ParamGovernedTemplate. `#[serde(skip)]`: consumed entirely within
+    // build_index_internal by resolve_param_governed_call_sites, which produces the
+    // (per-call-site) diagnostics that actually get serialised into ProjectIndex; this
+    // template itself never needs to survive past that, same reasoning as `delegates`
+    // and `param_schema_name` above.
+    #[serde(skip)]
+    param_governed: Option<ParamGovernedTemplate>,
 }
 
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
@@ -310,6 +328,16 @@ struct ProjectIndex {
     // own file nor the one importing it — so this must stay project-wide rather than
     // scoped to a single IndexEntry.
     all_schemas: HashMap<String, Vec<String>>,
+    // Diagnostics resolved at the *call site*, keyed by the calling file's absolute
+    // path — populated once, project-wide, by resolve_param_governed_call_sites, and
+    // spliced into a file's own diagnostics by check_file when that file is checked.
+    // Attributing these to the call site (rather than the access line inside the
+    // callee's own body, which stays one caller-independent AST location) is what lets
+    // two different callers passing two different literals for the same parameter
+    // resolve completely independently, instead of the callee's line needing two
+    // different diagnoses at once.
+    #[serde(default)]
+    call_site_errors: HashMap<String, Vec<LintError>>,
 }
 
 // Union schema name -> column list across every file's `schemas` map. First
@@ -467,6 +495,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
     func_names.extend(linter.requires.keys().cloned());
     func_names.extend(linter.delegates.keys().cloned());
     func_names.extend(linter.param_schema_names.keys().cloned());
+    func_names.extend(linter.param_governed_templates.keys().cloned());
     let functions: HashMap<String, IndexFunction> = func_names
         .into_iter()
         .map(|name| {
@@ -482,6 +511,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
                 .get(&name)
                 .cloned()
                 .unwrap_or_default();
+            let param_governed = linter.param_governed_templates.get(&name).cloned();
             // def_line may only be known via param_schema_names if this function had
             // no direct requires/delegates of its own (see the gate in visit_stmt).
             let def_line = if def_line == 0 {
@@ -498,6 +528,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
                     def_line,
                     delegates,
                     param_schema_name,
+                    param_governed,
                 },
             )
         })
@@ -587,10 +618,12 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
     let all_schemas = compute_all_schemas(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
+    let call_site_errors = resolve_param_governed_call_sites(project_root, &files);
     ProjectIndex {
         version: 1,
         files,
         all_schemas,
+        call_site_errors,
     }
 }
 
@@ -689,6 +722,213 @@ fn resolve_delegate_target(
         }
     }
     None
+}
+
+// Line/column for a source offset, without needing a full `Linter` instance — used by
+// resolve_param_governed_call_sites, which parses each file fresh outside any Linter's
+// own `check_file_internal` pass.
+fn compute_source_location(source: &str, offset: ruff_text_size::TextSize) -> (usize, usize) {
+    let line_index = LineIndex::from_source_text(source);
+    let source_code = SourceCode::new(source, &line_index);
+    let loc = source_code.line_column(offset);
+    (loc.line.get(), loc.column.get())
+}
+
+// Project-wide pass: for every function that `find_param_governed_feast_template`
+// found a template for, find every call site (anywhere in the project, at the same
+// statement-nesting depth `analyze_stmt_for_contract` already covers) and, where the
+// call passes a *literal* list for the governing parameter, resolve that call site's
+// specific columns and check them against the template's recorded accesses —
+// independently per call site, so two callers passing different literals for the same
+// parameter get diagnosed (or not) completely independently. A call site passing a
+// non-literal (a variable, a dynamically-built list, ...) is left exactly as today:
+// the callee's own untracked-dataframe fallback, unaffected by any of this.
+//
+// Diagnostics are returned keyed by the *calling* file's path — not the callee's file
+// — which is what lets this avoid ever needing two different diagnoses for the same
+// source line: the callee's own access line is one, single, caller-independent AST
+// location, and every different-per-caller outcome instead lives at that caller's own
+// (necessarily distinct) call-site location.
+fn resolve_param_governed_call_sites(
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, Vec<LintError>> {
+    let mut result: HashMap<String, Vec<LintError>> = HashMap::new();
+    let has_any_governed = files
+        .values()
+        .any(|entry| entry.functions.values().any(|f| f.param_governed.is_some()));
+    if !has_any_governed {
+        return result;
+    }
+
+    for file_path in files.keys() {
+        let Ok(source) = fs::read_to_string(file_path) else {
+            continue;
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            continue;
+        };
+        let module = parsed.into_syntax();
+        scan_stmts_for_governed_calls(
+            &module.body,
+            file_path,
+            &source,
+            project_root,
+            files,
+            &mut result,
+        );
+    }
+    result
+}
+
+fn scan_stmts_for_governed_calls(
+    stmts: &[Stmt],
+    file_path: &str,
+    source: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    out: &mut HashMap<String, Vec<LintError>>,
+) {
+    for stmt in stmts {
+        let call = match stmt {
+            Stmt::Expr(expr_stmt) => match &*expr_stmt.value {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            Stmt::Assign(assign) => match &*assign.value {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(call) = call {
+            check_governed_call_site(call, file_path, source, project_root, files, out);
+        }
+        match stmt {
+            Stmt::If(if_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &if_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    out,
+                );
+                for clause in &if_stmt.elif_else_clauses {
+                    scan_stmts_for_governed_calls(
+                        &clause.body,
+                        file_path,
+                        source,
+                        project_root,
+                        files,
+                        out,
+                    );
+                }
+            }
+            Stmt::For(for_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &for_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    out,
+                );
+            }
+            Stmt::While(while_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &while_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    out,
+                );
+            }
+            Stmt::With(with_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &with_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    out,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_governed_call_site(
+    call: &ast::ExprCall,
+    file_path: &str,
+    source: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    out: &mut HashMap<String, Vec<LintError>>,
+) {
+    let callee_name = match &*call.func {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(attr) => attr.attr.as_str(),
+        _ => return,
+    };
+    let Some((target_file, target_func)) =
+        resolve_delegate_target(file_path, callee_name, project_root, files)
+    else {
+        return;
+    };
+    let Some(func) = files
+        .get(&target_file)
+        .and_then(|e| e.functions.get(&target_func))
+    else {
+        return;
+    };
+    let Some(template) = &func.param_governed else {
+        return;
+    };
+
+    let arg_expr = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some(template.param_name.as_str()))
+        .map(|k| &k.value)
+        .or_else(|| call.arguments.args.get(template.param_index));
+    let Some(arg_expr) = arg_expr else {
+        return; // not passed at this call site (e.g. a default value) -- nothing to check
+    };
+    // Not a literal (a variable, a dynamically-built list, ...) -- leave exactly as
+    // today's untracked-dataframe fallback inside the callee, unaffected.
+    let Some(resolved_cols) =
+        Linter::feast_columns_from_list_expr(arg_expr, template.full_feature_names)
+    else {
+        return;
+    };
+
+    let (line, col) = compute_source_location(source, call.range().start());
+    for access in &template.accesses {
+        if !resolved_cols.iter().any(|c| c == &access.column) {
+            out.entry(file_path.to_string())
+                .or_default()
+                .push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNKNOWN_COLUMN.to_string(),
+                    message: format!(
+                        "Column '{}' does not exist for this call's resolved features {:?} \
+                     — would be a real bug at {}:{}:{} inside '{}'",
+                        access.column,
+                        resolved_cols,
+                        target_file,
+                        access.line,
+                        access.col,
+                        target_func
+                    ),
+                    severity: "error".to_string(),
+                });
+        }
+    }
 }
 
 // Memoised DFS over the delegate graph: a function's fully resolved requirement set
@@ -1035,6 +1275,40 @@ impl CaseFold {
     }
 }
 
+// A function parameter that, when a caller passes a *literal* argument for it, lets the
+// checker resolve a Feast `features=<param>` call inside this function's body and
+// validate the specific column accesses the body makes on its result — independently
+// per call site, since different callers can pass different (or no) literal for the
+// same parameter. Detected by `find_param_governed_feast_template`, consumed by
+// `resolve_param_governed_call_sites` — see that function's doc comment for how a
+// diagnostic ends up attributed to the *call site* rather than the access line inside
+// this function's own body (which stays a single, caller-independent AST location).
+//
+// Deliberately narrow, matching this checker's general philosophy for anything
+// heuristic: only the *chained* Feast form (`df = store.get_historical_features(...,
+// features=<param>).to_df()`) as a direct statement in the function's own top-level
+// body is recognized — not the split form (`job = store.get_...(...)`), not a
+// parameter buried in nested control flow, and not SQL-text-argument governance (a
+// parameter feeding `pd.read_sql(<param>, conn)` and similar). Extending to those is
+// possible but not implemented here.
+#[derive(Debug, Clone)]
+struct ParamGovernedTemplate {
+    param_name: String,
+    // Index among posonlyargs+args (kwonlyargs excluded — those can't be passed
+    // positionally at a call site) so a call site matching by position, not just by
+    // keyword, still resolves.
+    param_index: usize,
+    full_feature_names: bool,
+    accesses: Vec<ParamGovernedAccess>,
+}
+
+#[derive(Debug, Clone)]
+struct ParamGovernedAccess {
+    line: usize,
+    col: usize,
+    column: String,
+}
+
 const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "filter",
     "query",
@@ -1122,7 +1396,7 @@ struct CheckFileResult {
     stats: FileStats,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LintError {
     /// 1-indexed source line.
     pub line: usize,
@@ -1234,6 +1508,11 @@ pub struct Linter {
     // removes) the previous entry — matching real PEP 249 semantics, where a cursor
     // holds exactly one most-recently-executed query at a time.
     cursor_sql: HashMap<String, String>,
+    // func_name -> a recognized "parameter feeds a Feast features= call, whose result is
+    // subscripted in the same body" shape, found while indexing this file's functions.
+    // Consumed once, project-wide, by resolve_param_governed_call_sites -- see
+    // ParamGovernedTemplate's doc comment.
+    param_governed_templates: HashMap<String, ParamGovernedTemplate>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1481,6 +1760,7 @@ impl Linter {
             retrieval_jobs: HashMap::new(),
             open_schemas: std::collections::HashSet::new(),
             cursor_sql: HashMap::new(),
+            param_governed_templates: HashMap::new(),
         }
     }
 
@@ -2275,9 +2555,6 @@ impl Linter {
             .iter()
             .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("features"))
             .map(|k| &k.value)?;
-        let Expr::List(list) = features_list else {
-            return None;
-        };
 
         let full_feature_names = match call
             .arguments
@@ -2292,6 +2569,21 @@ impl Linter {
             None => false,
         };
 
+        Self::feast_columns_from_list_expr(features_list, full_feature_names)
+    }
+
+    // Shared by `extract_feast_feature_columns` above (the `features=` keyword found
+    // inline at its own call) and `resolve_param_governed_call_sites` (a literal list
+    // found at a call site elsewhere, substituted in for a parameter that governed the
+    // original call) — both need the exact same "view:feature" splitting and
+    // `full_feature_names` formatting applied to a literal list expression.
+    fn feast_columns_from_list_expr(
+        features_list: &Expr,
+        full_feature_names: bool,
+    ) -> Option<Vec<String>> {
+        let Expr::List(list) = features_list else {
+            return None;
+        };
         let mut columns = Vec::with_capacity(list.elts.len());
         for elt in &list.elts {
             let literal = Self::extract_string_literal(elt)?;
@@ -2309,6 +2601,240 @@ impl Linter {
             });
         }
         Some(columns)
+    }
+
+    // Detects `df = <recv>.get_historical_features(..., features=<param>, ...).to_df()`
+    // (the chained form only — see ParamGovernedTemplate's doc comment) as a direct
+    // top-level statement in `func_def`'s own body, where `<param>` is a bare name
+    // matching one of the function's own parameters, followed later in the same body by
+    // at least one `<target>["col"]` access. Returns `None` if no such shape is found,
+    // or if the shape is found but nothing subscripts its result (nothing to check).
+    fn find_param_governed_feast_template(
+        &self,
+        func_def: &ast::StmtFunctionDef,
+    ) -> Option<ParamGovernedTemplate> {
+        let param_names: Vec<&str> = func_def
+            .parameters
+            .posonlyargs
+            .iter()
+            .chain(func_def.parameters.args.iter())
+            .map(|p| p.parameter.name.id.as_str())
+            .collect();
+
+        let mut found: Option<(String, usize, bool, String, usize)> = None; // (param_name, param_index, full_feature_names, target_var, stmt_index)
+
+        for (i, stmt) in func_def.body.iter().enumerate() {
+            let Stmt::Assign(assign) = stmt else {
+                continue;
+            };
+            let Some(Expr::Name(target_name)) = assign.targets.first() else {
+                continue;
+            };
+            let Expr::Call(outer_call) = &*assign.value else {
+                continue;
+            };
+            let Expr::Attribute(outer_attr) = &*outer_call.func else {
+                continue;
+            };
+            if outer_attr.attr.as_str() != "to_df" {
+                continue;
+            }
+            let Expr::Call(inner_call) = &*outer_attr.value else {
+                continue;
+            };
+            let Expr::Attribute(inner_attr) = &*inner_call.func else {
+                continue;
+            };
+            if !FEAST_RETRIEVAL_METHODS.contains(&inner_attr.attr.as_str()) {
+                continue;
+            }
+            let Some(features_kw) = inner_call
+                .arguments
+                .keywords
+                .iter()
+                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("features"))
+            else {
+                continue;
+            };
+            let Expr::Name(features_name) = &features_kw.value else {
+                continue;
+            };
+            let Some(param_index) = param_names
+                .iter()
+                .position(|p| *p == features_name.id.as_str())
+            else {
+                continue;
+            };
+            let full_feature_names = match inner_call
+                .arguments
+                .keywords
+                .iter()
+                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("full_feature_names"))
+            {
+                Some(kw) => match &kw.value {
+                    Expr::BooleanLiteral(b) => b.value,
+                    _ => false,
+                },
+                None => false,
+            };
+            found = Some((
+                features_name.id.to_string(),
+                param_index,
+                full_feature_names,
+                target_name.id.to_string(),
+                i,
+            ));
+            break;
+        }
+
+        let (param_name, param_index, full_feature_names, target_var, found_at) = found?;
+
+        let mut accesses = Vec::new();
+        for stmt in &func_def.body[found_at + 1..] {
+            self.collect_subscript_accesses(stmt, &target_var, &mut accesses);
+        }
+        if accesses.is_empty() {
+            return None;
+        }
+
+        Some(ParamGovernedTemplate {
+            param_name,
+            param_index,
+            full_feature_names,
+            accesses,
+        })
+    }
+
+    // Recursively collects every `<target_var>["literal"]` subscript access reachable
+    // from `stmt`, matching the same nesting scope as `analyze_stmt_for_contract`
+    // (Return/Expr/Assign/AnnAssign/If/For/While/With) for consistency with the rest of
+    // this checker's "conservative rather than exhaustive" heuristics.
+    fn collect_subscript_accesses(
+        &self,
+        stmt: &Stmt,
+        target_var: &str,
+        out: &mut Vec<ParamGovernedAccess>,
+    ) {
+        match stmt {
+            Stmt::Return(ret) => {
+                if let Some(value) = &ret.value {
+                    self.collect_subscripts_in_expr(value, target_var, out);
+                }
+            }
+            Stmt::Expr(expr_stmt) => {
+                self.collect_subscripts_in_expr(&expr_stmt.value, target_var, out)
+            }
+            Stmt::Assign(assign) => self.collect_subscripts_in_expr(&assign.value, target_var, out),
+            Stmt::AnnAssign(ann) => {
+                if let Some(value) = &ann.value {
+                    self.collect_subscripts_in_expr(value, target_var, out);
+                }
+            }
+            Stmt::If(if_stmt) => {
+                for s in &if_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+                for clause in &if_stmt.elif_else_clauses {
+                    for s in &clause.body {
+                        self.collect_subscript_accesses(s, target_var, out);
+                    }
+                }
+            }
+            Stmt::For(for_stmt) => {
+                for s in &for_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                for s in &while_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                for s in &with_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Recursively finds every `<target_var>["literal"]` subscript reachable inside
+    // `expr` — a real access is very rarely the statement's own top-level expression
+    // shape (`print(df["col"])` is a Call whose argument is the subscript, not a bare
+    // subscript statement), so this has to actually walk into the common wrapping
+    // shapes rather than checking `expr` alone the way a first pass might assume.
+    fn collect_subscripts_in_expr(
+        &self,
+        expr: &Expr,
+        target_var: &str,
+        out: &mut Vec<ParamGovernedAccess>,
+    ) {
+        if let Expr::Subscript(sub) = expr {
+            if let Expr::Name(recv) = &*sub.value {
+                if recv.id.as_str() == target_var {
+                    if let Some(col) = Self::extract_string_literal(&sub.slice) {
+                        let (line, col_num) = self.source_location(expr.range().start());
+                        out.push(ParamGovernedAccess {
+                            line,
+                            col: col_num,
+                            column: col.to_string(),
+                        });
+                    }
+                }
+            }
+            // Deliberately not recursing into `sub.value`/`sub.slice` further here —
+            // a subscript's own base is either the target (handled above) or
+            // something else entirely, and nested chained subscripts on unrelated
+            // bases aren't this checker's concern.
+            return;
+        }
+        match expr {
+            Expr::Call(call) => {
+                self.collect_subscripts_in_expr(&call.func, target_var, out);
+                for arg in &call.arguments.args {
+                    self.collect_subscripts_in_expr(arg, target_var, out);
+                }
+                for kw in &call.arguments.keywords {
+                    self.collect_subscripts_in_expr(&kw.value, target_var, out);
+                }
+            }
+            Expr::Attribute(attr) => {
+                self.collect_subscripts_in_expr(&attr.value, target_var, out);
+            }
+            Expr::BinOp(bin) => {
+                self.collect_subscripts_in_expr(&bin.left, target_var, out);
+                self.collect_subscripts_in_expr(&bin.right, target_var, out);
+            }
+            Expr::UnaryOp(unary) => {
+                self.collect_subscripts_in_expr(&unary.operand, target_var, out);
+            }
+            Expr::BoolOp(bool_op) => {
+                for v in &bool_op.values {
+                    self.collect_subscripts_in_expr(v, target_var, out);
+                }
+            }
+            Expr::Compare(cmp) => {
+                self.collect_subscripts_in_expr(&cmp.left, target_var, out);
+                for c in &cmp.comparators {
+                    self.collect_subscripts_in_expr(c, target_var, out);
+                }
+            }
+            Expr::Tuple(t) => {
+                for el in &t.elts {
+                    self.collect_subscripts_in_expr(el, target_var, out);
+                }
+            }
+            Expr::List(l) => {
+                for el in &l.elts {
+                    self.collect_subscripts_in_expr(el, target_var, out);
+                }
+            }
+            Expr::Starred(s) => {
+                self.collect_subscripts_in_expr(&s.value, target_var, out);
+            }
+            _ => {}
+        }
     }
 
     // Register `target_names` as a DataFrame materialized from a Feast retrieval
@@ -3462,6 +3988,13 @@ impl Linter {
 
                 for body_stmt in &func_def.body {
                     self.visit_stmt(body_stmt, errors);
+                }
+                // Detect a parameter feeding a Feast features= call whose result is
+                // subscripted in this same body — see ParamGovernedTemplate's doc
+                // comment and resolve_param_governed_call_sites.
+                if let Some(template) = self.find_param_governed_feast_template(func_def) {
+                    self.param_governed_templates
+                        .insert(func_def.name.to_string(), template);
                 }
                 // If no annotation-based mapping, infer from `return <var>`.
                 // After visiting the body, self.variables holds the schema of every
@@ -6829,6 +7362,111 @@ df = store.get_historical_features(
 
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_should_resolve_divergent_call_sites_to_a_param_governed_feast_function_independently() {
+        // arrange: load_conv_rate's `feature_names` parameter feeds a Feast
+        // features=<param> call whose result is subscripted with "conv_rate" inside the
+        // same function. Two call sites pass DIFFERENT literal feature lists for that
+        // parameter -- the first resolves to {conv_rate} (the access is valid), the
+        // second resolves to {acc_rate} (the access is NOT valid) -- and a third call
+        // site passes a non-literal (dynamically built) list, which must be left
+        // exactly as today's untracked-dataframe fallback, unaffected by any of this.
+        // This is the core case: the SAME callee line (`print(df["conv_rate"])`) must
+        // NOT be flagged for the first call site while being flagged for the second --
+        // proven here by attributing the diagnostic to the call site, not that line.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+load_conv_rate(store, entity_df, ["driver_stats:conv_rate"])
+load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
+dynamic_names = build_feature_list()
+load_conv_rate(store, entity_df, dynamic_names)
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let mut linter = Linter::new();
+        let mut errors = linter.check_file_internal(source, &file_path).unwrap();
+        if let Some(extra) = index.call_site_errors.get(&file_path_str) {
+            errors.extend(extra.iter().cloned());
+        }
+        errors.sort_by_key(|e| (e.line, e.col));
+
+        // assert
+        // 1 untracked-dataframe from the intra-function check (features=feature_names
+        // is an unresolved bare parameter there) + 1 call-site error for the SECOND
+        // call site only -- the first (valid) and third (non-literal) call sites
+        // produce nothing.
+        assert_eq!(errors.len(), 2, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(errors[1].code, CODE_UNKNOWN_COLUMN);
+        assert_eq!(
+            errors[1].line, 12,
+            "should be attributed to the SECOND call site's line, not the callee's access line"
+        );
+        assert!(errors[1].message.contains("conv_rate"));
+    }
+
+    #[test]
+    fn test_should_resolve_param_governed_call_site_across_files() {
+        // arrange: load_conv_rate is defined in helpers.py; pipeline.py calls it twice
+        // with different literals, same as the same-file test above, but now resolved
+        // through resolve_delegate_target's cross-file import resolution.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("helpers.py"),
+            r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from helpers import load_conv_rate
+
+load_conv_rate(store, entity_df, ["driver_stats:conv_rate"])
+load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
+"#;
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let pipeline_path_str = pipeline_path.to_str().unwrap().to_string();
+
+        // assert
+        let errors = index
+            .call_site_errors
+            .get(&pipeline_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert_eq!(errors[0].line, 5, "should be the SECOND call site only");
+        assert!(errors[0].message.contains("conv_rate"));
+        assert!(errors[0].message.contains("helpers.py"));
     }
 
     #[test]

@@ -316,6 +316,46 @@ Suppress all warnings project-wide via `pyproject.toml`:
 warnings = false
 ```
 
+## Call-site argument tracing (Feast `features=`)
+
+Some functions take their column-determining argument as a *parameter* rather than a
+literal — a Feast retrieval wrapper's `features: list[str]`, say — so nothing about the
+function's own body can resolve it. typedframes traces a **literal** argument from each
+call site back through the parameter, resolving and validating that call independently:
+
+```python
+# feast_helpers.py
+def load_feature(store, entity_df, feature_names: list[str]):
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])  # valid for SOME callers, not others -- see below
+```
+
+```python
+# pipeline.py
+from feast_helpers import load_feature
+
+load_feature(store, entity_df, ["driver_stats:conv_rate"])  # ✓ OK -- resolved cleanly here
+load_feature(store, entity_df, ["driver_stats:acc_rate"])   # ✗ unknown-column, reported HERE
+```
+
+Both calls run the exact same `print(df["conv_rate"])` line inside `load_feature` — but
+each call site is checked **independently**, using whatever literal *that* caller
+passed. The diagnostic for the second call is attributed to the call site itself
+(`pipeline.py`, not `feast_helpers.py`), which is what makes this possible without one
+caller's outcome interfering with another's: `load_feature`'s own body is a single,
+caller-independent AST location, so it can only ever be validated once — the
+per-caller variation lives entirely in *which literal each call site actually passed*.
+A call site passing a non-literal (a variable, a dynamically-built list) is left
+exactly as it always was: an `untracked-dataframe` warning inside the callee itself,
+unaffected by any of this.
+
+Deliberately narrow scope, matching every other heuristic in this checker: only
+Feast's chained form (`store.get_historical_features(..., features=<param>).to_df()`)
+as a direct statement in the function's own top-level body is recognized, and only call
+sites reachable at module level (or nested in `if`/`for`/`while`/`with`, not buried
+inside another function) are traced. SQL-text-argument governance (a parameter feeding
+`pd.read_sql(<param>, conn)`) isn't covered by this yet.
+
 ## SQL and warehouse column inference
 
 Loads from a database or warehouse infer columns from the query's `SELECT` list rather

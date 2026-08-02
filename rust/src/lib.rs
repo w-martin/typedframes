@@ -2110,18 +2110,16 @@ impl Linter {
         (loc.line.get(), loc.column.get())
     }
 
-    // Format a schema name for use in an error message.
-    //
-    // For inferred schemas (those whose name starts with `__inferred_`):
-    //   - includes the full column set so the user can see what IS available
-    //   - includes the origin function/file when recorded by load_cross_file_symbols
-    //   - reports the line in the current file where the variable was bound
-    //
-    // For named schemas (BaseSchema subclasses): returns the schema name + defined line.
+    // Format a schema name for use in an error message. Always includes the full
+    // column set, so an "unknown column" message tells the reader what IS available
+    // without a separate lookup — for inferred schemas (those whose name starts with
+    // `__inferred_`), also includes the origin function/file when recorded by
+    // load_cross_file_symbols (where the columns were actually derived from); for
+    // named schemas (BaseSchema subclasses), the schema name + defined line.
     fn schema_display(&self, schema_name: &str, defined_line: usize) -> String {
+        let cols = self.schemas.get(schema_name).cloned().unwrap_or_default();
+        let cols_str = cols.join(", ");
         if schema_name.starts_with("__inferred_") {
-            let cols = self.schemas.get(schema_name).cloned().unwrap_or_default();
-            let cols_str = cols.join(", ");
             if let Some(origin) = self.schema_origins.get(schema_name) {
                 format!(
                     "inferred column set {{{cols_str}}} — fix: add the column at its source in {origin}"
@@ -2130,7 +2128,7 @@ impl Linter {
                 format!("inferred column set {{{cols_str}}} (defined at line {defined_line})")
             }
         } else {
-            format!("{schema_name} (defined at line {defined_line})")
+            format!("{schema_name} {{{cols_str}}} (defined at line {defined_line})")
         }
     }
 
@@ -4467,22 +4465,32 @@ impl Linter {
                 for target in &assign.targets {
                     if let Expr::Subscript(subscript) = target {
                         if let Expr::Name(name) = &*subscript.value {
-                            if let Some((schema_name, _)) = self.variables.get(name.id.as_str()) {
+                            if let Some((schema_name, defined_line)) =
+                                self.variables.get(name.id.as_str())
+                            {
                                 if let Some(col_name) =
                                     Self::extract_string_literal(&subscript.slice)
                                 {
                                     let schema_name = schema_name.clone();
+                                    let defined_line = *defined_line;
                                     let already_has_col =
                                         self.schema_has_column(&schema_name, col_name);
+                                    if !already_has_col {
+                                        let schema_display =
+                                            self.schema_display(&schema_name, defined_line);
+                                        errors.push(LintError {
+                                            line: current_line,
+                                            col: current_col,
+                                            code: CODE_UNKNOWN_COLUMN.to_string(),
+                                            message: format!(
+                                                "Column '{}' does not exist in {} (mutation tracking)",
+                                                col_name, schema_display
+                                            ),
+                                            severity: "error".to_string(),
+                                        });
+                                    }
                                     if let Some(columns) = self.schemas.get_mut(&schema_name) {
                                         if !already_has_col {
-                                            errors.push(LintError {
-                                                line: current_line,
-                                                col: current_col,
-                                                code: CODE_UNKNOWN_COLUMN.to_string(),
-                                                message: format!("Column '{}' does not exist in {} (mutation tracking)", col_name, schema_name),
-                                                severity: "error".to_string(),
-                                            });
                                             columns.push(col_name.to_string());
                                         }
                                     }
@@ -6028,6 +6036,80 @@ print(df["name"])
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("name"));
         assert!(errors[0].message.contains("UserSchema"));
+    }
+
+    #[test]
+    fn test_should_list_available_columns_for_a_named_schema_unknown_column_error() {
+        // Named schemas (BaseSchema subclasses) used to only get "SchemaName (defined
+        // at line N)" in an unknown-column message -- no column list, unlike inferred
+        // schemas. schema_display now includes the column set for named schemas too,
+        // so the reader can see what IS available without a separate lookup.
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].message.contains("user_id"),
+            "{}",
+            errors[0].message
+        );
+        assert!(errors[0].message.contains("email"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn test_should_list_available_columns_in_mutation_tracking_error() {
+        // df["new_col"] = ... on a named-schema-tracked variable, where new_col isn't
+        // in the schema, is flagged (mutation tracking) -- that message used to bypass
+        // schema_display entirely and print only the bare schema name, with no column
+        // list and no "defined at line" location. Now routes through schema_display
+        // like every other unknown-column message.
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: DataFrame[UserSchema] = load()
+df["new_column"] = 1
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("mutation tracking"));
+        assert!(
+            errors[0].message.contains("user_id"),
+            "{}",
+            errors[0].message
+        );
+        assert!(errors[0].message.contains("email"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("defined at line"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]

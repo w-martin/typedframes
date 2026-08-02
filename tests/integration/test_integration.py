@@ -139,10 +139,13 @@ print(df["wrong_column"])
             result = check_file(str(root / "pipeline.py"), index_bytes)
             errors = json.loads(result)["errors"]
 
-            # assert
+            # assert -- wrong_column is flagged; user_id is never flagged as its own
+            # error (it may legitimately appear inside wrong_column's own "available
+            # columns" listing, which is the point of that listing)
             messages = [e["message"] for e in errors]
             self.assertTrue(any("wrong_column" in m for m in messages))
-            self.assertFalse(any("user_id" in m for m in messages))
+            self.assertFalse(any("'user_id' does not exist" in m for m in messages))
+            self.assertEqual(len(errors), 1)
 
     def test_should_infer_columns_from_multi_column_subscript(self) -> None:
         """Test that a = df[["foo", "bar"]] creates an inferred schema and enforces it."""

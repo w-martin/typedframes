@@ -220,6 +220,14 @@ pub struct LinterConfig {
     // rather than indexing all of site-packages, which would be both expensive and a
     // much larger, unbounded trust surface.
     trace_external_packages: Option<Vec<String>>,
+    // Additional directory names to prune when collecting `.py` files, on top of the
+    // built-in default set (`.git`, `.venv`, `node_modules`, `__pycache__`, etc. — see
+    // `DEFAULT_EXCLUDED_DIRS`). Matches by bare directory name, not a path/glob
+    // pattern, mirroring how the built-in set already works. The Python CLI's own
+    // file collector (`_collect_python_files` in cli.py) reads this same key
+    // independently via `tomllib`, so both collectors stay in sync from one config
+    // value.
+    exclude: Option<Vec<String>>,
 }
 
 impl LinterConfig {
@@ -228,6 +236,7 @@ impl LinterConfig {
         warnings: None,
         sql_dialect: None,
         trace_external_packages: None,
+        exclude: None,
     };
 }
 
@@ -426,9 +435,15 @@ fn compute_all_schema_locations(
 // ── Index helpers ──────────────────────────────────────────────────────────────
 
 // Recursively collect all `.py` files under `dir`, skipping hidden entries (`.venv`,
-// `.git`, etc.).  Uses an explicit stack rather than recursion to avoid stack overflow
-// on very deep trees.
-fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
+// `.git`, etc.) and any name in `extra_excludes` (from `[tool.typedframes] exclude`,
+// for project-specific directories the built-in dot-prefix skip doesn't cover — e.g.
+// `.claude`'s own worktree checkouts ARE already dot-prefixed and covered by that rule,
+// but a non-dot directory like a vendored `third_party/` wouldn't be). Uses an
+// explicit stack rather than recursion to avoid stack overflow on very deep trees.
+fn collect_py_files(
+    dir: &Path,
+    extra_excludes: &std::collections::HashSet<String>,
+) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -439,7 +454,7 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') {
+            if name_str.starts_with('.') || extra_excludes.contains(name_str.as_ref()) {
                 continue;
             }
             if path.is_dir() {
@@ -533,7 +548,13 @@ fn collect_external_package_files(project_root: &Path, config: &LinterConfig) ->
     for package in packages {
         let package_dir = site_packages.join(package);
         if package_dir.is_dir() {
-            result.extend(collect_py_files(&package_dir));
+            // Never excludes anything here -- `exclude` is about pruning irrelevant
+            // project-local directories, not the internal structure of a package the
+            // user has explicitly opted into tracing.
+            result.extend(collect_py_files(
+                &package_dir,
+                &std::collections::HashSet::new(),
+            ));
             continue;
         }
         let single_module = site_packages.join(format!("{package}.py"));
@@ -676,7 +697,13 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
     // a mismatch here would make a SQL-derived schema's columns differ depending on
     // whether they were read from the cached project index or inferred fresh.
     let config = load_linter_config(project_root);
-    let mut py_files = collect_py_files(project_root);
+    let extra_excludes: std::collections::HashSet<String> = config
+        .exclude
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut py_files = collect_py_files(project_root, &extra_excludes);
     py_files.extend(collect_external_package_files(project_root, &config));
     let mut files = HashMap::new();
     for file_path in py_files {
@@ -6936,6 +6963,7 @@ def process(query: str) -> None:
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                exclude: None,
             },
         );
         let pipeline_path = root.join("pipeline.py");
@@ -7000,6 +7028,7 @@ def process(query: str) -> None:
             warnings: None,
             sql_dialect: Some("snowflake".to_string()),
             trace_external_packages: Some(vec!["internal_snowflake_pkg".to_string()]),
+            exclude: None,
         };
 
         // act: without the allowlist, nothing outside the project tree is indexed.
@@ -7321,6 +7350,63 @@ def process(path: str) -> None:
     }
 
     #[test]
+    fn test_load_linter_config_reads_exclude_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\".claude\", \"vendor\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(root).exclude,
+            Some(vec![".claude".to_string(), "vendor".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_should_prune_configured_exclude_directories_from_project_index() {
+        // A non-dot-prefixed directory (e.g. a vendored `third_party/`) isn't caught
+        // by collect_py_files's built-in dot-prefix skip -- [tool.typedframes] exclude
+        // is what lets a project prune it (or any other named directory) explicitly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"third_party\"]",
+        )
+        .unwrap();
+        fs::create_dir(root.join("third_party")).unwrap();
+        fs::write(
+            root.join("third_party").join("vendored.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class VendoredSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert -- only app.py was indexed; third_party/ was pruned entirely
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.contains("third_party")),
+            "third_party/ should have been pruned: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("VendoredSchema"));
+    }
+
+    #[test]
     fn test_with_context_sets_dialect_from_config() {
         let mut linter = Linter::new();
         assert_eq!(linter.sql_dialect, sql::SqlDialect::Generic);
@@ -7330,6 +7416,7 @@ def process(path: str) -> None:
             warnings: None,
             sql_dialect: Some("snowflake".to_string()),
             trace_external_packages: None,
+            exclude: None,
         };
         linter.with_context(PathBuf::from("/project"), &config);
         assert_eq!(linter.sql_dialect, sql::SqlDialect::Snowflake);
@@ -7361,6 +7448,7 @@ print(df["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                exclude: None,
             },
         );
 
@@ -7419,6 +7507,7 @@ print(lowered["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                exclude: None,
             },
         );
 
@@ -7451,6 +7540,7 @@ print(df["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                exclude: None,
             },
         );
 
@@ -7484,6 +7574,7 @@ print(lowered["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                exclude: None,
             },
         );
 

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,21 +54,50 @@ _EXCLUDED_DIRS = frozenset(
 )
 
 
-def _collect_python_files(path: Path) -> list[Path]:
+def _load_configured_excludes(path: Path) -> frozenset[str]:
+    """Read `[tool.typedframes] exclude` from path/pyproject.toml, if present.
+
+    Mirrors the Rust checker's own `[tool.typedframes] exclude` key (see
+    `load_linter_config` in rust/src/lib.rs) so a single config value controls both
+    collectors, regardless of which one runs for a given invocation. Only looks at
+    `path` itself (no walking up the ancestor chain) -- matches `_build_index_bytes`,
+    which already treats `path` as the project root when it's a directory.
+    """
+    if not path.is_dir():
+        return frozenset()
+    config_path = path / "pyproject.toml"
+    if not config_path.is_file():
+        return frozenset()
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError):
+        return frozenset()
+    exclude = data.get("tool", {}).get("typedframes", {}).get("exclude")
+    if not isinstance(exclude, list):
+        return frozenset()
+    return frozenset(entry for entry in exclude if isinstance(entry, str))
+
+
+def _collect_python_files(path: Path, extra_excludes: frozenset[str] = frozenset()) -> list[Path]:
     """Collect all .py files from a path (file or directory).
 
     Prunes descent into vendored/VCS/cache directories (see ``_EXCLUDED_DIRS``) so
     that pointing the checker at a real project root doesn't walk into `.venv`,
-    `node_modules`, `.git`, build caches, etc.
+    `node_modules`, `.git`, build caches, etc. `extra_excludes` adds project-specific
+    directory names on top of that default set (see `_load_configured_excludes`) --
+    e.g. `.claude`, which isn't a common-enough convention to hardcode as a default,
+    unlike `.venv`.
     """
     if path.is_file():
         if path.suffix == ".py":
             return [path]
         return []
 
+    excluded_dirs = _EXCLUDED_DIRS if not extra_excludes else _EXCLUDED_DIRS | extra_excludes
     found = []
     for dirpath, dirnames, filenames in os.walk(path):
-        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
         found.extend(Path(dirpath) / filename for filename in filenames if filename.endswith(".py"))
     return sorted(found)
 
@@ -339,7 +369,7 @@ def _run_check(args: argparse.Namespace) -> None:
 
     index_bytes = _build_index_bytes(path, args)
 
-    files = _collect_python_files(path)
+    files = _collect_python_files(path, _load_configured_excludes(path))
     start = time.perf_counter()
     all_errors, coverage = _check_files(files, index_bytes=index_bytes)
     elapsed = time.perf_counter() - start

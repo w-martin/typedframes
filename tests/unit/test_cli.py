@@ -8,7 +8,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from typedframes.cli import _check_files, _collect_python_files, _format_github, _format_text, main
+from typedframes.cli import (
+    _check_files,
+    _collect_python_files,
+    _format_github,
+    _format_text,
+    _load_configured_excludes,
+    main,
+)
 
 
 class TestCli(unittest.TestCase):
@@ -822,6 +829,150 @@ class TestCli(unittest.TestCase):
             # assert
             names = [f.name for f in result]
             self.assertEqual(names, ["app.py"])
+
+    def test_should_skip_extra_excluded_directories_when_collecting(self) -> None:
+        """Test that extra_excludes prunes project-specific directories on top of the built-in default set."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            claude_dir = root / ".claude" / "worktrees" / "agent-1"
+            claude_dir.mkdir(parents=True)
+            (claude_dir / "fake.py").write_text("x = 1\n")
+
+            real_dir = root / "real"
+            real_dir.mkdir()
+            (real_dir / "app.py").write_text("x = 1\n")
+
+            # act
+            result = _collect_python_files(root, frozenset({".claude"}))
+
+            # assert
+            names = [f.name for f in result]
+            self.assertEqual(names, ["app.py"])
+
+    def test_should_not_prune_anything_extra_when_no_excludes_given(self) -> None:
+        """Test that _collect_python_files with no extra_excludes only applies the built-in default set."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            custom_dir = root / "custom_vendor_dir"
+            custom_dir.mkdir()
+            (custom_dir / "fake.py").write_text("x = 1\n")
+
+            # act
+            result = _collect_python_files(root)
+
+            # assert -- not in the built-in default set, so not pruned
+            names = [f.name for f in result]
+            self.assertEqual(names, ["fake.py"])
+
+    def test_should_load_configured_excludes_from_pyproject_toml(self) -> None:
+        """Test that _load_configured_excludes reads [tool.typedframes] exclude from pyproject.toml."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = [".claude", "vendor"]\n')
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset({".claude", "vendor"}))
+
+    def test_should_return_empty_excludes_when_pyproject_toml_is_absent(self) -> None:
+        """Test that _load_configured_excludes returns an empty set when there's no pyproject.toml."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset())
+
+    def test_should_return_empty_excludes_when_path_is_a_file(self) -> None:
+        """Test that _load_configured_excludes returns an empty set for a single-file path."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "test.py"
+            py_file.write_text("x = 1\n")
+
+            # act
+            result = _load_configured_excludes(py_file)
+
+            # assert
+            self.assertEqual(result, frozenset())
+
+    def test_should_return_empty_excludes_when_pyproject_toml_is_malformed(self) -> None:
+        """Test that a malformed pyproject.toml doesn't crash exclude-config loading."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("this is not [ valid toml")
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset())
+
+    def test_should_return_empty_excludes_when_exclude_key_is_not_a_list(self) -> None:
+        """Test that a non-list exclude value is ignored rather than crashing."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = ".claude"\n')
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset())
+
+    def test_should_ignore_non_string_entries_in_exclude_list(self) -> None:
+        """Test that non-string entries in the exclude list are filtered out rather than crashing."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = [".claude", 42]\n')
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset({".claude"}))
+
+    def test_should_prune_configured_exclude_directory_end_to_end_via_main(self) -> None:
+        """Test that a configured [tool.typedframes] exclude directory is pruned by a real `check` run."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = [".claude"]\n')
+
+            claude_dir = root / ".claude"
+            claude_dir.mkdir()
+            (claude_dir / "broken.py").write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(root), "--no-index"])
+
+            # assert -- .claude/broken.py's unknown-column access would otherwise be a
+            # real error; it never gets collected at all, so the run is clean
+            output = captured.getvalue()
+            self.assertIn("✓ Checked 0 files", output)
 
     def test_should_skip_file_that_raises_oserror_and_continue(self) -> None:
         """Test that a per-file OSError from check_file is skipped, not fatal.

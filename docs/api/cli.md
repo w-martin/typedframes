@@ -169,6 +169,21 @@ trace_external_packages = ["internal_snowflake_pkg"]
   current auto-detection. Install the package normally (a real, non-editable install)
   for it to be traced.
 
+### Excluding additional directories
+
+`.git`, `.venv`, `node_modules`, `__pycache__`, and similar VCS/vendor/cache
+directories are pruned by default — no config needed. `exclude` adds project-specific
+directory names on top of that default set, matched by bare name rather than a
+path/glob pattern:
+
+```toml
+[tool.typedframes]
+exclude = [".claude", "legacy"]
+```
+
+Applies both when checking a directory directly (`typedframes check .`) and to the
+cross-file project index — a single `exclude` list controls both.
+
 ---
 
 ::: typedframes.cli.main

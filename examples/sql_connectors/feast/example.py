@@ -25,7 +25,14 @@ attributed to whichever call site actually got it wrong. The literal doesn't hav
 written out at the call site itself, either: `_forward_to_conv_rate_helper()` is a
 zero-arg function that just forwards to *another* zero-arg function that returns the
 literal, and typedframes follows that whole chain (as many hops as needed, with
-recursion protection against cycles) to resolve it. See `__main__` below.
+recursion protection against cycles) to resolve it. Nor does the callee itself have to
+return a literal at all: `_get_feature_names_dynamically("driver_stats")` takes a real
+argument and builds its return value with an f-string -- typedframes substitutes the
+literal `"driver_stats"` for that function's own parameter and evaluates the f-string
+with it, arriving at the same resolved feature list as if the caller had written it out
+directly. This only goes as far as a literal can actually be traced, though: a prefix
+read from an environment variable at runtime has nothing for the tracer to substitute,
+so `load_with_unresolvable_features` stays genuinely unresolved. See `__main__` below.
 
 Run: `typedframes check examples/sql_connectors/feast/`
 Run for real: `cd examples/sql_connectors/feast && uv run python example.py`
@@ -120,27 +127,29 @@ def load_online_features(store: FeatureStore) -> None:
 
 
 def load_with_unresolvable_features(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list[str]) -> None:
-    """A features list that's STILL unresolved even with call-site tracing.
+    """A features list that's STILL unresolved even with call-site + argument tracing.
 
     This function's `feature_names` parameter is call-site-governed exactly like
-    load_feature_by_name's — but every caller in this file passes a runtime-computed
-    value, never a literal or a resolvable zero-arg forward (see __main__:
-    `_get_feature_names_dynamically("driver_stats")`, which takes a real argument and
-    builds its return value with an f-string, not a literal list). No caller anywhere
-    resolves it, so the checker has nothing to fall back to.
+    load_feature_by_name's, and `_get_feature_names_dynamically`'s argument IS traced
+    (see load_feature_by_name's third call site in __main__) -- but this function's own
+    caller passes a *prefix* read from an environment variable at runtime, not a
+    literal. There is no literal anywhere in that call chain for the tracer to
+    substitute, so the checker has nothing to fall back to.
     """
     df = store.get_historical_features(
         entity_df=entity_df, features=feature_names
-    ).to_df()  # untracked-dataframe: features= isn't a literal list
+    ).to_df()  # untracked-dataframe: features= isn't traceable to a literal
     print(df)
 
 
 def _get_feature_names_dynamically(prefix: str) -> list[str]:
-    """Stands in for building a features list at runtime from some real input (a
-    request parameter, a config value, ...) -- genuinely unresolvable, even with
-    multi-hop call-site tracing: it takes an argument (only zero-arg forwards are
-    followed — see ReturnShape's doc comment), and its return value is built with an
-    f-string at runtime, not a literal list.
+    """Builds its return value with an f-string rather than returning a literal list --
+    but typedframes traces a *literal* argument through this too (see __main__):
+    `_get_feature_names_dynamically("driver_stats")` is resolved by substituting
+    "driver_stats" for `prefix` and evaluating the f-string with it, exactly as if the
+    caller had written out `["driver_stats:conv_rate"]` directly. Passed a
+    non-literal prefix instead (see `load_with_unresolvable_features`'s caller in
+    __main__), it's unresolvable, same as ever.
     """
     return [f"{prefix}:conv_rate"]
 
@@ -206,12 +215,16 @@ if __name__ == "__main__":
     load_via_split_form(store, entity_df)
     load_with_full_feature_names(store, entity_df)
     load_online_features(store)
-    load_with_unresolvable_features(store, entity_df, _get_feature_names_dynamically("driver_stats"))
+    # The prefix comes from a runtime environment variable -- no literal anywhere in
+    # this call chain, so this stays genuinely unresolved even with argument tracing:
+    runtime_prefix = os.environ.get("FEAST_VIEW_PREFIX", "driver_stats")
+    load_with_unresolvable_features(store, entity_df, _get_feature_names_dynamically(runtime_prefix))
     # load_with_full_feature_names_renamed_access() intentionally not run -- it really
     # does raise KeyError; see its docstring for why the checker doesn't catch it.
 
     load_feature_by_name(store, entity_df, ["driver_stats:conv_rate"])  # OK -- resolved cleanly at THIS call site
     load_feature_by_name(store, entity_df, _forward_to_conv_rate_helper())  # OK -- resolved through a 2-hop chain
+    load_feature_by_name(store, entity_df, _get_feature_names_dynamically("driver_stats"))  # OK -- argument substitution
 
     if TYPE_CHECKING:
         # Never executes (TYPE_CHECKING is always False at runtime) -- this call site

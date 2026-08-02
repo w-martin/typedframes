@@ -365,15 +365,37 @@ def get_conv_rate_features_via():    # zero-arg, just forwards to the one above
 load_feature(store, entity_df, get_conv_rate_features_via())  # ✓ OK -- resolved through 2 hops
 ```
 
-A call site can pass a call to a zero-argument helper instead of a literal, and that
-helper's own `return` is followed — through as many further zero-arg forwards as
-needed — until a literal is found (or a cycle, or any other shape this checker
-declines to guess at, is hit; recursion is protected against, the same way the
-existing `requires`/delegate-graph resolution already guards against a
-self-referential contract). A helper that takes an argument, computes its return
-value at runtime, or has more than one possible `return` path isn't followed —
-matching this checker's general preference for explicit-shape recognition over
-attempting to evaluate arbitrary code.
+A call site can pass a call to a helper instead of a literal, and that helper's own
+`return` is followed — through as many further hops as needed — until a literal is
+found (or a cycle, or any other shape this checker declines to guess at, is hit;
+recursion is protected against, the same way the existing `requires`/delegate-graph
+resolution already guards against a self-referential contract). This isn't limited to
+zero-arg forwarding, either — a **literal argument** passed to the helper is
+substituted for the helper's own parameter and carried into its return expression:
+
+```python
+def get_features(prefix: str):       # takes a real argument
+    return [f"{prefix}:conv_rate"]   # builds its return value with an f-string
+
+load_feature(store, entity_df, get_features("driver_stats"))  # ✓ OK -- "driver_stats"
+                                                                #    substituted for
+                                                                #    `prefix`, f-string
+                                                                #    evaluated with it
+```
+
+The literal has to actually reach the helper as a literal, though — a call site
+passing a *variable* (even one that happens to hold the same string at runtime, like a
+value read from an environment variable or config) gives the tracer nothing to
+substitute, and the chain stops being traceable there. Only a single positional
+argument's worth of substitution is supported per hop (no keyword arguments, no
+`*args`/defaults/arity mismatches), the helper's return expression has to be its
+*first* `return` (an f-string, a plain string, a list literal built from those, or
+another traceable call), and an f-string's interpolations have to be a bare parameter
+name with no conversion (`!r`) or format spec (`:>10`). Anything outside that shape —
+computing the return value with real logic, multiple statements' worth of
+transformation, a helper that takes more than the literal argument itself — isn't
+followed, matching this checker's general preference for explicit-shape recognition
+over attempting to evaluate arbitrary code.
 
 Deliberately narrow scope otherwise, matching every other heuristic in this checker:
 only Feast's chained form (`store.get_historical_features(..., features=<param>).to_df()`)

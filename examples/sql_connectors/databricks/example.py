@@ -93,7 +93,9 @@ def load_with_unknown_column() -> None:
     executed. Run `typedframes check .` to see it caught as unknown-column.
     """
     session = DatabricksSession.builder.host("workspace-url").create()
-    df = session.sql("SELECT customer_id, order_date, amount FROM customers.orders WHERE status = 'completed'").toPandas()
+    df = session.sql(
+        "SELECT customer_id, order_date, amount FROM customers.orders WHERE status = 'completed'"
+    ).toPandas()
     print(df["status"])  # unknown-column: not in {customer_id, order_date, amount}
 
 

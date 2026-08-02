@@ -1018,7 +1018,7 @@ fn check_governed_call_site(
                     code: CODE_UNKNOWN_COLUMN.to_string(),
                     message: format!(
                         "Column '{}' does not exist for this call's resolved features {:?} \
-                     — a real bug at {}:{}:{} inside '{}' if that access runs for this call",
+                     (accessed at {}:{}:{} inside '{}')",
                         access.column,
                         resolved_cols,
                         target_file,

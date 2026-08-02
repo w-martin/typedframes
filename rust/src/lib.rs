@@ -331,8 +331,12 @@ struct IndexFunction {
 #[derive(Serialize, Deserialize)]
 struct IndexEntry {
     schemas: HashMap<String, Vec<String>>, // schema name -> column list
+    // Named schema name -> (file it's defined in, definition line) -- see Linter's
+    // own `schema_locations` field for why this is tracked separately from `schemas`.
+    #[serde(default)]
+    schema_locations: HashMap<String, (String, usize)>,
     functions: HashMap<String, IndexFunction>, // function name -> return type info
-    exports: Vec<String>,                  // names in __all__, for wildcard-import resolution
+    exports: Vec<String>,                      // names in __all__, for wildcard-import resolution
     imports: HashMap<String, String>, // imported name -> dotted module it came from (`from X import Y`)
     // Local alias -> dotted module name, from plain `import module [as alias]`
     // statements. Lets resolve_delegate_target and load_cross_file_symbols follow
@@ -357,6 +361,11 @@ struct ProjectIndex {
     // own file nor the one importing it — so this must stay project-wide rather than
     // scoped to a single IndexEntry.
     all_schemas: HashMap<String, Vec<String>>,
+    // Project-wide schema name -> (file its class is defined in, definition line),
+    // unioned the same way as `all_schemas` above and for the same reason -- see
+    // Linter's own `schema_locations` field.
+    #[serde(default)]
+    all_schema_locations: HashMap<String, (String, usize)>,
     // Diagnostics resolved at the *call site*, keyed by the calling file's absolute
     // path — populated once, project-wide, by resolve_param_governed_call_sites, and
     // spliced into a file's own diagnostics by check_file when that file is checked.
@@ -394,6 +403,24 @@ fn compute_all_schemas(files: &HashMap<String, IndexEntry>) -> HashMap<String, V
         }
     }
     all_schemas
+}
+
+// Union schema name -> (file, definition line) across every file's `schema_locations`
+// map, mirroring compute_all_schemas -- a schema's class may live in a THIRD file,
+// neither the function's own file nor the one importing it, same reasoning as
+// `all_schemas` itself.
+fn compute_all_schema_locations(
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, (String, usize)> {
+    let mut all_schema_locations: HashMap<String, (String, usize)> = HashMap::new();
+    for entry in files.values() {
+        for (name, loc) in &entry.schema_locations {
+            all_schema_locations
+                .entry(name.clone())
+                .or_insert_with(|| loc.clone());
+        }
+    }
+    all_schema_locations
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
@@ -529,6 +556,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
     let _ = linter.check_file_internal(&source, path);
 
     let schemas = linter.schemas;
+    let schema_locations = linter.schema_locations;
     // Union function names across the return-schema, requires, delegates, and
     // param-schema-name maps — a function may appear in any subset of the four.
     let mut func_names: std::collections::BTreeSet<String> =
@@ -633,6 +661,7 @@ fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option
 
     Some(IndexEntry {
         schemas,
+        schema_locations,
         functions,
         exports,
         imports,
@@ -658,6 +687,7 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
         }
     }
     let all_schemas = compute_all_schemas(&files);
+    let all_schema_locations = compute_all_schema_locations(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
     let governed = resolve_param_governed_call_sites(project_root, &files);
@@ -665,6 +695,7 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
         version: 1,
         files,
         all_schemas,
+        all_schema_locations,
         call_site_errors: governed.call_site_errors,
         resolved_governed: governed.resolved_governed,
     }
@@ -1753,6 +1784,13 @@ pub struct Linter {
     variables: HashMap<String, (String, usize)>, // var_name -> (schema_name, defined_at_line)
     functions: HashMap<String, String>,          // func_name -> schema_name (from return type)
     schema_origins: HashMap<String, String>,     // inferred schema name -> "func (path:line)"
+    // Named schema (BaseSchema subclass / SQLAlchemy declarative model) name -> (file
+    // its class is defined in, definition line). Populated wherever `self.schemas`
+    // gets a named-schema entry (see Stmt::ClassDef handling), and carried cross-file
+    // by load_cross_file_symbols/import_name -- consulted by schema_display so an
+    // unknown-column message points at the schema's actual class definition, which can
+    // be an entirely different file than wherever the erroring variable was bound.
+    schema_locations: HashMap<String, (String, usize)>,
     requires: HashMap<String, (Vec<String>, usize)>, // func_name -> (direct required cols on 1st param, def line)
     delegates: HashMap<String, Vec<String>>, // func_name -> names called with its own (tainted) param forwarded
     param_requires: HashMap<String, (Vec<String>, String)>, // func_name -> (required cols, origin "func (path:line)")
@@ -2062,6 +2100,7 @@ impl Linter {
             variables: HashMap::new(),
             functions: HashMap::new(),
             schema_origins: HashMap::new(),
+            schema_locations: HashMap::new(),
             requires: HashMap::new(),
             delegates: HashMap::new(),
             param_requires: HashMap::new(),
@@ -2115,7 +2154,11 @@ impl Linter {
     // without a separate lookup — for inferred schemas (those whose name starts with
     // `__inferred_`), also includes the origin function/file when recorded by
     // load_cross_file_symbols (where the columns were actually derived from); for
-    // named schemas (BaseSchema subclasses), the schema name + defined line.
+    // named schemas (BaseSchema subclasses), the schema's own class-definition
+    // file/line from `schema_locations` — which may be a different file entirely than
+    // wherever the erroring variable was bound, so `defined_line` (that binding's own
+    // line, in the CURRENT file) is only a fallback for the rare case a named schema
+    // has no recorded location at all.
     fn schema_display(&self, schema_name: &str, defined_line: usize) -> String {
         let cols = self.schemas.get(schema_name).cloned().unwrap_or_default();
         let cols_str = cols.join(", ");
@@ -2127,6 +2170,8 @@ impl Linter {
             } else {
                 format!("inferred column set {{{cols_str}}} (defined at line {defined_line})")
             }
+        } else if let Some((file, line)) = self.schema_locations.get(schema_name) {
+            format!("{schema_name} {{{cols_str}}} (defined at {file}:{line})")
         } else {
             format!("{schema_name} {{{cols_str}}} (defined at line {defined_line})")
         }
@@ -2177,6 +2222,7 @@ impl Linter {
         // file checked (see `check_file`), so rebuilding a project-wide map in here
         // would cost O(files) per file, i.e. O(files^2) for a whole-project check.
         let all_schemas = &index.all_schemas;
+        let all_schema_locations = &index.all_schema_locations;
 
         let Ok(parsed) = parse_module(source) else {
             return;
@@ -2229,13 +2275,25 @@ impl Linter {
                         .collect()
                 };
                 for name in &names {
-                    self.import_name(entry, name, &file_path_display, all_schemas);
+                    self.import_name(
+                        entry,
+                        name,
+                        &file_path_display,
+                        all_schemas,
+                        all_schema_locations,
+                    );
                 }
                 continue;
             }
             for alias in &import_from.names {
                 let name = alias.name.id.as_str();
-                self.import_name(entry, name, &file_path_display, all_schemas);
+                self.import_name(
+                    entry,
+                    name,
+                    &file_path_display,
+                    all_schemas,
+                    all_schema_locations,
+                );
             }
         }
 
@@ -2268,7 +2326,13 @@ impl Linter {
                 let file_path_display = resolved_path.display().to_string();
                 let names: Vec<String> = entry.functions.keys().cloned().collect();
                 for name in &names {
-                    self.import_name(entry, name, &file_path_display, all_schemas);
+                    self.import_name(
+                        entry,
+                        name,
+                        &file_path_display,
+                        all_schemas,
+                        all_schema_locations,
+                    );
                 }
             }
         }
@@ -2285,9 +2349,13 @@ impl Linter {
         name: &str,
         file_path_display: &str,
         all_schemas: &HashMap<String, Vec<String>>,
+        all_schema_locations: &HashMap<String, (String, usize)>,
     ) {
         if let Some(cols) = entry.schemas.get(name) {
             self.schemas.insert(name.to_string(), cols.clone());
+        }
+        if let Some(loc) = entry.schema_locations.get(name) {
+            self.schema_locations.insert(name.to_string(), loc.clone());
         }
         let Some(func) = entry.functions.get(name) else {
             return;
@@ -2315,6 +2383,13 @@ impl Linter {
                     func.returns_schema.clone(),
                     format!("{name} ({file_path_display}{line_suffix})"),
                 );
+            } else if let Some(loc) = all_schema_locations.get(func.returns_schema.as_str()) {
+                // A named schema reached transitively through this function's
+                // return-schema annotation, possibly defined in a THIRD file (neither
+                // this one nor the function's own) -- schema_locations wouldn't have
+                // picked it up any other way.
+                self.schema_locations
+                    .insert(func.returns_schema.clone(), loc.clone());
             }
         }
         // Record the parameter-column contract so calls to this function
@@ -4111,6 +4186,7 @@ impl Linter {
     fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
+                let (class_def_line, _) = self.source_location(class_def.range().start());
                 let is_schema = class_def.bases().iter().any(|base| match base {
                     Expr::Attribute(attr) => Self::is_schema_base(attr.attr.as_str()),
                     Expr::Name(name) => {
@@ -4282,6 +4358,10 @@ impl Linter {
                         }
                     }
                     self.schemas.insert(class_def.name.to_string(), columns);
+                    self.schema_locations.insert(
+                        class_def.name.to_string(),
+                        (self.file_display.clone(), class_def_line),
+                    );
                 } else if Self::class_body_has_tablename(class_def) {
                     // SQLAlchemy declarative model: `class Order(Base): __tablename__ =
                     // "orders"; ...`. Detected structurally, via `__tablename__` in the
@@ -4299,6 +4379,10 @@ impl Linter {
                     // ("rename the column"), but a mapped class's column names come
                     // from an external database schema the user doesn't control.
                     self.schemas.insert(class_def.name.to_string(), columns);
+                    self.schema_locations.insert(
+                        class_def.name.to_string(),
+                        (self.file_display.clone(), class_def_line),
+                    );
                 }
             }
             Stmt::FunctionDef(func_def) => {
@@ -6041,9 +6125,11 @@ print(df["name"])
     #[test]
     fn test_should_list_available_columns_for_a_named_schema_unknown_column_error() {
         // Named schemas (BaseSchema subclasses) used to only get "SchemaName (defined
-        // at line N)" in an unknown-column message -- no column list, unlike inferred
-        // schemas. schema_display now includes the column set for named schemas too,
-        // so the reader can see what IS available without a separate lookup.
+        // at line N)" in an unknown-column message -- no column list, and that line was
+        // actually the VARIABLE's binding line, not the schema class's own definition.
+        // schema_display now includes the column set for named schemas too, and points
+        // at the class's actual definition (line 4, where `class UserSchema` is) rather
+        // than the variable binding (line 7).
         let source = r#"
 from typedframes import BaseSchema, Column
 
@@ -6069,6 +6155,63 @@ print(df["name"])
             errors[0].message
         );
         assert!(errors[0].message.contains("email"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("defined at test.py:4"),
+            "should point at the class definition (line 4), not the variable binding \
+             (line 7): {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_should_point_unknown_column_message_at_schema_defined_in_a_different_file() {
+        // A named schema imported from another file must still resolve its own
+        // class-definition location cross-file, not just its column list -- the
+        // schema's own file, not the importing pipeline file, is what belongs in
+        // "defined at ...".
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from schemas import UserSchema
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let index_bytes = rmp_serde::to_vec(&index).unwrap();
+        let index = get_cached_index(&index_bytes).unwrap();
+        let mut linter = Linter::new();
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        let schemas_path = root.join("schemas.py");
+        let expected = format!("defined at {}:4", schemas_path.to_str().unwrap());
+        assert!(
+            errors[0].message.contains(&expected),
+            "expected {:?} in {}",
+            expected,
+            errors[0].message
+        );
     }
 
     #[test]
@@ -6076,8 +6219,9 @@ print(df["name"])
         // df["new_col"] = ... on a named-schema-tracked variable, where new_col isn't
         // in the schema, is flagged (mutation tracking) -- that message used to bypass
         // schema_display entirely and print only the bare schema name, with no column
-        // list and no "defined at line" location. Now routes through schema_display
-        // like every other unknown-column message.
+        // list and no class-definition location. Now routes through schema_display
+        // like every other unknown-column message, pointing at the schema's own class
+        // definition (line 4, where `class UserSchema` is), not the mutating line.
         let source = r#"
 from typedframes import BaseSchema, Column
 
@@ -6106,7 +6250,7 @@ df["new_column"] = 1
         );
         assert!(errors[0].message.contains("email"), "{}", errors[0].message);
         assert!(
-            errors[0].message.contains("defined at line"),
+            errors[0].message.contains("defined at test.py:4"),
             "{}",
             errors[0].message
         );

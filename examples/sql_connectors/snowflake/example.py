@@ -116,11 +116,10 @@ def load_with_dynamic_filter(customer_id: str) -> None:
 
 
 def load_via_lowercasing_wrapper() -> None:
-    """A common real-world pattern: an internal package wraps Snowflake access and
-    lower-cases every column before returning, so callers don't have to deal with
-    Snowflake's upper-casing at all.
+    """A common real-world pattern: an internal package wraps Snowflake access.
 
-    typedframes recognizes this fold -- `.rename(columns=str.lower)` and
+    It lower-cases every column before returning, so callers don't have to deal with
+    Snowflake's upper-casing at all. typedframes recognizes this fold -- `.rename(columns=str.lower)` and
     `df.columns = df.columns.str.lower()` are both recognized, and propagate cross-file
     the same way any other inferred return schema does (see docs/usage.md's "Supported
     column-set transforms"). Only these specific, enumerated shapes are recognized --
@@ -143,10 +142,10 @@ def load_via_lowercasing_wrapper() -> None:
 
 
 def load_with_unknown_column() -> None:
-    """A real bug: 'order_id' is the query text's own spelling, not what Snowflake
-    actually returns (it's uppercased to 'ORDER_ID').
+    """A real bug: 'order_id' is the query text's own spelling.
 
-    Left out of __main__ below -- this is a static-analysis fixture, not meant to be
+    Not what Snowflake actually returns (it's uppercased to 'ORDER_ID'). Left out of
+    __main__ below -- this is a static-analysis fixture, not meant to be
     executed. Run `typedframes check .` to see it caught as unknown-column.
     """
     conn = connect(

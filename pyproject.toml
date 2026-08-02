@@ -93,6 +93,18 @@ ignore = [
 "tests/*" = ["S101", "SLF001", "S603", "S607"]
 "tests/fixtures/*" = ["T201"]
 "examples/*" = ["T201", "INP001", "D100", "D101", "D103", "BLE001", "ERA001", "F821", "PLR2004"]
+# S608: these connector examples deliberately build a query at runtime (an f-string, not
+# a literal) to demonstrate the untracked-dataframe case -- not a real injection risk in
+# example/demo code with no untrusted input. S106: fake connection credentials in
+# stand-in connector stubs, never real secrets. ARG001/ARG002: fake_snowflake.py's stub
+# methods intentionally match the real snowflake-connector/SQLAlchemy signatures they
+# stand in for, including parameters the fake doesn't need to use.
+"examples/sql_connectors/*" = ["S608", "S106", "ARG001", "ARG002"]
+# The Feast fixture parquet (feature_repo/data/driver_stats.parquet) has tz-naive
+# event_timestamp/created_timestamp columns; entity_df's own event_timestamp and the
+# materialize_incremental end_date have to stay tz-naive too, or Feast's point-in-time
+# join raises a tz-naive/tz-aware mismatch against that fixture.
+"examples/sql_connectors/feast/*" = ["DTZ005"]
 "tasks.py" = ["T201"]
 "src/typedframes/cli.py" = ["T201"]
 "benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]

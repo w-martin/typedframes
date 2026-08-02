@@ -84,5 +84,6 @@ def setup_moto_athena() -> None:
     resp = requests.post(
         "http://motoapi.amazonaws.com/moto-api/static/athena/query-results",
         json=expected_results,
+        timeout=10,
     )
     resp.raise_for_status()

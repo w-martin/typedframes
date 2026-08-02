@@ -156,9 +156,9 @@ def _get_feature_names_dynamically(prefix: str) -> list[str]:
 
 
 def load_feature_by_name(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list[str]) -> None:
-    """A parameter-governed features= call — traced back through literal call-site
-    arguments, independently per caller.
+    """A parameter-governed features= call.
 
+    Traced back through literal call-site arguments, independently per caller.
     Unlike load_with_unresolvable_features above (which the checker can never resolve,
     since it never looks at HOW this function is called), typedframes traces a
     *literal* argument from each call site back through this function's own

@@ -1,7 +1,7 @@
-"""A tiny in-process stand-in for Snowflake -- no OSS/local Snowflake emulator exists
-anywhere, unlike most of the other connectors in this repo.
+"""A tiny in-process stand-in for Snowflake.
 
-Reproduces the one behavior this example is actually about: Snowflake genuinely
+No OSS/local Snowflake emulator exists anywhere, unlike most of the other connectors in
+this repo. Reproduces the one behavior this example is actually about: Snowflake genuinely
 upper-cases unquoted identifiers. This is not a SQL engine -- it parses just enough of
 a `SELECT ... FROM ...` list to fabricate a small, correctly-shaped, correctly-cased
 result, which is enough for the demo functions in example.py to run for real and
@@ -24,7 +24,8 @@ _SELECT_RE = re.compile(r"select\s+(.*?)\s+from\s+", re.IGNORECASE | re.DOTALL)
 def _parse_select_columns(sql: str) -> list[str]:
     match = _SELECT_RE.search(sql)
     if not match:
-        raise ValueError(f"fake_snowflake can't parse this as a SELECT: {sql!r}")
+        msg = f"fake_snowflake can't parse this as a SELECT: {sql!r}"
+        raise ValueError(msg)
     return [c.strip().upper() for c in match.group(1).split(",")]
 
 

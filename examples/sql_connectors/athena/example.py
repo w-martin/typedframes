@@ -77,7 +77,6 @@ def load_with_unknown_column() -> None:
 
 if __name__ == "__main__":
     from moto import mock_aws
-
     from moto_setup import setup_moto_athena
 
     with mock_aws():

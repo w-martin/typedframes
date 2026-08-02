@@ -81,10 +81,9 @@ def load_with_qmark_parameter(min_price: float) -> None:
 
 
 def load_with_unknown_column() -> None:
-    """A real bug: 'OrderId' is the query text's own spelling, not what Redshift
-    actually returns.
+    """A real bug: 'OrderId' is the query text's own spelling.
 
-    Left out of __main__ below -- this is a static-analysis fixture, not meant to be
+    Not what Redshift actually returns. Left out of __main__ below -- this is a static-analysis fixture, not meant to be
     executed. Run `typedframes check .` to see it caught as unknown-column.
     """
     conn = redshift_connector.connect(host="localhost", port=5435, database="dev", user="user", password="pw")

@@ -14,8 +14,8 @@ case -- membership checks never fail by design, so no column access on a Feast r
 is ever flagged, even a genuinely wrong one. `load_with_full_feature_names_renamed_access`
 demonstrates the false-negative tradeoff that makes an open-schema error impossible: a
 real runtime KeyError that the checker stays silent on. `load_feature_set`'s first call
-site in `__main__` is the untracked-dataframe (info) case -- see below for why that's a
-property of the CALL SITE, not the function.
+site in `__main__` is the untracked-dataframe (warning) case -- see below for why
+that's a property of the CALL SITE, not the function.
 
 There IS a different, real error case, though: `load_feature_by_name` below takes its
 `features=` list as a parameter rather than a literal. typedframes traces a *literal*
@@ -134,7 +134,7 @@ def load_feature_set(store: FeatureStore, entity_df: pd.DataFrame, feature_names
 
     Its own body makes no column access to validate (just `print(df)`) -- the function
     itself is exactly as resolvable as load_feature_by_name is, in the abstract.
-    Whether a given call site ends up OK or gets its own untracked-dataframe info note
+    Whether a given call site ends up OK or gets its own untracked-dataframe warning
     depends entirely on what THAT call site passes, not on anything about this function
     -- see __main__ for a call site whose argument can't be traced to a literal.
     """
@@ -217,7 +217,7 @@ if __name__ == "__main__":
     load_online_features(store)
     # The prefix comes from a runtime environment variable -- no literal anywhere in
     # this call chain, so typedframes can't trace it to a literal and reports an
-    # untracked-dataframe info note right at THIS call site (not inside
+    # untracked-dataframe warning right at THIS call site (not inside
     # load_feature_set, which is exactly as resolvable as load_feature_by_name):
     runtime_prefix = os.environ.get("FEAST_VIEW_PREFIX", "driver_stats")
     load_feature_set(store, entity_df, _get_feature_names_dynamically(runtime_prefix))  # untracked-dataframe

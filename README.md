@@ -221,19 +221,20 @@ print(augmented["created_at"])  # ✓ OK
 
 ### Inference Gaps and Warnings
 
-**untracked-dataframe — unannotated data ingestion (off by default)**
+**untracked-dataframe — unannotated data ingestion (on by default)**
 
-By default, typedframes supports permissive Exploratory Data Analysis (EDA). When a DataFrame is loaded
-via `pd.read_csv()` without `usecols=` or a schema annotation, the checker assumes an *Unknown* state
-and bypasses strict column validation to avoid nagging you during discovery.
+When a DataFrame is loaded via `pd.read_csv()` without `usecols=` or a schema annotation, the checker
+assumes an *Unknown* state, bypasses strict column validation on it (to avoid false positives on columns
+it simply can't see), and flags the load itself as a warning-level diagnostic.
 
-To lock down production CI/CD pipelines, opt in to `untracked-dataframe` warnings with `--strict-ingest`:
+For permissive Exploratory Data Analysis (EDA) work where you don't want that noise yet, downgrade it to
+a quiet info-level note with `--lenient-ingest`:
 
 ```shell
-typedframes check src/ --strict-ingest
+typedframes check src/ --lenient-ingest
 ```
 
-With strict ingestion enabled, loading a DataFrame without a schema or `usecols=` produces:
+By default, loading a DataFrame without a schema or `usecols=` produces:
 
 ```python
 df = pd.read_csv("users.csv")

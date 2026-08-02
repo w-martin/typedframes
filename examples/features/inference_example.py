@@ -5,12 +5,13 @@ chains — without requiring explicit schema annotations. This example shows:
 
   1. Full schema annotation  (best practice — no warnings)
   2. usecols / columns=      (inferred schema — no warnings)
-  3. No columns specified    (untracked-dataframe warning — off by default, enable with --strict-ingest)
+  3. No columns specified    (untracked-dataframe warning — on by default)
   4. Method chain inference  (select, drop, rename, assign, filter)
 
-untracked-dataframe is suppressed by default (EDA-friendly mode). To enable it for production CI:
+untracked-dataframe is a warning by default. For permissive EDA workflows, downgrade
+it to a quiet info-level note:
 
-    typedframes check src/ --strict-ingest
+    typedframes check src/ --lenient-ingest
 
 Or suppress all warnings for a single run:
 
@@ -95,18 +96,19 @@ def load_parquet_polars() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. No columns specified — untracked-dataframe warning (off by default)
+# 3. No columns specified — untracked-dataframe warning (on by default)
 # ---------------------------------------------------------------------------
 # Without usecols/columns or a schema annotation, the checker assumes an
-# Unknown state and stays quiet. Run with --strict-ingest to enable the warning.
+# Unknown state and flags the load itself. Run with --lenient-ingest to
+# downgrade this to a quiet info-level note instead.
 #
-# Checker output (with --strict-ingest):
+# Checker output (by default):
 #   inference_example.py:N:1: warning[untracked-dataframe] columns unknown at lint time; specify
 #     `usecols`/`columns` or annotate: `df: Annotated[pd.DataFrame, MySchema] = pd.read_csv(...)`
 
 
 def load_without_columns() -> None:
-    """Load without column info — generates untracked-dataframe with --strict-ingest."""
+    """Load without column info — generates an untracked-dataframe warning."""
     df = pd.read_csv("users.csv")
     df_pl = pl.read_csv("users.csv")
     print(df, df_pl)

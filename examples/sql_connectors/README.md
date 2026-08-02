@@ -12,7 +12,7 @@ each example's own workspace-excluded `pyproject.toml`.
 
 Every directory explicitly illustrates all three things `typedframes check` can
 report, mirroring `examples/features/multi_file_inference/`'s convention: real column
-access that's OK, a live `untracked-dataframe` info case (an unresolvable query — a
+access that's OK, a live `untracked-dataframe` warning case (an unresolvable query — a
 dynamic/f-string-built one, or a parameterized query the SQL grammar can't parse), and
 a dedicated `load_with_unknown_column()` function with a genuine, uncommented bug —
 left out of the `__main__` block (it would raise a real `KeyError` if actually run) so

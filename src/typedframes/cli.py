@@ -185,14 +185,19 @@ def main(argv: list[str] | None = None) -> None:
     check_parser.add_argument(
         "--no-warnings",
         action="store_true",
-        help="Suppress all warnings (dropped-unknown-column and any enabled ingestion warnings).",
+        help="Suppress all warnings (dropped-unknown-column and untracked-dataframe).",
     )
     check_parser.add_argument(
         "--strict-ingest",
         action="store_true",
+        help="Deprecated, no-op: untracked-dataframe is a warning-level diagnostic by default now.",
+    )
+    check_parser.add_argument(
+        "--lenient-ingest",
+        action="store_true",
         help=(
-            "Escalate untracked-dataframe from an info-level diagnostic to a warning "
-            "for bare DataFrame loads without usecols= or columns=."
+            "Downgrade untracked-dataframe from a warning-level diagnostic back to "
+            "info-level for bare DataFrame loads without usecols= or columns=."
         ),
     )
     check_parser.add_argument(
@@ -288,16 +293,18 @@ def _print_results(
 
 
 def _apply_diagnostic_policy(all_errors: list[dict], args: argparse.Namespace) -> list[dict]:
-    """Apply --strict-ingest severity escalation and --no-warnings/--no-info filtering.
+    """Apply --lenient-ingest severity downgrade and --no-warnings/--no-info filtering.
 
-    untracked-dataframe is an info-level diagnostic by default (a low-key "here's what
-    the checker couldn't see" note); --strict-ingest escalates it to a warning for
-    users who want it to read as more actionable.
+    untracked-dataframe is a warning-level diagnostic by default; --lenient-ingest
+    downgrades it to an info-level "here's what the checker couldn't see" note for
+    users who want it to read as less actionable (e.g. exploratory/EDA work). Rust
+    already reports it as "warning" natively, so the default case needs no rewriting
+    here -- only --lenient-ingest's explicit opt-out does.
     """
-    escalated_severity = "warning" if args.strict_ingest else "info"
-    for e in all_errors:
-        if e.get("code") == "untracked-dataframe":
-            e["severity"] = escalated_severity
+    if args.lenient_ingest:
+        for e in all_errors:
+            if e.get("code") == "untracked-dataframe":
+                e["severity"] = "info"
 
     if args.no_warnings:
         all_errors = [e for e in all_errors if e.get("severity") != "warning"]

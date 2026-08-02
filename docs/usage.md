@@ -297,16 +297,17 @@ def transform(df):
 caller supplying only `{a, b}` is still flagged at the `transform(df)` call site, even
 though `c` is only ever referenced two calls deep, inside `finalize`.
 
-## Exploration mode (untracked-dataframe)
+## Ingestion warnings and exploration mode (untracked-dataframe)
 
-By default, bare DataFrame loads (no `usecols=` / `columns=` / schema annotation) are
-silent — the checker has no column information and makes no assumptions. This is
-intentional for EDA workflows where you load the full dataset first.
+By default, a bare DataFrame load (no `usecols=` / `columns=` / schema annotation)
+produces a warning-level `untracked-dataframe` diagnostic — the checker has no column
+information for it, and says so.
 
-Enable `untracked-dataframe` warnings when you want to enforce that every load has column information:
+For EDA workflows where you load the full dataset first and don't want that noise yet,
+downgrade it to a quiet info-level note instead:
 
 ```shell
-typedframes check src/ --strict-ingest
+typedframes check src/ --lenient-ingest
 ```
 
 Suppress all warnings project-wide via `pyproject.toml`:
@@ -348,11 +349,11 @@ per-caller variation lives entirely in *which literal each call site actually pa
 
 A call site passing a non-literal (a variable, a dynamically-built list) doesn't fall
 back to a generic warning inside `load_feature` either — it gets its **own**
-`untracked-dataframe` info note, attributed to that call site:
+`untracked-dataframe` warning, attributed to that call site:
 
 ```python
 dynamic_names = compute_features_somehow()
-load_feature(store, entity_df, dynamic_names)  # ℹ untracked-dataframe, reported HERE
+load_feature(store, entity_df, dynamic_names)  # ⚠ untracked-dataframe, reported HERE
 ```
 
 The function itself is exactly as resolvable as any other call-site-governed

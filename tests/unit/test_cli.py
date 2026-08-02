@@ -472,7 +472,7 @@ class TestCli(unittest.TestCase):
 
             # act
             with patch("sys.stdout", captured):
-                main(["check", str(py_file), "--no-index", "--strict-ingest"])
+                main(["check", str(py_file), "--no-index"])
 
             # assert
             output = captured.getvalue()
@@ -589,8 +589,8 @@ class TestCli(unittest.TestCase):
             self.assertIn("Column 'wrong'", output)
             self.assertIn("1 error", output)
 
-    def test_should_show_untracked_dataframe_as_info_by_default(self) -> None:
-        """Test that untracked-dataframe surfaces as a non-blocking info diagnostic by default."""
+    def test_should_show_untracked_dataframe_as_warning_by_default(self) -> None:
+        """Test that untracked-dataframe surfaces as a warning diagnostic by default."""
         # arrange
         w = {
             "file": "f.py",
@@ -615,6 +615,39 @@ class TestCli(unittest.TestCase):
             ):
                 main(["check", str(py_file)])
 
+            # assert -- shown as a warning, which turns the pass/fail headline into a
+            # (non-strict) failure count
+            output = captured.getvalue()
+            self.assertIn("columns unknown at lint time", output)
+            self.assertIn("warning[untracked-dataframe]", output)
+            self.assertIn("1 warning", output)
+
+    def test_should_downgrade_untracked_dataframe_to_info_with_lenient_ingest_flag(self) -> None:
+        """Test that --lenient-ingest downgrades untracked-dataframe from warning to info."""
+        # arrange
+        w = {
+            "file": "f.py",
+            "line": 1,
+            "col": 0,
+            "code": "untracked-dataframe",
+            "message": "columns unknown at lint time",
+            "severity": "warning",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "f.py"
+            py_file.write_text("x = 1\n")
+            captured = StringIO()
+
+            # act
+            with (
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([w], {"dataframes_total": 1, "dataframes_typed": 0}),
+                ),
+                patch("sys.stdout", captured),
+            ):
+                main(["check", str(py_file), "--lenient-ingest"])
+
             # assert \u2014 shown, but as a quiet "info" diagnostic, not a warning, and it
             # does not turn the pass/fail headline into a failure
             output = captured.getvalue()
@@ -622,8 +655,39 @@ class TestCli(unittest.TestCase):
             self.assertIn("info[untracked-dataframe]", output)
             self.assertIn("\u2713 Checked 1 file", output)
 
-    def test_should_escalate_untracked_dataframe_to_warning_with_strict_ingest_flag(self) -> None:
-        """Test that --strict-ingest escalates untracked-dataframe from info to warning."""
+    def test_should_leave_non_untracked_dataframe_errors_untouched_by_lenient_ingest(self) -> None:
+        """Test that --lenient-ingest only downgrades untracked-dataframe, leaving other codes alone."""
+        # arrange
+        e = {
+            "file": "f.py",
+            "line": 1,
+            "col": 0,
+            "code": "unknown-column",
+            "message": "Column 'x' not found",
+            "severity": "error",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "f.py"
+            py_file.write_text("x = 1\n")
+            captured = StringIO()
+
+            # act
+            with (
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([e], {"dataframes_total": 1, "dataframes_typed": 1}),
+                ),
+                patch("sys.stdout", captured),
+            ):
+                main(["check", str(py_file), "--lenient-ingest"])
+
+            # assert -- unknown-column stays an error, unaffected by the ingest flag
+            output = captured.getvalue()
+            self.assertIn("error[unknown-column]", output)
+            self.assertIn("1 error", output)
+
+    def test_should_treat_strict_ingest_flag_as_a_harmless_noop(self) -> None:
+        """Test that --strict-ingest is accepted but does nothing (untracked-dataframe is already a warning)."""
         # arrange
         w = {
             "file": "f.py",
@@ -648,9 +712,8 @@ class TestCli(unittest.TestCase):
             ):
                 main(["check", str(py_file), "--strict-ingest"])
 
-            # assert
+            # assert -- identical to the no-flag default
             output = captured.getvalue()
-            self.assertIn("columns unknown at lint time", output)
             self.assertIn("warning[untracked-dataframe]", output)
             self.assertIn("1 warning", output)
 
@@ -688,8 +751,8 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("0/1 DataFrames had column info (0%)", output)
 
-    def test_should_suppress_info_output_with_no_info_flag(self) -> None:
-        """Test that --no-info suppresses both the coverage line and info-level diagnostics."""
+    def test_should_suppress_coverage_line_with_no_info_flag(self) -> None:
+        """Test that --no-info suppresses the coverage line; untracked-dataframe (a warning) is unaffected."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             py_file = Path(tmpdir) / "untyped.py"
@@ -700,6 +763,26 @@ class TestCli(unittest.TestCase):
             # act
             with patch("sys.stdout", captured):
                 main(["check", str(py_file), "--no-info"])
+
+            # assert -- the coverage line is gone, but untracked-dataframe is a
+            # warning by default, not info, so --no-info alone doesn't touch it
+            output = captured.getvalue()
+            self.assertNotIn("DataFrames had column info", output)
+            self.assertIn("columns unknown at lint time", output)
+            self.assertIn("1 warning", output)
+
+    def test_should_suppress_info_output_with_lenient_ingest_and_no_info_flags(self) -> None:
+        """Test that --lenient-ingest --no-info together suppress both the coverage line and the diagnostic."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "untyped.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv')\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--lenient-ingest", "--no-info"])
 
             # assert
             output = captured.getvalue()

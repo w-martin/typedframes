@@ -14,8 +14,9 @@ typedframes check src/
 # Check without building the project index (each file checked independently)
 typedframes check src/ --no-index
 
-# Enable untracked-dataframe warnings for bare DataFrame loads (off by default)
-typedframes check src/ --strict-ingest
+# Downgrade untracked-dataframe from a warning to a quiet info-level note for bare
+# DataFrame loads (warning by default)
+typedframes check src/ --lenient-ingest
 
 # Output formats
 typedframes check src/ --output-format text    # default — ty-style, auto-colored in terminal
@@ -111,8 +112,8 @@ is a terminal (TTY); piping or redirecting strips them.
 |------|---------|---------|
 | `unknown-column` | Column not found in schema or inferred set | Always shown |
 | `reserved-name` | Column was renamed — use the new name | Always shown |
-| `untracked-dataframe` | Bare DataFrame load — no column info for checker | Off (use `--strict-ingest`) |
-| `dropped-unknown-column` | Dropped column doesn't exist in schema | Off (use `--strict-ingest`) |
+| `untracked-dataframe` | Bare DataFrame load — no column info for checker | Always shown (use `--lenient-ingest` to downgrade to info) |
+| `dropped-unknown-column` | Dropped column doesn't exist in schema | Always shown |
 | `missing-column` | Argument's columns don't satisfy the called function's parameter contract | Always shown |
 
 ## Project-level configuration

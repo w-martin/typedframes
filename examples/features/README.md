@@ -38,9 +38,9 @@ uv run typedframes check multi_file_with_schema/
 ## inference_example.py
 
 Single-file walkthrough of all inference modes: full schema annotation,
-`usecols=` inference, bare load (`untracked-dataframe` — off by default, enable with
-`--strict-ingest`), and method-chain propagation through rename / drop /
-assign / filter.
+`usecols=` inference, bare load (`untracked-dataframe` — a warning by default,
+downgrade to an info-level note with `--lenient-ingest`), and method-chain propagation
+through rename / drop / assign / filter.
 
 ```shell
 uv run mypy --config-file mypy_empty.ini --strict inference_example.py

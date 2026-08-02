@@ -997,8 +997,8 @@ fn check_governed_call_site(
                 code: CODE_UNTRACKED_DATAFRAME.to_string(),
                 message: format!(
                     "columns unknown at lint time; the `{}` argument passed here isn't \
-                     traceable to a literal `features=[\"view:feature\", ...]` list, so \
-                     column access inside '{}' can't be validated for this call",
+                     a literal (or traceable to one), so column access inside '{}' can't \
+                     be validated for this call",
                     template.param_name, target_func
                 ),
                 severity: "warning".to_string(),
@@ -1018,7 +1018,7 @@ fn check_governed_call_site(
                     code: CODE_UNKNOWN_COLUMN.to_string(),
                     message: format!(
                         "Column '{}' does not exist for this call's resolved features {:?} \
-                     — would be a real bug at {}:{}:{} inside '{}'",
+                     — a real bug at {}:{}:{} inside '{}' if that access runs for this call",
                         access.column,
                         resolved_cols,
                         target_file,

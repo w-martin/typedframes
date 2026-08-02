@@ -143,8 +143,9 @@ def load_with_unresolvable_features(store: FeatureStore, entity_df: pd.DataFrame
 
 
 def _get_feature_names_dynamically(prefix: str) -> list[str]:
-    """Builds its return value with an f-string rather than returning a literal list --
-    but typedframes traces a *literal* argument through this too (see __main__):
+    """Builds its return value with an f-string rather than returning a literal list.
+
+    typedframes traces a *literal* argument through this too (see __main__):
     `_get_feature_names_dynamically("driver_stats")` is resolved by substituting
     "driver_stats" for `prefix` and evaluating the f-string with it, exactly as if the
     caller had written out `["driver_stats:conv_rate"]` directly. Passed a
@@ -224,7 +225,9 @@ if __name__ == "__main__":
 
     load_feature_by_name(store, entity_df, ["driver_stats:conv_rate"])  # OK -- resolved cleanly at THIS call site
     load_feature_by_name(store, entity_df, _forward_to_conv_rate_helper())  # OK -- resolved through a 2-hop chain
-    load_feature_by_name(store, entity_df, _get_feature_names_dynamically("driver_stats"))  # OK -- argument substitution
+    load_feature_by_name(
+        store, entity_df, _get_feature_names_dynamically("driver_stats")
+    )  # OK -- argument substitution
 
     if TYPE_CHECKING:
         # Never executes (TYPE_CHECKING is always False at runtime) -- this call site

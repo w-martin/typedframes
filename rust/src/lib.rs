@@ -3280,7 +3280,9 @@ impl Linter {
                     col: current_col,
                     code: CODE_UNTRACKED_DATAFRAME.to_string(),
                     message: "columns unknown at lint time; name the columns in the \
-                              `SELECT` list (avoid `SELECT *`) or annotate: \
+                              `SELECT` list instead of `SELECT *` -- an explicit list is \
+                              what lets this checker (and readers) know which columns \
+                              actually exist, or annotate: \
                               `df: Annotated[pd.DataFrame, MySchema] = ...`"
                         .to_string(),
                     severity: "warning".to_string(),
@@ -4758,7 +4760,10 @@ impl Linter {
                                                 let hint = match load_kind {
                                                     LoadKind::Sql => {
                                                         "name the columns in the `SELECT` list \
-                                                         (avoid `SELECT *`) or annotate: \
+                                                         instead of `SELECT *` -- an explicit \
+                                                         list is what lets this checker (and \
+                                                         readers) know which columns actually \
+                                                         exist, or annotate: \
                                                          `df: Annotated[pd.DataFrame, MySchema] \
                                                          = pd.read_sql(...)`"
                                                     }

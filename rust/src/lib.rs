@@ -96,11 +96,13 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
     // Retract THIS file's own intra-function untracked-dataframe warnings for any
-    // function that at least one call site anywhere in the project actually resolved
-    // — see ProjectIndex.resolved_governed's doc comment for why this can't just
+    // function that at least one call site anywhere in the project was actually SEEN
+    // for — see ProjectIndex.resolved_governed's doc comment for why this can't just
     // happen unconditionally whenever a function has the param-governed shape (a
-    // function every real caller invokes with a dynamic value is still genuinely
-    // unresolved, and it would be wrong to silently drop its only diagnostic).
+    // function with no discoverable call site anywhere has nowhere else to put the
+    // diagnostic, so it would be wrong to silently drop its only one). A seen call
+    // site that failed to resolve gets its own untracked-dataframe diagnostic at the
+    // call site instead — see check_governed_call_site.
     if let Some(index) = &index {
         for (func_name, template) in &linter.param_governed_templates {
             if index
@@ -365,14 +367,16 @@ struct ProjectIndex {
     // different diagnoses at once.
     #[serde(default)]
     call_site_errors: HashMap<String, Vec<LintError>>,
-    // (file, func_name) pairs where at least one call site project-wide successfully
-    // resolved a literal argument for a param-governed Feast call — regardless of
-    // whether that resolution produced an error or not. Consulted by check_file to
-    // decide whether the intra-function untracked-dataframe warning
-    // register_feast_dataframe pushes for that same call is stale (retract it, the
-    // real answer lives at the call sites now) or still the only real signal (leave
-    // it — every actual caller passed something dynamic, so the call genuinely is
-    // unresolved and it would be wrong to silently report nothing at all).
+    // (file, func_name) pairs where at least one call site project-wide was actually
+    // SEEN for a param-governed Feast call — regardless of whether that call site's
+    // argument resolved to a literal or not. Consulted by check_file to decide whether
+    // the intra-function untracked-dataframe warning register_feast_dataframe pushes
+    // for that same call is stale (retract it — the real answer, resolved or not,
+    // lives at the call sites now, each with its own diagnostic: OK, an unknown-column
+    // error, or its own untracked-dataframe info) or still the only real signal (leave
+    // it — no call site anywhere in the project was ever traced back to this function
+    // at all, e.g. a fully dynamic dispatch, so there's nowhere else to put the
+    // warning and it would be wrong to silently report nothing).
     #[serde(default)]
     resolved_governed: std::collections::HashSet<(String, String)>,
 }
@@ -775,13 +779,15 @@ fn compute_source_location(source: &str, offset: ruff_text_size::TextSize) -> (u
 
 // Project-wide pass: for every function that `find_param_governed_feast_template`
 // found a template for, find every call site (anywhere in the project, at the same
-// statement-nesting depth `analyze_stmt_for_contract` already covers) and, where the
-// call passes a *literal* list for the governing parameter, resolve that call site's
-// specific columns and check them against the template's recorded accesses —
-// independently per call site, so two callers passing different literals for the same
-// parameter get diagnosed (or not) completely independently. A call site passing a
-// non-literal (a variable, a dynamically-built list, ...) is left exactly as today:
-// the callee's own untracked-dataframe fallback, unaffected by any of this.
+// statement-nesting depth `analyze_stmt_for_contract` already covers) and check it
+// against the template's recorded accesses — independently per call site, so two
+// callers passing different arguments for the same parameter get diagnosed (or not)
+// completely independently. A call site whose argument doesn't trace to a literal
+// (a variable with no traceable origin, a dynamically-built list, ...) gets its own
+// untracked-dataframe diagnostic right there, rather than falling back to the callee's
+// generic one — the callee's own shape is exactly as resolvable as any other governed
+// function; the ambiguity genuinely originates at the call site that couldn't produce
+// a literal, so that's where the diagnostic belongs.
 //
 // Diagnostics are returned keyed by the *calling* file's path — not the callee's file
 // — which is what lets this avoid ever needing two different diagnoses for the same
@@ -962,26 +968,44 @@ fn check_governed_call_site(
         files,
         &mut std::collections::HashSet::new(),
     );
-    // Not resolvable at all (a variable with no traceable origin, a dynamically-built
-    // list, a call with arguments, ...) -- leave exactly as today's untracked-dataframe
-    // fallback inside the callee, unaffected.
-    let Some(raw_items) = raw_items else {
-        return;
-    };
-    let Some(resolved_cols) =
-        Linter::feast_columns_from_raw_items(&raw_items, template.full_feature_names)
-    else {
-        return;
-    };
+    let resolved_cols = raw_items
+        .and_then(|raw| Linter::feast_columns_from_raw_items(&raw, template.full_feature_names));
 
-    // This call site DID resolve (whether or not it turns out to violate any recorded
-    // access) — the callee's own generic "columns unknown at lint time" framing is now
-    // stale for it, and check_file consults this to retract that warning.
+    // This call site is real -- it passes SOMETHING for the governed parameter, whether
+    // or not that something is traceable to a literal -- so the callee's own generic
+    // "columns unknown at lint time" framing is stale either way: either this call site
+    // resolves (validated right here, below), or it doesn't, in which case the SAME
+    // untracked-dataframe signal is reported HERE instead of inside the callee, since
+    // call-site tracing means this call site is where the real ambiguity actually
+    // originates -- the callee's own shape is exactly as resolvable as any other
+    // call-site-governed function, in the abstract. check_file consults this set either
+    // way to retract the callee's own line.
     result
         .resolved_governed
         .insert((target_file.clone(), target_func.clone()));
 
     let (line, col) = compute_source_location(source, call.range().start());
+
+    let Some(resolved_cols) = resolved_cols else {
+        result
+            .call_site_errors
+            .entry(file_path.to_string())
+            .or_default()
+            .push(LintError {
+                line,
+                col,
+                code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                message: format!(
+                    "columns unknown at lint time; the `{}` argument passed here isn't \
+                     traceable to a literal `features=[\"view:feature\", ...]` list, so \
+                     column access inside '{}' can't be validated for this call",
+                    template.param_name, target_func
+                ),
+                severity: "warning".to_string(),
+            });
+        return;
+    };
+
     for access in &template.accesses {
         if !resolved_cols.iter().any(|c| c == &access.column) {
             result
@@ -4321,13 +4345,15 @@ impl Linter {
                 // comment and resolve_param_governed_call_sites. Whether the
                 // untracked-dataframe warning register_feast_dataframe already pushed
                 // for this exact statement should be retracted depends on whether any
-                // ACTUAL call site anywhere in the project resolves it — not just on
-                // this shape existing — so that decision is deferred to check_file,
-                // informed by ProjectIndex.resolved_governed (see its doc comment for
-                // why: a function every real caller invokes with a dynamic value is
-                // still genuinely unresolved, and retracting its warning regardless of
-                // that would silently go from "we tell you it's unknown" to "we tell
-                // you nothing at all").
+                // ACTUAL call site anywhere in the project was ever traced back to it —
+                // not just on this shape existing — so that decision is deferred to
+                // check_file, informed by ProjectIndex.resolved_governed (see its doc
+                // comment for why: a governed call site that fails to resolve now gets
+                // its OWN untracked-dataframe diagnostic at the call site, so retracting
+                // the callee's line is safe whenever some call site was seen; only a
+                // function with no discoverable call site anywhere keeps this line as
+                // its sole diagnostic, so retracting unconditionally would silently go
+                // from "we tell you it's unknown" to "we tell you nothing at all").
                 if let Some(template) = self.find_param_governed_feast_template(func_def) {
                     self.param_governed_templates
                         .insert(func_def.name.to_string(), template);
@@ -7707,11 +7733,12 @@ df = store.get_historical_features(
         // same function. Two call sites pass DIFFERENT literal feature lists for that
         // parameter -- the first resolves to {conv_rate} (the access is valid), the
         // second resolves to {acc_rate} (the access is NOT valid) -- and a third call
-        // site passes a non-literal (dynamically built) list, which must be left
-        // exactly as today's untracked-dataframe fallback, unaffected by any of this.
-        // This is the core case: the SAME callee line (`print(df["conv_rate"])`) must
-        // NOT be flagged for the first call site while being flagged for the second --
-        // proven here by attributing the diagnostic to the call site, not that line.
+        // site passes a non-literal (dynamically built) list, which gets its OWN
+        // untracked-dataframe diagnostic right there, rather than falling back to the
+        // callee's generic one. This is the core case: the SAME callee line
+        // (`print(df["conv_rate"])`) must NOT be flagged for the first call site while
+        // being flagged for the second -- proven here by attributing the diagnostic to
+        // the call site, not that line.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("pyproject.toml"), "").unwrap();
@@ -7738,9 +7765,9 @@ load_conv_rate(store, entity_df, dynamic_names)
         let file_path_str = file_path.to_str().unwrap().to_string();
         let mut linter = Linter::new();
         let mut errors = linter.check_file_internal(source, &file_path).unwrap();
-        // Mirrors check_file's own retraction step: at least one call site here DOES
-        // resolve (the first and second both pass literals), so load_conv_rate is in
-        // resolved_governed and its stale intra-function warning should be retracted.
+        // Mirrors check_file's own retraction step: at least one call site here was
+        // seen (all three were), so load_conv_rate is in resolved_governed and its
+        // stale intra-function warning should be retracted.
         for (func_name, template) in &linter.param_governed_templates {
             if index
                 .resolved_governed
@@ -7759,18 +7786,25 @@ load_conv_rate(store, entity_df, dynamic_names)
         errors.sort_by_key(|e| (e.line, e.col));
 
         // assert
-        // The intra-function untracked-dataframe warning is suppressed: since at
-        // least one call site (the first) DOES resolve, "columns unknown at lint
-        // time" is stale/wrong, not a real signal -- only the SECOND call site's
-        // error remains. The first (valid) and third (non-literal) call sites
-        // produce nothing.
-        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        // The intra-function untracked-dataframe warning is suppressed: every call
+        // site was seen, so "columns unknown at lint time" inside the callee is
+        // stale/wrong, not a real signal. The first (valid literal) call site
+        // produces nothing; the second (wrong literal) produces an unknown-column
+        // error at ITS line; the third (non-literal) produces its OWN
+        // untracked-dataframe diagnostic at ITS line, not the callee's.
+        assert_eq!(errors.len(), 2, "errors: {errors:#?}");
         assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
         assert_eq!(
             errors[0].line, 12,
             "should be attributed to the SECOND call site's line, not the callee's access line"
         );
         assert!(errors[0].message.contains("conv_rate"));
+        assert_eq!(errors[1].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(
+            errors[1].line, 14,
+            "should be attributed to the THIRD call site's line, not the callee's access line"
+        );
+        assert!(errors[1].message.contains("feature_names"));
     }
 
     #[test]
@@ -7821,14 +7855,17 @@ load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
     }
 
     #[test]
-    fn test_should_keep_untracked_dataframe_warning_when_no_call_site_ever_resolves() {
+    fn test_should_move_untracked_dataframe_warning_to_the_unresolvable_call_site() {
         // Regression test: a function with the exact same param-governed SHAPE as
-        // load_conv_rate above, but where EVERY real call site passes a dynamically
-        // built value, never a literal. resolved_governed must stay empty for it, so
-        // check_file's retraction step must NOT fire -- silently dropping the only
-        // diagnostic here (going from "we tell you it's unknown" to "we tell you
-        // nothing at all") would be a real regression, not an improvement, since
-        // nothing anywhere actually resolves this call.
+        // load_conv_rate above, but where the only real call site passes a
+        // dynamically built value, never a literal. The function itself is exactly as
+        // resolvable as any other governed function -- the ambiguity originates at
+        // the call site, not inside the callee -- so the diagnostic must move there:
+        // resolved_governed DOES contain this pair (the call site was seen), the
+        // callee's own generic line is retracted, and the call site gets its own
+        // untracked-dataframe diagnostic instead. Silently dropping the diagnostic
+        // entirely (going from "we tell you it's unknown" to "we tell you nothing at
+        // all") would be a real regression -- the fix is relocation, not deletion.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("pyproject.toml"), "").unwrap();
@@ -7852,10 +7889,11 @@ load_conv_rate(store, entity_df, dynamic_names)
         let index = build_index_internal(root);
         let file_path_str = file_path.to_str().unwrap().to_string();
         assert!(
-            !index
+            index
                 .resolved_governed
                 .contains(&(file_path_str.clone(), "load_conv_rate".to_string())),
-            "no call site here passes a literal -- load_conv_rate must not be in resolved_governed"
+            "the call site was seen (even though its argument didn't resolve), so \
+             load_conv_rate must be in resolved_governed"
         );
 
         let mut linter = Linter::new();
@@ -7876,9 +7914,15 @@ load_conv_rate(store, entity_df, dynamic_names)
             errors.extend(extra.iter().cloned());
         }
 
-        // assert
+        // assert: the callee's own line (7) is retracted; the diagnostic reappears at
+        // the call site's line (12) instead.
         assert_eq!(errors.len(), 1, "errors: {errors:#?}");
         assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(
+            errors[0].line, 12,
+            "should be attributed to the call site, not the callee's access line"
+        );
+        assert!(errors[0].message.contains("feature_names"));
     }
 
     #[test]
@@ -8023,11 +8067,19 @@ load_conv_rate(store, entity_df, cyclic_a())
         // act -- must terminate (this test itself hanging is the failure mode)
         let index = build_index_internal(root);
 
-        // assert: unresolvable, so no call-site error and not in resolved_governed --
-        // the intra-function untracked-dataframe warning should stay in place.
+        // assert: the argument is unresolvable (the cycle guard gives up), but the
+        // call site itself was still seen -- so its own untracked-dataframe
+        // diagnostic is reported right there, and load_conv_rate is in
+        // resolved_governed so the callee's own generic line is retracted.
         let file_path_str = file_path.to_str().unwrap().to_string();
-        assert!(index.call_site_errors.get(&file_path_str).is_none());
-        assert!(!index
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert!(index
             .resolved_governed
             .contains(&(file_path_str, "load_conv_rate".to_string())));
     }

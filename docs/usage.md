@@ -345,13 +345,24 @@ passed. The diagnostic for the second call is attributed to the call site itself
 caller's outcome interfering with another's: `load_feature`'s own body is a single,
 caller-independent AST location, so it can only ever be validated once — the
 per-caller variation lives entirely in *which literal each call site actually passed*.
-A call site passing a non-literal (a variable, a dynamically-built list) is left
-exactly as it always was: an `untracked-dataframe` warning inside the callee itself,
-unaffected by any of this. That warning is only ever retracted once *some* real call
-site actually resolves the parameter — a function every caller invokes with a
-dynamically-built value stays genuinely unresolved, and the checker keeps saying so,
-rather than silently going from "we tell you it's unknown" to reporting nothing at
-all just because the shape happens to be call-site-traceable in principle.
+
+A call site passing a non-literal (a variable, a dynamically-built list) doesn't fall
+back to a generic warning inside `load_feature` either — it gets its **own**
+`untracked-dataframe` info note, attributed to that call site:
+
+```python
+dynamic_names = compute_features_somehow()
+load_feature(store, entity_df, dynamic_names)  # ℹ untracked-dataframe, reported HERE
+```
+
+The function itself is exactly as resolvable as any other call-site-governed
+function — the ambiguity genuinely originates at whichever call site couldn't produce
+a literal, not inside a callee whose own shape is perfectly fine in the abstract. The
+callee's own generic line is only ever left in place as the sole diagnostic when *no*
+call site anywhere in the project is ever traced back to it at all (e.g. the function
+is only reached through fully dynamic dispatch) — there the checker still keeps saying
+"columns unknown" rather than silently reporting nothing, since there's nowhere else
+to put it.
 
 The literal doesn't have to be written out at the call site itself, either:
 

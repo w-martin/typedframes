@@ -238,8 +238,8 @@ By default, loading a DataFrame without a schema or `usecols=` produces:
 
 ```python
 df = pd.read_csv("users.csv")
-# ⚠ untracked-dataframe: columns unknown at lint time; specify `usecols`/`columns` or
-#   annotate: `df: Annotated[pd.DataFrame, MySchema] = pd.read_csv(...)`
+# ⚠ untracked-dataframe: columns unknown at lint time; specify `usecols`/`columns`, or
+#   annotate the variable's type, e.g. `df: Annotated[pd.DataFrame, MySchema] = pd.read_csv(...)`
 ```
 
 Fix option 1 — annotate with a schema:

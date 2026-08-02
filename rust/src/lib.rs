@@ -3423,7 +3423,7 @@ impl Linter {
                     message: "columns unknown at lint time; name the columns in the \
                               `SELECT` list instead of `SELECT *` -- an explicit list is \
                               what lets this checker (and readers) know which columns \
-                              actually exist, or annotate: \
+                              actually exist, or annotate the variable's type, e.g. \
                               `df: Annotated[pd.DataFrame, MySchema] = ...`"
                         .to_string(),
                     severity: "warning".to_string(),
@@ -4923,22 +4923,23 @@ impl Linter {
                                                          instead of `SELECT *` -- an explicit \
                                                          list is what lets this checker (and \
                                                          readers) know which columns actually \
-                                                         exist, or annotate: \
-                                                         `df: Annotated[pd.DataFrame, MySchema] \
-                                                         = pd.read_sql(...)`"
+                                                         exist, or annotate the variable's \
+                                                         type, e.g. `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.read_sql(...)`"
                                                     }
                                                     LoadKind::File => {
-                                                        "specify `usecols`/`columns` or \
-                                                         annotate: `df: Annotated[pd.DataFrame, \
+                                                        "specify `usecols`/`columns`, or \
+                                                         annotate the variable's type, e.g. \
+                                                         `df: Annotated[pd.DataFrame, \
                                                          MySchema] = pd.read_csv(...)`"
                                                     }
                                                     LoadKind::Orm => {
                                                         "pass select(Model.col1, Model.col2, ...) \
                                                          referencing a registered model's known \
                                                          columns (a bare `select(Model)` isn't \
-                                                         supported), or annotate: \
-                                                         `df: Annotated[pd.DataFrame, MySchema] \
-                                                         = pd.read_sql(...)`"
+                                                         supported), or annotate the variable's \
+                                                         type, e.g. `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.read_sql(...)`"
                                                     }
                                                 };
                                                 errors.push(LintError {

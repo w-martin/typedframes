@@ -104,7 +104,8 @@ def load_parquet_polars() -> None:
 #
 # Checker output (by default):
 #   inference_example.py:N:1: warning[untracked-dataframe] columns unknown at lint time; specify
-#     `usecols`/`columns` or annotate: `df: Annotated[pd.DataFrame, MySchema] = pd.read_csv(...)`
+#     `usecols`/`columns`, or annotate the variable's type, e.g. `df: Annotated[pd.DataFrame,
+#     MySchema] = pd.read_csv(...)`
 
 
 def load_without_columns() -> None:

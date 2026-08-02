@@ -169,20 +169,33 @@ trace_external_packages = ["internal_snowflake_pkg"]
   current auto-detection. Install the package normally (a real, non-editable install)
   for it to be traced.
 
-### Excluding additional directories
+### Excluding directories
 
-`.git`, `.venv`, `node_modules`, `__pycache__`, and similar VCS/vendor/cache
-directories are pruned by default — no config needed. `exclude` adds project-specific
-directory names on top of that default set, matched by bare name rather than a
-path/glob pattern:
+The following are pruned by default — no config needed:
+
+```
+.bzr  .claude  .direnv  .eggs  .git  .git-rewrite  .hg  .ipynb_checkpoints
+.mypy_cache  .nox  .pants.d  .pytest_cache  .pytype  .ruff_cache  .svn  .tox
+.venv  .vscode  .idea  __pycache__  _build  buck-out  build  dist
+node_modules  site-packages  venv
+```
+
+`exclude` **replaces this default list entirely** — matching by bare directory name,
+not a path/glob pattern:
 
 ```toml
 [tool.typedframes]
 exclude = [".claude", "legacy"]
 ```
 
+This mirrors ruff's own `exclude` (there's no separate `extend-exclude`-style option
+here): once `exclude` is set, only the names you list are pruned, so re-list `.venv`
+(or anything else from the default set you still want ignored) alongside your own
+additions, or it'll be walked. An explicit `exclude = []` is a deliberate way to prune
+nothing at all.
+
 Applies both when checking a directory directly (`typedframes check .`) and to the
-cross-file project index — a single `exclude` list controls both.
+cross-file project index — a single `exclude` value controls both.
 
 ---
 

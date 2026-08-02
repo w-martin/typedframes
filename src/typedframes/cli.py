@@ -19,12 +19,16 @@ _BOLD_GREEN = "\033[1;32m"
 _BOLD_YELLOW = "\033[1;33m"
 _DIM = "\033[2m"  # low-key informational text: coverage summary, non-actionable suggestions
 
-# Directories that should never be descended into when collecting .py files: VCS
-# metadata, virtualenvs, caches, and vendored/build trees. Mirrors ruff's default
-# exclude list, a well-established precedent for "directories no linter should scan".
+# Directories that should never be descended into when collecting .py files by
+# default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
+# trees. Mirrors ruff's default exclude list, a well-established precedent for
+# "directories no linter should scan" -- including ruff's own override semantics:
+# [tool.typedframes] exclude in pyproject.toml REPLACES this set entirely rather than
+# adding to it (see _load_configured_excludes/_collect_python_files).
 _EXCLUDED_DIRS = frozenset(
     {
         ".bzr",
+        ".claude",
         ".direnv",
         ".eggs",
         ".git",
@@ -54,8 +58,15 @@ _EXCLUDED_DIRS = frozenset(
 )
 
 
-def _load_configured_excludes(path: Path) -> frozenset[str]:
+def _load_configured_excludes(path: Path) -> frozenset[str] | None:
     """Read `[tool.typedframes] exclude` from path/pyproject.toml, if present.
+
+    Returns `None` when nothing is configured (no pyproject.toml, no
+    `[tool.typedframes]` section, no `exclude` key, or a malformed value) -- the
+    caller's signal to fall back to the built-in default set (`_EXCLUDED_DIRS`)
+    rather than pruning nothing. An explicitly empty `exclude = []` is NOT `None`: it
+    means the user deliberately wants no directories pruned at all, same as any other
+    override value.
 
     Mirrors the Rust checker's own `[tool.typedframes] exclude` key (see
     `load_linter_config` in rust/src/lib.rs) so a single config value controls both
@@ -64,37 +75,37 @@ def _load_configured_excludes(path: Path) -> frozenset[str]:
     which already treats `path` as the project root when it's a directory.
     """
     if not path.is_dir():
-        return frozenset()
+        return None
     config_path = path / "pyproject.toml"
     if not config_path.is_file():
-        return frozenset()
+        return None
     try:
         with config_path.open("rb") as f:
             data = tomllib.load(f)
     except (tomllib.TOMLDecodeError, OSError):
-        return frozenset()
+        return None
     exclude = data.get("tool", {}).get("typedframes", {}).get("exclude")
     if not isinstance(exclude, list):
-        return frozenset()
+        return None
     return frozenset(entry for entry in exclude if isinstance(entry, str))
 
 
-def _collect_python_files(path: Path, extra_excludes: frozenset[str] = frozenset()) -> list[Path]:
+def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
     """Collect all .py files from a path (file or directory).
 
-    Prunes descent into vendored/VCS/cache directories (see ``_EXCLUDED_DIRS``) so
-    that pointing the checker at a real project root doesn't walk into `.venv`,
-    `node_modules`, `.git`, build caches, etc. `extra_excludes` adds project-specific
-    directory names on top of that default set (see `_load_configured_excludes`) --
-    e.g. `.claude`, which isn't a common-enough convention to hardcode as a default,
-    unlike `.venv`.
+    Prunes descent into vendored/VCS/cache directories: `configured_excludes` (see
+    `_load_configured_excludes`) REPLACES the built-in default set (``_EXCLUDED_DIRS``)
+    entirely when given -- it does not add to it, matching ruff's own `exclude`
+    semantics (as opposed to `extend-exclude`, which this checker doesn't have a
+    separate option for). `None` (the default -- nothing configured) falls back to
+    pruning the built-in default set alone.
     """
     if path.is_file():
         if path.suffix == ".py":
             return [path]
         return []
 
-    excluded_dirs = _EXCLUDED_DIRS if not extra_excludes else _EXCLUDED_DIRS | extra_excludes
+    excluded_dirs = _EXCLUDED_DIRS if configured_excludes is None else configured_excludes
     found = []
     for dirpath, dirnames, filenames in os.walk(path):
         dirnames[:] = [d for d in dirnames if d not in excluded_dirs]

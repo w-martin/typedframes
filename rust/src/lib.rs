@@ -220,13 +220,15 @@ pub struct LinterConfig {
     // rather than indexing all of site-packages, which would be both expensive and a
     // much larger, unbounded trust surface.
     trace_external_packages: Option<Vec<String>>,
-    // Additional directory names to prune when collecting `.py` files, on top of the
-    // built-in default set (`.git`, `.venv`, `node_modules`, `__pycache__`, etc. — see
-    // `DEFAULT_EXCLUDED_DIRS`). Matches by bare directory name, not a path/glob
-    // pattern, mirroring how the built-in set already works. The Python CLI's own
-    // file collector (`_collect_python_files` in cli.py) reads this same key
-    // independently via `tomllib`, so both collectors stay in sync from one config
-    // value.
+    // Directory names to prune when collecting `.py` files. When set, REPLACES the
+    // built-in default set (`DEFAULT_EXCLUDED_DIRS` -- `.git`, `.venv`, `node_modules`,
+    // `__pycache__`, `.claude`, etc.) entirely rather than adding to it, matching
+    // ruff's own `exclude` (as opposed to `extend-exclude`, which this checker doesn't
+    // have a separate option for) -- an explicit `exclude = []` means "prune nothing
+    // at all", a deliberate override, not "nothing configured". Matches by bare
+    // directory name, not a path/glob pattern. The Python CLI's own file collector
+    // (`_collect_python_files` in cli.py) reads this same key independently via
+    // `tomllib`, so both collectors stay in sync from one config value.
     exclude: Option<Vec<String>>,
 }
 
@@ -434,15 +436,51 @@ fn compute_all_schema_locations(
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
 
-// Recursively collect all `.py` files under `dir`, skipping hidden entries (`.venv`,
-// `.git`, etc.) and any name in `extra_excludes` (from `[tool.typedframes] exclude`,
-// for project-specific directories the built-in dot-prefix skip doesn't cover — e.g.
-// `.claude`'s own worktree checkouts ARE already dot-prefixed and covered by that rule,
-// but a non-dot directory like a vendored `third_party/` wouldn't be). Uses an
-// explicit stack rather than recursion to avoid stack overflow on very deep trees.
+// Directories that should never be descended into when collecting `.py` files by
+// default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
+// trees. Mirrors ruff's default exclude list (and cli.py's own `_EXCLUDED_DIRS`,
+// which MUST be kept in sync with this) -- including ruff's own override semantics:
+// `[tool.typedframes] exclude` in pyproject.toml REPLACES this set entirely rather
+// than adding to it (see `collect_py_files`).
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+    ".bzr",
+    ".claude",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    ".idea",
+    "__pycache__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+];
+
+// Recursively collect all `.py` files under `dir`, skipping any name in
+// `resolved_excludes` -- the caller's job to resolve (see `build_index_internal`):
+// either `[tool.typedframes] exclude`'s configured list, replacing
+// `DEFAULT_EXCLUDED_DIRS` entirely, or `DEFAULT_EXCLUDED_DIRS` itself when nothing is
+// configured. Uses an explicit stack rather than recursion to avoid stack overflow on
+// very deep trees.
 fn collect_py_files(
     dir: &Path,
-    extra_excludes: &std::collections::HashSet<String>,
+    resolved_excludes: &std::collections::HashSet<String>,
 ) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -454,7 +492,7 @@ fn collect_py_files(
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || extra_excludes.contains(name_str.as_ref()) {
+            if resolved_excludes.contains(name_str.as_ref()) {
                 continue;
             }
             if path.is_dir() {
@@ -697,13 +735,16 @@ fn build_index_internal(project_root: &Path) -> ProjectIndex {
     // a mismatch here would make a SQL-derived schema's columns differ depending on
     // whether they were read from the cached project index or inferred fresh.
     let config = load_linter_config(project_root);
-    let extra_excludes: std::collections::HashSet<String> = config
-        .exclude
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    let mut py_files = collect_py_files(project_root, &extra_excludes);
+    // A configured `exclude` REPLACES DEFAULT_EXCLUDED_DIRS entirely -- it does not
+    // add to it (see collect_py_files's doc comment).
+    let resolved_excludes: std::collections::HashSet<String> = match &config.exclude {
+        Some(list) => list.iter().cloned().collect(),
+        None => DEFAULT_EXCLUDED_DIRS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let mut py_files = collect_py_files(project_root, &resolved_excludes);
     py_files.extend(collect_external_package_files(project_root, &config));
     let mut files = HashMap::new();
     for file_path in py_files {
@@ -7367,9 +7408,9 @@ def process(path: str) -> None:
 
     #[test]
     fn test_should_prune_configured_exclude_directories_from_project_index() {
-        // A non-dot-prefixed directory (e.g. a vendored `third_party/`) isn't caught
-        // by collect_py_files's built-in dot-prefix skip -- [tool.typedframes] exclude
-        // is what lets a project prune it (or any other named directory) explicitly.
+        // A non-default directory (e.g. a vendored `third_party/`) isn't caught by
+        // DEFAULT_EXCLUDED_DIRS -- [tool.typedframes] exclude is what lets a project
+        // prune it (or any other named directory) explicitly.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(
@@ -7404,6 +7445,89 @@ class VendoredSchema(BaseSchema):
             "third_party/ should have been pruned: {indexed:#?}"
         );
         assert!(!index.all_schemas.contains_key("VendoredSchema"));
+    }
+
+    #[test]
+    fn test_should_prune_dot_claude_by_default_with_no_config_at_all() {
+        // .claude is in DEFAULT_EXCLUDED_DIRS -- pruned automatically with no
+        // [tool.typedframes] exclude configured at all, same as .venv/.git/etc.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".claude").join("worktrees").join("agent-1")).unwrap();
+        fs::write(
+            root.join(".claude")
+                .join("worktrees")
+                .join("agent-1")
+                .join("stale.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class StaleSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.contains(".claude")),
+            ".claude/ should have been pruned by default: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("StaleSchema"));
+    }
+
+    #[test]
+    fn test_should_replace_rather_than_add_to_default_excludes_when_configured() {
+        // Configuring [tool.typedframes] exclude REPLACES DEFAULT_EXCLUDED_DIRS
+        // entirely -- it does not add to it. A project that configures its own
+        // exclude list without re-listing .venv gets .venv walked again; that's the
+        // deliberate override semantics (matching ruff's own exclude, as opposed to
+        // extend-exclude), not a bug.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"custom_dir\"]",
+        )
+        .unwrap();
+        fs::create_dir(root.join("custom_dir")).unwrap();
+        fs::write(root.join("custom_dir").join("skipped.py"), "x = 1\n").unwrap();
+        fs::create_dir(root.join(".venv")).unwrap();
+        fs::write(
+            root.join(".venv").join("walked.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class VenvSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            !indexed.iter().any(|p| p.contains("custom_dir")),
+            "custom_dir/ should have been pruned (in the configured exclude list): {indexed:#?}"
+        );
+        assert!(
+            indexed.iter().any(|p| p.contains(".venv")),
+            ".venv/ should NOT be pruned once exclude is configured without re-listing \
+             it -- override, not union: {indexed:#?}"
+        );
+        assert!(index.all_schemas.contains_key("VenvSchema"));
     }
 
     #[test]

@@ -830,8 +830,8 @@ class TestCli(unittest.TestCase):
             names = [f.name for f in result]
             self.assertEqual(names, ["app.py"])
 
-    def test_should_skip_extra_excluded_directories_when_collecting(self) -> None:
-        """Test that extra_excludes prunes project-specific directories on top of the built-in default set."""
+    def test_should_prune_dot_claude_by_default_with_no_excludes_given(self) -> None:
+        """Test that .claude is pruned by the built-in default set with no config at all."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -845,14 +845,36 @@ class TestCli(unittest.TestCase):
             (real_dir / "app.py").write_text("x = 1\n")
 
             # act
-            result = _collect_python_files(root, frozenset({".claude"}))
+            result = _collect_python_files(root)
 
             # assert
             names = [f.name for f in result]
             self.assertEqual(names, ["app.py"])
 
+    def test_should_replace_rather_than_add_to_default_excludes_when_configured(self) -> None:
+        """Test that configured_excludes REPLACES the built-in default set rather than adding to it."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            custom_dir = root / "custom_dir"
+            custom_dir.mkdir()
+            (custom_dir / "skipped.py").write_text("x = 1\n")
+
+            venv_dir = root / ".venv"
+            venv_dir.mkdir()
+            (venv_dir / "walked.py").write_text("x = 1\n")
+
+            # act -- configuring exclude WITHOUT re-listing .venv should let .venv be
+            # walked again: override, not union.
+            result = _collect_python_files(root, frozenset({"custom_dir"}))
+
+            # assert
+            names = [f.name for f in result]
+            self.assertEqual(names, ["walked.py"])
+
     def test_should_not_prune_anything_extra_when_no_excludes_given(self) -> None:
-        """Test that _collect_python_files with no extra_excludes only applies the built-in default set."""
+        """Test that _collect_python_files with no configured_excludes only applies the built-in default set."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -880,8 +902,22 @@ class TestCli(unittest.TestCase):
             # assert
             self.assertEqual(result, frozenset({".claude", "vendor"}))
 
-    def test_should_return_empty_excludes_when_pyproject_toml_is_absent(self) -> None:
-        """Test that _load_configured_excludes returns an empty set when there's no pyproject.toml."""
+    def test_should_treat_an_explicitly_empty_exclude_list_as_prune_nothing(self) -> None:
+        """Test that exclude = [] is a deliberate override (prune nothing), not "not configured"."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\nexclude = []\n")
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert -- an empty frozenset, not None
+            self.assertEqual(result, frozenset())
+            self.assertIsNotNone(result)
+
+    def test_should_return_none_when_pyproject_toml_is_absent(self) -> None:
+        """Test that _load_configured_excludes returns None (not configured) when there's no pyproject.toml."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -890,10 +926,10 @@ class TestCli(unittest.TestCase):
             result = _load_configured_excludes(root)
 
             # assert
-            self.assertEqual(result, frozenset())
+            self.assertIsNone(result)
 
-    def test_should_return_empty_excludes_when_path_is_a_file(self) -> None:
-        """Test that _load_configured_excludes returns an empty set for a single-file path."""
+    def test_should_return_none_when_path_is_a_file(self) -> None:
+        """Test that _load_configured_excludes returns None for a single-file path."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             py_file = Path(tmpdir) / "test.py"
@@ -903,9 +939,9 @@ class TestCli(unittest.TestCase):
             result = _load_configured_excludes(py_file)
 
             # assert
-            self.assertEqual(result, frozenset())
+            self.assertIsNone(result)
 
-    def test_should_return_empty_excludes_when_pyproject_toml_is_malformed(self) -> None:
+    def test_should_return_none_when_pyproject_toml_is_malformed(self) -> None:
         """Test that a malformed pyproject.toml doesn't crash exclude-config loading."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -916,10 +952,10 @@ class TestCli(unittest.TestCase):
             result = _load_configured_excludes(root)
 
             # assert
-            self.assertEqual(result, frozenset())
+            self.assertIsNone(result)
 
-    def test_should_return_empty_excludes_when_exclude_key_is_not_a_list(self) -> None:
-        """Test that a non-list exclude value is ignored rather than crashing."""
+    def test_should_return_none_when_exclude_key_is_not_a_list(self) -> None:
+        """Test that a non-list exclude value is ignored (falls back to defaults) rather than crashing."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -929,7 +965,7 @@ class TestCli(unittest.TestCase):
             result = _load_configured_excludes(root)
 
             # assert
-            self.assertEqual(result, frozenset())
+            self.assertIsNone(result)
 
     def test_should_ignore_non_string_entries_in_exclude_list(self) -> None:
         """Test that non-string entries in the exclude list are filtered out rather than crashing."""
@@ -973,6 +1009,37 @@ class TestCli(unittest.TestCase):
             # real error; it never gets collected at all, so the run is clean
             output = captured.getvalue()
             self.assertIn("✓ Checked 0 files", output)
+
+    def test_should_walk_venv_again_once_exclude_is_configured_end_to_end_via_main(self) -> None:
+        """Test that configuring exclude without re-listing .venv lets .venv be walked again, via a real check run."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = ["custom_dir"]\n')
+
+            venv_dir = root / ".venv"
+            venv_dir.mkdir()
+            (venv_dir / "broken.py").write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(root), "--no-index"])
+
+            # assert -- .venv/broken.py IS collected and its unknown-column error IS
+            # reported, since exclude replaced the default set instead of adding to it
+            output = captured.getvalue()
+            self.assertIn("✗ Found 1 error", output)
+            self.assertIn("wrong", output)
 
     def test_should_skip_file_that_raises_oserror_and_continue(self) -> None:
         """Test that a per-file OSError from check_file is skipped, not fatal.

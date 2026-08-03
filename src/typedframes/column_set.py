@@ -56,7 +56,9 @@ class ColumnSet:
 
         For non-regex ColumnSets, returns the explicit member names.  For regex
         ColumnSets, raises ``ValueError`` because the matched column names are only
-        known at runtime (use ``PandasFrame.from_schema()`` for regex resolution).
+        known at runtime (the deprecated ``PandasFrame.from_schema()`` resolves
+        these; there is currently no ``Annotated[...]``-based equivalent since that
+        path has no runtime component to introspect actual columns against).
 
         Example:
             df[SensorSchema.temperatures.s]  # pandas — works for non-regex ColumnSets
@@ -65,7 +67,8 @@ class ColumnSet:
         if self.regex:
             msg = (
                 "Cannot get column names for regex ColumnSet without matched columns. "
-                "Use PandasFrame.from_schema() to resolve regex patterns at runtime."
+                "Use the deprecated PandasFrame.from_schema() to resolve regex "
+                "patterns at runtime."
             )
             raise ValueError(msg)
         return list(self.members)

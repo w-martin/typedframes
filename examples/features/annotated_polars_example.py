@@ -1,4 +1,10 @@
-"""Polars example — Annotated type annotation with pl.col() validation."""
+"""Polars example — Annotated type annotation with pl.col() validation.
+
+`PolarsFrame` is deprecated (see `docs/api/polars.md`) -- it was never a real
+runtime subclass to begin with (polars DataFrames can't be meaningfully
+subclassed), just an alias for `Annotated[pl.DataFrame, Schema]`.
+`Annotated[...]` directly is the only supported pattern going forward.
+"""
 
 from typing import Annotated
 

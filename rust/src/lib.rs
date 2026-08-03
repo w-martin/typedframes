@@ -2679,10 +2679,10 @@ impl Linter {
 
     // Check if a type name is a DataFrame/Frame type
     fn is_frame_type(name: &str) -> bool {
-        matches!(name, "DataFrame" | "PandasFrame" | "PolarsFrame")
+        name == "DataFrame"
     }
 
-    // Extract schema name from a type annotation like PandasFrame[Schema] or Annotated[pd.DataFrame, Schema]
+    // Extract schema name from a type annotation like DataFrame[Schema] or Annotated[pd.DataFrame, Schema]
     fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Subscript(subscript) => {
@@ -2712,15 +2712,12 @@ impl Linter {
             }
             Expr::StringLiteral(s) => {
                 let text = s.value.to_str();
-                let patterns = ["DataFrame[", "PandasFrame[", "PolarsFrame["];
-                for pattern in patterns {
-                    if text.contains(pattern) {
-                        if let Some(start) = text.find('[') {
-                            if let Some(end) = text.rfind(']') {
-                                let schema = text[start + 1..end].trim();
-                                if !schema.is_empty() && !schema.contains(',') {
-                                    return Some(schema);
-                                }
+                if text.contains("DataFrame[") {
+                    if let Some(start) = text.find('[') {
+                        if let Some(end) = text.rfind(']') {
+                            let schema = text[start + 1..end].trim();
+                            if !schema.is_empty() && !schema.contains(',') {
+                                return Some(schema);
                             }
                         }
                     }
@@ -4457,7 +4454,7 @@ impl Linter {
                 let (fn_def_line, _) = self.source_location(func_def.range().start());
                 self.all_function_names.insert(func_def.name.to_string());
 
-                // Track return type annotations like -> PandasFrame[Schema]
+                // Track return type annotations like -> DataFrame[Schema]
                 if let Some(returns) = &func_def.returns {
                     if let Some(schema_name) = Self::extract_schema_from_annotation(returns) {
                         self.functions
@@ -4465,9 +4462,9 @@ impl Linter {
                     }
                 }
 
-                // Schema-annotated parameters (`def f(df: PandasFrame[Schema])`,
+                // Schema-annotated parameters (`def f(df: DataFrame[Schema])`,
                 // `Annotated[pd.DataFrame, Schema]`, or a quoted equivalent) get tracked
-                // in self.variables exactly like a local `df: PandasFrame[Schema] = ...`
+                // in self.variables exactly like a local `df: DataFrame[Schema] = ...`
                 // assignment would — so accesses inside the body are validated against
                 // the declared schema, the same as anywhere else in the file, rather
                 // than left unchecked just because the binding came from a parameter.
@@ -4837,35 +4834,12 @@ impl Linter {
                                         }
                                     }
                                 }
-                            } else if func_name == "from_schema"
-                                || func_name == "from_pandas"
+                            } else if func_name == "from_pandas"
                                 || func_name == "from_polars"
                                 || LOAD_FUNCTIONS.contains(&func_name)
                             {
-                                // PandasFrame.from_schema(df, Schema) or Schema.from_pandas(df)
-                                if let Expr::Attribute(inner_attr) = &*attr.value {
-                                    // This is like PandasFrame.from_schema
-                                    let class_name = inner_attr.attr.as_str();
-                                    if class_name == "PandasFrame" || class_name == "PolarsFrame" {
-                                        // Find the schema argument
-                                        if call.arguments.args.len() >= 2 {
-                                            if let Expr::Name(schema_name) = &call.arguments.args[1]
-                                            {
-                                                for target in &assign.targets {
-                                                    if let Expr::Name(target_name) = target {
-                                                        self.variables.insert(
-                                                            target_name.id.to_string(),
-                                                            (
-                                                                schema_name.id.to_string(),
-                                                                current_line,
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if let Expr::Name(class_name) = &*attr.value {
+                                // Schema.from_pandas(df) / Schema.from_polars(df).
+                                if let Expr::Name(class_name) = &*attr.value {
                                     let class_str = class_name.id.as_str();
                                     if self.schemas.contains_key(class_str) {
                                         // Schema.from_pandas(df) style
@@ -5617,10 +5591,7 @@ impl Linter {
                     if let Expr::Subscript(subscript) = &*call.func {
                         if let Expr::Name(name) = &*subscript.value {
                             let type_name = name.id.as_str();
-                            if type_name == "DataFrame"
-                                || type_name == "PandasFrame"
-                                || type_name == "PolarsFrame"
-                            {
+                            if type_name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
@@ -5669,7 +5640,7 @@ impl Linter {
                             }
                         }
                     } else if let Expr::Name(func_name) = &*call.func {
-                        // Handle df = load_users() where load_users() -> PandasFrame[Schema]
+                        // Handle df = load_users() where load_users() -> DataFrame[Schema]
                         if let Some(schema_name) = self.functions.get(func_name.id.as_str()) {
                             let schema_name = schema_name.clone();
                             self.dataframes_total += 1;
@@ -5707,10 +5678,7 @@ impl Linter {
                         if let Expr::Subscript(subscript) = &*call.func {
                             if let Expr::Name(name) = &*subscript.value {
                                 let type_name = name.id.as_str();
-                                if type_name == "DataFrame"
-                                    || type_name == "PandasFrame"
-                                    || type_name == "PolarsFrame"
-                                {
+                                if type_name == "DataFrame" {
                                     if let Expr::Name(schema_name) = &*subscript.slice {
                                         if let Expr::Name(target_name) = &*ann_assign.target {
                                             self.variables.insert(
@@ -5750,9 +5718,8 @@ impl Linter {
                         }
 
                         if let Some(name) = type_name {
-                            // DataFrame[Schema], PandasFrame[Schema], PolarsFrame[Schema]
-                            if name == "DataFrame" || name == "PandasFrame" || name == "PolarsFrame"
-                            {
+                            // DataFrame[Schema]
+                            if name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     if let Expr::Name(target_name) = &*ann_assign.target {
                                         self.variables.insert(
@@ -5935,31 +5902,28 @@ impl Linter {
         ann_assign: &ast::StmtAnnAssign,
         current_line: usize,
     ) {
-        // Handle patterns like "DataFrame[Schema]", "PandasFrame[Schema]", "PolarsFrame[Schema]"
+        // Handle patterns like "DataFrame[Schema]"
         // and "Annotated[DataFrame, Schema]", "Annotated[pl.DataFrame, Schema]"
 
-        let patterns = ["DataFrame[", "PandasFrame[", "PolarsFrame["];
-        for pattern in patterns {
-            if s.contains(pattern) {
-                if let Some(start) = s.find('[') {
-                    if let Some(end) = s.rfind(']') {
-                        let schema_name = &s[start + 1..end];
-                        // Handle nested generics by taking the last part
-                        let schema = schema_name
-                            .split(',')
-                            .next_back()
-                            .unwrap_or(schema_name)
-                            .trim();
-                        if let Expr::Name(target_name) = &*ann_assign.target {
-                            self.variables.insert(
-                                target_name.id.to_string(),
-                                (schema.to_string(), current_line),
-                            );
-                        }
+        if s.contains("DataFrame[") {
+            if let Some(start) = s.find('[') {
+                if let Some(end) = s.rfind(']') {
+                    let schema_name = &s[start + 1..end];
+                    // Handle nested generics by taking the last part
+                    let schema = schema_name
+                        .split(',')
+                        .next_back()
+                        .unwrap_or(schema_name)
+                        .trim();
+                    if let Expr::Name(target_name) = &*ann_assign.target {
+                        self.variables.insert(
+                            target_name.id.to_string(),
+                            (schema.to_string(), current_line),
+                        );
                     }
                 }
-                return;
             }
+            return;
         }
 
         // Handle Annotated pattern
@@ -6359,14 +6323,13 @@ print(df["wrong_column"])
         // arrange
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-def load_users() -> PandasFrame[UserSchema]:
-    return PandasFrame.from_schema(pd.read_csv("users.csv"), UserSchema)
+def load_users() -> DataFrame[UserSchema]:
+    return pd.read_csv("users.csv")
 
 df = load_users()
 print(df["user_id"])
@@ -6465,14 +6428,13 @@ print(df["user_id"])
         // arrange
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-def load_users() -> PandasFrame[UserSchema]:
-    return PandasFrame.from_schema(pd.read_csv("users.csv"), UserSchema)
+def load_users() -> DataFrame[UserSchema]:
+    return pd.read_csv("users.csv")
 
 df = load_users()
 print(df["user_id"])
@@ -6754,13 +6716,12 @@ def g(df: pd.DataFrame) -> pd.DataFrame:
         // project index involved.
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     print(customers["email"])
 "#;
@@ -6803,14 +6764,13 @@ def load(path: str) -> pd.DataFrame:
             root.join("transforms.py"),
             r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
     email = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     return customers
 "#,
@@ -6866,10 +6826,9 @@ class CustomerSchema(BaseSchema):
         )
         .unwrap();
         let transforms_source = r#"
-from typedframes.pandas import PandasFrame
 from schemas import CustomerSchema
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     print(customers["not_a_real_column"])
     return customers
@@ -8677,7 +8636,7 @@ print(df["missing"])
 
     #[test]
     fn test_extract_schema_from_annotation() {
-        let source = "x: PandasFrame[MySchema] = df";
+        let source = "x: DataFrame[MySchema] = df";
         let parsed = parse_module(source).unwrap();
         let stmt = &parsed.into_syntax().body[0];
         if let Stmt::AnnAssign(ann) = stmt {
@@ -8708,7 +8667,6 @@ x = 1
         // "Column 'assign' does not exist" — method names are not column accesses.
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserData(BaseSchema):
     user_id = Column(type=int)
@@ -8716,7 +8674,7 @@ class UserData(BaseSchema):
 
 import pandas as pd
 
-df: PandasFrame[UserData] = pd.read_csv("users.csv")
+df: DataFrame[UserData] = pd.read_csv("users.csv")
 augmented = df.assign(created_at="2024-01-01")
 print(augmented["user_id"])
 "#;
@@ -8731,15 +8689,15 @@ print(augmented["user_id"])
     fn test_should_validate_pl_col_in_select() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class OrderSchema(BaseSchema):
     order_id = Column(type=int)
     amount = Column(type=float)
 
-df: PolarsFrame[OrderSchema] = pl.read_csv("orders.csv")
+df: Annotated[pl.DataFrame, OrderSchema] = pl.read_csv("orders.csv")
 result = df.select(pl.col("amount"))
 bad = df.select(pl.col("revenue"))
 "#;
@@ -8760,15 +8718,15 @@ bad = df.select(pl.col("revenue"))
     fn test_should_validate_pl_col_in_filter() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-df: PolarsFrame[UserSchema] = pl.read_csv("users.csv")
+df: Annotated[pl.DataFrame, UserSchema] = pl.read_csv("users.csv")
 result = df.filter(pl.col("user_id") > 10)
 bad = df.filter(pl.col("username") == "alice")
 "#;
@@ -8788,15 +8746,15 @@ bad = df.filter(pl.col("username") == "alice")
     fn test_should_validate_pl_col_list_in_select() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class SalesSchema(BaseSchema):
     region = Column(type=str)
     revenue = Column(type=float)
 
-df: PolarsFrame[SalesSchema] = pl.read_csv("sales.csv")
+df: Annotated[pl.DataFrame, SalesSchema] = pl.read_csv("sales.csv")
 result = df.select([pl.col("region"), pl.col("revenue")])
 bad = df.select([pl.col("region"), pl.col("profit")])
 "#;
@@ -8816,15 +8774,16 @@ bad = df.select([pl.col("region"), pl.col("profit")])
     fn test_should_validate_bare_col_import() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
+import polars as pl
 from polars import col
 
 class ItemSchema(BaseSchema):
     item_id = Column(type=int)
     price = Column(type=float)
 
-df: PolarsFrame[ItemSchema] = None
+df: Annotated[pl.DataFrame, ItemSchema] = None
 result = df.select(col("price"))
 bad = df.select(col("cost"))
 "#;
@@ -8844,15 +8803,15 @@ bad = df.select(col("cost"))
     fn test_should_validate_chained_pl_col() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class StockSchema(BaseSchema):
     ticker = Column(type=str)
     close = Column(type=float)
 
-df: PolarsFrame[StockSchema] = pl.read_csv("stocks.csv")
+df: Annotated[pl.DataFrame, StockSchema] = pl.read_csv("stocks.csv")
 result = df.filter(pl.col("close").is_not_null())
 bad = df.filter(pl.col("open").is_not_null())
 "#;
@@ -8872,15 +8831,15 @@ bad = df.filter(pl.col("open").is_not_null())
     fn test_should_pass_valid_pl_col() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class MetricsSchema(BaseSchema):
     date = Column(type=str)
     value = Column(type=float)
 
-df: PolarsFrame[MetricsSchema] = pl.read_csv("metrics.csv")
+df: Annotated[pl.DataFrame, MetricsSchema] = pl.read_csv("metrics.csv")
 filtered = df.filter(pl.col("value") > 100)
 selected = df.select([pl.col("date"), pl.col("value")])
 "#;

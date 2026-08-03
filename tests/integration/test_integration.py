@@ -112,13 +112,12 @@ class ProductSchema(BaseSchema):
         # arrange
         loaders_source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-def load_users() -> PandasFrame[UserSchema]:
+def load_users() -> DataFrame[UserSchema]:
     pass
 """
         pipeline_source = """
@@ -152,14 +151,13 @@ print(df["wrong_column"])
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
     baz = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 a = df[["foo", "bar"]]
 _ = a["baz"]
 _ = a["foo"]
@@ -185,13 +183,12 @@ _ = a["foo"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 a = df[["foo", "missing"]]
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -214,12 +211,11 @@ a = df[["foo", "missing"]]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     col = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 filtered = df.filter(df["col"] == "x")
 _ = filtered["nonexistent"]
 """
@@ -243,13 +239,12 @@ _ = filtered["nonexistent"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
 
-df: PolarsFrame[MySchema] = PolarsFrame.from_schema(load(), MySchema)
+df: Annotated[pl.DataFrame, MySchema] = load()
 small = df.select(["foo"])
 _ = small["foo"]
 _ = small["bar"]
@@ -275,14 +270,13 @@ _ = small["bar"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
     baz = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 trimmed = df.drop(columns=["baz"])
 _ = trimmed["baz"]
 _ = trimmed["foo"]
@@ -308,13 +302,12 @@ _ = trimmed["foo"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 trimmed = df.drop(columns=["nonexistent"])
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -337,13 +330,12 @@ trimmed = df.drop(columns=["nonexistent"])
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     other = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 renamed = df.rename(columns={"foo": "bar"})
 _ = renamed["foo"]
 _ = renamed["bar"]
@@ -369,12 +361,11 @@ _ = renamed["bar"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     old = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 augmented = df.assign(new_col=1)
 _ = augmented["new_col"]
 _ = augmented["old"]
@@ -524,18 +515,17 @@ _ = df["revenue"]
             Path(temp_file).unlink()
 
     def test_should_not_warn_when_load_has_schema_annotation(self) -> None:
-        """Test that df: PandasFrame[MySchema] = pd.read_csv(...) does not emit untracked-dataframe."""
+        """Test that df: DataFrame[MySchema] = pd.read_csv(...) does not emit untracked-dataframe."""
         # arrange
         source = """
 import pandas as pd
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     a = Column(type=str)
     b = Column(type=int)
 
-df: PandasFrame[MySchema] = pd.read_csv("x.csv")
+df: DataFrame[MySchema] = pd.read_csv("x.csv")
 _ = df["a"]
 _ = df["c"]
 """
@@ -561,14 +551,13 @@ _ = df["c"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
     baz = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 a = df[["foo", "bar"]]
 b = a.filter(a["foo"] == "x")
 _ = b["foo"]
@@ -699,13 +688,12 @@ def process(path: str) -> None:
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     print(customers["email"])
 """
@@ -738,14 +726,13 @@ def load(path: str) -> pd.DataFrame:
 """
         transforms_source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
     email = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     return customers
 """
@@ -852,13 +839,12 @@ def preproc(df: pd.DataFrame) -> pd.DataFrame:
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class Schema(BaseSchema):
     a = Column(type=int)
     b = Column(type=int)
 
-def combine(df: PandasFrame[Schema]):
+def combine(df: DataFrame[Schema]):
     return df["a"] + df["bad"]
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -881,12 +867,11 @@ def combine(df: PandasFrame[Schema]):
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class Schema(BaseSchema):
     a = Column(type=int)
 
-def enrich(df: PandasFrame[Schema]):
+def enrich(df: DataFrame[Schema]):
     return df.assign(doubled=df["bad"] * 2)
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:

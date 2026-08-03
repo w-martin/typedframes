@@ -257,9 +257,10 @@ priority over body-scanning. This is more precise: it catches every column the f
 needs, not just the ones its body happens to subscript directly.
 
 ```python
-from typedframes.pandas import PandasFrame
+from typing import Annotated
+import pandas as pd
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: Annotated[pd.DataFrame, CustomerSchema]):
     print(customers["name"])
     # 'email' is declared on CustomerSchema but never subscripted here directly —
     # it's still part of the contract, and accessing it inside the function is

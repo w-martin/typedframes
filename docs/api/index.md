@@ -10,6 +10,6 @@ at lint time.
 | [Schema Algebra](schema_algebra.md) | `combine_schemas`, `SchemaConflictError` — composing schemas |
 | [Pandera Integration](pandera.md) | `to_pandera_schema` — runtime validation bridge |
 | [Exceptions](exceptions.md) | `ColumnGroupError`, `MissingDependencyError` |
-| [pandas](pandas.md) | `PandasFrame` — runtime enhancement (advanced) |
-| [polars](polars.md) | `PolarsFrame` — runtime enhancement (advanced) |
+| [pandas](pandas.md) | `PandasFrame` — deprecated runtime enhancement |
+| [polars](polars.md) | `PolarsFrame` — deprecated alias |
 | [CLI](cli.md) | `typedframes check` command |

@@ -48,27 +48,31 @@ uv run ty check inference_example.py
 uv run typedframes check inference_example.py
 ```
 
-## pandasframe_example.py
+## annotated_pandas_example.py
 
 `Annotated[pd.DataFrame, Schema]` basics: string column access, descriptor
 `.s` for refactor-safe names, and intentional errors to show what the checker
-catches.
+catches. Plain `pd.DataFrame` throughout — no `PandasFrame` subclass involved,
+despite the similar-sounding older filename this replaces
+(`pandasframe_example.py`). `PandasFrame`/`PolarsFrame` are deprecated — see
+`docs/api/pandas.md`/`polars.md` for why — so this `Annotated[...]` form is the
+only pattern demonstrated going forward.
 
 ```shell
-uv run mypy --config-file mypy_empty.ini --strict pandasframe_example.py
-uv run ty check pandasframe_example.py
-uv run typedframes check pandasframe_example.py
+uv run mypy --config-file mypy_empty.ini --strict annotated_pandas_example.py
+uv run ty check annotated_pandas_example.py
+uv run typedframes check annotated_pandas_example.py
 ```
 
-## polarsframe_example.py
+## annotated_polars_example.py
 
 `Annotated[pl.DataFrame, Schema]` with validated `pl.col()` references, polars
 expressions via `Schema.col`, and intentional errors.
 
 ```shell
-uv run mypy --config-file mypy_empty.ini --strict polarsframe_example.py
-uv run ty check polarsframe_example.py
-uv run typedframes check polarsframe_example.py
+uv run mypy --config-file mypy_empty.ini --strict annotated_polars_example.py
+uv run ty check annotated_polars_example.py
+uv run typedframes check annotated_polars_example.py
 ```
 
 ## schema_algebra_example.py

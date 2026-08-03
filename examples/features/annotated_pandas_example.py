@@ -1,4 +1,9 @@
-"""Pandas example — Annotated type annotation with column validation."""
+"""Pandas example — Annotated type annotation with column validation.
+
+Plain `pd.DataFrame` throughout — no `PandasFrame` subclass involved. `PandasFrame`
+is deprecated (see `docs/api/pandas.md`); `Annotated[pd.DataFrame, Schema]` is the
+only supported pattern going forward.
+"""
 
 from typing import Annotated
 

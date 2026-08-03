@@ -14,7 +14,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_detect_missing_column(self) -> None:
         """Test that the checker detects missing columns."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -25,7 +25,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_suggest_typo_correction(self) -> None:
         """Test that the checker suggests corrections for typos."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -36,7 +36,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_catch_polars_column_errors(self) -> None:
         """Test that the checker catches column errors in polars examples."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -47,7 +47,7 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
     def test_should_run_via_python_extension(self) -> None:
         """Test that the Rust checker works via Python extension."""
         # arrange
-        example_file = str(Path("examples/typedframes_example.py").absolute())
+        example_file = str(Path("examples/features/typedframes_example.py").absolute())
 
         # act
         result = check_file(example_file)
@@ -112,13 +112,12 @@ class ProductSchema(BaseSchema):
         # arrange
         loaders_source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-def load_users() -> PandasFrame[UserSchema]:
+def load_users() -> DataFrame[UserSchema]:
     pass
 """
         pipeline_source = """
@@ -139,24 +138,26 @@ print(df["wrong_column"])
             result = check_file(str(root / "pipeline.py"), index_bytes)
             errors = json.loads(result)["errors"]
 
-            # assert
+            # assert -- wrong_column is flagged; user_id is never flagged as its own
+            # error (it may legitimately appear inside wrong_column's own "available
+            # columns" listing, which is the point of that listing)
             messages = [e["message"] for e in errors]
             self.assertTrue(any("wrong_column" in m for m in messages))
-            self.assertFalse(any("user_id" in m for m in messages))
+            self.assertFalse(any("'user_id' does not exist" in m for m in messages))
+            self.assertEqual(len(errors), 1)
 
     def test_should_infer_columns_from_multi_column_subscript(self) -> None:
         """Test that a = df[["foo", "bar"]] creates an inferred schema and enforces it."""
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
     baz = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 a = df[["foo", "bar"]]
 _ = a["baz"]
 _ = a["foo"]
@@ -182,13 +183,12 @@ _ = a["foo"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 a = df[["foo", "missing"]]
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -211,12 +211,11 @@ a = df[["foo", "missing"]]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     col = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 filtered = df.filter(df["col"] == "x")
 _ = filtered["nonexistent"]
 """
@@ -240,13 +239,12 @@ _ = filtered["nonexistent"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
 
-df: PolarsFrame[MySchema] = PolarsFrame.from_schema(load(), MySchema)
+df: Annotated[pl.DataFrame, MySchema] = load()
 small = df.select(["foo"])
 _ = small["foo"]
 _ = small["bar"]
@@ -272,14 +270,13 @@ _ = small["bar"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
     baz = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 trimmed = df.drop(columns=["baz"])
 _ = trimmed["baz"]
 _ = trimmed["foo"]
@@ -305,13 +302,12 @@ _ = trimmed["foo"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 trimmed = df.drop(columns=["nonexistent"])
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -334,13 +330,12 @@ trimmed = df.drop(columns=["nonexistent"])
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     other = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 renamed = df.rename(columns={"foo": "bar"})
 _ = renamed["foo"]
 _ = renamed["bar"]
@@ -366,12 +361,11 @@ _ = renamed["bar"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     old = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 augmented = df.assign(new_col=1)
 _ = augmented["new_col"]
 _ = augmented["old"]
@@ -444,19 +438,94 @@ df = pd.read_csv("x.csv")
         finally:
             Path(temp_file).unlink()
 
+    def test_should_infer_columns_from_read_sql_select_list(self) -> None:
+        """Test that pd.read_sql infers columns from a literal SELECT list."""
+        # arrange
+        source = """
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+_ = df["order_id"]
+_ = df["revenue"]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)["errors"]
+
+            # assert — "revenue" not in the SELECT list, "order_id" is fine
+            messages = [e["message"] for e in errors]
+            self.assertTrue(any("revenue" in m for m in messages))
+            self.assertFalse(any("'order_id' does not exist" in m for m in messages))
+        finally:
+            Path(temp_file).unlink()
+
+    def test_should_fold_sql_column_case_per_configured_dialect(self) -> None:
+        """Test that sql_dialect in pyproject.toml folds identifier case for read_sql."""
+        # arrange
+        pipeline_source = """
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id FROM orders", conn)
+_ = df["order_id"]
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pipeline.py").write_text(pipeline_source)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nsql_dialect = "snowflake"\n')
+
+            # act
+            result = check_file(str(root / "pipeline.py"), None)
+            errors = json.loads(result)["errors"]
+
+            # assert — Snowflake upper-cases unquoted identifiers, so the query's own
+            # lowercase spelling is a real bug, not a false positive to suppress
+            messages = [e["message"] for e in errors]
+            self.assertTrue(any("order_id" in m and "ORDER_ID" in m for m in messages))
+
+    def test_should_trace_sql_through_a_single_assigned_variable(self) -> None:
+        """Test that a query kept in a constant resolves the same as an inline literal."""
+        # arrange
+        source = """
+import pandas as pd
+
+QUERY = "SELECT order_id, amount FROM orders"
+df = pd.read_sql(QUERY, conn)
+_ = df["order_id"]
+_ = df["revenue"]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(source)
+            temp_file = f.name
+
+        try:
+            # act
+            result = check_file(temp_file, None)
+            errors = json.loads(result)["errors"]
+
+            # assert
+            messages = [e["message"] for e in errors]
+            self.assertTrue(any("revenue" in m for m in messages))
+            self.assertFalse(any("'order_id' does not exist" in m for m in messages))
+        finally:
+            Path(temp_file).unlink()
+
     def test_should_not_warn_when_load_has_schema_annotation(self) -> None:
-        """Test that df: PandasFrame[MySchema] = pd.read_csv(...) does not emit untracked-dataframe."""
+        """Test that df: DataFrame[MySchema] = pd.read_csv(...) does not emit untracked-dataframe."""
         # arrange
         source = """
 import pandas as pd
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     a = Column(type=str)
     b = Column(type=int)
 
-df: PandasFrame[MySchema] = pd.read_csv("x.csv")
+df: DataFrame[MySchema] = pd.read_csv("x.csv")
 _ = df["a"]
 _ = df["c"]
 """
@@ -482,14 +551,13 @@ _ = df["c"]
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class MySchema(BaseSchema):
     foo = Column(type=str)
     bar = Column(type=str)
     baz = Column(type=str)
 
-df: PandasFrame[MySchema] = PandasFrame.from_schema(load(), MySchema)
+df: DataFrame[MySchema] = load()
 a = df[["foo", "bar"]]
 b = a.filter(a["foo"] == "x")
 _ = b["foo"]
@@ -620,13 +688,12 @@ def process(path: str) -> None:
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     print(customers["email"])
 """
@@ -659,14 +726,13 @@ def load(path: str) -> pd.DataFrame:
 """
         transforms_source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
     email = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     return customers
 """
@@ -773,13 +839,12 @@ def preproc(df: pd.DataFrame) -> pd.DataFrame:
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class Schema(BaseSchema):
     a = Column(type=int)
     b = Column(type=int)
 
-def combine(df: PandasFrame[Schema]):
+def combine(df: DataFrame[Schema]):
     return df["a"] + df["bad"]
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -802,12 +867,11 @@ def combine(df: PandasFrame[Schema]):
         # arrange
         source = """
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class Schema(BaseSchema):
     a = Column(type=int)
 
-def enrich(df: PandasFrame[Schema]):
+def enrich(df: DataFrame[Schema]):
     return df.assign(doubled=df["bad"] * 2)
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:

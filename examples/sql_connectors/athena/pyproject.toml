@@ -1,0 +1,22 @@
+[project]
+name = "athena-connector-example"
+version = "0.1.0"
+description = "Runnable typedframes example: SQL column inference against AWS Athena"
+requires-python = ">=3.11"
+dependencies = [
+    "pyathena>=3.9",
+    "pandas>=2.0",
+    "boto3>=1.34",
+]
+
+[dependency-groups]
+dev = [
+    "typedframes[mypy]",
+    "moto[athena,s3]>=5.0",
+]
+
+[tool.uv.sources]
+typedframes = { path = "../../..", editable = true }
+
+[tool.typedframes]
+enabled = true

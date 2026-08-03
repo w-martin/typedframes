@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.3.1) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.4.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > schema validation over production-grade stability.
 >
@@ -110,7 +110,7 @@ typedframes check src/
 # ✗ Found 1 error in 12 files (0.0s)
 ```
 
-See [`examples/multi_file_inference/`](examples/multi_file_inference/) for a multi-file example with no `BaseSchema`
+See [`examples/features/multi_file_inference/`](examples/features/multi_file_inference/) for a multi-file example with no `BaseSchema`
 classes at all.
 
 ### Define Your Schema (Once)
@@ -221,24 +221,25 @@ print(augmented["created_at"])  # ✓ OK
 
 ### Inference Gaps and Warnings
 
-**untracked-dataframe — unannotated data ingestion (off by default)**
+**untracked-dataframe — unannotated data ingestion (on by default)**
 
-By default, typedframes supports permissive Exploratory Data Analysis (EDA). When a DataFrame is loaded
-via `pd.read_csv()` without `usecols=` or a schema annotation, the checker assumes an *Unknown* state
-and bypasses strict column validation to avoid nagging you during discovery.
+When a DataFrame is loaded via `pd.read_csv()` without `usecols=` or a schema annotation, the checker
+assumes an *Unknown* state, bypasses strict column validation on it (to avoid false positives on columns
+it simply can't see), and flags the load itself as a warning-level diagnostic.
 
-To lock down production CI/CD pipelines, opt in to `untracked-dataframe` warnings with `--strict-ingest`:
+For permissive Exploratory Data Analysis (EDA) work where you don't want that noise yet, downgrade it to
+a quiet info-level note with `--lenient-ingest`:
 
 ```shell
-typedframes check src/ --strict-ingest
+typedframes check src/ --lenient-ingest
 ```
 
-With strict ingestion enabled, loading a DataFrame without a schema or `usecols=` produces:
+By default, loading a DataFrame without a schema or `usecols=` produces:
 
 ```python
 df = pd.read_csv("users.csv")
-# ⚠ untracked-dataframe: columns unknown at lint time; specify `usecols`/`columns` or
-#   annotate: `df: Annotated[pd.DataFrame, MySchema] = pd.read_csv(...)`
+# ⚠ untracked-dataframe: columns unknown at lint time; specify `usecols`/`columns`, or
+#   annotate the variable's type, e.g. `df: Annotated[pd.DataFrame, MySchema] = pd.read_csv(...)`
 ```
 
 Fix option 1 — annotate with a schema:
@@ -305,13 +306,28 @@ Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
 
 ### See Also
 
-- [`examples/inference_example.py`](examples/inference_example.py) — single-file walkthrough of all four inference
+- [`examples/features/inference_example.py`](examples/features/inference_example.py) — single-file walkthrough of all four inference
   scenarios with annotated ✓/✗ comments.
-- [`examples/multi_file_inference/`](examples/multi_file_inference/) — multi-file project checked with
-  `typedframes check examples/multi_file_inference/`; no `BaseSchema` anywhere. Includes a function
+- [`examples/features/multi_file_inference/`](examples/features/multi_file_inference/) — multi-file project checked with
+  `typedframes check examples/features/multi_file_inference/`; no `BaseSchema` anywhere. Includes a function
   parameter contract violation caught at the call site (`missing-column`).
-- [`examples/multi_file_with_schema/`](examples/multi_file_with_schema/) — same scenario with `BaseSchema`
+- [`examples/features/multi_file_with_schema/`](examples/features/multi_file_with_schema/) — same scenario with `BaseSchema`
   classes; the checker follows schemas across module boundaries via the project index.
+- SQL / data-warehouse column inference — the column set is inferred from a query's `SELECT` list instead of
+  `usecols=`/`columns=`, including tracing the query back through a single-assignment variable or a `.sql` file,
+  and dialect-aware identifier case folding (`sql_dialect` in `pyproject.toml` — see [Project-level
+  configuration](docs/api/cli.md#project-level-configuration)):
+  [`examples/sql_connectors/snowflake/`](examples/sql_connectors/snowflake/), [`examples/sql_connectors/bigquery/`](examples/sql_connectors/bigquery/),
+  [`examples/sql_connectors/athena/`](examples/sql_connectors/athena/), [`examples/sql_connectors/redshift/`](examples/sql_connectors/redshift/),
+  [`examples/sql_connectors/databricks/`](examples/sql_connectors/databricks/), [`examples/sql_connectors/pyspark/`](examples/sql_connectors/pyspark/),
+  [`examples/sql_connectors/duckdb/`](examples/sql_connectors/duckdb/), [`examples/sql_connectors/connectorx/`](examples/sql_connectors/connectorx/),
+  [`examples/sql_connectors/sqlalchemy/`](examples/sql_connectors/sqlalchemy/) (Core `select()` and declarative models, not just raw SQL text),
+  [`examples/sql_connectors/feast/`](examples/sql_connectors/feast/) (feature-store retrieval, registered as an *open* schema since
+  `entity_df`'s own columns aren't enumerable in general), and
+  [`examples/sql_connectors/azure_synapse/`](examples/sql_connectors/azure_synapse/) (Azure's closest analog to Athena, including T-SQL's
+  `[bracket-quoted]` identifier convention). A wrapper function that case-folds a connector's result before
+  returning it (`.rename(columns=str.lower)`, `df.columns = df.columns.str.lower()`) is traced cross-file
+  too — see [docs/usage.md's "Supported column-set transforms"](docs/usage.md#supported-column-set-transforms).
 
 ---
 
@@ -417,17 +433,17 @@ code reference.
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-07-13 · Darwin 25.5.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
+*2026-08-01 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
 
 | Tool | Version | What it does | typedframes (13 files) | great_expectations (482 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.3.1 | DataFrame column checker | 43ms ±668µs | 213ms ±4ms |
-| ruff | 0.15.21 | Linter (no type checking) | 26ms ±1ms | 193ms ±2ms |
-| ty | 0.0.58 | Type checker | 72ms ±3ms | 181ms ±9ms |
-| pyrefly | 1.1.1 | Type checker | 107ms ±4ms | 557ms ±16ms |
-| mypy | 2.2.0 | Type checker (no plugin) | 2.77s ±41ms | 4.21s ±71ms |
-| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.78s ±34ms | 4.48s ±63ms |
-| pyright | 1.1.411 | Type checker | 743ms ±8ms | 3.34s ±43ms |
+| typedframes | 0.4.0 | DataFrame column checker | 45ms ±2ms (IQR 3ms) | 202ms ±1ms (IQR 2ms) |
+| ruff | 0.15.21 | Linter (no type checking) | 29ms ±2ms (IQR 3ms) | 193ms ±2ms (IQR 4ms) |
+| ty | 0.0.58 | Type checker | 73ms ±2ms (IQR 3ms) | 183ms ±9ms (IQR 17ms) |
+| pyrefly | 1.1.1 | Type checker | 108ms ±2ms (IQR 3ms) | 559ms ±15ms (IQR 25ms) |
+| mypy | 2.2.0 | Type checker (no plugin) | 2.85s ±51ms (IQR 58ms) | 4.23s ±65ms (IQR 95ms) |
+| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.86s ±35ms (IQR 38ms) | 4.41s ±48ms (IQR 54ms) |
+| pyright | 1.1.411 | Type checker | 714ms ±13ms (IQR 22ms) | 3.28s ±51ms (IQR 52ms) |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -627,7 +643,7 @@ merged: Annotated[pd.DataFrame, UserOrders] = users.merge(orders, on=UserPublic.
 
 Overlapping columns with the same type are allowed (common after merges). Conflicting types raise `SchemaConflictError`.
 
-See [`examples/schema_algebra_example.py`](examples/schema_algebra_example.py) for a complete walkthrough.
+See [`examples/features/schema_algebra_example.py`](examples/features/schema_algebra_example.py) for a complete walkthrough.
 
 ---
 
@@ -640,7 +656,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.3.1                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
+| **Version tested**              | 0.4.0                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
@@ -1039,7 +1055,7 @@ calls give it enough information to validate column access and propagate that kn
 (`rename`, `drop`, `assign`, `select`, …). `BaseSchema` is a progressive enhancement that unlocks cross-file
 awareness (schemas travel with function return types across module boundaries) and IDE autocomplete via
 descriptors — but the checker catches real column errors from day one without it. See
-[`examples/multi_file_inference/`](examples/multi_file_inference/) for a complete demo with no schema classes.
+[`examples/features/multi_file_inference/`](examples/features/multi_file_inference/) for a complete demo with no schema classes.
 
 **Q: Does this work with existing pandas/polars code?**
 A: Yes. You can gradually adopt typedframes by adding schemas to new code. Existing code continues to work.

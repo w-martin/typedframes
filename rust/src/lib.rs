@@ -30,7 +30,10 @@
 //! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
 //! after all errors have been collected.
 
+mod sql;
+
 use pyo3::prelude::*;
+use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, SourceCode};
@@ -67,16 +70,56 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
 
     let mut linter = Linter::new();
+    linter.with_context(project_root.clone(), &config);
 
+    // Diagnostics resolved at a call site in THIS file, targeting a function elsewhere
+    // whose parameter governs a Feast features= call — see
+    // resolve_param_governed_call_sites. Collected before check_file_internal runs so
+    // they can be merged into its own diagnostics below. Kept across the whole
+    // function (not just this block) since resolved_governed is also needed AFTER
+    // check_file_internal runs, to decide which of THIS file's own intra-function
+    // warnings are now stale.
+    let mut call_site_errors: Vec<LintError> = Vec::new();
+    let mut index: Option<Arc<ProjectIndex>> = None;
     if let Some(bytes) = index_bytes {
-        if let Some(index) = get_cached_index(&bytes) {
-            linter.load_cross_file_symbols(&index, &source, path, &project_root);
+        if let Some(idx) = get_cached_index(&bytes) {
+            linter.load_cross_file_symbols(&idx, &source, path, &project_root);
+            if let Some(extra) = idx.call_site_errors.get(&file_path) {
+                call_site_errors = extra.clone();
+            }
+            index = Some(idx);
         }
     }
 
     let mut errors = linter
         .check_file_internal(&source, path)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    // Retract THIS file's own intra-function untracked-dataframe warnings for any
+    // function that at least one call site anywhere in the project was actually SEEN
+    // for — see ProjectIndex.resolved_governed's doc comment for why this can't just
+    // happen unconditionally whenever a function has the param-governed shape (a
+    // function with no discoverable call site anywhere has nowhere else to put the
+    // diagnostic, so it would be wrong to silently drop its only one). A seen call
+    // site that failed to resolve gets its own untracked-dataframe diagnostic at the
+    // call site instead — see check_governed_call_site.
+    if let Some(index) = &index {
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
+    }
+
+    errors.extend(call_site_errors);
+    errors.sort_by_key(|e| (e.line, e.col));
 
     if !config.warnings.unwrap_or(true) {
         errors.retain(|e| e.severity != "warning");
@@ -158,11 +201,45 @@ struct ToolConfig {
 }
 
 // `[tool.typedframes]` configuration block.
-// All fields are optional; absent keys default to `true`.
+// All fields are optional; absent keys default as documented on each field.
 #[derive(serde::Deserialize)]
-struct LinterConfig {
+pub struct LinterConfig {
     enabled: Option<bool>,  // default: true
     warnings: Option<bool>, // default: true
+    // Dialect name used to fold unquoted SQL identifier case when inferring columns
+    // from a literal SELECT list (e.g. "snowflake", "postgres", "bigquery"). Unknown or
+    // absent values fall back to `SqlDialect::Generic` (no folding) — see
+    // `SqlDialect::from_config_str`.
+    sql_dialect: Option<String>,
+    // Explicit allowlist of installed (non-project) package names whose own
+    // Annotated[...]/BaseSchema declarations and recognized transform patterns should
+    // be indexed the same way first-party files are -- e.g. an internal company
+    // package that wraps a SQL connector. Resolved from the project's own auto-detected
+    // `.venv` site-packages directory (see `find_site_packages_dir`); no editable-install
+    // support and no path override in this version. Deliberately an explicit allowlist
+    // rather than indexing all of site-packages, which would be both expensive and a
+    // much larger, unbounded trust surface.
+    trace_external_packages: Option<Vec<String>>,
+    // Directory names to prune when collecting `.py` files. When set, REPLACES the
+    // built-in default set (`DEFAULT_EXCLUDED_DIRS` -- `.git`, `.venv`, `node_modules`,
+    // `__pycache__`, `.claude`, etc.) entirely rather than adding to it, matching
+    // ruff's own `exclude` (as opposed to `extend-exclude`, which this checker doesn't
+    // have a separate option for) -- an explicit `exclude = []` means "prune nothing
+    // at all", a deliberate override, not "nothing configured". Matches by bare
+    // directory name, not a path/glob pattern. The Python CLI's own file collector
+    // (`_collect_python_files` in cli.py) reads this same key independently via
+    // `tomllib`, so both collectors stay in sync from one config value.
+    exclude: Option<Vec<String>>,
+}
+
+impl LinterConfig {
+    const EMPTY: Self = Self {
+        enabled: None,
+        warnings: None,
+        sql_dialect: None,
+        trace_external_packages: None,
+        exclude: None,
+    };
 }
 
 // Read `[tool.typedframes]` from `pyproject.toml` at `project_root`.
@@ -171,39 +248,23 @@ struct LinterConfig {
 fn load_linter_config(project_root: &Path) -> LinterConfig {
     let config_path = project_root.join("pyproject.toml");
     if !config_path.exists() {
-        return LinterConfig {
-            enabled: None,
-            warnings: None,
-        };
+        return LinterConfig::EMPTY;
     }
 
     let content = match fs::read_to_string(config_path) {
         Ok(c) => c,
-        Err(_) => {
-            return LinterConfig {
-                enabled: None,
-                warnings: None,
-            }
-        }
+        Err(_) => return LinterConfig::EMPTY,
     };
 
     let config: Config = match toml::from_str(&content) {
         Ok(c) => c,
-        Err(_) => {
-            return LinterConfig {
-                enabled: None,
-                warnings: None,
-            }
-        }
+        Err(_) => return LinterConfig::EMPTY,
     };
 
     config
         .tool
         .and_then(|t| t.typedframes)
-        .unwrap_or(LinterConfig {
-            enabled: None,
-            warnings: None,
-        })
+        .unwrap_or(LinterConfig::EMPTY)
 }
 
 /// Return `true` if the linter is enabled for `project_root` (default: `true`).
@@ -267,14 +328,26 @@ struct IndexFunction {
     // resolve_param_schema_requires, must not be serialised into ProjectIndex.
     #[serde(skip)]
     param_schema_name: String,
+    // A parameter that governs a recognized Feast features= call inside this function's
+    // body — see ParamGovernedTemplate. `#[serde(skip)]`: consumed entirely within
+    // build_index_internal by resolve_param_governed_call_sites, which produces the
+    // (per-call-site) diagnostics that actually get serialised into ProjectIndex; this
+    // template itself never needs to survive past that, same reasoning as `delegates`
+    // and `param_schema_name` above.
+    #[serde(skip)]
+    param_governed: Option<ParamGovernedTemplate>,
 }
 
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
 #[derive(Serialize, Deserialize)]
 struct IndexEntry {
     schemas: HashMap<String, Vec<String>>, // schema name -> column list
+    // Named schema name -> (file it's defined in, definition line) -- see Linter's
+    // own `schema_locations` field for why this is tracked separately from `schemas`.
+    #[serde(default)]
+    schema_locations: HashMap<String, (String, usize)>,
     functions: HashMap<String, IndexFunction>, // function name -> return type info
-    exports: Vec<String>,                  // names in __all__, for wildcard-import resolution
+    exports: Vec<String>,                      // names in __all__, for wildcard-import resolution
     imports: HashMap<String, String>, // imported name -> dotted module it came from (`from X import Y`)
     // Local alias -> dotted module name, from plain `import module [as alias]`
     // statements. Lets resolve_delegate_target and load_cross_file_symbols follow
@@ -299,6 +372,33 @@ struct ProjectIndex {
     // own file nor the one importing it — so this must stay project-wide rather than
     // scoped to a single IndexEntry.
     all_schemas: HashMap<String, Vec<String>>,
+    // Project-wide schema name -> (file its class is defined in, definition line),
+    // unioned the same way as `all_schemas` above and for the same reason -- see
+    // Linter's own `schema_locations` field.
+    #[serde(default)]
+    all_schema_locations: HashMap<String, (String, usize)>,
+    // Diagnostics resolved at the *call site*, keyed by the calling file's absolute
+    // path — populated once, project-wide, by resolve_param_governed_call_sites, and
+    // spliced into a file's own diagnostics by check_file when that file is checked.
+    // Attributing these to the call site (rather than the access line inside the
+    // callee's own body, which stays one caller-independent AST location) is what lets
+    // two different callers passing two different literals for the same parameter
+    // resolve completely independently, instead of the callee's line needing two
+    // different diagnoses at once.
+    #[serde(default)]
+    call_site_errors: HashMap<String, Vec<LintError>>,
+    // (file, func_name) pairs where at least one call site project-wide was actually
+    // SEEN for a param-governed Feast call — regardless of whether that call site's
+    // argument resolved to a literal or not. Consulted by check_file to decide whether
+    // the intra-function untracked-dataframe warning register_feast_dataframe pushes
+    // for that same call is stale (retract it — the real answer, resolved or not,
+    // lives at the call sites now, each with its own diagnostic: OK, an unknown-column
+    // error, or its own untracked-dataframe info) or still the only real signal (leave
+    // it — no call site anywhere in the project was ever traced back to this function
+    // at all, e.g. a fully dynamic dispatch, so there's nowhere else to put the
+    // warning and it would be wrong to silently report nothing).
+    #[serde(default)]
+    resolved_governed: std::collections::HashSet<(String, String)>,
 }
 
 // Union schema name -> column list across every file's `schemas` map. First
@@ -316,12 +416,72 @@ fn compute_all_schemas(files: &HashMap<String, IndexEntry>) -> HashMap<String, V
     all_schemas
 }
 
+// Union schema name -> (file, definition line) across every file's `schema_locations`
+// map, mirroring compute_all_schemas -- a schema's class may live in a THIRD file,
+// neither the function's own file nor the one importing it, same reasoning as
+// `all_schemas` itself.
+fn compute_all_schema_locations(
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, (String, usize)> {
+    let mut all_schema_locations: HashMap<String, (String, usize)> = HashMap::new();
+    for entry in files.values() {
+        for (name, loc) in &entry.schema_locations {
+            all_schema_locations
+                .entry(name.clone())
+                .or_insert_with(|| loc.clone());
+        }
+    }
+    all_schema_locations
+}
+
 // ── Index helpers ──────────────────────────────────────────────────────────────
 
-// Recursively collect all `.py` files under `dir`, skipping hidden entries (`.venv`,
-// `.git`, etc.).  Uses an explicit stack rather than recursion to avoid stack overflow
-// on very deep trees.
-fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
+// Directories that should never be descended into when collecting `.py` files by
+// default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
+// trees. Mirrors ruff's default exclude list (and cli.py's own `_EXCLUDED_DIRS`,
+// which MUST be kept in sync with this) -- including ruff's own override semantics:
+// `[tool.typedframes] exclude` in pyproject.toml REPLACES this set entirely rather
+// than adding to it (see `collect_py_files`).
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+    ".bzr",
+    ".claude",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    ".idea",
+    "__pycache__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+];
+
+// Recursively collect all `.py` files under `dir`, skipping any name in
+// `resolved_excludes` -- the caller's job to resolve (see `build_index_internal`):
+// either `[tool.typedframes] exclude`'s configured list, replacing
+// `DEFAULT_EXCLUDED_DIRS` entirely, or `DEFAULT_EXCLUDED_DIRS` itself when nothing is
+// configured. Uses an explicit stack rather than recursion to avoid stack overflow on
+// very deep trees.
+fn collect_py_files(
+    dir: &Path,
+    resolved_excludes: &std::collections::HashSet<String>,
+) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -332,7 +492,7 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') {
+            if resolved_excludes.contains(name_str.as_ref()) {
                 continue;
             }
             if path.is_dir() {
@@ -345,17 +505,117 @@ fn collect_py_files(dir: &Path) -> Vec<PathBuf> {
     result
 }
 
+// Auto-detect a project's virtualenv site-packages directory, for resolving
+// explicitly allowlisted external packages (`trace_external_packages` config option).
+// Tries the conventional `.venv` layout on both Unix (`lib/pythonX.Y/site-packages`,
+// version-globbed since it depends on the interpreter the venv was created with) and
+// Windows (`Lib/site-packages`). No path override in this version — this is the
+// convention this project's own examples use (a `uv`-managed `.venv`); a project using
+// a differently-named or externally-managed environment simply won't resolve anything,
+// same as any other candidate path that doesn't exist.
+// Memoized because `resolve_module_file` — which calls this — runs once per import
+// statement across an entire project check, and the answer can never change within a
+// single process's lifetime (see INDEX_CACHE above for the same reasoning). Without
+// this, a large project with a real `.venv` would re-`read_dir` the same `lib/`
+// directory on every single import resolution, turning one cheap directory listing
+// into one per import statement in the whole project.
+static SITE_PACKAGES_CACHE: Mutex<Option<(PathBuf, Option<PathBuf>)>> = Mutex::new(None);
+
+fn find_site_packages_dir(project_root: &Path) -> Option<PathBuf> {
+    if let Ok(cache) = SITE_PACKAGES_CACHE.lock() {
+        if let Some((cached_root, result)) = cache.as_ref() {
+            if cached_root == project_root {
+                return result.clone();
+            }
+        }
+    }
+    let result = find_site_packages_dir_uncached(project_root);
+    if let Ok(mut cache) = SITE_PACKAGES_CACHE.lock() {
+        *cache = Some((project_root.to_path_buf(), result.clone()));
+    }
+    result
+}
+
+fn find_site_packages_dir_uncached(project_root: &Path) -> Option<PathBuf> {
+    let venv = project_root.join(".venv");
+    if !venv.is_dir() {
+        return None;
+    }
+    let windows_layout = venv.join("Lib").join("site-packages");
+    if windows_layout.is_dir() {
+        return Some(windows_layout);
+    }
+    let lib_dir = venv.join("lib");
+    let entries = fs::read_dir(&lib_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("python"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let candidate = path.join("site-packages");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// Collect `.py` files for each explicitly allowlisted external package (see
+// LinterConfig::trace_external_packages), resolved from the project's own
+// site-packages directory. Deliberately narrow: only the allowlisted packages' own
+// directories are walked — never the whole site-packages tree, which would be both
+// expensive and a far larger, unbounded trust surface than an explicit opt-in list.
+fn collect_external_package_files(project_root: &Path, config: &LinterConfig) -> Vec<PathBuf> {
+    let Some(packages) = config.trace_external_packages.as_ref() else {
+        return Vec::new();
+    };
+    if packages.is_empty() {
+        return Vec::new();
+    }
+    let Some(site_packages) = find_site_packages_dir(project_root) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for package in packages {
+        let package_dir = site_packages.join(package);
+        if package_dir.is_dir() {
+            // Never excludes anything here -- `exclude` is about pruning irrelevant
+            // project-local directories, not the internal structure of a package the
+            // user has explicitly opted into tracing.
+            result.extend(collect_py_files(
+                &package_dir,
+                &std::collections::HashSet::new(),
+            ));
+            continue;
+        }
+        let single_module = site_packages.join(format!("{package}.py"));
+        if single_module.is_file() {
+            result.push(single_module);
+        }
+    }
+    result
+}
+
 // Parse one `.py` file and extract its symbols into an IndexEntry.
 // Runs the linter in index mode (diagnostics discarded) to collect schemas and
 // functions, then separately parses `__all__` assignments and `from X import Y`
 // statements for wildcard-import support and delegate-target resolution respectively.
-fn index_file(path: &Path) -> Option<IndexEntry> {
+fn index_file(path: &Path, project_root: &Path, config: &LinterConfig) -> Option<IndexEntry> {
     let source = fs::read_to_string(path).ok()?;
 
     let mut linter = Linter::new();
+    linter.with_context(project_root.to_path_buf(), config);
     let _ = linter.check_file_internal(&source, path);
 
     let schemas = linter.schemas;
+    let schema_locations = linter.schema_locations;
     // Union function names across the return-schema, requires, delegates, and
     // param-schema-name maps — a function may appear in any subset of the four.
     let mut func_names: std::collections::BTreeSet<String> =
@@ -363,6 +623,8 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
     func_names.extend(linter.requires.keys().cloned());
     func_names.extend(linter.delegates.keys().cloned());
     func_names.extend(linter.param_schema_names.keys().cloned());
+    func_names.extend(linter.param_governed_templates.keys().cloned());
+    func_names.extend(linter.all_function_names.iter().cloned());
     let functions: HashMap<String, IndexFunction> = func_names
         .into_iter()
         .map(|name| {
@@ -378,6 +640,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
                 .get(&name)
                 .cloned()
                 .unwrap_or_default();
+            let param_governed = linter.param_governed_templates.get(&name).cloned();
             // def_line may only be known via param_schema_names if this function had
             // no direct requires/delegates of its own (see the gate in visit_stmt).
             let def_line = if def_line == 0 {
@@ -394,6 +657,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
                     def_line,
                     delegates,
                     param_schema_name,
+                    param_governed,
                 },
             )
         })
@@ -456,6 +720,7 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
 
     Some(IndexEntry {
         schemas,
+        schema_locations,
         functions,
         exports,
         imports,
@@ -465,22 +730,42 @@ fn index_file(path: &Path) -> Option<IndexEntry> {
 
 // Build a ProjectIndex by indexing every `.py` file under `project_root`.
 fn build_index_internal(project_root: &Path) -> ProjectIndex {
-    let py_files = collect_py_files(project_root);
+    // Loaded once and threaded into every per-file `Linter`, so index-time inference
+    // (this function) and check-time inference (`check_file`) agree on `sql_dialect` —
+    // a mismatch here would make a SQL-derived schema's columns differ depending on
+    // whether they were read from the cached project index or inferred fresh.
+    let config = load_linter_config(project_root);
+    // A configured `exclude` REPLACES DEFAULT_EXCLUDED_DIRS entirely -- it does not
+    // add to it (see collect_py_files's doc comment).
+    let resolved_excludes: std::collections::HashSet<String> = match &config.exclude {
+        Some(list) => list.iter().cloned().collect(),
+        None => DEFAULT_EXCLUDED_DIRS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let mut py_files = collect_py_files(project_root, &resolved_excludes);
+    py_files.extend(collect_external_package_files(project_root, &config));
     let mut files = HashMap::new();
     for file_path in py_files {
-        if let Some(entry) = index_file(&file_path) {
+        if let Some(entry) = index_file(&file_path, project_root, &config) {
             if let Some(path_str) = file_path.to_str() {
                 files.insert(path_str.to_string(), entry);
             }
         }
     }
     let all_schemas = compute_all_schemas(&files);
+    let all_schema_locations = compute_all_schema_locations(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
+    let governed = resolve_param_governed_call_sites(project_root, &files);
     ProjectIndex {
         version: 1,
         files,
         all_schemas,
+        all_schema_locations,
+        call_site_errors: governed.call_site_errors,
+        resolved_governed: governed.resolved_governed,
     }
 }
 
@@ -527,10 +812,17 @@ fn resolve_module_file(
     files: &HashMap<String, IndexEntry>,
 ) -> Option<String> {
     let mod_path = module_name.replace('.', "/");
-    let candidates = [
+    let mut candidates = vec![
         project_root.join(format!("{mod_path}.py")),
         project_root.join("src").join(format!("{mod_path}.py")),
     ];
+    // An explicitly allowlisted external package (see collect_external_package_files)
+    // is indexed into the same `files` map under its real site-packages path — these
+    // two extra candidates are how an import of it actually gets found.
+    if let Some(site_packages) = find_site_packages_dir(project_root) {
+        candidates.push(site_packages.join(format!("{mod_path}.py")));
+        candidates.push(site_packages.join(&mod_path).join("__init__.py"));
+    }
     candidates
         .iter()
         .filter_map(|p| p.to_str())
@@ -572,6 +864,271 @@ fn resolve_delegate_target(
         }
     }
     None
+}
+
+// Line/column for a source offset, without needing a full `Linter` instance — used by
+// resolve_param_governed_call_sites, which parses each file fresh outside any Linter's
+// own `check_file_internal` pass.
+fn compute_source_location(source: &str, offset: ruff_text_size::TextSize) -> (usize, usize) {
+    let line_index = LineIndex::from_source_text(source);
+    let source_code = SourceCode::new(source, &line_index);
+    let loc = source_code.line_column(offset);
+    (loc.line.get(), loc.column.get())
+}
+
+// Project-wide pass: for every function that `find_param_governed_feast_template`
+// found a template for, find every call site (anywhere in the project, at the same
+// statement-nesting depth `analyze_stmt_for_contract` already covers) and check it
+// against the template's recorded accesses — independently per call site, so two
+// callers passing different arguments for the same parameter get diagnosed (or not)
+// completely independently. A call site whose argument doesn't trace to a literal
+// (a variable with no traceable origin, a dynamically-built list, ...) gets its own
+// untracked-dataframe diagnostic right there, rather than falling back to the callee's
+// generic one — the callee's own shape is exactly as resolvable as any other governed
+// function; the ambiguity genuinely originates at the call site that couldn't produce
+// a literal, so that's where the diagnostic belongs.
+//
+// Diagnostics are returned keyed by the *calling* file's path — not the callee's file
+// — which is what lets this avoid ever needing two different diagnoses for the same
+// source line: the callee's own access line is one, single, caller-independent AST
+// location, and every different-per-caller outcome instead lives at that caller's own
+// (necessarily distinct) call-site location.
+struct GovernedCallSiteResult {
+    call_site_errors: HashMap<String, Vec<LintError>>,
+    resolved_governed: std::collections::HashSet<(String, String)>,
+}
+
+fn resolve_param_governed_call_sites(
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+) -> GovernedCallSiteResult {
+    let mut result = GovernedCallSiteResult {
+        call_site_errors: HashMap::new(),
+        resolved_governed: std::collections::HashSet::new(),
+    };
+    let has_any_governed = files
+        .values()
+        .any(|entry| entry.functions.values().any(|f| f.param_governed.is_some()));
+    if !has_any_governed {
+        return result;
+    }
+
+    for file_path in files.keys() {
+        let Ok(source) = fs::read_to_string(file_path) else {
+            continue;
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            continue;
+        };
+        let module = parsed.into_syntax();
+        scan_stmts_for_governed_calls(
+            &module.body,
+            file_path,
+            &source,
+            project_root,
+            files,
+            &mut result,
+        );
+    }
+    result
+}
+
+fn scan_stmts_for_governed_calls(
+    stmts: &[Stmt],
+    file_path: &str,
+    source: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    result: &mut GovernedCallSiteResult,
+) {
+    for stmt in stmts {
+        let call = match stmt {
+            Stmt::Expr(expr_stmt) => match &*expr_stmt.value {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            Stmt::Assign(assign) => match &*assign.value {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(call) = call {
+            check_governed_call_site(call, file_path, source, project_root, files, result);
+        }
+        match stmt {
+            Stmt::If(if_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &if_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    result,
+                );
+                for clause in &if_stmt.elif_else_clauses {
+                    scan_stmts_for_governed_calls(
+                        &clause.body,
+                        file_path,
+                        source,
+                        project_root,
+                        files,
+                        result,
+                    );
+                }
+            }
+            Stmt::For(for_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &for_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    result,
+                );
+            }
+            Stmt::While(while_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &while_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    result,
+                );
+            }
+            Stmt::With(with_stmt) => {
+                scan_stmts_for_governed_calls(
+                    &with_stmt.body,
+                    file_path,
+                    source,
+                    project_root,
+                    files,
+                    result,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_governed_call_site(
+    call: &ast::ExprCall,
+    file_path: &str,
+    source: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    result: &mut GovernedCallSiteResult,
+) {
+    let callee_name = match &*call.func {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(attr) => attr.attr.as_str(),
+        _ => return,
+    };
+    let Some((target_file, target_func)) =
+        resolve_delegate_target(file_path, callee_name, project_root, files)
+    else {
+        return;
+    };
+    let Some(func) = files
+        .get(&target_file)
+        .and_then(|e| e.functions.get(&target_func))
+    else {
+        return;
+    };
+    let Some(template) = &func.param_governed else {
+        return;
+    };
+
+    let arg_expr = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some(template.param_name.as_str()))
+        .map(|k| &k.value)
+        .or_else(|| call.arguments.args.get(template.param_index));
+    let Some(arg_expr) = arg_expr else {
+        return; // not passed at this call site (e.g. a default value) -- nothing to check
+    };
+    // A general lazy evaluator: a direct literal list, a literal/f-string built from an
+    // environment of substituted parameter values, or a call to another function --
+    // whose own argument expressions are evaluated in the CURRENT (empty, at the call
+    // site) environment, bound to the callee's parameters, and followed recursively
+    // through its first return statement, as many hops as needed with cycle
+    // protection. This is strictly more general than a zero-arg forward: a caller
+    // doesn't have to pass the literal directly, or even forward a zero-arg call --
+    // `helper("driver_stats")` is followed by substituting "driver_stats" for helper's
+    // own parameter and evaluating its f-string return with it.
+    let raw_items = eval_feast_list_expr(
+        arg_expr,
+        &HashMap::new(),
+        file_path,
+        project_root,
+        files,
+        &mut std::collections::HashSet::new(),
+    );
+    let resolved_cols = raw_items
+        .and_then(|raw| Linter::feast_columns_from_raw_items(&raw, template.full_feature_names));
+
+    // This call site is real -- it passes SOMETHING for the governed parameter, whether
+    // or not that something is traceable to a literal -- so the callee's own generic
+    // "columns unknown at lint time" framing is stale either way: either this call site
+    // resolves (validated right here, below), or it doesn't, in which case the SAME
+    // untracked-dataframe signal is reported HERE instead of inside the callee, since
+    // call-site tracing means this call site is where the real ambiguity actually
+    // originates -- the callee's own shape is exactly as resolvable as any other
+    // call-site-governed function, in the abstract. check_file consults this set either
+    // way to retract the callee's own line.
+    result
+        .resolved_governed
+        .insert((target_file.clone(), target_func.clone()));
+
+    let (line, col) = compute_source_location(source, call.range().start());
+
+    let Some(resolved_cols) = resolved_cols else {
+        result
+            .call_site_errors
+            .entry(file_path.to_string())
+            .or_default()
+            .push(LintError {
+                line,
+                col,
+                code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                message: format!(
+                    "columns unknown at lint time; the `{}` argument passed here isn't \
+                     a literal (or traceable to one), so column access inside '{}' can't \
+                     be validated for this call",
+                    template.param_name, target_func
+                ),
+                severity: "warning".to_string(),
+            });
+        return;
+    };
+
+    for access in &template.accesses {
+        if !resolved_cols.iter().any(|c| c == &access.column) {
+            result
+                .call_site_errors
+                .entry(file_path.to_string())
+                .or_default()
+                .push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNKNOWN_COLUMN.to_string(),
+                    message: format!(
+                        "Column '{}' does not exist for this call's resolved features {:?} \
+                     (accessed at {}:{}:{} inside '{}')",
+                        access.column,
+                        resolved_cols,
+                        target_file,
+                        access.line,
+                        access.col,
+                        target_func
+                    ),
+                    severity: "error".to_string(),
+                });
+        }
+    }
 }
 
 // Memoised DFS over the delegate graph: a function's fully resolved requirement set
@@ -651,6 +1208,209 @@ fn resolve_transitive_requires(project_root: &Path, files: &mut HashMap<String, 
             }
         }
     }
+}
+
+// General lazy evaluator for a feature-list-producing expression: a literal list, a
+// literal string/f-string built from an environment of substituted parameter values,
+// or a call to another function -- in which case the call's own argument expressions
+// are evaluated in the CURRENT environment, bound to the callee's parameter names, and
+// the callee's first return statement is evaluated recursively in that new
+// environment. This subsumes direct literals, zero-arg forwarding, AND argument
+// substitution in one general mechanism. `visiting` breaks cycles (mutually- or
+// self-delegating chains) the same way resolve_node_requires does elsewhere.
+fn eval_feast_list_expr(
+    expr: &Expr,
+    env: &HashMap<String, String>,
+    file: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    visiting: &mut std::collections::HashSet<FuncNode>,
+) -> Option<Vec<String>> {
+    match expr {
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .map(|e| eval_feast_string_expr(e, env))
+            .collect(),
+        Expr::Call(call) => eval_feast_call(call, env, file, project_root, files, visiting),
+        _ => None,
+    }
+}
+
+fn eval_feast_string_expr(expr: &Expr, env: &HashMap<String, String>) -> Option<String> {
+    match expr {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+        Expr::Name(n) => env.get(n.id.as_str()).cloned(),
+        Expr::FString(f) => eval_fstring_expr(f, env),
+        _ => None,
+    }
+}
+
+fn eval_fstring_expr(fstring: &ast::ExprFString, env: &HashMap<String, String>) -> Option<String> {
+    let mut result = String::new();
+    for part in fstring.value.as_slice() {
+        match part {
+            ast::FStringPart::Literal(lit) => result.push_str(&lit.value),
+            ast::FStringPart::FString(f) => {
+                for element in f.elements.iter() {
+                    match element {
+                        ast::InterpolatedStringElement::Literal(lit) => {
+                            result.push_str(&lit.value);
+                        }
+                        ast::InterpolatedStringElement::Interpolation(interp) => {
+                            if interp.conversion != ast::ConversionFlag::None
+                                || interp.format_spec.is_some()
+                            {
+                                return None;
+                            }
+                            let Expr::Name(name) = &*interp.expression else {
+                                return None;
+                            };
+                            result.push_str(env.get(name.id.as_str())?);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(result)
+}
+
+fn eval_feast_call(
+    call: &ast::ExprCall,
+    env: &HashMap<String, String>,
+    file: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    visiting: &mut std::collections::HashSet<FuncNode>,
+) -> Option<Vec<String>> {
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let callee_name = match &*call.func {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return None,
+    };
+    let (target_file, target_func) =
+        resolve_delegate_target(file, callee_name, project_root, files)?;
+    let node = (target_file.clone(), target_func.clone());
+    if visiting.contains(&node) {
+        return None;
+    }
+
+    let mut arg_values = Vec::with_capacity(call.arguments.args.len());
+    for arg in &call.arguments.args {
+        arg_values.push(eval_feast_string_expr(arg, env)?);
+    }
+
+    let source = fs::read_to_string(&target_file).ok()?;
+    let parsed = parse_module(&source).ok()?;
+    let module = parsed.into_syntax();
+    let func_def = find_function_def_by_name(&module.body, &target_func)?;
+
+    let param_names: Vec<String> = func_def
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(func_def.parameters.args.iter())
+        .map(|p| p.parameter.name.id.to_string())
+        .collect();
+    if param_names.len() != arg_values.len() {
+        return None;
+    }
+    let new_env: HashMap<String, String> = param_names.into_iter().zip(arg_values).collect();
+
+    let return_expr = find_first_return_expr(&func_def.body)?;
+
+    visiting.insert(node.clone());
+    let result = eval_feast_list_expr(
+        return_expr,
+        &new_env,
+        &target_file,
+        project_root,
+        files,
+        visiting,
+    );
+    visiting.remove(&node);
+    result
+}
+
+fn find_function_def_by_name<'a>(
+    stmts: &'a [Stmt],
+    name: &str,
+) -> Option<&'a ast::StmtFunctionDef> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::FunctionDef(f) if f.name.as_str() == name => return Some(f),
+            Stmt::If(if_stmt) => {
+                if let Some(f) = find_function_def_by_name(&if_stmt.body, name) {
+                    return Some(f);
+                }
+                for clause in &if_stmt.elif_else_clauses {
+                    if let Some(f) = find_function_def_by_name(&clause.body, name) {
+                        return Some(f);
+                    }
+                }
+            }
+            Stmt::For(for_stmt) => {
+                if let Some(f) = find_function_def_by_name(&for_stmt.body, name) {
+                    return Some(f);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                if let Some(f) = find_function_def_by_name(&while_stmt.body, name) {
+                    return Some(f);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                if let Some(f) = find_function_def_by_name(&with_stmt.body, name) {
+                    return Some(f);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_first_return_expr(stmts: &[Stmt]) -> Option<&Expr> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return(ret) => {
+                if let Some(v) = &ret.value {
+                    return Some(v);
+                }
+            }
+            Stmt::If(if_stmt) => {
+                if let Some(e) = find_first_return_expr(&if_stmt.body) {
+                    return Some(e);
+                }
+                for clause in &if_stmt.elif_else_clauses {
+                    if let Some(e) = find_first_return_expr(&clause.body) {
+                        return Some(e);
+                    }
+                }
+            }
+            Stmt::For(for_stmt) => {
+                if let Some(e) = find_first_return_expr(&for_stmt.body) {
+                    return Some(e);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                if let Some(e) = find_first_return_expr(&while_stmt.body) {
+                    return Some(e);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                if let Some(e) = find_first_return_expr(&with_stmt.body) {
+                    return Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -832,9 +1592,133 @@ const LOAD_FUNCTIONS: &[&str] = &[
     "scan_json",
     "scan_ndjson",
     "scan_ipc",
+    "read_database",
+    "read_database_uri",
+    "read_gbq",
 ];
 
 const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars"];
+
+// Load functions whose column set lives in a SQL SELECT list rather than a
+// usecols/columns/dtype/schema kwarg. `read_sql_table` is deliberately excluded: its
+// first positional argument is a table name, not SQL, so attempting to parse it as SQL
+// would just fail (harmlessly, but for the wrong reason) rather than being skipped
+// because we know better.
+const SQL_LOAD_FUNCTIONS: &[&str] = &[
+    "read_sql",
+    "read_sql_query",
+    "read_database",
+    "read_database_uri",
+    "read_gbq",
+];
+
+// Feast FeatureStore methods whose result eventually becomes a DataFrame via `.to_df()`
+// — either chained directly, or via an intermediate RetrievalJob/OnlineResponse
+// variable (the split form; see `retrieval_jobs`). Not gated on any particular receiver
+// name (e.g. `store`) — matched structurally by method name plus a literal `features=`
+// keyword, since the receiver is whatever variable the caller's FeatureStore happens to
+// be bound to.
+const FEAST_RETRIEVAL_METHODS: &[&str] = &["get_historical_features", "get_online_features"];
+
+// The `connectorx` package (conventionally imported `as cx`) exposes a `read_sql`
+// function with the SQL text as its SECOND positional argument
+// (`cx.read_sql(conn_uri, sql)`) — the reverse of pandas' `pd.read_sql(sql, conn)` —
+// so it needs its own argument-position handling rather than reusing
+// `extract_sql_literal`. Its own module list, separate from `LOAD_MODULES`
+// (pd/pl), since it isn't a DataFrame-library namespace itself.
+const CONNECTORX_MODULES: &[&str] = &["connectorx", "cx"];
+
+// DataFrame-materializing method that finalizes a connector call chain into an actual
+// DataFrame: google-cloud-bigquery's `.to_dataframe()`, PySpark/Databricks Connect's
+// `.toPandas()`, DuckDB's `.df()`/`.pl()`. Only dispatches when the call it's chained
+// onto is confirmed to be one of `SQL_PRODUCING_METHODS` — see
+// `sql_producing_call_args`, and its call sites for why "any receiver's `.df()`" isn't
+// enough on its own (that name in particular is common and unrelated most of the time).
+const SQL_FINALIZE_METHODS: &[&str] = &["to_dataframe", "toPandas", "df", "pl"];
+
+// Methods/bare functions whose first positional (or `sql=`/`query=` keyword) argument
+// is SQL text, chained into one of `SQL_FINALIZE_METHODS`: `client.query(sql)`
+// (BigQuery), `spark.sql(sql)`/`session.sql(sql)` (PySpark/Databricks Connect),
+// `duckdb.sql(sql)`/`duckdb.query(sql)`.
+const SQL_PRODUCING_METHODS: &[&str] = &["query", "sql"];
+
+// Which family of load a call belongs to — used only to phrase the
+// `untracked-dataframe` hint appropriately when extraction fails. Not persisted anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    File,
+    Sql,
+    // A SQLAlchemy Core `select(...)` statement (or a `Name` bound to one) rather than
+    // SQL text — see `extract_orm_select_columns`.
+    Orm,
+}
+
+// A recognized case-fold of an *already-known* column set — e.g. a connector-specific
+// package that queries Snowflake (columns come back upper-cased, per `sql_dialect`
+// folding) and then lower-cases them all before returning. Deliberately narrow: this
+// matches two specific, literal AST shapes (`.rename(columns=str.lower)` /
+// `df.columns = df.columns.str.lower()`, and their `.upper()` counterparts) rather
+// than attempting to evaluate arbitrary user-defined transform functions, which is not
+// possible in general for a static checker — any custom function (`my_pkg.normalize`,
+// a lambda, anything data-dependent) is invisible to this and passes the base schema
+// through unchanged, neither erroring nor folding it. See docs/usage.md's "Supported
+// column-set transforms" section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseFold {
+    Lower,
+    Upper,
+}
+
+impl CaseFold {
+    fn apply(self, s: &str) -> String {
+        match self {
+            CaseFold::Lower => s.to_lowercase(),
+            CaseFold::Upper => s.to_uppercase(),
+        }
+    }
+}
+
+// A function parameter that, when a caller passes a *literal* argument for it, lets the
+// checker resolve a Feast `features=<param>` call inside this function's body and
+// validate the specific column accesses the body makes on its result — independently
+// per call site, since different callers can pass different (or no) literal for the
+// same parameter. Detected by `find_param_governed_feast_template`, consumed by
+// `resolve_param_governed_call_sites` — see that function's doc comment for how a
+// diagnostic ends up attributed to the *call site* rather than the access line inside
+// this function's own body (which stays a single, caller-independent AST location).
+//
+// Deliberately narrow, matching this checker's general philosophy for anything
+// heuristic: only the *chained* Feast form (`df = store.get_historical_features(...,
+// features=<param>).to_df()`) as a direct statement in the function's own top-level
+// body is recognized — not the split form (`job = store.get_...(...)`), not a
+// parameter buried in nested control flow, and not SQL-text-argument governance (a
+// parameter feeding `pd.read_sql(<param>, conn)` and similar). Extending to those is
+// possible but not implemented here.
+#[derive(Debug, Clone)]
+struct ParamGovernedTemplate {
+    param_name: String,
+    // Index among posonlyargs+args (kwonlyargs excluded — those can't be passed
+    // positionally at a call site) so a call site matching by position, not just by
+    // keyword, still resolves.
+    param_index: usize,
+    full_feature_names: bool,
+    accesses: Vec<ParamGovernedAccess>,
+    // Position of the governing `df = store.get_...(...).to_df()` statement itself —
+    // used only to remove the untracked-dataframe warning `register_feast_dataframe`
+    // already pushed for it during the normal body walk (which runs before this
+    // template is even detected). That local, in-isolation "columns unknown at lint
+    // time" framing is simply wrong once we know this call is resolvable by tracing
+    // callers — the real answer moved to the call sites, not "unknown".
+    governing_line: usize,
+    governing_col: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ParamGovernedAccess {
+    line: usize,
+    col: usize,
+    column: String,
+}
 
 const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "filter",
@@ -923,7 +1807,7 @@ struct CheckFileResult {
     stats: FileStats,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LintError {
     /// 1-indexed source line.
     pub line: usize,
@@ -968,6 +1852,13 @@ pub struct Linter {
     variables: HashMap<String, (String, usize)>, // var_name -> (schema_name, defined_at_line)
     functions: HashMap<String, String>,          // func_name -> schema_name (from return type)
     schema_origins: HashMap<String, String>,     // inferred schema name -> "func (path:line)"
+    // Named schema (BaseSchema subclass / SQLAlchemy declarative model) name -> (file
+    // its class is defined in, definition line). Populated wherever `self.schemas`
+    // gets a named-schema entry (see Stmt::ClassDef handling), and carried cross-file
+    // by load_cross_file_symbols/import_name -- consulted by schema_display so an
+    // unknown-column message points at the schema's actual class definition, which can
+    // be an entirely different file than wherever the erroring variable was bound.
+    schema_locations: HashMap<String, (String, usize)>,
     requires: HashMap<String, (Vec<String>, usize)>, // func_name -> (direct required cols on 1st param, def line)
     delegates: HashMap<String, Vec<String>>, // func_name -> names called with its own (tainted) param forwarded
     param_requires: HashMap<String, (Vec<String>, String)>, // func_name -> (required cols, origin "func (path:line)")
@@ -986,6 +1877,66 @@ pub struct Linter {
     // with unrelated calls.
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    // Dialect used to fold unquoted SQL identifier case when inferring columns from a
+    // literal SELECT list. Defaults to `Generic` (no folding); set from
+    // `[tool.typedframes] sql_dialect` in pyproject.toml via `with_context`.
+    sql_dialect: sql::SqlDialect,
+    // Project root, used to resolve and safety-check `.sql` file reads traced back from
+    // a load call (see `read_sql_file`). `None` for standalone/no-config invocations,
+    // in which case file-based SQL tracing is skipped entirely rather than guessed at.
+    project_root: Option<PathBuf>,
+    // Names bound to a plain string literal (or a resolvable `.sql`/text file read —
+    // see `resolve_literal_rhs`) exactly once anywhere in the module. Populated by a
+    // `StringBindingCollector` pre-pass in `check_file_internal`, before the main
+    // statement walk, so that e.g. a module-level `QUERY = "..."` constant is visible
+    // no matter where in the file it's used. A name reassigned, conditionally assigned,
+    // augmented-assigned, or bound by anything other than a plain literal/file-read is
+    // absent from this map entirely — see `StringBindingCollector::record` for the
+    // poison-on-any-second-binding policy this relies on.
+    string_var_candidates: HashMap<String, String>,
+    // Names bound to a resolved SQLAlchemy Core `select(...)` column list — e.g.
+    // `stmt = select(Order.id, Order.amount)`. Populated inline during the main
+    // top-to-bottom statement walk (unlike `string_var_candidates`, which needs a
+    // whole-module pre-pass): resolving a `select(...)` call requires the referenced
+    // model's columns to already be in `self.schemas`, which — like every other
+    // variable/schema binding this checker tracks — is only guaranteed for a class
+    // defined earlier in the same file (or in another file, via the project index).
+    // A later reassignment simply overwrites the entry, consistent with how
+    // `self.variables` already behaves elsewhere in this checker.
+    stmt_var_candidates: HashMap<String, Vec<String>>,
+    // Names bound to a Feast `store.get_historical_features(...)`/
+    // `get_online_features(...)` result's resolved feature-name columns, BEFORE
+    // `.to_df()` is called on it (the split form: `job = store.get_...(...)`, then
+    // `df = job.to_df()`). Kept separate from `self.variables`/`self.schemas` — a
+    // RetrievalJob/OnlineResponse isn't a DataFrame, so `job["x"]` shouldn't be
+    // validated as a column access the way it would be if `job` were registered there.
+    // See `register_feast_dataframe` for where this becomes an actual tracked frame.
+    retrieval_jobs: HashMap<String, Vec<String>>,
+    // Schema names (from `self.schemas`) whose known column list is deliberately
+    // incomplete — currently only Feast retrieval results (see
+    // `register_feast_dataframe`), whose real output also includes entity_df's join
+    // keys and timestamp column, not resolvable in general. `schema_has_column` treats
+    // membership against these as always `true`, so `unknown-column` can never
+    // false-positive on a real column this checker just doesn't know about.
+    open_schemas: std::collections::HashSet<String>,
+    // Cursor variable name -> the SQL text most recently passed to `cursor.execute(sql)`
+    // (the PEP 249 pattern used by Snowflake, Redshift, and similar connectors), until
+    // a later `cursor.fetch_pandas_all()` materializes it into a DataFrame. A second
+    // `execute()` on the same cursor overwrites (or, if its argument doesn't resolve,
+    // removes) the previous entry — matching real PEP 249 semantics, where a cursor
+    // holds exactly one most-recently-executed query at a time.
+    cursor_sql: HashMap<String, String>,
+    // func_name -> a recognized "parameter feeds a Feast features= call, whose result is
+    // subscripted in the same body" shape, found while indexing this file's functions.
+    // Consumed once, project-wide, by resolve_param_governed_call_sites -- see
+    // ParamGovernedTemplate's doc comment.
+    param_governed_templates: HashMap<String, ParamGovernedTemplate>,
+    // Every top-level function name defined anywhere in this file, regardless of
+    // whether it has any schema/requires/param-governed info of its own -- needed so
+    // resolve_delegate_target can find a plain helper (e.g. one that just returns a
+    // literal list or f-string) as a valid call target for eval_feast_call, which
+    // re-parses the target file itself rather than needing anything precomputed here.
+    all_function_names: std::collections::BTreeSet<String>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1032,6 +1983,178 @@ fn find_returned_var(stmts: &[Stmt]) -> Option<String> {
     None
 }
 
+// A candidate `string_var_candidates` entry: either resolved to a stable literal value,
+// or excluded because more than one binding (of any kind) touched the name. See
+// `StringBindingCollector::record`.
+enum StringBinding {
+    Literal(String),
+    Poisoned,
+}
+
+// AST visitor that finds every binding site of every name in a module and resolves
+// single-binding, string-literal-valued ones. Implements `Visitor` (rather than
+// hand-rolling recursion into every statement/expression variant) so that binding forms
+// buried inside nested bodies — `if`/`for`/`while`/`with`/`try`/comprehensions/nested
+// functions — are covered by the trait's default `walk_*` recursion instead of needing
+// to be threaded through by hand.
+struct StringBindingCollector<'a> {
+    linter: &'a Linter,
+    current_file: &'a Path,
+    reads_used: u32,
+    bindings: HashMap<String, StringBinding>,
+}
+
+impl<'a> StringBindingCollector<'a> {
+    // Record a binding of `name`. Any name already present (regardless of what it was
+    // previously recorded as) is poisoned by this second binding — reassignment,
+    // conditional assignment, and augmented assignment all resolve to "exclude" this
+    // way without needing to reason about control flow. `resolved: None` means "this
+    // binding exists but isn't a literal we can use" (e.g. a for-loop variable, a
+    // function parameter, an import) — poisons on first sight too.
+    fn record(&mut self, name: &str, resolved: Option<String>) {
+        if self.bindings.contains_key(name) {
+            self.bindings
+                .insert(name.to_string(), StringBinding::Poisoned);
+            return;
+        }
+        self.bindings.insert(
+            name.to_string(),
+            match resolved {
+                Some(s) => StringBinding::Literal(s),
+                None => StringBinding::Poisoned,
+            },
+        );
+    }
+
+    // Poison every bare `Name` reachable inside an assignment-target expression —
+    // handles tuple/list unpacking and starred targets. Attribute (`obj.x = ...`) and
+    // subscript (`d["x"] = ...`) targets don't bind a plain name at all, so they're
+    // left alone entirely (neither recorded nor poisoned).
+    fn record_target_names(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(n) => self.record(n.id.as_str(), None),
+            Expr::Tuple(t) => {
+                for elt in &t.elts {
+                    self.record_target_names(elt);
+                }
+            }
+            Expr::List(l) => {
+                for elt in &l.elts {
+                    self.record_target_names(elt);
+                }
+            }
+            Expr::Starred(s) => self.record_target_names(&s.value),
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visitor<'a> for StringBindingCollector<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::Assign(assign) => {
+                // Only a single bare-Name target is treated as a literal candidate;
+                // multi-target assignment (`a = b = "x"`) and destructuring targets
+                // poison every name they touch instead of guessing which one "owns"
+                // the literal.
+                if let [Expr::Name(n)] = assign.targets.as_slice() {
+                    let resolved = self.linter.resolve_literal_rhs(
+                        &assign.value,
+                        self.current_file,
+                        &mut self.reads_used,
+                    );
+                    self.record(n.id.as_str(), resolved);
+                } else {
+                    for target in &assign.targets {
+                        self.record_target_names(target);
+                    }
+                }
+            }
+            Stmt::AnnAssign(ann) => {
+                // A bare `x: str` with no value binds nothing at runtime — not a
+                // binding site at all, so neither recorded nor poisoned.
+                if let (Expr::Name(n), Some(value)) = (&*ann.target, &ann.value) {
+                    let resolved = self.linter.resolve_literal_rhs(
+                        value,
+                        self.current_file,
+                        &mut self.reads_used,
+                    );
+                    self.record(n.id.as_str(), resolved);
+                }
+            }
+            Stmt::AugAssign(aug) => self.record_target_names(&aug.target),
+            Stmt::For(for_stmt) => self.record_target_names(&for_stmt.target),
+            Stmt::Global(g) => {
+                for name in &g.names {
+                    self.record(name.as_str(), None);
+                }
+            }
+            Stmt::Nonlocal(nl) => {
+                for name in &nl.names {
+                    self.record(name.as_str(), None);
+                }
+            }
+            Stmt::Delete(del) => {
+                for target in &del.targets {
+                    self.record_target_names(target);
+                }
+            }
+            Stmt::Import(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.record(bound.as_str(), None);
+                }
+            }
+            Stmt::ImportFrom(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.record(bound.as_str(), None);
+                }
+            }
+            _ => {}
+        }
+        ast_visitor::walk_stmt(self, stmt);
+    }
+
+    fn visit_except_handler(&mut self, handler: &'a ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(h) = handler;
+        if let Some(name) = &h.name {
+            self.record(name.as_str(), None);
+        }
+        ast_visitor::walk_except_handler(self, handler);
+    }
+
+    fn visit_parameter(&mut self, parameter: &'a ast::Parameter) {
+        self.record(parameter.name.as_str(), None);
+        ast_visitor::walk_parameter(self, parameter);
+    }
+
+    fn visit_with_item(&mut self, item: &'a ast::WithItem) {
+        if let Some(vars) = &item.optional_vars {
+            self.record_target_names(vars);
+        }
+        ast_visitor::walk_with_item(self, item);
+    }
+
+    fn visit_comprehension(&mut self, comp: &'a ast::Comprehension) {
+        self.record_target_names(&comp.target);
+        ast_visitor::walk_comprehension(self, comp);
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        // Walrus (`q := "..."`) always poisons rather than being resolved: it's almost
+        // always used for control flow (`if (q := f()):`), and a containing expression
+        // that runs more than once (a loop, a comprehension) would make "the" value of
+        // `q` not actually stable the way a single top-level assignment's is.
+        if let Expr::Named(named) = expr {
+            if let Expr::Name(n) = &*named.target {
+                self.record(n.id.as_str(), None);
+            }
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
+}
+
 impl Default for Linter {
     fn default() -> Self {
         Self::new()
@@ -1045,6 +2168,7 @@ impl Linter {
             variables: HashMap::new(),
             functions: HashMap::new(),
             schema_origins: HashMap::new(),
+            schema_locations: HashMap::new(),
             requires: HashMap::new(),
             delegates: HashMap::new(),
             param_requires: HashMap::new(),
@@ -1054,6 +2178,28 @@ impl Linter {
             file_display: String::new(),
             dataframes_total: 0,
             dataframes_typed: 0,
+            sql_dialect: sql::SqlDialect::Generic,
+            project_root: None,
+            string_var_candidates: HashMap::new(),
+            stmt_var_candidates: HashMap::new(),
+            retrieval_jobs: HashMap::new(),
+            open_schemas: std::collections::HashSet::new(),
+            cursor_sql: HashMap::new(),
+            param_governed_templates: HashMap::new(),
+            all_function_names: std::collections::BTreeSet::new(),
+        }
+    }
+
+    // Apply project-level context resolved by the caller: the project root (for
+    // resolving `.sql` file reads traced back from a load call) and the configured SQL
+    // dialect (for identifier case folding — see `sql::SqlDialect`). Kept as a
+    // post-construction setter rather than a `new()` parameter so the 35+ existing
+    // `Linter::new()` call sites (mostly tests, which don't care about either) are
+    // undisturbed.
+    pub fn with_context(&mut self, root: PathBuf, config: &LinterConfig) {
+        self.project_root = Some(root);
+        if let Some(dialect) = &config.sql_dialect {
+            self.sql_dialect = sql::SqlDialect::from_config_str(dialect);
         }
     }
 
@@ -1071,27 +2217,31 @@ impl Linter {
         (loc.line.get(), loc.column.get())
     }
 
-    // Format a schema name for use in an error message.
-    //
-    // For inferred schemas (those whose name starts with `__inferred_`):
-    //   - includes the full column set so the user can see what IS available
-    //   - includes the origin function/file when recorded by load_cross_file_symbols
-    //   - reports the line in the current file where the variable was bound
-    //
-    // For named schemas (BaseSchema subclasses): returns the schema name + defined line.
+    // Format a schema name for use in an error message. Always includes the full
+    // column set, so an "unknown column" message tells the reader what IS available
+    // without a separate lookup — for inferred schemas (those whose name starts with
+    // `__inferred_`), also includes the origin function/file when recorded by
+    // load_cross_file_symbols (where the columns were actually derived from); for
+    // named schemas (BaseSchema subclasses), the schema's own class-definition
+    // file/line from `schema_locations` — which may be a different file entirely than
+    // wherever the erroring variable was bound, so `defined_line` (that binding's own
+    // line, in the CURRENT file) is only a fallback for the rare case a named schema
+    // has no recorded location at all.
     fn schema_display(&self, schema_name: &str, defined_line: usize) -> String {
+        let cols = self.schemas.get(schema_name).cloned().unwrap_or_default();
+        let cols_str = cols.join(", ");
         if schema_name.starts_with("__inferred_") {
-            let cols = self.schemas.get(schema_name).cloned().unwrap_or_default();
-            let cols_str = cols.join(", ");
             if let Some(origin) = self.schema_origins.get(schema_name) {
                 format!(
-                    "inferred column set {{{cols_str}}} — fix: add column to usecols/columns in {origin}"
+                    "inferred column set {{{cols_str}}} — fix: add the column at its source in {origin}"
                 )
             } else {
                 format!("inferred column set {{{cols_str}}} (defined at line {defined_line})")
             }
+        } else if let Some((file, line)) = self.schema_locations.get(schema_name) {
+            format!("{schema_name} {{{cols_str}}} (defined at {file}:{line})")
         } else {
-            format!("{schema_name} (defined at line {defined_line})")
+            format!("{schema_name} {{{cols_str}}} (defined at line {defined_line})")
         }
     }
 
@@ -1106,10 +2256,12 @@ impl Linter {
         self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
         let parsed = parse_module(source).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let module = parsed.into_syntax();
+        self.string_var_candidates = self.collect_string_var_candidates(&module.body, path);
         let mut errors = Vec::new();
 
-        for stmt in parsed.into_syntax().body {
-            self.visit_stmt(&stmt, &mut errors);
+        for stmt in &module.body {
+            self.visit_stmt(stmt, &mut errors);
         }
 
         errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
@@ -1138,6 +2290,7 @@ impl Linter {
         // file checked (see `check_file`), so rebuilding a project-wide map in here
         // would cost O(files) per file, i.e. O(files^2) for a whole-project check.
         let all_schemas = &index.all_schemas;
+        let all_schema_locations = &index.all_schema_locations;
 
         let Ok(parsed) = parse_module(source) else {
             return;
@@ -1157,23 +2310,19 @@ impl Linter {
             if module_name.starts_with("typedframes") {
                 continue;
             }
-            let mod_path = module_name.replace('.', "/");
-            let candidates = [
-                project_root.join(format!("{mod_path}.py")),
-                project_root.join("src").join(format!("{mod_path}.py")),
-            ];
-            let Some(resolved_path) = candidates.iter().find(|p| p.exists()) else {
+            // resolve_module_file also tries an explicitly allowlisted external
+            // package's site-packages location (see collect_external_package_files),
+            // not just project_root/project_root/src.
+            let Some(resolved_str) = resolve_module_file(module_name, project_root, &index.files)
+            else {
                 continue;
             };
-            let Some(resolved_str) = resolved_path.to_str() else {
-                continue;
-            };
-            let Some(entry) = index.files.get(resolved_str) else {
+            let Some(entry) = index.files.get(&resolved_str) else {
                 continue;
             };
             // Use the full resolved path (not just the basename) so error messages
             // contain an openable `file:line` reference regardless of cwd.
-            let file_path_display = resolved_path.display().to_string();
+            let file_path_display = resolved_str.clone();
             // `from X import *`: ruff represents the wildcard as a single alias named
             // "*". Expand to the module's declared __all__, or — matching real Python
             // semantics for a module with no __all__ — every public (non-`_`-prefixed)
@@ -1194,13 +2343,25 @@ impl Linter {
                         .collect()
                 };
                 for name in &names {
-                    self.import_name(entry, name, &file_path_display, all_schemas);
+                    self.import_name(
+                        entry,
+                        name,
+                        &file_path_display,
+                        all_schemas,
+                        all_schema_locations,
+                    );
                 }
                 continue;
             }
             for alias in &import_from.names {
                 let name = alias.name.id.as_str();
-                self.import_name(entry, name, &file_path_display, all_schemas);
+                self.import_name(
+                    entry,
+                    name,
+                    &file_path_display,
+                    all_schemas,
+                    all_schema_locations,
+                );
             }
         }
 
@@ -1233,7 +2394,13 @@ impl Linter {
                 let file_path_display = resolved_path.display().to_string();
                 let names: Vec<String> = entry.functions.keys().cloned().collect();
                 for name in &names {
-                    self.import_name(entry, name, &file_path_display, all_schemas);
+                    self.import_name(
+                        entry,
+                        name,
+                        &file_path_display,
+                        all_schemas,
+                        all_schema_locations,
+                    );
                 }
             }
         }
@@ -1250,9 +2417,13 @@ impl Linter {
         name: &str,
         file_path_display: &str,
         all_schemas: &HashMap<String, Vec<String>>,
+        all_schema_locations: &HashMap<String, (String, usize)>,
     ) {
         if let Some(cols) = entry.schemas.get(name) {
             self.schemas.insert(name.to_string(), cols.clone());
+        }
+        if let Some(loc) = entry.schema_locations.get(name) {
+            self.schema_locations.insert(name.to_string(), loc.clone());
         }
         let Some(func) = entry.functions.get(name) else {
             return;
@@ -1280,6 +2451,13 @@ impl Linter {
                     func.returns_schema.clone(),
                     format!("{name} ({file_path_display}{line_suffix})"),
                 );
+            } else if let Some(loc) = all_schema_locations.get(func.returns_schema.as_str()) {
+                // A named schema reached transitively through this function's
+                // return-schema annotation, possibly defined in a THIRD file (neither
+                // this one nor the function's own) -- schema_locations wouldn't have
+                // picked it up any other way.
+                self.schema_locations
+                    .insert(func.returns_schema.clone(), loc.clone());
             }
         }
         // Record the parameter-column contract so calls to this function
@@ -1308,12 +2486,203 @@ impl Linter {
         }
     }
 
-    // Check if a type name is a DataFrame/Frame type
-    fn is_frame_type(name: &str) -> bool {
-        matches!(name, "DataFrame" | "PandasFrame" | "PolarsFrame")
+    // `__tablename__ = "orders"` (or `__tablename__: str = "orders"`) in a class's own
+    // body — the structural signature of a SQLAlchemy declarative model, checked
+    // instead of base-class name since the declarative base is normally imported from a
+    // project-local module. Deliberately does not walk inherited/mixin base classes for
+    // this — an abstract mixin that itself has no `__tablename__` isn't recognized.
+    fn class_body_has_tablename(class_def: &ast::StmtClassDef) -> bool {
+        class_def.body.iter().any(|stmt| {
+            let (target, value) = match stmt {
+                Stmt::Assign(assign) => match assign.targets.as_slice() {
+                    [Expr::Name(n)] => (n.id.as_str(), Some(assign.value.as_ref())),
+                    _ => return false,
+                },
+                Stmt::AnnAssign(ann) => match ann.target.as_ref() {
+                    Expr::Name(n) => (n.id.as_str(), ann.value.as_deref()),
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            target == "__tablename__" && value.and_then(Self::extract_string_literal).is_some()
+        })
     }
 
-    // Extract schema name from a type annotation like PandasFrame[Schema] or Annotated[pd.DataFrame, Schema]
+    // Class attribute names that never denote a mapped column, whatever they're
+    // assigned to.
+    const ORM_NON_COLUMN_ATTRS: &[&str] = &[
+        "__tablename__",
+        "__table_args__",
+        "__mapper_args__",
+        "__table__",
+        "metadata",
+        "registry",
+        "query",
+    ];
+
+    // Calls that construct a legitimate class attribute with no corresponding database
+    // column — excluded rather than swept in as a column the way the permissive
+    // typedframes-schema extractor's fallback (used for `is_schema_base` classes) would.
+    const ORM_NON_COLUMN_CALLS: &[&str] = &[
+        "relationship",
+        "column_property",
+        "association_proxy",
+        "declared_attr",
+        "query_expression",
+        "synonym",
+    ];
+
+    // Column extractor for a SQLAlchemy declarative model (see `class_body_has_tablename`).
+    // Deliberately separate from the typedframes-schema extractor above rather than
+    // sharing it: that extractor's fallback treats *any* annotated or assigned class
+    // attribute as a column, which on a real model would sweep in `__tablename__`,
+    // `__table_args__`, `relationship(...)` attributes, and `Mapped[list[...]]`
+    // to-many-relationship annotations. This one uses an allowlist instead: an
+    // attribute is a column only if it's a `Column(...)`/`mapped_column(...)` call
+    // (optionally wrapped in `deferred(...)`), or a bare `x: Mapped[T]` with no value
+    // where `T` isn't itself a relationship shape.
+    fn extract_orm_columns(class_def: &ast::StmtClassDef) -> Vec<String> {
+        let mut columns = Vec::new();
+        for body_stmt in &class_def.body {
+            match body_stmt {
+                Stmt::AnnAssign(ann) => {
+                    let Expr::Name(name) = ann.target.as_ref() else {
+                        continue;
+                    };
+                    let attr_name = name.id.as_str();
+                    if attr_name.starts_with('_') || Self::ORM_NON_COLUMN_ATTRS.contains(&attr_name)
+                    {
+                        continue;
+                    }
+                    match &ann.value {
+                        Some(value) => {
+                            if let Some(cols) = Self::orm_column_from_call(value, attr_name) {
+                                columns.extend(cols);
+                            }
+                        }
+                        None => {
+                            if !Self::is_relationship_annotation(&ann.annotation) {
+                                columns.push(attr_name.to_string());
+                            }
+                        }
+                    }
+                }
+                Stmt::Assign(assign) => {
+                    let [Expr::Name(name)] = assign.targets.as_slice() else {
+                        continue;
+                    };
+                    let attr_name = name.id.as_str();
+                    if attr_name.starts_with('_') || Self::ORM_NON_COLUMN_ATTRS.contains(&attr_name)
+                    {
+                        continue;
+                    }
+                    if let Some(cols) = Self::orm_column_from_call(&assign.value, attr_name) {
+                        columns.extend(cols);
+                    }
+                }
+                _ => {}
+            }
+        }
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
+    // `Column(...)` / `mapped_column(...)` / `deferred(Column(...))` → the resulting
+    // column name(s): the attribute name, plus a DB-name override from a leading
+    // positional string literal or a `name=` keyword when it differs from the
+    // attribute name — SQLAlchemy allows code to reference either spelling
+    // (`mapped_column("db_name", ...)` puts the real DB name in the first positional
+    // arg), so registering both avoids a spurious unknown-column on whichever one a
+    // caller writes. `relationship(...)` and friends (`ORM_NON_COLUMN_CALLS`) return
+    // `None` — excluded rather than swept in, unlike the permissive fallback the
+    // non-ORM schema extractor above uses.
+    fn orm_column_from_call(value: &Expr, attr_name: &str) -> Option<Vec<String>> {
+        let Expr::Call(call) = value else {
+            return None;
+        };
+        let fn_name = match &*call.func {
+            Expr::Name(n) => n.id.as_str(),
+            Expr::Attribute(a) => a.attr.as_str(),
+            _ => return None,
+        };
+        if fn_name == "deferred" {
+            return call
+                .arguments
+                .args
+                .first()
+                .and_then(|inner| Self::orm_column_from_call(inner, attr_name));
+        }
+        if Self::ORM_NON_COLUMN_CALLS.contains(&fn_name) {
+            return None;
+        }
+        if fn_name != "Column" && fn_name != "mapped_column" {
+            return None;
+        }
+
+        let mut names = vec![attr_name.to_string()];
+        if let Some(db_name) = call
+            .arguments
+            .args
+            .first()
+            .and_then(Self::extract_string_literal)
+        {
+            if db_name != attr_name {
+                names.push(db_name.to_string());
+            }
+        }
+        for keyword in &call.arguments.keywords {
+            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("name") {
+                if let Some(db_name) = Self::extract_string_literal(&keyword.value) {
+                    if db_name != attr_name && !names.iter().any(|n| n == db_name) {
+                        names.push(db_name.to_string());
+                    }
+                }
+            }
+        }
+        Some(names)
+    }
+
+    // `Mapped[list[...]]` / `Mapped[List[...]]` / `Mapped[Set[...]]` (a to-many
+    // relationship's typing shape) or `Mapped["OtherModel"]` (a quoted forward
+    // reference — the idiom for a to-one relationship typed without importing the
+    // referenced class) — never a real column, whatever the bare-annotation fallback
+    // in `extract_orm_columns` would otherwise assume.
+    fn is_relationship_annotation(annotation: &Expr) -> bool {
+        let Expr::Subscript(sub) = annotation else {
+            return false;
+        };
+        let is_mapped = match &*sub.value {
+            Expr::Name(n) => n.id.as_str() == "Mapped",
+            Expr::Attribute(a) => a.attr.as_str() == "Mapped",
+            _ => false,
+        };
+        if !is_mapped {
+            return false;
+        }
+        match &*sub.slice {
+            Expr::StringLiteral(_) => true,
+            Expr::Subscript(inner) => {
+                let collection_name = match &*inner.value {
+                    Expr::Name(n) => Some(n.id.as_str()),
+                    Expr::Attribute(a) => Some(a.attr.as_str()),
+                    _ => None,
+                };
+                matches!(
+                    collection_name,
+                    Some("list" | "List" | "set" | "Set" | "Sequence")
+                )
+            }
+            _ => false,
+        }
+    }
+
+    // Check if a type name is a DataFrame/Frame type
+    fn is_frame_type(name: &str) -> bool {
+        name == "DataFrame"
+    }
+
+    // Extract schema name from a type annotation like DataFrame[Schema] or Annotated[pd.DataFrame, Schema]
     fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Subscript(subscript) => {
@@ -1343,15 +2712,12 @@ impl Linter {
             }
             Expr::StringLiteral(s) => {
                 let text = s.value.to_str();
-                let patterns = ["DataFrame[", "PandasFrame[", "PolarsFrame["];
-                for pattern in patterns {
-                    if text.contains(pattern) {
-                        if let Some(start) = text.find('[') {
-                            if let Some(end) = text.rfind(']') {
-                                let schema = text[start + 1..end].trim();
-                                if !schema.is_empty() && !schema.contains(',') {
-                                    return Some(schema);
-                                }
+                if text.contains("DataFrame[") {
+                    if let Some(start) = text.find('[') {
+                        if let Some(end) = text.rfind(']') {
+                            let schema = text[start + 1..end].trim();
+                            if !schema.is_empty() && !schema.contains(',') {
+                                return Some(schema);
                             }
                         }
                     }
@@ -1389,14 +2755,22 @@ impl Linter {
         }
     }
 
-    // Extract column names from a load function call (usecols/columns kwarg or dtype/schema dict keys).
-    fn extract_load_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
+    // Extract column names from a load function call: `usecols`/`columns` kwarg,
+    // `dtype`/`schema` dict keys, or — for SQL-shaped load functions — the SELECT list
+    // of a literal SQL string. Returns the columns alongside which family satisfied the
+    // extraction, so the caller can phrase a kind-appropriate `untracked-dataframe` hint
+    // when extraction fails.
+    fn extract_load_columns(
+        &self,
+        func_name: &str,
+        call: &ast::ExprCall,
+    ) -> (Option<Vec<String>>, LoadKind) {
         for keyword in &call.arguments.keywords {
             let kw_name = keyword.arg.as_ref().map(|s| s.as_str());
             match kw_name {
                 Some("usecols") | Some("columns") => {
                     if let Some(cols) = Self::extract_string_list(&keyword.value) {
-                        return Some(cols);
+                        return (Some(cols), LoadKind::File);
                     }
                 }
                 Some("dtype") | Some("schema") => {
@@ -1409,14 +2783,862 @@ impl Linter {
                             .map(|s| s.to_string())
                             .collect();
                         if !keys.is_empty() {
-                            return Some(keys);
+                            return (Some(keys), LoadKind::File);
                         }
                     }
                 }
                 _ => {}
             }
         }
+
+        if !SQL_LOAD_FUNCTIONS.contains(&func_name) {
+            return (None, LoadKind::File);
+        }
+
+        // chunksize= makes the call return an iterator of frames, not a single frame —
+        // there is no one column set to attach to the assigned variable.
+        let has_chunksize = call
+            .arguments
+            .keywords
+            .iter()
+            .any(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("chunksize"));
+        if has_chunksize {
+            return (None, LoadKind::Sql);
+        }
+
+        // A SQLAlchemy Core statement (`pd.read_sql(select(Order.id, ...), engine)`, or
+        // a `Name` bound to one) takes priority over SQL-text parsing — it isn't a
+        // string at all, so `extract_sql_literal` would never match it anyway, but
+        // checking first keeps the two paths clearly separate rather than relying on
+        // that fallthrough.
+        if let Some(cols) = self.extract_orm_select_columns(call) {
+            return (Some(cols), LoadKind::Orm);
+        }
+
+        let Some(sql_text) = self.extract_sql_literal(call) else {
+            return (None, LoadKind::Sql);
+        };
+
+        match sql::columns_from_select(&sql_text, self.sql_dialect) {
+            sql::SqlOutcome::Columns(cols) => (Some(cols), LoadKind::Sql),
+            sql::SqlOutcome::Wildcard | sql::SqlOutcome::Unparsed => (None, LoadKind::Sql),
+        }
+    }
+
+    // Locate a literal SQL string passed to a SQL-shaped load call: the `sql=`/`query=`
+    // keyword if present, else the first positional argument. Unwraps one layer of
+    // `text(...)` / `sqlalchemy.text(...)`, the idiomatic way to pass raw SQL through a
+    // SQLAlchemy engine. Returns `None` for f-strings, variables, or anything else that
+    // isn't a literal — those cases fall through to the existing untracked-dataframe
+    // nudge rather than being (wrongly) treated as unresolvable SQL.
+    fn extract_sql_literal(&self, call: &ast::ExprCall) -> Option<String> {
+        for keyword in &call.arguments.keywords {
+            if matches!(
+                keyword.arg.as_ref().map(|s| s.as_str()),
+                Some("sql") | Some("query")
+            ) {
+                return self.extract_sql_expr(&keyword.value);
+            }
+        }
+        call.arguments
+            .args
+            .first()
+            .and_then(|expr| self.extract_sql_expr(expr))
+    }
+
+    // Resolve a SQL-shaped argument expression to its text: a literal string, a
+    // `text(...)`/`sqlalchemy.text(...)`-wrapped literal, or a `Name` bound (per
+    // `string_var_candidates`) to a literal or a resolvable `.sql` file read. Deliberately
+    // does NOT resolve f-strings, `.format()`, string concatenation, or any variable
+    // reassigned more than once — see `StringBindingCollector` for why, and
+    // `check_file_internal`'s `LoadKind::Sql` untracked-dataframe hint for how that's
+    // surfaced to the user instead of silently guessing.
+    fn extract_sql_expr(&self, expr: &Expr) -> Option<String> {
+        if let Some(s) = Self::extract_string_literal(expr) {
+            return Some(s.to_string());
+        }
+        if let Expr::Name(name) = expr {
+            return self.string_var_candidates.get(name.id.as_str()).cloned();
+        }
+        if let Expr::Call(inner) = expr {
+            let fn_name = match &*inner.func {
+                Expr::Name(n) => n.id.as_str(),
+                Expr::Attribute(a) => a.attr.as_str(),
+                _ => return None,
+            };
+            if fn_name == "text" {
+                return inner
+                    .arguments
+                    .args
+                    .first()
+                    .and_then(|expr| self.extract_sql_expr(expr));
+            }
+        }
         None
+    }
+
+    // Column-preserving Core statement methods: chaining any of these onto a
+    // `select(...)` doesn't change which columns are projected, so `extract_select_columns`
+    // sees through them to the underlying `select(...)` call. Anything else chained
+    // (`.subquery()`, `.cte()`, `.union(...)`, `.add_columns(...)`, ...) isn't
+    // recognized, and the whole expression is left unresolved rather than guessed at.
+    const SELECT_CHAIN_METHODS: &[&str] = &[
+        "where", "filter", "join", "order_by", "limit", "offset", "group_by", "having", "distinct",
+    ];
+
+    // Locate the SQL-shaped argument (`sql=`/`query=` keyword, else first positional)
+    // the same way `extract_sql_literal` does, but resolve it as a SQLAlchemy Core
+    // statement's column list instead of as SQL text.
+    fn extract_orm_select_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        for keyword in &call.arguments.keywords {
+            if matches!(
+                keyword.arg.as_ref().map(|s| s.as_str()),
+                Some("sql") | Some("query")
+            ) {
+                return self.extract_select_columns(&keyword.value);
+            }
+        }
+        call.arguments
+            .args
+            .first()
+            .and_then(|expr| self.extract_select_columns(expr))
+    }
+
+    // Resolve a SQLAlchemy Core statement expression to its projected column list: a
+    // `select(...)` call, a chain of `SELECT_CHAIN_METHODS` on one, or a `Name` bound
+    // (via `stmt_var_candidates`) to an already-resolved one.
+    fn extract_select_columns(&self, expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Name(n) => self.stmt_var_candidates.get(n.id.as_str()).cloned(),
+            Expr::Call(call) => {
+                let fn_name = match &*call.func {
+                    Expr::Name(n) => n.id.as_str(),
+                    Expr::Attribute(a) => a.attr.as_str(),
+                    _ => return None,
+                };
+                if fn_name == "select" {
+                    return self.extract_select_args(&call.arguments.args);
+                }
+                if Self::SELECT_CHAIN_METHODS.contains(&fn_name) {
+                    if let Expr::Attribute(attr) = &*call.func {
+                        return self.extract_select_columns(&attr.value);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    // The column list for `select(arg1, arg2, ...)`: every argument must resolve to a
+    // single, unambiguous column name (see `extract_select_arg_column`), or the whole
+    // select is left unresolved — never a partial list, since a silently-dropped
+    // argument would understate the real projection and risk a false unknown-column
+    // later on a column that's actually there. In particular a bare `select(Model)`
+    // (all of a model's columns) is deliberately NOT supported: `extract_orm_columns`
+    // is allowlist-based and can under-extract on an unusual declarative pattern, and
+    // treating its output as "the complete column set" here would compound that.
+    fn extract_select_args(&self, args: &[Expr]) -> Option<Vec<String>> {
+        if args.is_empty() {
+            return None;
+        }
+        args.iter()
+            .map(|arg| self.extract_select_arg_column(arg))
+            .collect()
+    }
+
+    // A single `select(...)` argument's resulting column name: `Model.col` (an
+    // attribute referencing a registered model's known column), or
+    // `Model.col.label("alias")`. Anything else — a bare model, `func.count(...)`,
+    // `text(...)`, a literal, a starred arg — bails the whole select rather than
+    // guessing.
+    fn extract_select_arg_column(&self, arg: &Expr) -> Option<String> {
+        if let Expr::Call(call) = arg {
+            if let Expr::Attribute(outer) = &*call.func {
+                if outer.attr.as_str() == "label" {
+                    self.validate_model_attribute(&outer.value)?;
+                    let alias = call
+                        .arguments
+                        .args
+                        .first()
+                        .and_then(Self::extract_string_literal)?;
+                    return Some(alias.to_string());
+                }
+            }
+            return None;
+        }
+        self.validate_model_attribute(arg)
+    }
+
+    // `Model.col` where `Model` is a registered schema (declarative model or otherwise)
+    // and `col` is one of its known columns. Returns `None` — bailing the containing
+    // select entirely — if `Model` isn't registered or `col` isn't one of its columns:
+    // hybrid properties, synonyms, and association proxies are all legal SQLAlchemy
+    // attributes with no static column mapping, so treating an unrecognized attribute
+    // as an error would be wrong at least as often as it would be right.
+    fn validate_model_attribute(&self, expr: &Expr) -> Option<String> {
+        let Expr::Attribute(attr) = expr else {
+            return None;
+        };
+        let Expr::Name(model) = &*attr.value else {
+            return None;
+        };
+        let columns = self.schemas.get(model.id.as_str())?;
+        let col = attr.attr.as_str();
+        columns.iter().any(|c| c == col).then(|| col.to_string())
+    }
+
+    // Column set for a Feast `features=["view:feature", ...]` list: each element must
+    // be a `"view:feature"` string literal (the ref format Feast documents), and the
+    // resulting column is the part after the colon — or, when `full_feature_names=True`,
+    // `"view__feature"` (double underscore, per Feast's own docstring). Bails entirely
+    // (`None`) on: no `features=` keyword at all (so a plain method-name match alone
+    // never dispatches — see `FEAST_RETRIEVAL_METHODS`'s call sites), a non-literal
+    // list element (a `Name`, a comprehension, a `FeatureService` member projection
+    // like `fv[["conv_rate"]]`), an element without exactly one `:`, or a non-literal
+    // `full_feature_names`. Never a partial column set for the same reason as
+    // `extract_select_args`: a silently-dropped element would understate the real
+    // projection.
+    //
+    // Note this can NEVER be the complete output column set regardless — Feast's real
+    // output also includes entity_df's join keys and timestamp column, which aren't
+    // resolvable in general. That's handled at the call site by registering the result
+    // as an *open* schema (`register_feast_dataframe`), not by trying to enumerate
+    // those columns here.
+    fn extract_feast_feature_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        let features_list = call
+            .arguments
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("features"))
+            .map(|k| &k.value)?;
+
+        let full_feature_names = match call
+            .arguments
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("full_feature_names"))
+        {
+            Some(kw) => match &kw.value {
+                Expr::BooleanLiteral(b) => b.value,
+                _ => return None,
+            },
+            None => false,
+        };
+
+        Self::feast_columns_from_list_expr(features_list, full_feature_names)
+    }
+
+    // Shared by `extract_feast_feature_columns` above (the `features=` keyword found
+    // inline at its own call) and `resolve_param_governed_call_sites` (a literal list
+    // found at a call site elsewhere, substituted in for a parameter that governed the
+    // original call) — both need the exact same "view:feature" splitting and
+    // `full_feature_names` formatting applied to a literal list expression.
+    fn feast_columns_from_list_expr(
+        features_list: &Expr,
+        full_feature_names: bool,
+    ) -> Option<Vec<String>> {
+        let Expr::List(list) = features_list else {
+            return None;
+        };
+        let mut raw = Vec::with_capacity(list.elts.len());
+        for elt in &list.elts {
+            raw.push(Self::extract_string_literal(elt)?.to_string());
+        }
+        Self::feast_columns_from_raw_items(&raw, full_feature_names)
+    }
+
+    // The "view:feature" splitting and full_feature_names formatting shared by
+    // feast_columns_from_list_expr (a literal AST list) and eval_feast_string_expr
+    // (raw strings recovered by evaluating a callee's `return [...]`, possibly with
+    // call-site arguments substituted in — see eval_feast_call).
+    fn feast_columns_from_raw_items(
+        raw: &[String],
+        full_feature_names: bool,
+    ) -> Option<Vec<String>> {
+        let mut columns = Vec::with_capacity(raw.len());
+        for literal in raw {
+            let (view, feature) = literal.split_once(':')?;
+            // `feature` still contains any colon after the first (split_once only
+            // splits on the first match), so this rejects anything but exactly one `:`
+            // in the whole ref.
+            if view.is_empty() || feature.is_empty() || feature.contains(':') {
+                return None;
+            }
+            columns.push(if full_feature_names {
+                format!("{view}__{feature}")
+            } else {
+                feature.to_string()
+            });
+        }
+        Some(columns)
+    }
+
+    // Detects `df = <recv>.get_historical_features(..., features=<param>, ...).to_df()`
+    // (the chained form only — see ParamGovernedTemplate's doc comment) as a direct
+    // top-level statement in `func_def`'s own body, where `<param>` is a bare name
+    // matching one of the function's own parameters, followed later in the same body by
+    // at least one `<target>["col"]` access. Returns `None` if no such shape is found,
+    // or if the shape is found but nothing subscripts its result (nothing to check).
+    fn find_param_governed_feast_template(
+        &self,
+        func_def: &ast::StmtFunctionDef,
+    ) -> Option<ParamGovernedTemplate> {
+        let param_names: Vec<&str> = func_def
+            .parameters
+            .posonlyargs
+            .iter()
+            .chain(func_def.parameters.args.iter())
+            .map(|p| p.parameter.name.id.as_str())
+            .collect();
+
+        let mut found: Option<(String, usize, bool, String, usize, usize, usize)> = None; // (param_name, param_index, full_feature_names, target_var, stmt_index, governing_line, governing_col)
+
+        for (i, stmt) in func_def.body.iter().enumerate() {
+            let Stmt::Assign(assign) = stmt else {
+                continue;
+            };
+            let Some(Expr::Name(target_name)) = assign.targets.first() else {
+                continue;
+            };
+            let Expr::Call(outer_call) = &*assign.value else {
+                continue;
+            };
+            let Expr::Attribute(outer_attr) = &*outer_call.func else {
+                continue;
+            };
+            if outer_attr.attr.as_str() != "to_df" {
+                continue;
+            }
+            let Expr::Call(inner_call) = &*outer_attr.value else {
+                continue;
+            };
+            let Expr::Attribute(inner_attr) = &*inner_call.func else {
+                continue;
+            };
+            if !FEAST_RETRIEVAL_METHODS.contains(&inner_attr.attr.as_str()) {
+                continue;
+            }
+            let Some(features_kw) = inner_call
+                .arguments
+                .keywords
+                .iter()
+                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("features"))
+            else {
+                continue;
+            };
+            let Expr::Name(features_name) = &features_kw.value else {
+                continue;
+            };
+            let Some(param_index) = param_names
+                .iter()
+                .position(|p| *p == features_name.id.as_str())
+            else {
+                continue;
+            };
+            let full_feature_names = match inner_call
+                .arguments
+                .keywords
+                .iter()
+                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("full_feature_names"))
+            {
+                Some(kw) => match &kw.value {
+                    Expr::BooleanLiteral(b) => b.value,
+                    _ => false,
+                },
+                None => false,
+            };
+            let (governing_line, governing_col) = self.source_location(assign.range().start());
+            found = Some((
+                features_name.id.to_string(),
+                param_index,
+                full_feature_names,
+                target_name.id.to_string(),
+                i,
+                governing_line,
+                governing_col,
+            ));
+            break;
+        }
+
+        let (
+            param_name,
+            param_index,
+            full_feature_names,
+            target_var,
+            found_at,
+            governing_line,
+            governing_col,
+        ) = found?;
+
+        let mut accesses = Vec::new();
+        for stmt in &func_def.body[found_at + 1..] {
+            self.collect_subscript_accesses(stmt, &target_var, &mut accesses);
+        }
+        // No `accesses.is_empty()` bailout here — a function with nothing to validate
+        // internally (e.g. `print(df)`, no subscript at all) is STILL param-governed
+        // and resolvable via call-site tracing; the intra-function untracked-dataframe
+        // warning is just as stale for it as for one with recorded accesses. Bailing
+        // out here would leave that warning uncorrected purely because there happens
+        // to be nothing to check, which is a different question from whether the call
+        // is resolvable at all.
+
+        Some(ParamGovernedTemplate {
+            param_name,
+            param_index,
+            full_feature_names,
+            accesses,
+            governing_line,
+            governing_col,
+        })
+    }
+
+    // Recursively collects every `<target_var>["literal"]` subscript access reachable
+    // from `stmt`, matching the same nesting scope as `analyze_stmt_for_contract`
+    // (Return/Expr/Assign/AnnAssign/If/For/While/With) for consistency with the rest of
+    // this checker's "conservative rather than exhaustive" heuristics.
+    fn collect_subscript_accesses(
+        &self,
+        stmt: &Stmt,
+        target_var: &str,
+        out: &mut Vec<ParamGovernedAccess>,
+    ) {
+        match stmt {
+            Stmt::Return(ret) => {
+                if let Some(value) = &ret.value {
+                    self.collect_subscripts_in_expr(value, target_var, out);
+                }
+            }
+            Stmt::Expr(expr_stmt) => {
+                self.collect_subscripts_in_expr(&expr_stmt.value, target_var, out)
+            }
+            Stmt::Assign(assign) => self.collect_subscripts_in_expr(&assign.value, target_var, out),
+            Stmt::AnnAssign(ann) => {
+                if let Some(value) = &ann.value {
+                    self.collect_subscripts_in_expr(value, target_var, out);
+                }
+            }
+            Stmt::If(if_stmt) => {
+                for s in &if_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+                for clause in &if_stmt.elif_else_clauses {
+                    for s in &clause.body {
+                        self.collect_subscript_accesses(s, target_var, out);
+                    }
+                }
+            }
+            Stmt::For(for_stmt) => {
+                for s in &for_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+            }
+            Stmt::While(while_stmt) => {
+                for s in &while_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                for s in &with_stmt.body {
+                    self.collect_subscript_accesses(s, target_var, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Recursively finds every `<target_var>["literal"]` subscript reachable inside
+    // `expr` — a real access is very rarely the statement's own top-level expression
+    // shape (`print(df["col"])` is a Call whose argument is the subscript, not a bare
+    // subscript statement), so this has to actually walk into the common wrapping
+    // shapes rather than checking `expr` alone the way a first pass might assume.
+    fn collect_subscripts_in_expr(
+        &self,
+        expr: &Expr,
+        target_var: &str,
+        out: &mut Vec<ParamGovernedAccess>,
+    ) {
+        if let Expr::Subscript(sub) = expr {
+            if let Expr::Name(recv) = &*sub.value {
+                if recv.id.as_str() == target_var {
+                    if let Some(col) = Self::extract_string_literal(&sub.slice) {
+                        let (line, col_num) = self.source_location(expr.range().start());
+                        out.push(ParamGovernedAccess {
+                            line,
+                            col: col_num,
+                            column: col.to_string(),
+                        });
+                    }
+                }
+            }
+            // Deliberately not recursing into `sub.value`/`sub.slice` further here —
+            // a subscript's own base is either the target (handled above) or
+            // something else entirely, and nested chained subscripts on unrelated
+            // bases aren't this checker's concern.
+            return;
+        }
+        match expr {
+            Expr::Call(call) => {
+                self.collect_subscripts_in_expr(&call.func, target_var, out);
+                for arg in &call.arguments.args {
+                    self.collect_subscripts_in_expr(arg, target_var, out);
+                }
+                for kw in &call.arguments.keywords {
+                    self.collect_subscripts_in_expr(&kw.value, target_var, out);
+                }
+            }
+            Expr::Attribute(attr) => {
+                self.collect_subscripts_in_expr(&attr.value, target_var, out);
+            }
+            Expr::BinOp(bin) => {
+                self.collect_subscripts_in_expr(&bin.left, target_var, out);
+                self.collect_subscripts_in_expr(&bin.right, target_var, out);
+            }
+            Expr::UnaryOp(unary) => {
+                self.collect_subscripts_in_expr(&unary.operand, target_var, out);
+            }
+            Expr::BoolOp(bool_op) => {
+                for v in &bool_op.values {
+                    self.collect_subscripts_in_expr(v, target_var, out);
+                }
+            }
+            Expr::Compare(cmp) => {
+                self.collect_subscripts_in_expr(&cmp.left, target_var, out);
+                for c in &cmp.comparators {
+                    self.collect_subscripts_in_expr(c, target_var, out);
+                }
+            }
+            Expr::Tuple(t) => {
+                for el in &t.elts {
+                    self.collect_subscripts_in_expr(el, target_var, out);
+                }
+            }
+            Expr::List(l) => {
+                for el in &l.elts {
+                    self.collect_subscripts_in_expr(el, target_var, out);
+                }
+            }
+            Expr::Starred(s) => {
+                self.collect_subscripts_in_expr(&s.value, target_var, out);
+            }
+            _ => {}
+        }
+    }
+
+    // Register `target_names` as a DataFrame materialized from a Feast retrieval
+    // (`.to_df()` on a `get_historical_features`/`get_online_features` result), with an
+    // *open* schema over `cols` when resolved. See `open_schemas`'s docs for why exact
+    // matching would be wrong here regardless of how well `features=` parsed.
+    fn register_feast_dataframe(
+        &mut self,
+        cols: Option<Vec<String>>,
+        target_names: &[String],
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        self.dataframes_total += 1;
+        match cols {
+            Some(cols) => {
+                self.dataframes_typed += 1;
+                let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
+                self.open_schemas.insert(schema_name.clone());
+                for name in target_names {
+                    self.variables
+                        .insert(name.clone(), (schema_name.clone(), current_line));
+                }
+            }
+            None => {
+                errors.push(LintError {
+                    line: current_line,
+                    col: current_col,
+                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                    message: "columns unknown at lint time; pass a literal \
+                              `features=[\"view:feature\", ...]` list to resolve the \
+                              retrieved columns"
+                        .to_string(),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
+    }
+
+    // If `expr` is a call to one of `SQL_PRODUCING_METHODS` (`client.query(...)`,
+    // `spark.sql(...)`, `duckdb.sql(...)`/`duckdb.query(...)`), return it so its SQL
+    // argument can be resolved — otherwise `None`. Kept as a separate check (rather than
+    // folding straight into column extraction) so the chained-finalize dispatch below
+    // can tell "not our pattern at all" (stay silent) apart from "our pattern, but the
+    // SQL didn't resolve" (worth an untracked-dataframe hint) — see its call site.
+    fn sql_producing_call(expr: &Expr) -> Option<&ast::ExprCall> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let fn_name = match &*call.func {
+            Expr::Name(n) => n.id.as_str(),
+            Expr::Attribute(a) => a.attr.as_str(),
+            _ => return None,
+        };
+        SQL_PRODUCING_METHODS.contains(&fn_name).then_some(call)
+    }
+
+    // Register `target_names` as a DataFrame with an ordinary (exact-match) schema
+    // inferred from a literal SQL string, or an untracked-dataframe warning if `sql`
+    // couldn't be resolved to one. Shared by the chained-finalize
+    // (`client.query(sql).to_dataframe()`) and cursor (`cursor.fetch_pandas_all()`)
+    // connector patterns, which differ only in how they locate the SQL text.
+    fn register_sql_dataframe(
+        &mut self,
+        sql: Option<&str>,
+        target_names: &[String],
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        self.dataframes_total += 1;
+        let cols = sql.and_then(
+            |sql| match sql::columns_from_select(sql, self.sql_dialect) {
+                sql::SqlOutcome::Columns(cols) => Some(cols),
+                sql::SqlOutcome::Wildcard | sql::SqlOutcome::Unparsed => None,
+            },
+        );
+        match cols {
+            Some(cols) => {
+                self.dataframes_typed += 1;
+                let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
+                for name in target_names {
+                    self.variables
+                        .insert(name.clone(), (schema_name.clone(), current_line));
+                }
+            }
+            None => {
+                errors.push(LintError {
+                    line: current_line,
+                    col: current_col,
+                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                    message: "columns unknown at lint time; name the columns in the \
+                              `SELECT` list instead of `SELECT *` -- an explicit list is \
+                              what lets this checker (and readers) know which columns \
+                              actually exist, or annotate the variable's type, e.g. \
+                              `df: Annotated[pd.DataFrame, MySchema] = ...`"
+                        .to_string(),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
+    }
+
+    // Resolve the right-hand side of a candidate string-variable binding: a plain
+    // string literal, or a recognized `.sql` file read (`open(p).read()`,
+    // `Path(p).read_text()`/`pathlib.Path(p).read_text()`). Called only from
+    // `StringBindingCollector` while building `string_var_candidates` — NOT from
+    // `extract_sql_expr` directly, since by the time a load call is checked, any file
+    // read has already been resolved once (and budget-capped) during the pre-pass.
+    fn resolve_literal_rhs(
+        &self,
+        expr: &Expr,
+        current_file: &Path,
+        reads_used: &mut u32,
+    ) -> Option<String> {
+        if let Some(s) = Self::extract_string_literal(expr) {
+            return Some(s.to_string());
+        }
+        if let Expr::Call(call) = expr {
+            return self.resolve_file_read_call(call, current_file, reads_used);
+        }
+        None
+    }
+
+    // Match `open(p).read()` and `p.read_text()` (where `p` is itself a path
+    // expression — `Path(p)`/`pathlib.Path(p)`, or `Path(__file__).parent / "x.sql"`
+    // with no further `Path(...)` wrapper, since nobody writes
+    // `Path(Path(__file__).parent / "x.sql")`), resolve the path via
+    // `resolve_path_expr`, and read the file through `read_sql_file`'s safety checks.
+    // The split `with open(p) as f: ... sql = f.read()` form is deliberately not
+    // handled — it would need a second traced-binding namespace for file handles, and
+    // the direct chained form covers the common case.
+    fn resolve_file_read_call(
+        &self,
+        call: &ast::ExprCall,
+        current_file: &Path,
+        reads_used: &mut u32,
+    ) -> Option<String> {
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+
+        match attr.attr.as_str() {
+            "read" => {
+                // open(p).read()
+                let Expr::Call(inner) = &*attr.value else {
+                    return None;
+                };
+                let is_open = matches!(&*inner.func, Expr::Name(n) if n.id.as_str() == "open");
+                if !is_open {
+                    return None;
+                }
+                // Reject a binary-mode open ("rb" etc.) rather than reading raw bytes
+                // as if they were UTF-8 SQL text.
+                let binary_mode = inner
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(inner.arguments.keywords.iter().map(|k| &k.value))
+                    .any(|a| matches!(Self::extract_string_literal(a), Some(m) if m.contains('b')));
+                if binary_mode {
+                    return None;
+                }
+                let path_arg = inner.arguments.args.first()?;
+                let path = self.resolve_path_expr(path_arg, current_file)?;
+                self.read_sql_file(&path, reads_used)
+            }
+            "read_text" => {
+                // The receiver of `.read_text()` IS the path expression itself —
+                // `Path(p).read_text()` or `(Path(__file__).parent / "x.sql").read_text()`.
+                let path = self.resolve_path_expr(&attr.value, current_file)?;
+                self.read_sql_file(&path, reads_used)
+            }
+            _ => None,
+        }
+    }
+
+    // Resolve a path-shaped expression to a filesystem path: a `Path(p)`/
+    // `pathlib.Path(p)` call over a string literal, or
+    // `Path(__file__).parent / "literal.sql"` anchored to the file currently being
+    // checked. Deliberately does NOT resolve a `Name` through `string_var_candidates` —
+    // path variables and SQL-text variables share no ordering guarantee within a single
+    // linear pre-pass, so doing that safely would need a fixed-point resolution loop;
+    // out of scope while call sites overwhelmingly pass the path inline.
+    fn resolve_path_expr(&self, expr: &Expr, current_file: &Path) -> Option<PathBuf> {
+        if let Some(s) = Self::extract_string_literal(expr) {
+            return Some(PathBuf::from(s));
+        }
+        if let Expr::Call(call) = expr {
+            let is_path_ctor = match &*call.func {
+                Expr::Name(n) => n.id.as_str() == "Path",
+                Expr::Attribute(a) => a.attr.as_str() == "Path",
+                _ => false,
+            };
+            if is_path_ctor {
+                return call
+                    .arguments
+                    .args
+                    .first()
+                    .and_then(Self::extract_string_literal)
+                    .map(PathBuf::from);
+            }
+        }
+        if let Expr::BinOp(binop) = expr {
+            if binop.op == ast::Operator::Div && Self::is_file_parent_expr(&binop.left) {
+                if let Some(s) = Self::extract_string_literal(&binop.right) {
+                    return current_file.parent().map(|dir| dir.join(s));
+                }
+            }
+        }
+        None
+    }
+
+    // Matches `Path(__file__).parent` (with or without a `pathlib.` prefix on `Path`).
+    fn is_file_parent_expr(expr: &Expr) -> bool {
+        let Expr::Attribute(attr) = expr else {
+            return false;
+        };
+        if attr.attr.as_str() != "parent" {
+            return false;
+        }
+        let Expr::Call(call) = &*attr.value else {
+            return false;
+        };
+        let is_path_ctor = match &*call.func {
+            Expr::Name(n) => n.id.as_str() == "Path",
+            Expr::Attribute(a) => a.attr.as_str() == "Path",
+            _ => false,
+        };
+        is_path_ctor
+            && matches!(
+                call.arguments.args.first(),
+                Some(Expr::Name(n)) if n.id.as_str() == "__file__"
+            )
+    }
+
+    // Safety-checked read of a `.sql` file traced back from a load call. The real
+    // security boundary is project-root containment, checked below AFTER
+    // canonicalizing both sides (which also catches symlink escapes, since
+    // canonicalization follows symlinks) — NOT rejecting absolute paths outright, since
+    // `resolve_path_arg`'s `Path(__file__).parent / "x.sql"` case legitimately produces
+    // an absolute path whenever the file being checked was itself passed in as an
+    // absolute path (the normal case for every real caller). An absolute path a user
+    // wrote directly, e.g. `Path("/etc/passwd")`, still gets rejected: it canonicalizes
+    // to itself, which isn't under the project root. Also refuses: any extension other
+    // than `.sql`; a budget of more than `MAX_SQL_FILE_READS_PER_FILE` reads per file
+    // checked; files over `MAX_SQL_FILE_BYTES`; and anything that isn't a plain file (a
+    // FIFO under the project root would otherwise hang the linter, since reading one
+    // blocks until a writer opens it).
+    fn read_sql_file(&self, path: &Path, reads_used: &mut u32) -> Option<String> {
+        const MAX_SQL_FILE_BYTES: u64 = 256 * 1024;
+        const MAX_SQL_FILE_READS_PER_FILE: u32 = 32;
+
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+        {
+            return None;
+        }
+        let root = self.project_root.as_ref()?;
+        if *reads_used >= MAX_SQL_FILE_READS_PER_FILE {
+            return None;
+        }
+
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let canonical_root = fs::canonicalize(root).ok()?;
+        let canonical_target = fs::canonicalize(&candidate).ok()?;
+        if !canonical_target.starts_with(&canonical_root) {
+            return None;
+        }
+
+        let metadata = fs::metadata(&canonical_target).ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_SQL_FILE_BYTES {
+            return None;
+        }
+
+        *reads_used += 1;
+        fs::read_to_string(&canonical_target).ok()
+    }
+
+    // Build `string_var_candidates`: names bound to a plain string literal (or a
+    // resolvable `.sql` file read) exactly once anywhere in the module. Runs once, as a
+    // pre-pass over the whole module before `visit_stmt`'s single top-to-bottom walk —
+    // NOT incrementally during that walk. Two reasons: (1) `visit_stmt` recurses into a
+    // function body at its `def` site, so a module-level constant defined *after* the
+    // function using it would otherwise be invisible; (2) `self.variables` already
+    // tracks names flatly with no scope stack (see its own docs), so a bare pre-pass
+    // over every binding site inherits that same simplicity for free — a name assigned
+    // once in each of two different functions is two bindings of one flat name, and is
+    // correctly excluded as ambiguous, rather than requiring real scope resolution.
+    fn collect_string_var_candidates(&self, body: &[Stmt], path: &Path) -> HashMap<String, String> {
+        let mut collector = StringBindingCollector {
+            linter: self,
+            current_file: path,
+            reads_used: 0,
+            bindings: HashMap::new(),
+        };
+        for stmt in body {
+            collector.visit_stmt(stmt);
+        }
+        collector
+            .bindings
+            .into_iter()
+            .filter_map(|(name, binding)| match binding {
+                StringBinding::Literal(s) => Some((name, s)),
+                StringBinding::Poisoned => None,
+            })
+            .collect()
     }
 
     // Extract dropped column names from a drop() call.
@@ -1474,6 +3696,72 @@ impl Linter {
         None
     }
 
+    // `str.lower` / `str.upper` referenced bare (not called) — the shape `rename(...)`
+    // takes as its `columns=`/first-positional argument to case-fold every column,
+    // rather than remap specific ones by name.
+    fn expr_as_str_case_fold(expr: &Expr) -> Option<CaseFold> {
+        if let Expr::Attribute(attr) = expr {
+            if let Expr::Name(name) = &*attr.value {
+                if name.id.as_str() == "str" {
+                    return match attr.attr.as_str() {
+                        "lower" => Some(CaseFold::Lower),
+                        "upper" => Some(CaseFold::Upper),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    // Extract a case-fold from a rename() call: `.rename(columns=str.lower)` (pandas)
+    // or `.rename(str.lower)` (polars' first-positional convention, mirroring
+    // extract_rename_mapping's dict handling above).
+    fn extract_rename_case_fold(call: &ast::ExprCall) -> Option<CaseFold> {
+        for keyword in &call.arguments.keywords {
+            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("columns") {
+                return Self::expr_as_str_case_fold(&keyword.value);
+            }
+        }
+        if let Some(first_arg) = call.arguments.args.first() {
+            return Self::expr_as_str_case_fold(first_arg);
+        }
+        None
+    }
+
+    // `df.columns.str.lower()` / `.str.upper()` — the RHS shape of
+    // `df.columns = df.columns.str.lower()`. Returns the receiver's variable name
+    // (so the caller can confirm it matches the assignment target) and the fold.
+    fn extract_columns_str_fold(value: &Expr) -> Option<(String, CaseFold)> {
+        let Expr::Call(call) = value else {
+            return None;
+        };
+        let Expr::Attribute(fold_attr) = &*call.func else {
+            return None;
+        };
+        let fold = match fold_attr.attr.as_str() {
+            "lower" => CaseFold::Lower,
+            "upper" => CaseFold::Upper,
+            _ => return None,
+        };
+        let Expr::Attribute(str_attr) = &*fold_attr.value else {
+            return None;
+        };
+        if str_attr.attr.as_str() != "str" {
+            return None;
+        }
+        let Expr::Attribute(columns_attr) = &*str_attr.value else {
+            return None;
+        };
+        if columns_attr.attr.as_str() != "columns" {
+            return None;
+        }
+        let Expr::Name(recv) = &*columns_attr.value else {
+            return None;
+        };
+        Some((recv.id.to_string(), fold))
+    }
+
     fn extract_string_dict(dict: &ast::ExprDict) -> Option<HashMap<String, String>> {
         let mut map = HashMap::new();
         for item in &dict.items {
@@ -1497,6 +3785,30 @@ impl Linter {
         let name = format!("__inferred_{}_at_{}", var, line);
         self.schemas.insert(name.clone(), cols);
         name
+    }
+
+    // Column membership check used by every column-access validator (see
+    // `schema_has_column`'s call sites). Exact match: SQL-derived schemas already have
+    // `self.sql_dialect`'s case-folding baked into their column names by
+    // `sql::columns_from_select` at inference time, so e.g. a Snowflake query genuinely
+    // produces `ORDER_ID`, and `df["order_id"]` is a real bug worth reporting, not a
+    // false positive to suppress. Kept as a named helper (rather than inlining
+    // `cols.iter().any(|c| c == col)` at each call site) so every validator agrees by
+    // construction if this ever needs to change again.
+    //
+    // The one exception is an *open* schema (`self.open_schemas`, e.g. a Feast
+    // retrieval result — see `register_feast_dataframe`): membership is unconditionally
+    // `true` there, because the known column list is deliberately incomplete (Feast's
+    // real output also includes entity_df's join keys and timestamp column, which
+    // aren't resolvable in general) and treating it as exhaustive would manufacture
+    // false unknown-column errors on real columns this checker just doesn't know about.
+    fn schema_has_column(&self, schema_name: &str, col: &str) -> bool {
+        if self.open_schemas.contains(schema_name) {
+            return true;
+        }
+        self.schemas
+            .get(schema_name)
+            .is_some_and(|cols| cols.iter().any(|c| c == col))
     }
 
     // Extract a column name from a `pl.col("name")` or `col("name")` call expression.
@@ -1939,6 +4251,7 @@ impl Linter {
     fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
+                let (class_def_line, _) = self.source_location(class_def.range().start());
                 let is_schema = class_def.bases().iter().any(|base| match base {
                     Expr::Attribute(attr) => Self::is_schema_base(attr.attr.as_str()),
                     Expr::Name(name) => {
@@ -2110,12 +4423,38 @@ impl Linter {
                         }
                     }
                     self.schemas.insert(class_def.name.to_string(), columns);
+                    self.schema_locations.insert(
+                        class_def.name.to_string(),
+                        (self.file_display.clone(), class_def_line),
+                    );
+                } else if Self::class_body_has_tablename(class_def) {
+                    // SQLAlchemy declarative model: `class Order(Base): __tablename__ =
+                    // "orders"; ...`. Detected structurally, via `__tablename__` in the
+                    // class's own body, rather than by base-class name — the declarative
+                    // base is normally imported from a project-local module
+                    // (`class Order(Base)`), so it's never one of the fixed names
+                    // `is_schema_base` recognizes. Uses a separate, allowlist-based
+                    // extractor rather than the permissive one above: see
+                    // `extract_orm_columns` for why (its "any annotated attribute is a
+                    // column" fallback would sweep in `relationship(...)` attributes,
+                    // `__table_args__`, etc., which aren't real database columns).
+                    let columns = Self::extract_orm_columns(class_def);
+                    // Deliberately no RESERVED_METHODS conflict check here: that
+                    // warning is authoring advice for typedframes-native schemas
+                    // ("rename the column"), but a mapped class's column names come
+                    // from an external database schema the user doesn't control.
+                    self.schemas.insert(class_def.name.to_string(), columns);
+                    self.schema_locations.insert(
+                        class_def.name.to_string(),
+                        (self.file_display.clone(), class_def_line),
+                    );
                 }
             }
             Stmt::FunctionDef(func_def) => {
                 let (fn_def_line, _) = self.source_location(func_def.range().start());
+                self.all_function_names.insert(func_def.name.to_string());
 
-                // Track return type annotations like -> PandasFrame[Schema]
+                // Track return type annotations like -> DataFrame[Schema]
                 if let Some(returns) = &func_def.returns {
                     if let Some(schema_name) = Self::extract_schema_from_annotation(returns) {
                         self.functions
@@ -2123,9 +4462,9 @@ impl Linter {
                     }
                 }
 
-                // Schema-annotated parameters (`def f(df: PandasFrame[Schema])`,
+                // Schema-annotated parameters (`def f(df: DataFrame[Schema])`,
                 // `Annotated[pd.DataFrame, Schema]`, or a quoted equivalent) get tracked
-                // in self.variables exactly like a local `df: PandasFrame[Schema] = ...`
+                // in self.variables exactly like a local `df: DataFrame[Schema] = ...`
                 // assignment would — so accesses inside the body are validated against
                 // the declared schema, the same as anywhere else in the file, rather
                 // than left unchecked just because the binding came from a parameter.
@@ -2149,6 +4488,24 @@ impl Linter {
 
                 for body_stmt in &func_def.body {
                     self.visit_stmt(body_stmt, errors);
+                }
+                // Detect a parameter feeding a Feast features= call whose result is
+                // subscripted in this same body — see ParamGovernedTemplate's doc
+                // comment and resolve_param_governed_call_sites. Whether the
+                // untracked-dataframe warning register_feast_dataframe already pushed
+                // for this exact statement should be retracted depends on whether any
+                // ACTUAL call site anywhere in the project was ever traced back to it —
+                // not just on this shape existing — so that decision is deferred to
+                // check_file, informed by ProjectIndex.resolved_governed (see its doc
+                // comment for why: a governed call site that fails to resolve now gets
+                // its OWN untracked-dataframe diagnostic at the call site, so retracting
+                // the callee's line is safe whenever some call site was seen; only a
+                // function with no discoverable call site anywhere keeps this line as
+                // its sole diagnostic, so retracting unconditionally would silently go
+                // from "we tell you it's unknown" to "we tell you nothing at all").
+                if let Some(template) = self.find_param_governed_feast_template(func_def) {
+                    self.param_governed_templates
+                        .insert(func_def.name.to_string(), template);
                 }
                 // If no annotation-based mapping, infer from `return <var>`.
                 // After visiting the body, self.variables holds the schema of every
@@ -2257,24 +4614,73 @@ impl Linter {
                 for target in &assign.targets {
                     if let Expr::Subscript(subscript) = target {
                         if let Expr::Name(name) = &*subscript.value {
-                            if let Some((schema_name, _)) = self.variables.get(name.id.as_str()) {
+                            if let Some((schema_name, defined_line)) =
+                                self.variables.get(name.id.as_str())
+                            {
                                 if let Some(col_name) =
                                     Self::extract_string_literal(&subscript.slice)
                                 {
                                     let schema_name = schema_name.clone();
+                                    let defined_line = *defined_line;
+                                    let already_has_col =
+                                        self.schema_has_column(&schema_name, col_name);
+                                    if !already_has_col {
+                                        let schema_display =
+                                            self.schema_display(&schema_name, defined_line);
+                                        errors.push(LintError {
+                                            line: current_line,
+                                            col: current_col,
+                                            code: CODE_UNKNOWN_COLUMN.to_string(),
+                                            message: format!(
+                                                "Column '{}' does not exist in {} (mutation tracking)",
+                                                col_name, schema_display
+                                            ),
+                                            severity: "error".to_string(),
+                                        });
+                                    }
                                     if let Some(columns) = self.schemas.get_mut(&schema_name) {
-                                        if !columns.iter().any(|c| c == col_name) {
-                                            errors.push(LintError {
-                                                line: current_line,
-                                                col: current_col,
-                                                code: CODE_UNKNOWN_COLUMN.to_string(),
-                                                message: format!("Column '{}' does not exist in {} (mutation tracking)", col_name, schema_name),
-                                                severity: "error".to_string(),
-                                            });
+                                        if !already_has_col {
                                             columns.push(col_name.to_string());
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // df.columns = df.columns.str.lower() / .str.upper() -- a recognized
+                // case-fold of an already-known column set (see CaseFold's doc comment
+                // for why this is a fixed, narrow pattern rather than general support
+                // for arbitrary transform functions).
+                for target in &assign.targets {
+                    if let Expr::Attribute(target_attr) = target {
+                        if target_attr.attr.as_str() != "columns" {
+                            continue;
+                        }
+                        let Expr::Name(target_recv) = &*target_attr.value else {
+                            continue;
+                        };
+                        let Some((rhs_recv, fold)) = Self::extract_columns_str_fold(&assign.value)
+                        else {
+                            continue;
+                        };
+                        if rhs_recv != target_recv.id.as_str() {
+                            continue;
+                        }
+                        if let Some((schema_name, _)) =
+                            self.variables.get(target_recv.id.as_str()).cloned()
+                        {
+                            if let Some(base_cols) = self.schemas.get(&schema_name).cloned() {
+                                let new_cols: Vec<String> =
+                                    base_cols.iter().map(|c| fold.apply(c)).collect();
+                                let new_schema = self.make_inferred_schema(
+                                    new_cols,
+                                    target_recv.id.as_str(),
+                                    current_line,
+                                );
+                                self.variables
+                                    .insert(target_recv.id.to_string(), (new_schema, current_line));
                             }
                         }
                     }
@@ -2361,6 +4767,26 @@ impl Linter {
                 }
 
                 if let Expr::Call(call) = &*assign.value {
+                    // Handle stmt = select(Order.id, Order.amount) — and the same
+                    // chained onto .where(...)/.order_by(...)/etc, see
+                    // SELECT_CHAIN_METHODS — so a later pd.read_sql(stmt, engine) can
+                    // resolve `stmt` via `stmt_var_candidates`. Checked unconditionally
+                    // here (rather than inside the match below) since the outermost
+                    // call in the chained form is a `.where(...)` *method* call, not a
+                    // bare `select(...)` name call, and would otherwise never reach the
+                    // `Expr::Name(func_name)` arm at all. A later reassignment of the
+                    // same name simply overwrites this entry (consistent with how
+                    // `self.variables` already behaves) rather than needing the
+                    // whole-module poisoning discipline `string_var_candidates` relies
+                    // on — this only has to be correct in top-to-bottom order, like
+                    // every other variable binding this checker tracks.
+                    if let [Expr::Name(target_name)] = assign.targets.as_slice() {
+                        if let Some(cols) = self.extract_select_columns(&assign.value) {
+                            self.stmt_var_candidates
+                                .insert(target_name.id.to_string(), cols);
+                        }
+                    }
+
                     let mut is_merge_or_concat = false;
                     let mut merge_schema = None;
 
@@ -2408,35 +4834,12 @@ impl Linter {
                                         }
                                     }
                                 }
-                            } else if func_name == "from_schema"
-                                || func_name == "from_pandas"
+                            } else if func_name == "from_pandas"
                                 || func_name == "from_polars"
                                 || LOAD_FUNCTIONS.contains(&func_name)
                             {
-                                // PandasFrame.from_schema(df, Schema) or Schema.from_pandas(df)
-                                if let Expr::Attribute(inner_attr) = &*attr.value {
-                                    // This is like PandasFrame.from_schema
-                                    let class_name = inner_attr.attr.as_str();
-                                    if class_name == "PandasFrame" || class_name == "PolarsFrame" {
-                                        // Find the schema argument
-                                        if call.arguments.args.len() >= 2 {
-                                            if let Expr::Name(schema_name) = &call.arguments.args[1]
-                                            {
-                                                for target in &assign.targets {
-                                                    if let Expr::Name(target_name) = target {
-                                                        self.variables.insert(
-                                                            target_name.id.to_string(),
-                                                            (
-                                                                schema_name.id.to_string(),
-                                                                current_line,
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if let Expr::Name(class_name) = &*attr.value {
+                                // Schema.from_pandas(df) / Schema.from_polars(df).
+                                if let Expr::Name(class_name) = &*attr.value {
                                     let class_str = class_name.id.as_str();
                                     if self.schemas.contains_key(class_str) {
                                         // Schema.from_pandas(df) style
@@ -2453,9 +4856,102 @@ impl Linter {
                                     } else if LOAD_MODULES.contains(&class_str)
                                         && LOAD_FUNCTIONS.contains(&func_name)
                                     {
-                                        // pd.read_csv() / pl.scan_parquet() etc.
+                                        // pd.read_csv() / pl.scan_parquet() / pd.read_sql() etc.
                                         self.dataframes_total += 1;
-                                        match Self::extract_load_columns(call) {
+                                        let (extracted, load_kind) =
+                                            self.extract_load_columns(func_name, call);
+                                        match extracted {
+                                            Some(cols) => {
+                                                self.dataframes_typed += 1;
+                                                let target_names: Vec<String> = assign
+                                                    .targets
+                                                    .iter()
+                                                    .filter_map(|t| {
+                                                        if let Expr::Name(n) = t {
+                                                            Some(n.id.to_string())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .collect();
+                                                let var_name = target_names
+                                                    .first()
+                                                    .map(|s| s.as_str())
+                                                    .unwrap_or("df");
+                                                let schema_name = self.make_inferred_schema(
+                                                    cols,
+                                                    var_name,
+                                                    current_line,
+                                                );
+                                                for name in &target_names {
+                                                    self.variables.insert(
+                                                        name.clone(),
+                                                        (schema_name.clone(), current_line),
+                                                    );
+                                                }
+                                            }
+                                            None => {
+                                                let hint = match load_kind {
+                                                    LoadKind::Sql => {
+                                                        "name the columns in the `SELECT` list \
+                                                         instead of `SELECT *` -- an explicit \
+                                                         list is what lets this checker (and \
+                                                         readers) know which columns actually \
+                                                         exist, or annotate the variable's \
+                                                         type, e.g. `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.read_sql(...)`"
+                                                    }
+                                                    LoadKind::File => {
+                                                        "specify `usecols`/`columns`, or \
+                                                         annotate the variable's type, e.g. \
+                                                         `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.read_csv(...)`"
+                                                    }
+                                                    LoadKind::Orm => {
+                                                        "pass select(Model.col1, Model.col2, ...) \
+                                                         referencing a registered model's known \
+                                                         columns (a bare `select(Model)` isn't \
+                                                         supported), or annotate the variable's \
+                                                         type, e.g. `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.read_sql(...)`"
+                                                    }
+                                                };
+                                                errors.push(LintError {
+                                                    line: current_line,
+                                                    col: current_col,
+                                                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                                                    message: format!(
+                                                        "columns unknown at lint time; {hint}"
+                                                    ),
+                                                    severity: "warning".to_string(),
+                                                });
+                                            }
+                                        }
+                                    } else if CONNECTORX_MODULES.contains(&class_str)
+                                        && func_name == "read_sql"
+                                    {
+                                        // connectorx.read_sql(conn_uri, sql) — SQL is
+                                        // the second positional argument, the reverse of
+                                        // pandas' convention, so this can't reuse
+                                        // extract_load_columns/extract_sql_literal.
+                                        self.dataframes_total += 1;
+                                        let sql = call
+                                            .arguments
+                                            .args
+                                            .get(1)
+                                            .and_then(|a| self.extract_sql_expr(a));
+                                        let cols =
+                                            sql.and_then(|sql| {
+                                                match sql::columns_from_select(
+                                                    &sql,
+                                                    self.sql_dialect,
+                                                ) {
+                                                    sql::SqlOutcome::Columns(cols) => Some(cols),
+                                                    sql::SqlOutcome::Wildcard
+                                                    | sql::SqlOutcome::Unparsed => None,
+                                                }
+                                            });
+                                        match cols {
                                             Some(cols) => {
                                                 self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
@@ -2490,10 +4986,12 @@ impl Linter {
                                                     line: current_line,
                                                     col: current_col,
                                                     code: CODE_UNTRACKED_DATAFRAME.to_string(),
-                                                    message: "columns unknown at lint time; \
-                                                              specify `usecols`/`columns` or \
-                                                              annotate: `df: Annotated[pd.DataFrame, MySchema] \
-                                                              = pd.read_csv(...)`"
+                                                    message: "columns unknown at lint \
+                                                              time; name the columns in \
+                                                              the `SELECT` list (avoid \
+                                                              `SELECT *`) or annotate: \
+                                                              `df: Annotated[pd.DataFrame, \
+                                                              MySchema] = ...`"
                                                         .to_string(),
                                                     severity: "warning".to_string(),
                                                 });
@@ -2598,6 +5096,135 @@ impl Linter {
                                         }
                                     }
                                 }
+                            } else if FEAST_RETRIEVAL_METHODS.contains(&func_name) {
+                                // job = store.get_historical_features(entity_df=..., features=[...])
+                                // — the split form's first half. Not yet a DataFrame (a
+                                // RetrievalJob/OnlineResponse), so tracked in the
+                                // separate `retrieval_jobs` map rather than
+                                // `self.variables` — otherwise `job["x"]` before
+                                // `.to_df()` would be (wrongly) validated as a column
+                                // access. See `register_feast_dataframe` for where this
+                                // actually becomes a tracked DataFrame.
+                                if let Some(cols) = self.extract_feast_feature_columns(call) {
+                                    if let [Expr::Name(target_name)] = assign.targets.as_slice() {
+                                        self.retrieval_jobs
+                                            .insert(target_name.id.to_string(), cols);
+                                    }
+                                }
+                            } else if func_name == "to_df" {
+                                // Either half of Feast's two DataFrame-materializing
+                                // shapes: the split form's second half
+                                // (`df = job.to_df()`, `job` resolved via
+                                // `retrieval_jobs` above), or the chained form
+                                // (`df = store.get_historical_features(...).to_df()`)
+                                // in one statement. Anything else calling `.to_df()`
+                                // (unrelated to Feast) is deliberately left alone —
+                                // matched only once one of these two specific shapes is
+                                // confirmed, not on the method name alone.
+                                let feast_cols = match &*attr.value {
+                                    Expr::Name(recv) => {
+                                        self.retrieval_jobs.get(recv.id.as_str()).cloned().map(Some)
+                                    }
+                                    Expr::Call(inner_call) => match &*inner_call.func {
+                                        Expr::Attribute(inner_attr)
+                                            if FEAST_RETRIEVAL_METHODS
+                                                .contains(&inner_attr.attr.as_str()) =>
+                                        {
+                                            Some(self.extract_feast_feature_columns(inner_call))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                };
+                                if let Some(cols) = feast_cols {
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_name =
+                                        target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                    self.register_feast_dataframe(
+                                        cols,
+                                        &target_names,
+                                        var_name,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
+                                }
+                            } else if SQL_FINALIZE_METHODS.contains(&func_name) {
+                                // client.query(sql).to_dataframe() / spark.sql(sql)
+                                // .toPandas() / duckdb.sql(sql).df()/.pl() — only
+                                // dispatched once the call this is chained onto is
+                                // confirmed to be one of SQL_PRODUCING_METHODS with a
+                                // resolvable SQL argument; `.df()`/`.pl()`/`.toPandas()`
+                                // alone are too generic a signal (plenty of unrelated
+                                // code has methods by those names) to count or warn on
+                                // by name alone.
+                                if let Some(inner_call) = Self::sql_producing_call(&attr.value) {
+                                    let sql = self.extract_sql_literal(inner_call);
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_name =
+                                        target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                    self.register_sql_dataframe(
+                                        sql.as_deref(),
+                                        &target_names,
+                                        var_name,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
+                                }
+                            } else if func_name == "fetch_pandas_all" {
+                                // cursor.fetch_pandas_all() — the second half of the
+                                // Snowflake/Redshift cursor pattern; the SQL text was
+                                // recorded by the `cursor.execute(sql)` bare-statement
+                                // handling above. Unlike the finalize methods above,
+                                // this name is specific enough that dispatching on it
+                                // alone (even with no prior tracked `execute()`) is
+                                // safe — it isn't a generic accessor name plausibly
+                                // used for something unrelated.
+                                if let Expr::Name(recv) = &*attr.value {
+                                    let sql = self.cursor_sql.get(recv.id.as_str()).cloned();
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_name =
+                                        target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                    self.register_sql_dataframe(
+                                        sql.as_deref(),
+                                        &target_names,
+                                        var_name,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
+                                }
                             } else if func_name == "drop" {
                                 if let Expr::Name(recv) = &*attr.value {
                                     let recv_str = recv.id.as_str();
@@ -2682,8 +5309,43 @@ impl Linter {
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
                                     let mapping = Self::extract_rename_mapping(call);
-                                    match (base_cols, mapping) {
-                                        (Some(base_cols), Some(mapping)) => {
+                                    let case_fold = if mapping.is_none() {
+                                        Self::extract_rename_case_fold(call)
+                                    } else {
+                                        None
+                                    };
+                                    match (base_cols, mapping, case_fold) {
+                                        (Some(base_cols), None, Some(fold)) => {
+                                            let new_cols: Vec<String> =
+                                                base_cols.iter().map(|c| fold.apply(c)).collect();
+                                            let target_names: Vec<String> = assign
+                                                .targets
+                                                .iter()
+                                                .filter_map(|t| {
+                                                    if let Expr::Name(n) = t {
+                                                        Some(n.id.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect();
+                                            let var_name = target_names
+                                                .first()
+                                                .map(|s| s.as_str())
+                                                .unwrap_or("unknown");
+                                            let schema_name = self.make_inferred_schema(
+                                                new_cols,
+                                                var_name,
+                                                current_line,
+                                            );
+                                            for name in &target_names {
+                                                self.variables.insert(
+                                                    name.clone(),
+                                                    (schema_name.clone(), current_line),
+                                                );
+                                            }
+                                        }
+                                        (Some(base_cols), Some(mapping), _) => {
                                             let schema_display = base_info
                                                 .as_ref()
                                                 .map(|(s, l)| self.schema_display(s, *l))
@@ -2905,6 +5567,13 @@ impl Linter {
                             combined_cols.dedup();
 
                             let combined_schema_name = format!("{}_{}", s1, s2);
+                            // An open schema (see `register_feast_dataframe`) stays open
+                            // after a merge/concat: its column list was already known to
+                            // be incomplete before the join, and combining it with
+                            // another frame's columns doesn't make it any more complete.
+                            if self.open_schemas.contains(&s1) || self.open_schemas.contains(&s2) {
+                                self.open_schemas.insert(combined_schema_name.clone());
+                            }
                             self.schemas
                                 .insert(combined_schema_name.clone(), combined_cols);
                             for target in &assign.targets {
@@ -2922,10 +5591,7 @@ impl Linter {
                     if let Expr::Subscript(subscript) = &*call.func {
                         if let Expr::Name(name) = &*subscript.value {
                             let type_name = name.id.as_str();
-                            if type_name == "DataFrame"
-                                || type_name == "PandasFrame"
-                                || type_name == "PolarsFrame"
-                            {
+                            if type_name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
@@ -2974,7 +5640,7 @@ impl Linter {
                             }
                         }
                     } else if let Expr::Name(func_name) = &*call.func {
-                        // Handle df = load_users() where load_users() -> PandasFrame[Schema]
+                        // Handle df = load_users() where load_users() -> DataFrame[Schema]
                         if let Some(schema_name) = self.functions.get(func_name.id.as_str()) {
                             let schema_name = schema_name.clone();
                             self.dataframes_total += 1;
@@ -3012,10 +5678,7 @@ impl Linter {
                         if let Expr::Subscript(subscript) = &*call.func {
                             if let Expr::Name(name) = &*subscript.value {
                                 let type_name = name.id.as_str();
-                                if type_name == "DataFrame"
-                                    || type_name == "PandasFrame"
-                                    || type_name == "PolarsFrame"
-                                {
+                                if type_name == "DataFrame" {
                                     if let Expr::Name(schema_name) = &*subscript.slice {
                                         if let Expr::Name(target_name) = &*ann_assign.target {
                                             self.variables.insert(
@@ -3055,9 +5718,8 @@ impl Linter {
                         }
 
                         if let Some(name) = type_name {
-                            // DataFrame[Schema], PandasFrame[Schema], PolarsFrame[Schema]
-                            if name == "DataFrame" || name == "PandasFrame" || name == "PolarsFrame"
-                            {
+                            // DataFrame[Schema]
+                            if name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     if let Expr::Name(target_name) = &*ann_assign.target {
                                         self.variables.insert(
@@ -3146,6 +5808,28 @@ impl Linter {
                                     self.add_column_inplace(recv.id.as_str(), col_name, line);
                                 }
                             }
+                        } else if func_name == "execute" {
+                            // cursor.execute(sql) — the PEP 249 pattern used by
+                            // Snowflake, Redshift, and similar DB-API connectors. The
+                            // SQL text is bound to the cursor, not returned, so it's
+                            // tracked in `cursor_sql` until a later
+                            // `cursor.fetch_pandas_all()` (see the Assign arm) turns it
+                            // into a DataFrame.
+                            if let Expr::Name(recv) = &*attr.value {
+                                let sql = call
+                                    .arguments
+                                    .args
+                                    .first()
+                                    .and_then(|a| self.extract_sql_expr(a));
+                                match sql {
+                                    Some(sql) => {
+                                        self.cursor_sql.insert(recv.id.to_string(), sql);
+                                    }
+                                    None => {
+                                        self.cursor_sql.remove(recv.id.as_str());
+                                    }
+                                }
+                            }
                         }
                         // Validate pl.col() / col() references for bare expression method calls.
                         if let Expr::Name(recv) = &*attr.value {
@@ -3218,31 +5902,28 @@ impl Linter {
         ann_assign: &ast::StmtAnnAssign,
         current_line: usize,
     ) {
-        // Handle patterns like "DataFrame[Schema]", "PandasFrame[Schema]", "PolarsFrame[Schema]"
+        // Handle patterns like "DataFrame[Schema]"
         // and "Annotated[DataFrame, Schema]", "Annotated[pl.DataFrame, Schema]"
 
-        let patterns = ["DataFrame[", "PandasFrame[", "PolarsFrame["];
-        for pattern in patterns {
-            if s.contains(pattern) {
-                if let Some(start) = s.find('[') {
-                    if let Some(end) = s.rfind(']') {
-                        let schema_name = &s[start + 1..end];
-                        // Handle nested generics by taking the last part
-                        let schema = schema_name
-                            .split(',')
-                            .next_back()
-                            .unwrap_or(schema_name)
-                            .trim();
-                        if let Expr::Name(target_name) = &*ann_assign.target {
-                            self.variables.insert(
-                                target_name.id.to_string(),
-                                (schema.to_string(), current_line),
-                            );
-                        }
+        if s.contains("DataFrame[") {
+            if let Some(start) = s.find('[') {
+                if let Some(end) = s.rfind(']') {
+                    let schema_name = &s[start + 1..end];
+                    // Handle nested generics by taking the last part
+                    let schema = schema_name
+                        .split(',')
+                        .next_back()
+                        .unwrap_or(schema_name)
+                        .trim();
+                    if let Expr::Name(target_name) = &*ann_assign.target {
+                        self.variables.insert(
+                            target_name.id.to_string(),
+                            (schema.to_string(), current_line),
+                        );
                     }
                 }
-                return;
             }
+            return;
         }
 
         // Handle Annotated pattern
@@ -3288,7 +5969,7 @@ impl Linter {
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             let attr_name = attr.attr.as_str();
-                            if !columns.contains(&attr_name.to_string())
+                            if !self.schema_has_column(schema_name, attr_name)
                                 && !RESERVED_METHODS.contains(&attr_name)
                             {
                                 let (line, col) = self.source_location(attr.range().start());
@@ -3320,7 +6001,7 @@ impl Linter {
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
                             if let Some(col_name) = Self::extract_string_literal(&subscript.slice) {
-                                if !columns.iter().any(|c| c == col_name) {
+                                if !self.schema_has_column(schema_name, col_name) {
                                     let (line, col) =
                                         self.source_location(subscript.range().start());
                                     let schema_display =
@@ -3475,6 +6156,140 @@ print(df["name"])
     }
 
     #[test]
+    fn test_should_list_available_columns_for_a_named_schema_unknown_column_error() {
+        // Named schemas (BaseSchema subclasses) used to only get "SchemaName (defined
+        // at line N)" in an unknown-column message -- no column list, and that line was
+        // actually the VARIABLE's binding line, not the schema class's own definition.
+        // schema_display now includes the column set for named schemas too, and points
+        // at the class's actual definition (line 4, where `class UserSchema` is) rather
+        // than the variable binding (line 7).
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].message.contains("user_id"),
+            "{}",
+            errors[0].message
+        );
+        assert!(errors[0].message.contains("email"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("defined at test.py:4"),
+            "should point at the class definition (line 4), not the variable binding \
+             (line 7): {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_should_point_unknown_column_message_at_schema_defined_in_a_different_file() {
+        // A named schema imported from another file must still resolve its own
+        // class-definition location cross-file, not just its column list -- the
+        // schema's own file, not the importing pipeline file, is what belongs in
+        // "defined at ...".
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from schemas import UserSchema
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let index_bytes = rmp_serde::to_vec(&index).unwrap();
+        let index = get_cached_index(&index_bytes).unwrap();
+        let mut linter = Linter::new();
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        let schemas_path = root.join("schemas.py");
+        let expected = format!("defined at {}:4", schemas_path.to_str().unwrap());
+        assert!(
+            errors[0].message.contains(&expected),
+            "expected {:?} in {}",
+            expected,
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_should_list_available_columns_in_mutation_tracking_error() {
+        // df["new_col"] = ... on a named-schema-tracked variable, where new_col isn't
+        // in the schema, is flagged (mutation tracking) -- that message used to bypass
+        // schema_display entirely and print only the bare schema name, with no column
+        // list and no class-definition location. Now routes through schema_display
+        // like every other unknown-column message, pointing at the schema's own class
+        // definition (line 4, where `class UserSchema` is), not the mutating line.
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: DataFrame[UserSchema] = load()
+df["new_column"] = 1
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("mutation tracking"));
+        assert!(
+            errors[0].message.contains("user_id"),
+            "{}",
+            errors[0].message
+        );
+        assert!(errors[0].message.contains("email"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("defined at test.py:4"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
     fn test_should_lint_annotated_polars_pattern() {
         // arrange
         let source = r#"
@@ -3508,14 +6323,13 @@ print(df["wrong_column"])
         // arrange
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-def load_users() -> PandasFrame[UserSchema]:
-    return PandasFrame.from_schema(pd.read_csv("users.csv"), UserSchema)
+def load_users() -> DataFrame[UserSchema]:
+    return pd.read_csv("users.csv")
 
 df = load_users()
 print(df["user_id"])
@@ -3614,14 +6428,13 @@ print(df["user_id"])
         // arrange
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-def load_users() -> PandasFrame[UserSchema]:
-    return PandasFrame.from_schema(pd.read_csv("users.csv"), UserSchema)
+def load_users() -> DataFrame[UserSchema]:
+    return pd.read_csv("users.csv")
 
 df = load_users()
 print(df["user_id"])
@@ -3903,13 +6716,12 @@ def g(df: pd.DataFrame) -> pd.DataFrame:
         // project index involved.
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     print(customers["email"])
 "#;
@@ -3952,14 +6764,13 @@ def load(path: str) -> pd.DataFrame:
             root.join("transforms.py"),
             r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
     name = Column(type=str)
     email = Column(type=str)
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     return customers
 "#,
@@ -4015,10 +6826,9 @@ class CustomerSchema(BaseSchema):
         )
         .unwrap();
         let transforms_source = r#"
-from typedframes.pandas import PandasFrame
 from schemas import CustomerSchema
 
-def contact_label(customers: PandasFrame[CustomerSchema]):
+def contact_label(customers: DataFrame[CustomerSchema]):
     print(customers["name"])
     print(customers["not_a_real_column"])
     return customers
@@ -4100,6 +6910,181 @@ def process(path: str) -> None:
         assert_eq!(errors[0].code, "unknown-column");
         assert!(errors[0].message.contains("not_a_real_column"));
         assert!(errors[0].message.contains("CustomerSchema"));
+    }
+
+    #[test]
+    fn test_should_propagate_case_folded_schema_from_an_unannotated_cross_file_helper() {
+        // arrange: an internal-package-style helper in loaders.py queries Snowflake
+        // (columns come back upper-cased under sql_dialect="snowflake"), then
+        // lower-cases them all before returning -- no BaseSchema/Annotated return type
+        // anywhere. pipeline.py, in a different file, only sees the lower-cased names.
+        // The cross-file return-schema mechanism must pick up the POST-fold schema
+        // (not the raw upper-cased Snowflake one) when resolving load_orders' return
+        // type at pipeline.py's call site.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+import pandas as pd
+import internal_snowflake_pkg
+
+def load_orders(query: str) -> pd.DataFrame:
+    conn = internal_snowflake_pkg.connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+    return df
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from loaders import load_orders
+
+def process(query: str) -> None:
+    orders = load_orders(query)
+    print(orders["order_id"])
+    print(orders["ORDER_ID"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(
+            root.to_path_buf(),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
+                exclude: None,
+            },
+        );
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_trace_an_allowlisted_package_installed_in_venv_site_packages() {
+        // arrange: same scenario as the cross-file case-fold test above, but this time
+        // the case-folding helper genuinely lives OUTSIDE the project tree, in a fake
+        // .venv/lib/pythonX.Y/site-packages/internal_snowflake_pkg/ -- simulating a real
+        // pip-installed internal package, not just another first-party file. Without
+        // `trace_external_packages` naming it, this must NOT be indexed at all (today's
+        // behavior: pipeline.py's call site is untraceable, load_orders' return type is
+        // simply unknown); with it, the same post-fold propagation must work across
+        // that install boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    conn = connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+    return df
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_snowflake_pkg import load_orders
+
+def process(query: str) -> None:
+    orders = load_orders(query)
+    print(orders["order_id"])
+    print(orders["ORDER_ID"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        let config_with_allowlist = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: Some("snowflake".to_string()),
+            trace_external_packages: Some(vec!["internal_snowflake_pkg".to_string()]),
+            exclude: None,
+        };
+
+        // act: without the allowlist, nothing outside the project tree is indexed.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\n",
+        )
+        .unwrap();
+        let index_without_allowlist = build_index_internal(root);
+        let mut linter_without = Linter::new();
+        linter_without.with_context(root.to_path_buf(), &config_with_allowlist);
+        let pipeline_path = root.join("pipeline.py");
+        linter_without.load_cross_file_symbols(
+            &index_without_allowlist,
+            pipeline_source,
+            &pipeline_path,
+            root,
+        );
+        let errors_without = linter_without
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+        assert_eq!(
+            errors_without.len(),
+            0,
+            "load_orders' return type must be untraceable without the allowlist: {errors_without:?}"
+        );
+
+        // act: with the allowlist, the external package is indexed and its post-fold
+        // return schema is picked up at pipeline.py's call site.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\ntrace_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+        let index_with_allowlist = build_index_internal(root);
+        let mut linter_with = Linter::new();
+        linter_with.with_context(root.to_path_buf(), &config_with_allowlist);
+        linter_with.load_cross_file_symbols(
+            &index_with_allowlist,
+            pipeline_source,
+            &pipeline_path,
+            root,
+        );
+        let errors_with = linter_with
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(
+            errors_with.len(),
+            1,
+            "expected one error, got: {errors_with:?}"
+        );
+        assert_eq!(errors_with[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors_with[0].message.contains("ORDER_ID"));
     }
 
     #[test]
@@ -4341,6 +7326,1306 @@ def process(path: str) -> None:
     }
 
     #[test]
+    fn test_load_linter_config_reads_sql_dialect() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Absent entirely -> None, so `with_context` leaves the dialect at its
+        // Generic default rather than overwriting it.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = true",
+        )
+        .unwrap();
+        assert_eq!(load_linter_config(root).sql_dialect, None);
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(root).sql_dialect,
+            Some("snowflake".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_linter_config_reads_exclude_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\".claude\", \"vendor\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(root).exclude,
+            Some(vec![".claude".to_string(), "vendor".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_should_prune_configured_exclude_directories_from_project_index() {
+        // A non-default directory (e.g. a vendored `third_party/`) isn't caught by
+        // DEFAULT_EXCLUDED_DIRS -- [tool.typedframes] exclude is what lets a project
+        // prune it (or any other named directory) explicitly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"third_party\"]",
+        )
+        .unwrap();
+        fs::create_dir(root.join("third_party")).unwrap();
+        fs::write(
+            root.join("third_party").join("vendored.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class VendoredSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert -- only app.py was indexed; third_party/ was pruned entirely
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.contains("third_party")),
+            "third_party/ should have been pruned: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("VendoredSchema"));
+    }
+
+    #[test]
+    fn test_should_prune_dot_claude_by_default_with_no_config_at_all() {
+        // .claude is in DEFAULT_EXCLUDED_DIRS -- pruned automatically with no
+        // [tool.typedframes] exclude configured at all, same as .venv/.git/etc.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".claude").join("worktrees").join("agent-1")).unwrap();
+        fs::write(
+            root.join(".claude")
+                .join("worktrees")
+                .join("agent-1")
+                .join("stale.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class StaleSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.contains(".claude")),
+            ".claude/ should have been pruned by default: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("StaleSchema"));
+    }
+
+    #[test]
+    fn test_should_replace_rather_than_add_to_default_excludes_when_configured() {
+        // Configuring [tool.typedframes] exclude REPLACES DEFAULT_EXCLUDED_DIRS
+        // entirely -- it does not add to it. A project that configures its own
+        // exclude list without re-listing .venv gets .venv walked again; that's the
+        // deliberate override semantics (matching ruff's own exclude, as opposed to
+        // extend-exclude), not a bug.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"custom_dir\"]",
+        )
+        .unwrap();
+        fs::create_dir(root.join("custom_dir")).unwrap();
+        fs::write(root.join("custom_dir").join("skipped.py"), "x = 1\n").unwrap();
+        fs::create_dir(root.join(".venv")).unwrap();
+        fs::write(
+            root.join(".venv").join("walked.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class VenvSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            !indexed.iter().any(|p| p.contains("custom_dir")),
+            "custom_dir/ should have been pruned (in the configured exclude list): {indexed:#?}"
+        );
+        assert!(
+            indexed.iter().any(|p| p.contains(".venv")),
+            ".venv/ should NOT be pruned once exclude is configured without re-listing \
+             it -- override, not union: {indexed:#?}"
+        );
+        assert!(index.all_schemas.contains_key("VenvSchema"));
+    }
+
+    #[test]
+    fn test_with_context_sets_dialect_from_config() {
+        let mut linter = Linter::new();
+        assert_eq!(linter.sql_dialect, sql::SqlDialect::Generic);
+
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: Some("snowflake".to_string()),
+            trace_external_packages: None,
+            exclude: None,
+        };
+        linter.with_context(PathBuf::from("/project"), &config);
+        assert_eq!(linter.sql_dialect, sql::SqlDialect::Snowflake);
+        assert_eq!(linter.project_root, Some(PathBuf::from("/project")));
+    }
+
+    #[test]
+    fn test_snowflake_dialect_folds_read_sql_columns_to_uppercase_and_flags_lowercase_access() {
+        // A Snowflake connection genuinely returns ORDER_ID (uppercase) for an unquoted
+        // `order_id` in the SELECT list — see sql::SqlDialect::fold_case. Once
+        // sql_dialect is wired to "snowflake", the checker should infer the schema with
+        // that real casing, so reading it back with the lowercase spelling actually
+        // used in the query text is flagged as unknown-column (a real bug: it would be
+        // a KeyError at runtime), while the correctly-cased access passes clean. This
+        // is the exact-match-plus-folding behavior chosen over silently accepting both
+        // cases.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+print(df["order_id"])
+print(df["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
+                exclude: None,
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("order_id"));
+        assert!(
+            errors[0].message.contains("ORDER_ID"),
+            "expected a case-corrected suggestion, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_generic_dialect_does_not_fold_read_sql_columns() {
+        // Without an explicit sql_dialect, columns keep the exact spelling from the
+        // query text (SqlDialect::Generic preserves case) — the default, safest
+        // behavior for engines the checker hasn't been told about.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+print(df["order_id"])
+"#;
+        let mut linter = Linter::new();
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_fold_columns_via_rename_with_str_lower() {
+        // A Snowflake result genuinely has upper-cased columns; .rename(columns=str.lower)
+        // -- a callable, not a literal dict -- should fold the whole known column set to
+        // lower case, not be silently treated as a no-op.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+lowered = df.rename(columns=str.lower)
+print(lowered["order_id"])
+print(lowered["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
+                exclude: None,
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_fold_columns_via_columns_attribute_assignment() {
+        // df.columns = df.columns.str.lower() -- an attribute-assignment target, not a
+        // method-chain call -- should be recognized the same way as the rename() form.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+df.columns = df.columns.str.lower()
+print(df["order_id"])
+print(df["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
+                exclude: None,
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_not_fold_columns_for_unrecognized_transform_function() {
+        // A custom/arbitrary transform function is NOT reverse-engineered -- the base
+        // schema passes through unchanged (neither folded nor flagged), same as any
+        // other unrecognized rename() argument shape.
+        let source = r#"
+import pandas as pd
+import my_internal_pkg
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+lowered = df.rename(columns=my_internal_pkg.normalize)
+print(lowered["ORDER_ID"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(
+            PathBuf::from("/project"),
+            &LinterConfig {
+                enabled: None,
+                warnings: None,
+                sql_dialect: Some("snowflake".to_string()),
+                trace_external_packages: None,
+                exclude: None,
+            },
+        );
+
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // The base schema passes through UNCHANGED (still upper-cased) -- not folded,
+        // but also not flagged as an error just for being an unrecognized call shape.
+        assert_eq!(
+            errors.len(),
+            0,
+            "unrecognized transform should pass the pre-fold base schema through untouched: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_traces_sql_through_a_single_assigned_variable() {
+        // A module-level (or function-local — the checker doesn't distinguish, see
+        // StringBindingCollector) constant assigned exactly once should resolve just
+        // like an inline literal.
+        let source = r#"
+import pandas as pd
+
+QUERY = "SELECT order_id, amount FROM orders"
+df = pd.read_sql(QUERY, conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_reassigned_sql_variable_is_not_traced() {
+        // A second binding of QUERY poisons it — the checker must not guess which
+        // assignment was actually in effect at the read_sql call, so the load falls
+        // through to the untracked-dataframe hint instead of inferring a (possibly
+        // wrong) column set.
+        let source = r#"
+import pandas as pd
+
+QUERY = "SELECT order_id FROM orders"
+QUERY = "SELECT customer_id FROM customers"
+df = pd.read_sql(QUERY, conn)
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_traces_sql_from_a_file_under_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("orders.sql"),
+            "SELECT order_id, amount FROM orders",
+        )
+        .unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("orders.sql").read_text()
+df = pd.read_sql(sql, conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_file_read_refuses_path_escaping_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outside = temp.path().parent().unwrap();
+        fs::write(outside.join("secret.sql"), "SELECT * FROM secrets").unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("../secret.sql").read_text()
+df = pd.read_sql(sql, conn)
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        // Unresolved -> falls through to untracked-dataframe, never a fabricated
+        // column set from a file outside the project.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_file_read_refuses_non_sql_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("orders.txt"), "SELECT order_id FROM orders").unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("orders.txt").read_text()
+df = pd.read_sql(sql, conn)
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_traces_sql_from_file_via_path_file_parent() {
+        // Path(__file__).parent / "orders.sql" resolves to an ABSOLUTE path (since the
+        // file being checked is passed in as an absolute path by every real caller) —
+        // regression test for a bug where read_sql_file unconditionally refused
+        // absolute paths and could never actually accept this legitimate idiom.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("orders.sql"),
+            "SELECT order_id, amount FROM orders",
+        )
+        .unwrap();
+
+        let source = r#"
+import pandas as pd
+from pathlib import Path
+
+sql = (Path(__file__).parent / "orders.sql").read_text()
+df = pd.read_sql(sql, conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_file_read_refuses_absolute_path_outside_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outside = temp.path().parent().unwrap();
+        let secret_path = outside.join("secret.sql");
+        fs::write(&secret_path, "SELECT * FROM secrets").unwrap();
+
+        let source = format!(
+            r#"
+import pandas as pd
+from pathlib import Path
+
+sql = Path("{}").read_text()
+df = pd.read_sql(sql, conn)
+"#,
+            secret_path.display()
+        );
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let errors = linter
+            .check_file_internal(&source, &root.join("pipeline.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_fstring_sql_is_silently_untracked_not_a_new_diagnostic() {
+        // f-string SQL is refused (it's the injection anti-pattern parameterized
+        // queries exist to avoid), but the checker doesn't have taint analysis to tell
+        // a safe interpolation from a real vulnerability, so it stays silent rather
+        // than emitting an unactionable injection warning — just the same
+        // untracked-dataframe hint as any other unresolvable load.
+        let source = r#"
+import pandas as pd
+
+cols = "order_id, amount"
+df = pd.read_sql(f"SELECT {cols} FROM orders", conn)
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_declarative_model_20_style_registers_mapped_columns() {
+        let source = r#"
+from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase
+
+class Base(DeclarativeBase):
+    pass
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    amount: Mapped[float]
+    customer_items: Mapped[list["Item"]]
+"#;
+        let mut linter = Linter::new();
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        let cols = linter
+            .schemas
+            .get("Order")
+            .expect("Order should be registered");
+        assert!(cols.contains(&"id".to_string()), "cols: {cols:?}");
+        assert!(cols.contains(&"amount".to_string()), "cols: {cols:?}");
+        assert!(
+            !cols.contains(&"customer_items".to_string()),
+            "relationship attribute should be excluded: {cols:?}"
+        );
+        assert!(
+            !cols.contains(&"__tablename__".to_string()),
+            "dunder should be excluded: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_declarative_model_legacy_column_style_and_positional_db_name() {
+        let source = r#"
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column("order_id", Integer, primary_key=True)
+    amount = Column(Integer)
+    customer = relationship("Customer")
+"#;
+        let mut linter = Linter::new();
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        let cols = linter
+            .schemas
+            .get("Order")
+            .expect("Order should be registered");
+        // Both the attribute name and the positional DB-name override are registered.
+        assert!(cols.contains(&"id".to_string()), "cols: {cols:?}");
+        assert!(cols.contains(&"order_id".to_string()), "cols: {cols:?}");
+        assert!(cols.contains(&"amount".to_string()), "cols: {cols:?}");
+        assert!(
+            !cols.contains(&"customer".to_string()),
+            "relationship() should be excluded: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_orm_model_skips_reserved_method_name_check() {
+        // "count" would trip CODE_RESERVED_NAME on a typedframes-native BaseSchema, but
+        // an ORM model's column names come from an external database the user doesn't
+        // control renaming — the check must not fire here.
+        let source = r#"
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    count: Mapped[int]
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert!(
+            errors.iter().all(|e| e.code != CODE_RESERVED_NAME),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_columns_resolve_inline_in_read_sql() {
+        let source = r#"
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    amount: Mapped[float]
+
+df = pd.read_sql(select(Order.id, Order.amount), engine)
+print(df["id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_select_columns_resolve_through_a_bound_variable_and_label() {
+        let source = r#"
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    amount: Mapped[float]
+
+stmt = select(Order.id, Order.amount.label("total")).where(Order.amount > 0)
+df = pd.read_sql(stmt, engine)
+print(df["total"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_bare_select_of_model_is_unresolved() {
+        // select(Order) — pulling "all" of a model's columns — is deliberately not
+        // supported: the ORM extractor is allowlist-based and can under-extract on an
+        // unusual declarative pattern, so treating its output as "the complete column
+        // set" here would risk a false unknown-column later.
+        let source = r#"
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+df = pd.read_sql(select(Order), engine)
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_feast_chained_form_registers_open_schema_over_feature_columns() {
+        // The critical case: df["driver_id"] is an entity join key, NOT one of the
+        // features= names, and is the first line of the canonical Feast tutorial. If
+        // this were an exact-match schema it would be a false unknown-column — the
+        // whole reason register_feast_dataframe marks it open instead.
+        let source = r#"
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate", "driver_stats:acc_rate"],
+).to_df()
+print(df["conv_rate"])
+print(df["driver_id"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        let schema_name = &linter.variables.get("df").unwrap().0;
+        assert!(linter.open_schemas.contains(schema_name));
+    }
+
+    #[test]
+    fn test_feast_split_form_job_not_treated_as_dataframe_before_to_df() {
+        let source = r#"
+job = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+)
+df = job.to_df()
+print(df["conv_rate"])
+print(df["driver_id"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert!(
+            !linter.variables.contains_key("job"),
+            "job (a RetrievalJob, not a DataFrame) should not be tracked in self.variables"
+        );
+    }
+
+    #[test]
+    fn test_feast_full_feature_names_uses_double_underscore() {
+        let source = r#"
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+    full_feature_names=True,
+).to_df()
+print(df["driver_stats__conv_rate"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_feast_unresolvable_features_falls_through_to_untracked_dataframe() {
+        let source = r#"
+feature_names = get_feature_list()
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=feature_names,
+).to_df()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_should_resolve_divergent_call_sites_to_a_param_governed_feast_function_independently() {
+        // arrange: load_conv_rate's `feature_names` parameter feeds a Feast
+        // features=<param> call whose result is subscripted with "conv_rate" inside the
+        // same function. Two call sites pass DIFFERENT literal feature lists for that
+        // parameter -- the first resolves to {conv_rate} (the access is valid), the
+        // second resolves to {acc_rate} (the access is NOT valid) -- and a third call
+        // site passes a non-literal (dynamically built) list, which gets its OWN
+        // untracked-dataframe diagnostic right there, rather than falling back to the
+        // callee's generic one. This is the core case: the SAME callee line
+        // (`print(df["conv_rate"])`) must NOT be flagged for the first call site while
+        // being flagged for the second -- proven here by attributing the diagnostic to
+        // the call site, not that line.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+load_conv_rate(store, entity_df, ["driver_stats:conv_rate"])
+load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
+dynamic_names = build_feature_list()
+load_conv_rate(store, entity_df, dynamic_names)
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let mut linter = Linter::new();
+        let mut errors = linter.check_file_internal(source, &file_path).unwrap();
+        // Mirrors check_file's own retraction step: at least one call site here was
+        // seen (all three were), so load_conv_rate is in resolved_governed and its
+        // stale intra-function warning should be retracted.
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path_str.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
+        if let Some(extra) = index.call_site_errors.get(&file_path_str) {
+            errors.extend(extra.iter().cloned());
+        }
+        errors.sort_by_key(|e| (e.line, e.col));
+
+        // assert
+        // The intra-function untracked-dataframe warning is suppressed: every call
+        // site was seen, so "columns unknown at lint time" inside the callee is
+        // stale/wrong, not a real signal. The first (valid literal) call site
+        // produces nothing; the second (wrong literal) produces an unknown-column
+        // error at ITS line; the third (non-literal) produces its OWN
+        // untracked-dataframe diagnostic at ITS line, not the callee's.
+        assert_eq!(errors.len(), 2, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert_eq!(
+            errors[0].line, 12,
+            "should be attributed to the SECOND call site's line, not the callee's access line"
+        );
+        assert!(errors[0].message.contains("conv_rate"));
+        assert_eq!(errors[1].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(
+            errors[1].line, 14,
+            "should be attributed to the THIRD call site's line, not the callee's access line"
+        );
+        assert!(errors[1].message.contains("feature_names"));
+    }
+
+    #[test]
+    fn test_should_resolve_param_governed_call_site_across_files() {
+        // arrange: load_conv_rate is defined in helpers.py; pipeline.py calls it twice
+        // with different literals, same as the same-file test above, but now resolved
+        // through resolve_delegate_target's cross-file import resolution.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("helpers.py"),
+            r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from helpers import load_conv_rate
+
+load_conv_rate(store, entity_df, ["driver_stats:conv_rate"])
+load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
+"#;
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let pipeline_path_str = pipeline_path.to_str().unwrap().to_string();
+
+        // assert
+        let errors = index
+            .call_site_errors
+            .get(&pipeline_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert_eq!(errors[0].line, 5, "should be the SECOND call site only");
+        assert!(errors[0].message.contains("conv_rate"));
+        assert!(errors[0].message.contains("helpers.py"));
+    }
+
+    #[test]
+    fn test_should_move_untracked_dataframe_warning_to_the_unresolvable_call_site() {
+        // Regression test: a function with the exact same param-governed SHAPE as
+        // load_conv_rate above, but where the only real call site passes a
+        // dynamically built value, never a literal. The function itself is exactly as
+        // resolvable as any other governed function -- the ambiguity originates at
+        // the call site, not inside the callee -- so the diagnostic must move there:
+        // resolved_governed DOES contain this pair (the call site was seen), the
+        // callee's own generic line is retracted, and the call site gets its own
+        // untracked-dataframe diagnostic instead. Silently dropping the diagnostic
+        // entirely (going from "we tell you it's unknown" to "we tell you nothing at
+        // all") would be a real regression -- the fix is relocation, not deletion.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+dynamic_names = build_feature_list()
+load_conv_rate(store, entity_df, dynamic_names)
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        assert!(
+            index
+                .resolved_governed
+                .contains(&(file_path_str.clone(), "load_conv_rate".to_string())),
+            "the call site was seen (even though its argument didn't resolve), so \
+             load_conv_rate must be in resolved_governed"
+        );
+
+        let mut linter = Linter::new();
+        let mut errors = linter.check_file_internal(source, &file_path).unwrap();
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path_str.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
+        if let Some(extra) = index.call_site_errors.get(&file_path_str) {
+            errors.extend(extra.iter().cloned());
+        }
+
+        // assert: the callee's own line (7) is retracted; the diagnostic reappears at
+        // the call site's line (12) instead.
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(
+            errors[0].line, 12,
+            "should be attributed to the call site, not the callee's access line"
+        );
+        assert!(errors[0].message.contains("feature_names"));
+    }
+
+    #[test]
+    fn test_should_resolve_call_site_argument_through_a_multi_hop_delegate_chain() {
+        // A call site doesn't have to pass the literal directly -- it can pass a call
+        // to a zero-arg helper, which itself just forwards to ANOTHER helper, which
+        // finally returns the literal. resolve_returns_literal_list must follow that
+        // whole chain (helper_a -> helper_b -> literal), not just one hop.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def helper_b() -> list[str]:
+    return ["driver_stats:acc_rate"]
+
+
+def helper_a() -> list[str]:
+    return helper_b()
+
+
+load_conv_rate(store, entity_df, helper_a())
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: helper_a resolves (through helper_b) to {acc_rate}, which does NOT
+        // satisfy load_conv_rate's print(df["conv_rate"]) -- caught two hops away.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("conv_rate"));
+        assert!(
+            index
+                .resolved_governed
+                .contains(&(file_path_str, "load_conv_rate".to_string())),
+            "load_conv_rate should be resolved_governed via the multi-hop chain"
+        );
+    }
+
+    #[test]
+    fn test_should_resolve_call_site_argument_through_literal_substitution_into_an_fstring() {
+        // A call site can pass a call like `feature_names("driver_stats")` -- a
+        // genuine argument, not a zero-arg forward -- whose callee builds its return
+        // value with an f-string that interpolates that very parameter. The evaluator
+        // must substitute the literal "driver_stats" for the callee's own parameter
+        // and evaluate the f-string with it, arriving at the same resolved feature list
+        // as if the call site had written the literal out directly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def feature_names(prefix: str) -> list[str]:
+    return [f"{prefix}:conv_rate"]
+
+
+load_conv_rate(store, entity_df, feature_names("driver_stats"))
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: feature_names("driver_stats") resolves (via argument substitution
+        // into the f-string) to {"driver_stats:conv_rate"}, which DOES satisfy
+        // load_conv_rate's print(df["conv_rate"]) -- no error, and the callee's own
+        // untracked-dataframe warning is retracted.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+        assert!(
+            index
+                .resolved_governed
+                .contains(&(file_path_str, "load_conv_rate".to_string())),
+            "load_conv_rate should be resolved_governed via argument substitution"
+        );
+    }
+
+    #[test]
+    fn test_should_not_hang_on_a_self_delegating_return_chain() {
+        // Recursion protection: a function whose `return` shape delegates to itself
+        // (or a cycle of functions delegating to each other) must resolve to
+        // unresolvable rather than looping forever -- mirrors
+        // test_should_not_hang_on_mutually_delegating_functions's existing coverage
+        // for the *requires* side of this same cycle-protection pattern.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def cyclic_a() -> list[str]:
+    return cyclic_b()
+
+
+def cyclic_b() -> list[str]:
+    return cyclic_a()
+
+
+load_conv_rate(store, entity_df, cyclic_a())
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act -- must terminate (this test itself hanging is the failure mode)
+        let index = build_index_internal(root);
+
+        // assert: the argument is unresolvable (the cycle guard gives up), but the
+        // call site itself was still seen -- so its own untracked-dataframe
+        // diagnostic is reported right there, and load_conv_rate is in
+        // resolved_governed so the callee's own generic line is retracted.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert!(index
+            .resolved_governed
+            .contains(&(file_path_str, "load_conv_rate".to_string())));
+    }
+
+    #[test]
+    fn test_unrelated_to_df_call_is_left_alone() {
+        // `.to_df()` on something that never went through a recognized Feast
+        // retrieval call must not be treated as a Feast result at all.
+        let source = r#"
+df = some_other_object.to_df()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert!(!linter.variables.contains_key("df"));
+    }
+
+    #[test]
+    fn test_bigquery_chained_query_to_dataframe_resolves_columns() {
+        let source = r#"
+df = client.query("SELECT user_id, total_spent FROM analytics.customers").to_dataframe()
+print(df["user_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_pyspark_chained_sql_to_pandas_resolves_columns() {
+        let source = r#"
+df = spark.sql("SELECT order_id, amount FROM orders").toPandas()
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_duckdb_chained_sql_df_resolves_columns() {
+        let source = r#"
+df = duckdb.sql("SELECT order_id, amount FROM 'orders.parquet'").df()
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_unrelated_df_method_is_left_alone_not_treated_as_sql() {
+        // `.df()` chained onto something that ISN'T one of SQL_PRODUCING_METHODS must
+        // not be treated as a SQL-producing call at all — no dataframes_total bump, no
+        // untracked-dataframe warning, since plenty of unrelated code has a `.df()`
+        // accessor for something else entirely.
+        let source = r#"
+df = some_relation.transform().df()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert_eq!(linter.dataframes_total, 0);
+    }
+
+    #[test]
+    fn test_snowflake_cursor_execute_then_fetch_pandas_all_resolves_columns() {
+        let source = r#"
+cursor.execute("SELECT order_id, amount FROM orders")
+df = cursor.fetch_pandas_all()
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_cursor_reexecute_with_unresolvable_query_poisons_previous_entry() {
+        // A second execute() with an unresolvable (variable) query must not leave the
+        // first execute()'s columns silently in effect for the next fetch.
+        let source = r#"
+cursor.execute("SELECT order_id FROM orders")
+cursor.execute(dynamic_query)
+df = cursor.fetch_pandas_all()
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_connectorx_read_sql_uses_second_positional_argument() {
+        let source = r#"
+import connectorx as cx
+
+df = cx.read_sql(conn_uri, "SELECT order_id, amount FROM orders")
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
     fn test_levenshtein() {
         assert_eq!(levenshtein("kitten", "sitting"), 3);
         assert_eq!(levenshtein("flaw", "lawn"), 2);
@@ -4351,7 +8636,7 @@ def process(path: str) -> None:
 
     #[test]
     fn test_extract_schema_from_annotation() {
-        let source = "x: PandasFrame[MySchema] = df";
+        let source = "x: DataFrame[MySchema] = df";
         let parsed = parse_module(source).unwrap();
         let stmt = &parsed.into_syntax().body[0];
         if let Stmt::AnnAssign(ann) = stmt {
@@ -4382,7 +8667,6 @@ x = 1
         // "Column 'assign' does not exist" — method names are not column accesses.
         let source = r#"
 from typedframes import BaseSchema, Column
-from typedframes.pandas import PandasFrame
 
 class UserData(BaseSchema):
     user_id = Column(type=int)
@@ -4390,7 +8674,7 @@ class UserData(BaseSchema):
 
 import pandas as pd
 
-df: PandasFrame[UserData] = pd.read_csv("users.csv")
+df: DataFrame[UserData] = pd.read_csv("users.csv")
 augmented = df.assign(created_at="2024-01-01")
 print(augmented["user_id"])
 "#;
@@ -4405,15 +8689,15 @@ print(augmented["user_id"])
     fn test_should_validate_pl_col_in_select() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class OrderSchema(BaseSchema):
     order_id = Column(type=int)
     amount = Column(type=float)
 
-df: PolarsFrame[OrderSchema] = pl.read_csv("orders.csv")
+df: Annotated[pl.DataFrame, OrderSchema] = pl.read_csv("orders.csv")
 result = df.select(pl.col("amount"))
 bad = df.select(pl.col("revenue"))
 "#;
@@ -4434,15 +8718,15 @@ bad = df.select(pl.col("revenue"))
     fn test_should_validate_pl_col_in_filter() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
     email = Column(type=str)
 
-df: PolarsFrame[UserSchema] = pl.read_csv("users.csv")
+df: Annotated[pl.DataFrame, UserSchema] = pl.read_csv("users.csv")
 result = df.filter(pl.col("user_id") > 10)
 bad = df.filter(pl.col("username") == "alice")
 "#;
@@ -4462,15 +8746,15 @@ bad = df.filter(pl.col("username") == "alice")
     fn test_should_validate_pl_col_list_in_select() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class SalesSchema(BaseSchema):
     region = Column(type=str)
     revenue = Column(type=float)
 
-df: PolarsFrame[SalesSchema] = pl.read_csv("sales.csv")
+df: Annotated[pl.DataFrame, SalesSchema] = pl.read_csv("sales.csv")
 result = df.select([pl.col("region"), pl.col("revenue")])
 bad = df.select([pl.col("region"), pl.col("profit")])
 "#;
@@ -4490,15 +8774,16 @@ bad = df.select([pl.col("region"), pl.col("profit")])
     fn test_should_validate_bare_col_import() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
+import polars as pl
 from polars import col
 
 class ItemSchema(BaseSchema):
     item_id = Column(type=int)
     price = Column(type=float)
 
-df: PolarsFrame[ItemSchema] = None
+df: Annotated[pl.DataFrame, ItemSchema] = None
 result = df.select(col("price"))
 bad = df.select(col("cost"))
 "#;
@@ -4518,15 +8803,15 @@ bad = df.select(col("cost"))
     fn test_should_validate_chained_pl_col() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class StockSchema(BaseSchema):
     ticker = Column(type=str)
     close = Column(type=float)
 
-df: PolarsFrame[StockSchema] = pl.read_csv("stocks.csv")
+df: Annotated[pl.DataFrame, StockSchema] = pl.read_csv("stocks.csv")
 result = df.filter(pl.col("close").is_not_null())
 bad = df.filter(pl.col("open").is_not_null())
 "#;
@@ -4546,15 +8831,15 @@ bad = df.filter(pl.col("open").is_not_null())
     fn test_should_pass_valid_pl_col() {
         // arrange
         let source = r#"
+from typing import Annotated
 from typedframes import BaseSchema, Column
-from typedframes.polars import PolarsFrame
 import polars as pl
 
 class MetricsSchema(BaseSchema):
     date = Column(type=str)
     value = Column(type=float)
 
-df: PolarsFrame[MetricsSchema] = pl.read_csv("metrics.csv")
+df: Annotated[pl.DataFrame, MetricsSchema] = pl.read_csv("metrics.csv")
 filtered = df.filter(pl.col("value") > 100)
 selected = df.select([pl.col("date"), pl.col("value")])
 "#;
@@ -4838,5 +9123,191 @@ def process(path: str) -> None:
         assert_eq!(errors[0].code, "missing-column");
         assert!(errors[0].message.contains("missing column(s) {c}"));
         assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    // ── Benchmark: site-packages resolution overhead ────────────────────────────
+    //
+    // `cargo bench` (criterion) can't link in this environment -- pyo3's
+    // "extension-module" feature deliberately omits libpython, which is fine for the
+    // cdylib actually loaded by Python but breaks any standalone executable built from
+    // this crate (the criterion harness's own `main()`, same as the `typedframes_checker`
+    // `[[bin]]` target). `cargo test --lib` reliably links (nothing here calls into the
+    // pyo3-macro-generated FFI glue), so these are ordinary #[test]s used as a timing
+    // vehicle, not correctness assertions -- run explicitly with:
+    //   cargo test --lib bench_ -- --ignored --nocapture
+
+    fn write_import_heavy_project(root: &Path, num_files: usize) {
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        for hub in 0..5 {
+            fs::write(
+                root.join(format!("hub{hub}.py")),
+                format!(
+                    r#"
+import pandas as pd
+
+def load_hub{hub}(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, usecols=["a", "b", "c"])
+"#
+                ),
+            )
+            .unwrap();
+        }
+        for i in 0..num_files {
+            let hub = i % 5;
+            fs::write(
+                root.join(format!("mod_{i}.py")),
+                format!(
+                    r#"
+from hub{hub} import load_hub{hub}
+
+def process_{i}(path: str) -> None:
+    df = load_hub{hub}(path)
+    print(df["a"])
+"#
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_without_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, no .venv: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_with_venv_present_but_unused() {
+        // Same project, but with a real (populated-looking) .venv present --
+        // trace_external_packages is NOT set, so no external package should actually
+        // be indexed, but every import resolution still probes for a site-packages
+        // dir (cached after the first call -- this measures whether that caching
+        // actually keeps the cost negligible for the common case where the feature
+        // isn't in use at all).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        // A handful of unrelated installed packages, so the directory listing this
+        // benchmark exercises isn't unrealistically empty.
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+            fs::write(site_packages.join(pkg).join("__init__.py"), "").unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, .venv present (unused): {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_with_venv_and_allowlisted_package() {
+        // Same as above, but trace_external_packages actually names one of the fake
+        // installed packages -- measures the added cost of actually indexing an
+        // external package's files, not just probing for the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+            fs::write(site_packages.join(pkg).join("__init__.py"), "").unwrap();
+        }
+        let internal_pkg = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&internal_pkg).unwrap();
+        fs::write(
+            internal_pkg.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    return pd.read_csv(query, usecols=["order_id", "amount"])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\ntrace_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, .venv + allowlisted package: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_find_site_packages_dir_repeated_calls_uncached() {
+        // Directly measures what EVERY resolve_module_file call used to pay before
+        // SITE_PACKAGES_CACHE was added -- one read_dir per call, simulating roughly
+        // one import statement's worth of resolution per iteration.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+        }
+
+        let iterations = 1000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = find_site_packages_dir_uncached(root);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "find_site_packages_dir_uncached x{iterations}: {:?} total, {:?}/call",
+            elapsed,
+            elapsed / iterations
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = find_site_packages_dir(root);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "find_site_packages_dir (cached) x{iterations}: {:?} total, {:?}/call",
+            elapsed,
+            elapsed / iterations
+        );
     }
 }

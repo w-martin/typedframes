@@ -88,11 +88,11 @@ checker.
 |------|----------|---------|---------|
 | `unknown-column` | Error | Column `'<name>'` not found in `<Schema>`. Did you mean `'<suggestion>'`? | Always reported |
 | `reserved-name` | Error | Renamed-from column `'<name>'` not found in `<Schema>` | Always reported |
-| `untracked-dataframe` | Warning | Columns unknown at lint time — annotate with a schema to enable column checking | Off by default |
-| `dropped-unknown-column` | Warning | Dropped column `'<name>'` does not exist in `<Schema>` | Off by default |
+| `untracked-dataframe` | Warning | Columns unknown at lint time — annotate with a schema to enable column checking | Always reported |
+| `dropped-unknown-column` | Warning | Dropped column `'<name>'` does not exist in `<Schema>` | Always reported |
 
-**untracked-dataframe** is suppressed unless `--strict-ingest` is passed to the CLI. This keeps the
-checker quiet on exploratory scripts that load data without a schema annotation.
+**untracked-dataframe** downgrades to a quiet info-level note when `--lenient-ingest` is passed to the
+CLI, for exploratory scripts that load data without a schema annotation and don't want the noise yet.
 
 **unknown-column** reports the closest column name as a typo suggestion when the edit distance is
 small (≤ 2 characters), which helps catch common capitalization and spelling mistakes.

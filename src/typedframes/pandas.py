@@ -1,7 +1,21 @@
-"""PandasFrame - typed pandas DataFrame subclass with schema awareness."""
+"""PandasFrame - typed pandas DataFrame subclass with schema awareness.
+
+Deprecated: prefer ``Annotated[pd.DataFrame, Schema]`` instead. ``PandasFrame`` and
+its polars counterpart ``PolarsFrame`` were never able to reach parity with each
+other -- polars DataFrames can't be meaningfully subclassed, so ``PolarsFrame`` is
+just an alias for ``Annotated[pl.DataFrame, Schema]`` with no real runtime subclass
+behind it, while ``PandasFrame`` genuinely is one, an asymmetry that's confusing on
+its own and that also makes ``PolarsFrame``'s alias mechanism break Liskov
+substitution under strict type checking (assigning a plain ``pl.DataFrame`` to a
+``PolarsFrame[Schema]``-annotated variable is flagged as a type error, even though
+it's the only way the alias is ever actually used). ``Annotated[...]`` alone is
+sufficient for everything the static checker validates, without either of these
+maintenance-heavy runtime wrapper mechanisms.
+"""
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, overload
 
 import pandas as pd
@@ -15,6 +29,12 @@ if TYPE_CHECKING:
     from typing import Self
 
 SchemaT = TypeVar("SchemaT", bound=BaseSchema)
+
+_DEPRECATION_MESSAGE = (
+    "PandasFrame is deprecated and will be removed in a future release. "
+    "Use `Annotated[pd.DataFrame, Schema]` instead -- the static checker validates "
+    "column access identically either way, without PandasFrame's runtime subclass."
+)
 
 
 class PandasFrame(pd.DataFrame, Generic[SchemaT]):
@@ -85,6 +105,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
             PandasFrame with schema metadata.
 
         """
+        warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
         if column_consumed_map is None:
             _, column_consumed_map = schema.compute_column_map(list(df.columns))
 

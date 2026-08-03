@@ -163,68 +163,6 @@ def main():
 }
 
 #[test]
-fn test_should_support_pandas_frame_subscript() {
-    // arrange
-    let mut linter = Linter::new();
-    let source = r#"
-from typedframes.pandas import PandasFrame
-from typedframes import BaseSchema, Column
-
-class UserSchema(BaseSchema):
-    user_id = Column(type=int)
-    email = Column(type=str)
-
-def main():
-    df: PandasFrame[UserSchema] = load()
-    print(df["user_id"])  # OK
-    print(df["missing"])  # Error
-"#;
-    let dir = tempdir().unwrap();
-    let file_path = dir.path().join("test.py");
-    fs::write(&file_path, source).unwrap();
-
-    // act
-    let errors = linter.check_file_internal(source, &file_path).unwrap();
-
-    // assert
-    assert!(!errors.is_empty());
-    assert!(errors.iter().any(|e| e
-        .message
-        .contains("Column 'missing' does not exist in UserSchema")));
-}
-
-#[test]
-fn test_should_support_polars_frame_subscript() {
-    // arrange
-    let mut linter = Linter::new();
-    let source = r#"
-from typedframes.polars import PolarsFrame
-from typedframes import BaseSchema, Column
-
-class UserSchema(BaseSchema):
-    user_id = Column(type=int)
-    email = Column(type=str)
-
-def main():
-    df: PolarsFrame[UserSchema] = load()
-    print(df["user_id"])  # OK
-    print(df["missing"])  # Error
-"#;
-    let dir = tempdir().unwrap();
-    let file_path = dir.path().join("test.py");
-    fs::write(&file_path, source).unwrap();
-
-    // act
-    let errors = linter.check_file_internal(source, &file_path).unwrap();
-
-    // assert
-    assert!(!errors.is_empty());
-    assert!(errors.iter().any(|e| e
-        .message
-        .contains("Column 'missing' does not exist in UserSchema")));
-}
-
-#[test]
 fn test_should_support_merge_and_concat() {
     // arrange
     let mut linter = Linter::new();

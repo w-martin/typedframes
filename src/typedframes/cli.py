@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,12 +19,16 @@ _BOLD_GREEN = "\033[1;32m"
 _BOLD_YELLOW = "\033[1;33m"
 _DIM = "\033[2m"  # low-key informational text: coverage summary, non-actionable suggestions
 
-# Directories that should never be descended into when collecting .py files: VCS
-# metadata, virtualenvs, caches, and vendored/build trees. Mirrors ruff's default
-# exclude list, a well-established precedent for "directories no linter should scan".
+# Directories that should never be descended into when collecting .py files by
+# default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
+# trees. Mirrors ruff's default exclude list, a well-established precedent for
+# "directories no linter should scan" -- including ruff's own override semantics:
+# [tool.typedframes] exclude in pyproject.toml REPLACES this set entirely rather than
+# adding to it (see _load_configured_excludes/_collect_python_files).
 _EXCLUDED_DIRS = frozenset(
     {
         ".bzr",
+        ".claude",
         ".direnv",
         ".eggs",
         ".git",
@@ -53,21 +58,57 @@ _EXCLUDED_DIRS = frozenset(
 )
 
 
-def _collect_python_files(path: Path) -> list[Path]:
+def _load_configured_excludes(path: Path) -> frozenset[str] | None:
+    """Read `[tool.typedframes] exclude` from path/pyproject.toml, if present.
+
+    Returns `None` when nothing is configured (no pyproject.toml, no
+    `[tool.typedframes]` section, no `exclude` key, or a malformed value) -- the
+    caller's signal to fall back to the built-in default set (`_EXCLUDED_DIRS`)
+    rather than pruning nothing. An explicitly empty `exclude = []` is NOT `None`: it
+    means the user deliberately wants no directories pruned at all, same as any other
+    override value.
+
+    Mirrors the Rust checker's own `[tool.typedframes] exclude` key (see
+    `load_linter_config` in rust/src/lib.rs) so a single config value controls both
+    collectors, regardless of which one runs for a given invocation. Only looks at
+    `path` itself (no walking up the ancestor chain) -- matches `_build_index_bytes`,
+    which already treats `path` as the project root when it's a directory.
+    """
+    if not path.is_dir():
+        return None
+    config_path = path / "pyproject.toml"
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError):
+        return None
+    exclude = data.get("tool", {}).get("typedframes", {}).get("exclude")
+    if not isinstance(exclude, list):
+        return None
+    return frozenset(entry for entry in exclude if isinstance(entry, str))
+
+
+def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
     """Collect all .py files from a path (file or directory).
 
-    Prunes descent into vendored/VCS/cache directories (see ``_EXCLUDED_DIRS``) so
-    that pointing the checker at a real project root doesn't walk into `.venv`,
-    `node_modules`, `.git`, build caches, etc.
+    Prunes descent into vendored/VCS/cache directories: `configured_excludes` (see
+    `_load_configured_excludes`) REPLACES the built-in default set (``_EXCLUDED_DIRS``)
+    entirely when given -- it does not add to it, matching ruff's own `exclude`
+    semantics (as opposed to `extend-exclude`, which this checker doesn't have a
+    separate option for). `None` (the default -- nothing configured) falls back to
+    pruning the built-in default set alone.
     """
     if path.is_file():
         if path.suffix == ".py":
             return [path]
         return []
 
+    excluded_dirs = _EXCLUDED_DIRS if configured_excludes is None else configured_excludes
     found = []
     for dirpath, dirnames, filenames in os.walk(path):
-        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
         found.extend(Path(dirpath) / filename for filename in filenames if filename.endswith(".py"))
     return sorted(found)
 
@@ -185,14 +226,19 @@ def main(argv: list[str] | None = None) -> None:
     check_parser.add_argument(
         "--no-warnings",
         action="store_true",
-        help="Suppress all warnings (dropped-unknown-column and any enabled ingestion warnings).",
+        help="Suppress all warnings (dropped-unknown-column and untracked-dataframe).",
     )
     check_parser.add_argument(
         "--strict-ingest",
         action="store_true",
+        help="Deprecated, no-op: untracked-dataframe is a warning-level diagnostic by default now.",
+    )
+    check_parser.add_argument(
+        "--lenient-ingest",
+        action="store_true",
         help=(
-            "Escalate untracked-dataframe from an info-level diagnostic to a warning "
-            "for bare DataFrame loads without usecols= or columns=."
+            "Downgrade untracked-dataframe from a warning-level diagnostic back to "
+            "info-level for bare DataFrame loads without usecols= or columns=."
         ),
     )
     check_parser.add_argument(
@@ -288,16 +334,18 @@ def _print_results(
 
 
 def _apply_diagnostic_policy(all_errors: list[dict], args: argparse.Namespace) -> list[dict]:
-    """Apply --strict-ingest severity escalation and --no-warnings/--no-info filtering.
+    """Apply --lenient-ingest severity downgrade and --no-warnings/--no-info filtering.
 
-    untracked-dataframe is an info-level diagnostic by default (a low-key "here's what
-    the checker couldn't see" note); --strict-ingest escalates it to a warning for
-    users who want it to read as more actionable.
+    untracked-dataframe is a warning-level diagnostic by default; --lenient-ingest
+    downgrades it to an info-level "here's what the checker couldn't see" note for
+    users who want it to read as less actionable (e.g. exploratory/EDA work). Rust
+    already reports it as "warning" natively, so the default case needs no rewriting
+    here -- only --lenient-ingest's explicit opt-out does.
     """
-    escalated_severity = "warning" if args.strict_ingest else "info"
-    for e in all_errors:
-        if e.get("code") == "untracked-dataframe":
-            e["severity"] = escalated_severity
+    if args.lenient_ingest:
+        for e in all_errors:
+            if e.get("code") == "untracked-dataframe":
+                e["severity"] = "info"
 
     if args.no_warnings:
         all_errors = [e for e in all_errors if e.get("severity") != "warning"]
@@ -332,7 +380,7 @@ def _run_check(args: argparse.Namespace) -> None:
 
     index_bytes = _build_index_bytes(path, args)
 
-    files = _collect_python_files(path)
+    files = _collect_python_files(path, _load_configured_excludes(path))
     start = time.perf_counter()
     all_errors, coverage = _check_files(files, index_bytes=index_bytes)
     elapsed = time.perf_counter() - start

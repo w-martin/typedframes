@@ -14,8 +14,9 @@ typedframes check src/
 # Check without building the project index (each file checked independently)
 typedframes check src/ --no-index
 
-# Enable untracked-dataframe warnings for bare DataFrame loads (off by default)
-typedframes check src/ --strict-ingest
+# Downgrade untracked-dataframe from a warning to a quiet info-level note for bare
+# DataFrame loads (warning by default)
+typedframes check src/ --lenient-ingest
 
 # Output formats
 typedframes check src/ --output-format text    # default — ty-style, auto-colored in terminal
@@ -43,6 +44,54 @@ pl.read_json("data.json", schema={"a": int, "b": str})
 Any `usecols=` (pandas) or `columns=` / `schema=` (polars) argument teaches the checker
 which columns are available, regardless of file format.
 
+## SQL and warehouse column inference
+
+For database/warehouse loads, the checker infers columns from the query's `SELECT`
+list instead of a kwarg:
+
+```python
+pd.read_sql("SELECT a, b FROM t", conn)
+pd.read_sql_query("SELECT a, b FROM t", conn)
+pl.read_database("SELECT a, b FROM t", connection)
+pl.read_database_uri("SELECT a, b FROM t", uri)
+pd.read_gbq("SELECT a, b FROM t", project_id=...)
+```
+
+This also traces the query text back through:
+
+- a **single-assignment variable** (`QUERY = "SELECT a, b FROM t"`, used later) — a
+  variable assigned more than once anywhere in the file is not resolved, since the
+  checker can't know which assignment was in effect at the call site;
+- a **`.sql` file** (`Path("query.sql").read_text()`, `open("query.sql").read()`,
+  project-root-relative only);
+- SQLAlchemy's `text(...)` wrapper, `select(Model.col1, Model.col2, ...)` (Core, against
+  a declarative model's columns), and connector-specific shapes like
+  `client.query(sql).to_dataframe()` (BigQuery), `spark.sql(sql).toPandas()`
+  (PySpark/Databricks), `duckdb.sql(sql).df()`, and the `cursor.execute(sql)` /
+  `cursor.fetch_pandas_all()` pattern (Snowflake, Redshift).
+
+An f-string or `.format()`-built query is deliberately **not** resolved — that's the SQL
+injection anti-pattern parameterized queries exist to avoid — and falls through to
+`untracked-dataframe` like any other unresolvable load, without a separate injection
+warning (the checker has no taint analysis to distinguish a safe interpolation from a
+real vulnerability).
+
+Set `sql_dialect` in `pyproject.toml` to fold identifier case the way a specific engine
+does (e.g. Snowflake upper-cases unquoted identifiers, Postgres/Redshift lower-case
+them) — see [Project-level configuration](#project-level-configuration). Full examples
+for eleven connectors, including Feast and SQLAlchemy, live in the repo's
+`examples/sql_connectors/` directory (`snowflake/`, `bigquery/`, `athena/`, `redshift/`,
+`databricks/`, `pyspark/`, `duckdb/`, `connectorx/`, `sqlalchemy/`, `feast/`,
+`azure_synapse/`).
+
+A wrapper function that queries one of these connectors and then case-folds the
+result (e.g. an internal package that queries Snowflake and lower-cases its
+genuinely-upper-cased columns before returning) is also traced, cross-file, via
+`.rename(columns=str.lower)` / `df.columns = df.columns.str.lower()` (and the
+`.upper()` equivalents) — see [usage.md's "Supported column-set
+transforms"](../usage.md#supported-column-set-transforms) for exactly what's
+recognized and why arbitrary custom transform functions aren't.
+
 ## Output format
 
 ```
@@ -63,8 +112,8 @@ is a terminal (TTY); piping or redirecting strips them.
 |------|---------|---------|
 | `unknown-column` | Column not found in schema or inferred set | Always shown |
 | `reserved-name` | Column was renamed — use the new name | Always shown |
-| `untracked-dataframe` | Bare DataFrame load — no column info for checker | Off (use `--strict-ingest`) |
-| `dropped-unknown-column` | Dropped column doesn't exist in schema | Off (use `--strict-ingest`) |
+| `untracked-dataframe` | Bare DataFrame load — no column info for checker | Always shown (use `--lenient-ingest` to downgrade to info) |
+| `dropped-unknown-column` | Dropped column doesn't exist in schema | Always shown |
 | `missing-column` | Argument's columns don't satisfy the called function's parameter contract | Always shown |
 
 ## Project-level configuration
@@ -76,6 +125,77 @@ Add to `pyproject.toml` to disable all warnings project-wide:
 enabled  = true
 warnings = false
 ```
+
+Set `sql_dialect` to fold unquoted SQL identifier case the way a specific engine does
+when inferring columns from a `SELECT` list (see [SQL and warehouse column
+inference](#sql-and-warehouse-column-inference)). Unset or unrecognized values default
+to no folding (columns keep the exact case written in the query).
+
+```toml
+[tool.typedframes]
+sql_dialect = "snowflake"  # one of: bigquery, snowflake, redshift, databricks,
+                           # duckdb, postgres, mysql, hive, spark, mssql
+                           # (mssql aliases: sqlserver, synapse, fabric)
+```
+
+SQL parsing also accepts T-SQL's `[bracket-quoted]` identifiers (SQL Server, Azure SQL,
+Synapse, Fabric Warehouse) alongside standard `"double-quoted"` ones, regardless of
+`sql_dialect`.
+
+### Tracing installed (non-project) packages
+
+By default, only files under the project itself are indexed — nothing inside `.venv`
+or any other installed-dependency location. `trace_external_packages` is an explicit
+allowlist of installed package names whose `Annotated[...]`/`BaseSchema` declarations
+and recognized transform patterns (rename, drop, case-fold, etc. — the same fixed set
+already applied to first-party code) should also be indexed. This is the mechanism a
+company-internal package (e.g. one that wraps a SQL connector) needs for its callers'
+column access to be validated cross-file, the same as any project-local helper.
+
+```toml
+[tool.typedframes]
+trace_external_packages = ["internal_snowflake_pkg"]
+```
+
+- The package's install location is auto-detected from the project's own `.venv`
+  (`lib/pythonX.Y/site-packages` on Unix, `Lib/site-packages` on Windows) — there is no
+  path override in this version, and no other virtualenv-manager layout is searched.
+- Only the named packages' own directories are walked — never the whole
+  `site-packages` tree, which would be both expensive and a far larger, unbounded
+  trust surface than an explicit opt-in list.
+- **Editable installs are not supported in this version.** A package installed via
+  `pip install -e` (or `uv`'s equivalent) resolves through a `.pth`/`direct_url.json`
+  redirect rather than living directly under `site-packages`, and isn't found by the
+  current auto-detection. Install the package normally (a real, non-editable install)
+  for it to be traced.
+
+### Excluding directories
+
+The following are pruned by default — no config needed:
+
+```
+.bzr  .claude  .direnv  .eggs  .git  .git-rewrite  .hg  .ipynb_checkpoints
+.mypy_cache  .nox  .pants.d  .pytest_cache  .pytype  .ruff_cache  .svn  .tox
+.venv  .vscode  .idea  __pycache__  _build  buck-out  build  dist
+node_modules  site-packages  venv
+```
+
+`exclude` **replaces this default list entirely** — matching by bare directory name,
+not a path/glob pattern:
+
+```toml
+[tool.typedframes]
+exclude = [".claude", "legacy"]
+```
+
+This mirrors ruff's own `exclude` (there's no separate `extend-exclude`-style option
+here): once `exclude` is set, only the names you list are pruned, so re-list `.venv`
+(or anything else from the default set you still want ignored) alongside your own
+additions, or it'll be walked. An explicit `exclude = []` is a deliberate way to prune
+nothing at all.
+
+Applies both when checking a directory directly (`typedframes check .`) and to the
+cross-file project index — a single `exclude` value controls both.
 
 ---
 

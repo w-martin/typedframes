@@ -1,0 +1,32 @@
+# goccy/bigquery-emulator's --data-from-yaml seed format.
+# NOT independently verified against a live emulator (no docker in the environment this
+# was written in) -- schema matches the emulator's documented format as of writing, but
+# double-check against `bigquery-emulator --help` / its README if this doesn't load.
+projects:
+  - id: my-project
+    datasets:
+      - id: analytics
+        tables:
+          - id: customers
+            columns:
+              - name: user_id
+                type: INTEGER
+              - name: total_spent
+                type: FLOAT
+              - name: signup_date
+                type: DATE
+              - name: region
+                type: STRING
+            data:
+              - user_id: 1
+                total_spent: 1500.0
+                signup_date: "2026-01-01"
+                region: "us"
+              - user_id: 2
+                total_spent: 800.0
+                signup_date: "2026-02-01"
+                region: "eu"
+              - user_id: 3
+                total_spent: 2200.5
+                signup_date: "2026-03-15"
+                region: "us"

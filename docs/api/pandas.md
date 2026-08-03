@@ -21,13 +21,26 @@ print(df["order_id"])          # ✓ native pandas, validated by checker
 print(df[OrderSchema.amount.s])  # ✓ refactor-safe via .s descriptor
 ```
 
-## `PandasFrame` — runtime enhancement
+## `PandasFrame` — deprecated runtime enhancement
 
-`PandasFrame` is a `pd.DataFrame` subclass that adds runtime column validation and
-descriptor dispatch (`df[Schema.column]`). Use it when you need:
+!!! warning "Deprecated"
+    `PandasFrame` is deprecated and will be removed in a future release. Use
+    `Annotated[pd.DataFrame, Schema]` (above) instead — the static checker validates
+    column access identically either way, without a runtime subclass.
 
-- Regex `ColumnSet` resolution against actual DataFrame columns at runtime
-- Descriptor-based subscript access (`df[Schema.column]`) without `.s`
+    `PandasFrame` and its polars counterpart, `PolarsFrame`, were never able to reach
+    parity with each other: polars DataFrames are Rust objects that can't be
+    meaningfully subclassed, so `PolarsFrame` has only ever been an alias for
+    `Annotated[pl.DataFrame, Schema]` with no real runtime subclass behind it, while
+    `PandasFrame` genuinely is one. That asymmetry is confusing on its own, and it
+    also means `PolarsFrame`'s alias mechanism breaks Liskov substitution under
+    strict type checking (assigning the plain `pl.DataFrame` it always actually is at
+    runtime to a `PolarsFrame[Schema]`-annotated variable is flagged as a type error).
+    `Annotated[...]` alone is sufficient for everything the static checker validates,
+    without either maintenance-heavy runtime wrapper mechanism.
+
+`PandasFrame` was a `pd.DataFrame` subclass that added runtime column validation and
+descriptor dispatch (`df[Schema.column]`):
 
 ```python
 from typedframes.pandas import PandasFrame
@@ -37,13 +50,9 @@ class SalesSchema(BaseSchema):
     product_id  = Column(type=int)
     region_cols = ColumnSet(members=r"region_\w+", type=float, regex=True)
 
-# Runtime: resolves regex ColumnSet against actual columns
+# Deprecated -- emits a DeprecationWarning; prefer Annotated[pd.DataFrame, Schema]
 df = PandasFrame.from_schema(pd.read_csv("sales.csv"), SalesSchema)
 ```
-
-!!! note
-    Prefer `Annotated[pd.DataFrame, Schema]` for new code. `PandasFrame` is most useful
-    when regex `ColumnSet` patterns need to be resolved against actual data at runtime.
 
 ---
 

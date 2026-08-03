@@ -1,0 +1,173 @@
+"""SQL column inference against Snowflake.
+
+Snowflake genuinely upper-cases unquoted identifiers: `SELECT order_id FROM orders`
+returns a column literally named `ORDER_ID`, not `order_id` (verified against
+Snowflake's own identifier documentation — quoted identifiers like `"order_id"` are the
+escape hatch that preserves case). With `sql_dialect = "snowflake"` set in this
+directory's `pyproject.toml`, typedframes folds identifier case the same way at lint
+time, so writing `df["order_id"]` against a Snowflake result is flagged as a real bug —
+not silently accepted the way it would be under a naive case-insensitive design.
+
+Run: `typedframes check examples/sql_connectors/snowflake/`
+Run for real: `uv run python example.py`
+
+No OSS/local Snowflake emulator exists anywhere, so `fake_snowflake.py` substitutes a
+hand-rolled `connect()`/`create_engine()` that reproduces just the upper-casing
+behavior this example demonstrates -- not a real SQL engine. Real code would instead
+`from snowflake.connector import connect` and `from sqlalchemy import create_engine`
+(against a real `snowflake-sqlalchemy` URL).
+"""
+
+import os
+from pathlib import Path
+
+import pandas as pd
+from fake_snowflake import connect, create_engine
+
+
+def load_via_cursor_literal() -> None:
+    """snowflake-connector-python's native cursor pattern, with an inline query."""
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+
+    print(df["ORDER_ID"])  # OK -- Snowflake's real (uppercased) column name
+    # print(df["order_id"])  -- unknown-column: the query text's own spelling,
+    #   but not what Snowflake actually returns (did you mean 'ORDER_ID'?)
+
+
+def load_via_sqlalchemy_engine() -> None:
+    """The alternative snowflake-sqlalchemy + pd.read_sql path — same dialect folding."""
+    engine = create_engine(os.environ["SNOWFLAKE_SQLALCHEMY_URL"])
+    df = pd.read_sql("SELECT customer_id, region FROM customers", engine)
+
+    print(df["CUSTOMER_ID"])  # OK
+    # print(df["customer_id"])  -- unknown-column (did you mean 'CUSTOMER_ID'?)
+
+
+def load_via_traced_variable() -> None:
+    """A query kept in a single-assignment variable resolves like an inline literal.
+
+    typedframes traces `query` back to its single assignment (see the checker's
+    string_var_candidates) — reassigning it anywhere else in this file would make it
+    unresolvable rather than risk guessing which assignment applied at the call site.
+    """
+    query = "SELECT order_id, status FROM orders WHERE status = 'completed'"
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute(query)
+    df = cursor.fetch_pandas_all()
+
+    print(df["STATUS"])  # OK
+    # print(df["status"])  -- unknown-column (did you mean 'STATUS'?)
+
+
+def load_via_query_file() -> None:
+    """A query kept in orders.sql alongside this file, for readability/review.
+
+    typedframes reads the file at lint time (project-root-relative only, capped in
+    size, refuses anything that escapes the project root) to infer the same column set
+    it would from an inline literal.
+    """
+    sql = (Path(__file__).parent / "orders.sql").read_text()
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute(sql)
+    df = cursor.fetch_pandas_all()
+
+    print(df["CUSTOMER_ID"])  # OK -- orders.sql selects order_id, customer_id, amount, status
+    # print(df["customer_id"])  -- unknown-column (did you mean 'CUSTOMER_ID'?)
+
+
+def load_with_dynamic_filter(customer_id: str) -> None:
+    """A parameterized query — the PEP 249-recommended way to avoid SQL injection.
+
+    typedframes doesn't (and shouldn't) try to resolve an f-string here: it has no
+    taint analysis to distinguish a safe interpolation from a real vulnerability, so
+    an unresolvable query just falls through to the untracked-dataframe hint rather
+    than a noisy, unactionable injection warning.
+    """
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders WHERE customer_id = %s", (customer_id,))
+    df = cursor.fetch_pandas_all()  # untracked-dataframe: parameterized query, not a literal
+    print(df)
+
+
+def load_via_lowercasing_wrapper() -> None:
+    """A common real-world pattern: an internal package wraps Snowflake access.
+
+    It lower-cases every column before returning, so callers don't have to deal with
+    Snowflake's upper-casing at all. typedframes recognizes this fold -- `.rename(columns=str.lower)` and
+    `df.columns = df.columns.str.lower()` are both recognized, and propagate cross-file
+    the same way any other inferred return schema does (see docs/usage.md's "Supported
+    column-set transforms"). Only these specific, enumerated shapes are recognized --
+    an arbitrary custom function (`df.rename(columns=my_pkg.normalize)`) is invisible
+    to the checker and passes the pre-fold schema through unchanged.
+    """
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+
+    print(df["order_id"])  # OK -- folded to lower case, matches the query text's spelling
+    # print(df["ORDER_ID"])  -- unknown-column: that was the pre-fold (Snowflake-real) spelling
+
+
+def load_with_unknown_column() -> None:
+    """A real bug: 'order_id' is the query text's own spelling.
+
+    Not what Snowflake actually returns (it's uppercased to 'ORDER_ID'). Left out of
+    __main__ below -- this is a static-analysis fixture, not meant to be
+    executed. Run `typedframes check .` to see it caught as unknown-column.
+    """
+    conn = connect(
+        account="my_account",
+        user="user",
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        warehouse="WH",
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    print(df["order_id"])  # unknown-column: not in {ORDER_ID, AMOUNT} (did you mean 'ORDER_ID'?)
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("SNOWFLAKE_PASSWORD", "unused-fake-password")
+    os.environ.setdefault("SNOWFLAKE_SQLALCHEMY_URL", "snowflake://unused/fake/url")
+
+    load_via_cursor_literal()
+    load_via_sqlalchemy_engine()
+    load_via_traced_variable()
+    load_via_query_file()
+    load_with_dynamic_filter(customer_id="C123")
+    load_via_lowercasing_wrapper()
+    # load_with_unknown_column() intentionally not run -- see its docstring.

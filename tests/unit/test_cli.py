@@ -8,7 +8,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from typedframes.cli import _check_files, _collect_python_files, _format_github, _format_text, main
+from typedframes.cli import (
+    _check_files,
+    _collect_python_files,
+    _format_github,
+    _format_text,
+    _load_configured_excludes,
+    main,
+)
 
 
 class TestCli(unittest.TestCase):
@@ -472,7 +479,7 @@ class TestCli(unittest.TestCase):
 
             # act
             with patch("sys.stdout", captured):
-                main(["check", str(py_file), "--no-index", "--strict-ingest"])
+                main(["check", str(py_file), "--no-index"])
 
             # assert
             output = captured.getvalue()
@@ -589,8 +596,8 @@ class TestCli(unittest.TestCase):
             self.assertIn("Column 'wrong'", output)
             self.assertIn("1 error", output)
 
-    def test_should_show_untracked_dataframe_as_info_by_default(self) -> None:
-        """Test that untracked-dataframe surfaces as a non-blocking info diagnostic by default."""
+    def test_should_show_untracked_dataframe_as_warning_by_default(self) -> None:
+        """Test that untracked-dataframe surfaces as a warning diagnostic by default."""
         # arrange
         w = {
             "file": "f.py",
@@ -615,6 +622,39 @@ class TestCli(unittest.TestCase):
             ):
                 main(["check", str(py_file)])
 
+            # assert -- shown as a warning, which turns the pass/fail headline into a
+            # (non-strict) failure count
+            output = captured.getvalue()
+            self.assertIn("columns unknown at lint time", output)
+            self.assertIn("warning[untracked-dataframe]", output)
+            self.assertIn("1 warning", output)
+
+    def test_should_downgrade_untracked_dataframe_to_info_with_lenient_ingest_flag(self) -> None:
+        """Test that --lenient-ingest downgrades untracked-dataframe from warning to info."""
+        # arrange
+        w = {
+            "file": "f.py",
+            "line": 1,
+            "col": 0,
+            "code": "untracked-dataframe",
+            "message": "columns unknown at lint time",
+            "severity": "warning",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "f.py"
+            py_file.write_text("x = 1\n")
+            captured = StringIO()
+
+            # act
+            with (
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([w], {"dataframes_total": 1, "dataframes_typed": 0}),
+                ),
+                patch("sys.stdout", captured),
+            ):
+                main(["check", str(py_file), "--lenient-ingest"])
+
             # assert \u2014 shown, but as a quiet "info" diagnostic, not a warning, and it
             # does not turn the pass/fail headline into a failure
             output = captured.getvalue()
@@ -622,8 +662,39 @@ class TestCli(unittest.TestCase):
             self.assertIn("info[untracked-dataframe]", output)
             self.assertIn("\u2713 Checked 1 file", output)
 
-    def test_should_escalate_untracked_dataframe_to_warning_with_strict_ingest_flag(self) -> None:
-        """Test that --strict-ingest escalates untracked-dataframe from info to warning."""
+    def test_should_leave_non_untracked_dataframe_errors_untouched_by_lenient_ingest(self) -> None:
+        """Test that --lenient-ingest only downgrades untracked-dataframe, leaving other codes alone."""
+        # arrange
+        e = {
+            "file": "f.py",
+            "line": 1,
+            "col": 0,
+            "code": "unknown-column",
+            "message": "Column 'x' not found",
+            "severity": "error",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "f.py"
+            py_file.write_text("x = 1\n")
+            captured = StringIO()
+
+            # act
+            with (
+                patch(
+                    "typedframes.cli._check_files",
+                    return_value=([e], {"dataframes_total": 1, "dataframes_typed": 1}),
+                ),
+                patch("sys.stdout", captured),
+            ):
+                main(["check", str(py_file), "--lenient-ingest"])
+
+            # assert -- unknown-column stays an error, unaffected by the ingest flag
+            output = captured.getvalue()
+            self.assertIn("error[unknown-column]", output)
+            self.assertIn("1 error", output)
+
+    def test_should_treat_strict_ingest_flag_as_a_harmless_noop(self) -> None:
+        """Test that --strict-ingest is accepted but does nothing (untracked-dataframe is already a warning)."""
         # arrange
         w = {
             "file": "f.py",
@@ -648,9 +719,8 @@ class TestCli(unittest.TestCase):
             ):
                 main(["check", str(py_file), "--strict-ingest"])
 
-            # assert
+            # assert -- identical to the no-flag default
             output = captured.getvalue()
-            self.assertIn("columns unknown at lint time", output)
             self.assertIn("warning[untracked-dataframe]", output)
             self.assertIn("1 warning", output)
 
@@ -688,8 +758,8 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("0/1 DataFrames had column info (0%)", output)
 
-    def test_should_suppress_info_output_with_no_info_flag(self) -> None:
-        """Test that --no-info suppresses both the coverage line and info-level diagnostics."""
+    def test_should_suppress_coverage_line_with_no_info_flag(self) -> None:
+        """Test that --no-info suppresses the coverage line; untracked-dataframe (a warning) is unaffected."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             py_file = Path(tmpdir) / "untyped.py"
@@ -700,6 +770,26 @@ class TestCli(unittest.TestCase):
             # act
             with patch("sys.stdout", captured):
                 main(["check", str(py_file), "--no-info"])
+
+            # assert -- the coverage line is gone, but untracked-dataframe is a
+            # warning by default, not info, so --no-info alone doesn't touch it
+            output = captured.getvalue()
+            self.assertNotIn("DataFrames had column info", output)
+            self.assertIn("columns unknown at lint time", output)
+            self.assertIn("1 warning", output)
+
+    def test_should_suppress_info_output_with_lenient_ingest_and_no_info_flags(self) -> None:
+        """Test that --lenient-ingest --no-info together suppress both the coverage line and the diagnostic."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "untyped.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv')\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--lenient-ingest", "--no-info"])
 
             # assert
             output = captured.getvalue()
@@ -739,6 +829,217 @@ class TestCli(unittest.TestCase):
             # assert
             names = [f.name for f in result]
             self.assertEqual(names, ["app.py"])
+
+    def test_should_prune_dot_claude_by_default_with_no_excludes_given(self) -> None:
+        """Test that .claude is pruned by the built-in default set with no config at all."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            claude_dir = root / ".claude" / "worktrees" / "agent-1"
+            claude_dir.mkdir(parents=True)
+            (claude_dir / "fake.py").write_text("x = 1\n")
+
+            real_dir = root / "real"
+            real_dir.mkdir()
+            (real_dir / "app.py").write_text("x = 1\n")
+
+            # act
+            result = _collect_python_files(root)
+
+            # assert
+            names = [f.name for f in result]
+            self.assertEqual(names, ["app.py"])
+
+    def test_should_replace_rather_than_add_to_default_excludes_when_configured(self) -> None:
+        """Test that configured_excludes REPLACES the built-in default set rather than adding to it."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            custom_dir = root / "custom_dir"
+            custom_dir.mkdir()
+            (custom_dir / "skipped.py").write_text("x = 1\n")
+
+            venv_dir = root / ".venv"
+            venv_dir.mkdir()
+            (venv_dir / "walked.py").write_text("x = 1\n")
+
+            # act -- configuring exclude WITHOUT re-listing .venv should let .venv be
+            # walked again: override, not union.
+            result = _collect_python_files(root, frozenset({"custom_dir"}))
+
+            # assert
+            names = [f.name for f in result]
+            self.assertEqual(names, ["walked.py"])
+
+    def test_should_not_prune_anything_extra_when_no_excludes_given(self) -> None:
+        """Test that _collect_python_files with no configured_excludes only applies the built-in default set."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            custom_dir = root / "custom_vendor_dir"
+            custom_dir.mkdir()
+            (custom_dir / "fake.py").write_text("x = 1\n")
+
+            # act
+            result = _collect_python_files(root)
+
+            # assert -- not in the built-in default set, so not pruned
+            names = [f.name for f in result]
+            self.assertEqual(names, ["fake.py"])
+
+    def test_should_load_configured_excludes_from_pyproject_toml(self) -> None:
+        """Test that _load_configured_excludes reads [tool.typedframes] exclude from pyproject.toml."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = [".claude", "vendor"]\n')
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset({".claude", "vendor"}))
+
+    def test_should_treat_an_explicitly_empty_exclude_list_as_prune_nothing(self) -> None:
+        """Test that exclude = [] is a deliberate override (prune nothing), not "not configured"."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\nexclude = []\n")
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert -- an empty frozenset, not None
+            self.assertEqual(result, frozenset())
+            self.assertIsNotNone(result)
+
+    def test_should_return_none_when_pyproject_toml_is_absent(self) -> None:
+        """Test that _load_configured_excludes returns None (not configured) when there's no pyproject.toml."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertIsNone(result)
+
+    def test_should_return_none_when_path_is_a_file(self) -> None:
+        """Test that _load_configured_excludes returns None for a single-file path."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "test.py"
+            py_file.write_text("x = 1\n")
+
+            # act
+            result = _load_configured_excludes(py_file)
+
+            # assert
+            self.assertIsNone(result)
+
+    def test_should_return_none_when_pyproject_toml_is_malformed(self) -> None:
+        """Test that a malformed pyproject.toml doesn't crash exclude-config loading."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("this is not [ valid toml")
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertIsNone(result)
+
+    def test_should_return_none_when_exclude_key_is_not_a_list(self) -> None:
+        """Test that a non-list exclude value is ignored (falls back to defaults) rather than crashing."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = ".claude"\n')
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertIsNone(result)
+
+    def test_should_ignore_non_string_entries_in_exclude_list(self) -> None:
+        """Test that non-string entries in the exclude list are filtered out rather than crashing."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = [".claude", 42]\n')
+
+            # act
+            result = _load_configured_excludes(root)
+
+            # assert
+            self.assertEqual(result, frozenset({".claude"}))
+
+    def test_should_prune_configured_exclude_directory_end_to_end_via_main(self) -> None:
+        """Test that a configured [tool.typedframes] exclude directory is pruned by a real `check` run."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = [".claude"]\n')
+
+            claude_dir = root / ".claude"
+            claude_dir.mkdir()
+            (claude_dir / "broken.py").write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(root), "--no-index"])
+
+            # assert -- .claude/broken.py's unknown-column access would otherwise be a
+            # real error; it never gets collected at all, so the run is clean
+            output = captured.getvalue()
+            self.assertIn("✓ Checked 0 files", output)
+
+    def test_should_walk_venv_again_once_exclude_is_configured_end_to_end_via_main(self) -> None:
+        """Test that configuring exclude without re-listing .venv lets .venv be walked again, via a real check run."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text('[tool.typedframes]\nexclude = ["custom_dir"]\n')
+
+            venv_dir = root / ".venv"
+            venv_dir.mkdir()
+            (venv_dir / "broken.py").write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(root), "--no-index"])
+
+            # assert -- .venv/broken.py IS collected and its unknown-column error IS
+            # reported, since exclude replaced the default set instead of adding to it
+            output = captured.getvalue()
+            self.assertIn("✗ Found 1 error", output)
+            self.assertIn("wrong", output)
 
     def test_should_skip_file_that_raises_oserror_and_continue(self) -> None:
         """Test that a per-file OSError from check_file is skipped, not fatal.

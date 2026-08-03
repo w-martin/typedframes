@@ -180,8 +180,9 @@ StaticFrame's column access uses string subscription (`frame['column_name']`), w
 
 ```bash
 $ typedframes check d_checker_demo.py
-d_checker_demo.py:35:15: error[unknown-column] Column 'custmer_name' does not exist in OrderSchema (defined at line 28) (did you mean 'customer_name'?)
-✗ Found 1 error in 1 file (0.0s)
+d_checker_demo.py:37:15: error[unknown-column] Column 'custmer_name' does not exist in OrderSchema (defined at line 30) (did you mean 'customer_name'?)
+d_checker_demo.py:41:15: error[unknown-column] Column 'revenue' does not exist in OrderSchema (defined at line 30)
+✗ Found 2 errors in 1 file (0.0s)
 ```
 
 **Key requirement:** Must annotate locally with `Annotated[pd.DataFrame, Schema]` to trigger checking:

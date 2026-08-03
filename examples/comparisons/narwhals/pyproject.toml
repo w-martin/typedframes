@@ -9,6 +9,7 @@ dependencies = [
     "polars",
     "mypy",
     "typedframes[mypy]>=0.2.1",
+    "pandas-stubs>=3.0.0",
 ]
 
 [tool.typedframes]

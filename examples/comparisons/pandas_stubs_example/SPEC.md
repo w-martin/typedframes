@@ -2,9 +2,9 @@
 
 ## Setup
 
-- **pandas-stubs version**: 3.0.3.260530
-- **pandas version**: 3.0.3
-- **mypy version**: 2.1.0
+- **pandas-stubs version**: 3.0.5.260730
+- **pandas version**: 3.0.5
+- **mypy version**: 2.3.0
 - **typedframes version**: 0.3.1
 - **Python**: ≥3.11
 
@@ -48,9 +48,9 @@ All three raise `KeyError` at runtime, but **mypy reports no errors**.
 When running mypy with the typedframes plugin on `c_typedframes_comparison.py`:
 
 ```
-c_typedframes_comparison.py:49: error: Column 'custmer_name' does not exist in OrderSchema (defined at line 33) (did you mean 'customer_name'?)  [misc]
-c_typedframes_comparison.py:54: error: Column 'unit_cost' does not exist in OrderSchema (defined at line 33)  [misc]
-c_typedframes_comparison.py:59: error: Column 'completely_made_up' does not exist in OrderSchema (defined at line 33)  [misc]
+c_typedframes_comparison.py:52: error: Column 'custmer_name' does not exist in OrderSchema (defined at line 34) (did you mean 'customer_name'?)  [misc]
+c_typedframes_comparison.py:57: error: Column 'unit_cost' does not exist in OrderSchema (defined at line 34)  [misc]
+c_typedframes_comparison.py:62: error: Column 'completely_made_up' does not exist in OrderSchema (defined at line 34)  [misc]
 Found 3 errors in 1 file (checked 1 source file)
 ```
 

@@ -110,10 +110,15 @@ def process_orders(orders: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
 - Same intentional typos as `b_static_analysis.py`
 
 **Run**: `uv run mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini 2>&1`
-**Output**: mypy REPORTS column errors statically:
+**Output**: mypy REPORTS column errors statically for subscript access:
 ```
-c_typedframes_comparison.py:70: error: Column 'sku' does not exist in OrderSchema
+c_typedframes_comparison.py:69: error: Column 'sku' does not exist in OrderSchema (defined at line 65)  [misc]
+c_typedframes_comparison.py:90: error: Column 'qty' does not exist in OrderSchema (defined at line 86)  [misc]
+Found 2 errors in 1 file (checked 1 source file)
 ```
+(The `.groupby("custmer_name")` typo in `process_orders` is not caught — column names
+passed to `.groupby()` aren't yet tracked by the checker, only subscript/`pl.col()`-style
+access. See `MYPY_OUTPUTS.txt` for the full breakdown.)
 
 ---
 
@@ -133,8 +138,8 @@ uv add --dev "typedframes[mypy]>=0.2.1"
 
 - **pandas-type-checks**: 1.1.3
 - **typedframes**: 0.3.1
-- **pandas**: 2.3.3
-- **mypy**: 2.1.0
+- **pandas**: 3.0.5
+- **mypy**: 2.3.0
 
 ---
 
@@ -169,9 +174,9 @@ uv add --dev "typedframes[mypy]>=0.2.1"
 
 ## Active Development Status
 
-⚠️ **pandas-type-checks**: Low activity. Last release November 2024. Issue/PR response rate minimal. No major pandas 3.x compatibility work visible.
+⚠️ **pandas-type-checks**: Low activity. Latest release (1.1.3) was 2024-08-23, per PyPI. No pandas 3.x compatibility work visible — this comparison's own `a_working_example.py` needed a dtype spec fix (`"object"` → `"str"`) to work under pandas 3.0's new default string dtype.
 
-✓ **typedframes**: Active development. Latest release June 2026. Ongoing mypy plugin enhancements, multi-dataframe support.
+✓ **typedframes**: Active development. Latest release (0.3.1) was 2026-07-13.
 
 ---
 

@@ -12,10 +12,8 @@ dependencies = [
 dev = [
     "pandas>=3.0.1",
     "typedframes[mypy]>=0.2.1",
+    "pandas-stubs>=3.0.0",
 ]
 
 [tool.typedframes]
 enabled = true
-
-[tool.uv.sources]
-typedframes = { path = "../..", editable = true }

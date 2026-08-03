@@ -5,7 +5,7 @@ It defines an OrderSchema and provides functions that work with it correctly.
 """
 
 import pandas as pd
-import pandera as pa
+import pandera.pandas as pa
 from pandera.typing import DataFrame
 
 

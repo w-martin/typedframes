@@ -433,17 +433,17 @@ code reference.
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-08-01 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
+*2026-08-03 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
 
 | Tool | Version | What it does | typedframes (13 files) | great_expectations (482 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.4.0 | DataFrame column checker | 45ms ±2ms (IQR 3ms) | 202ms ±1ms (IQR 2ms) |
-| ruff | 0.15.21 | Linter (no type checking) | 29ms ±2ms (IQR 3ms) | 193ms ±2ms (IQR 4ms) |
-| ty | 0.0.58 | Type checker | 73ms ±2ms (IQR 3ms) | 183ms ±9ms (IQR 17ms) |
-| pyrefly | 1.1.1 | Type checker | 108ms ±2ms (IQR 3ms) | 559ms ±15ms (IQR 25ms) |
-| mypy | 2.2.0 | Type checker (no plugin) | 2.85s ±51ms (IQR 58ms) | 4.23s ±65ms (IQR 95ms) |
-| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.86s ±35ms (IQR 38ms) | 4.41s ±48ms (IQR 54ms) |
-| pyright | 1.1.411 | Type checker | 714ms ±13ms (IQR 22ms) | 3.28s ±51ms (IQR 52ms) |
+| typedframes | 0.4.0 | DataFrame column checker | 48ms ±873µs (IQR 2ms) | 216ms ±3ms (IQR 6ms) |
+| ruff | 0.15.21 | Linter (no type checking) | 29ms ±698µs (IQR 1ms) | 190ms ±4ms (IQR 5ms) |
+| ty | 0.0.58 | Type checker | 76ms ±2ms (IQR 2ms) | 188ms ±12ms (IQR 22ms) |
+| pyrefly | 1.1.1 | Type checker | 112ms ±2ms (IQR 2ms) | 557ms ±11ms (IQR 22ms) |
+| mypy | 2.2.0 | Type checker (no plugin) | 2.92s ±20ms (IQR 18ms) | 4.68s ±295ms (IQR 607ms) |
+| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.96s ±14ms (IQR 19ms) | 5.18s ±38ms (IQR 31ms) |
+| pyright | 1.1.411 | Type checker | 762ms ±7ms (IQR 8ms) | 3.96s ±43ms (IQR 57ms) |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -656,7 +656,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.4.0                  | 0.32.1      | 1.18.2             | 0.3.7                 | 3.0.3        | 0.1.2       | 1.1.3              | 5.0.0            | 2.23.0   | 2.13.0           | 0.8.6            |
+| **Version tested**              | 0.4.0                  | 0.32.1      | 1.19.1             | 0.3.7                 | 3.0.5        | 0.1.2       | 1.1.3              | 5.0.0            | 2.24.0   | 3.0.0            | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
@@ -675,7 +675,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ⚠️ Limited        |
 | Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes            |
 | DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
-| **Project Status (Feb 2026)**   |
+| **Project Status (Aug 2026)**   |
 | Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
 
 **Legend:** ✅ Full support | ⚠️ Limited/Partial | ❌ Not supported
@@ -690,11 +690,13 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   hints for runtime validation via typeguard. Despite documentation implying mypy support, there is no mypy plugin —
   column access errors are not caught statically. No standalone checker. No polars support.
 
-- **[pandas-stubs](https://github.com/pandas-dev/pandas-stubs)** (v3.0.3): Official pandas type stubs. Provides
+- **[pandas-stubs](https://github.com/pandas-dev/pandas-stubs)** (v3.0.5): Official pandas type stubs. Provides
   API-level types but no column-level checking.
 
-- **[dataenforce](https://github.com/CedricFR/dataenforce)** (v0.1.2): Runtime validation via decorator. Marked as
-  experimental/not production-ready. Appears inactive. Broken on Python 3.13+ due to removal of internal typing APIs.
+- **[dataenforce](https://github.com/CedricFR/dataenforce)** (v0.1.2, the only release ever published): Runtime
+  validation via decorator. Appears inactive/abandoned. Broken on every currently-supported Python version
+  (3.11 through 3.14) due to removal of internal typing APIs (`typing._TypingEmpty`) it depends on — confirmed
+  working only as far back as Python 3.9.
 
 - **[pandas-type-checks](https://pypi.org/project/pandas-type-checks/)** (v1.1.3): Runtime validation decorator. No
   static analysis.
@@ -703,43 +705,44 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   Not compatible with pandas/polars — requires a full rewrite to StaticFrame's own API. Column access is still
   string-based; mypy does not catch column name typos. Type safety comes from immutability guarantees, not schema checking.
 
-- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.23.0): Compatibility layer that provides a unified API
+- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.24.0): Compatibility layer that provides a unified API
   across pandas, polars, DuckDB, cuDF, and more. Solves a different problem—write-once-run-anywhere portability, not
   type safety. See [Why Abstraction Layers Don't Solve Type Safety](#why-abstraction-layers-dont-solve-type-safety)
   below.
 
-- **[Great Expectations](https://greatexpectations.io/)** (v1.18.2): Comprehensive data quality framework. Defines
+- **[Great Expectations](https://greatexpectations.io/)** (v1.19.1): Comprehensive data quality framework. Defines
   "expectations" (assertions) about data values, distributions, and schema properties. Excellent for runtime
   validation, data documentation, and data quality monitoring. No static analysis or column-level type checking in
   code. Supports pandas, Spark, and SQL backends.
 
-- **[dataframely](https://github.com/Quantco/dataframely)** (v2.13.0): Polars-only runtime validation library from Quantco.
+- **[dataframely](https://github.com/Quantco/dataframely)** (v3.0.0): Polars-only runtime validation library from Quantco.
   Schemas are defined as classes inheriting `dy.Schema` with typed descriptor fields (`dy.String()`, `dy.Float64()`)
   and `@dy.rule()` decorators for cross-column and group-level constraints. Returns `dy.DataFrame[Schema]` generic
   types that give call-site narrowing to type checkers, but does not validate column subscript access inside function
-  bodies. No lint-time or static analysis capability. Supports nullability, string constraints, numeric bounds,
-  cross-column rules, soft validation, test data generation, and SQLAlchemy/PyArrow export.
+  bodies, and (as of 3.0) that narrowing doesn't even survive a `.filter()` call — it returns a plain `pl.DataFrame`.
+  3.0 also removed the `dy.Series` type entirely; column access now returns a plain `pl.Series`. No lint-time or
+  static analysis capability. Supports nullability, string constraints, numeric bounds, cross-column rules, soft
+  validation, test data generation, and SQLAlchemy/PyArrow export.
 
 - **[patito](https://github.com/JakobGM/patito)** (v0.8.6): Runtime validation library using a Pydantic-style `patito.Model`
   class. Polars is the primary backend; pandas is supported but works by converting to Polars via PyArrow (an
-  undeclared dependency). DuckDB is not supported despite appearing in some documentation—validation crashes immediately
-  on DuckDB relations. No static analysis or standalone checker.
+  undeclared dependency). No static analysis or standalone checker.
 
 ### Type Checkers (Not DataFrame-Specific)
 
 These are general Python type checkers. They don't validate DataFrame column names, but they can be used alongside
 typedframes for comprehensive type checking:
 
-- **[mypy](https://mypy-lang.org/)** (v1.19.1): The original Python type checker. typedframes provides a mypy plugin for
+- **[mypy](https://mypy-lang.org/)** (v2.2.0): The original Python type checker. typedframes provides a mypy plugin for
   column checking. See [performance benchmarks](#static-analysis-performance).
 
-- **[ty](https://github.com/astral-sh/ty)** (v0.0.19, Astral): New Rust-based type checker, 10-60x faster than mypy on
+- **[ty](https://github.com/astral-sh/ty)** (v0.0.58, Astral): New Rust-based type checker, 10-60x faster than mypy on
   large codebases. Does not support mypy plugins—use typedframes standalone checker.
 
-- **[pyrefly](https://pyrefly.org/)** (v0.54.0, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,
+- **[pyrefly](https://pyrefly.org/)** (v1.1.1, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,
   but no DataFrame column checking.
 
-- **[pyright](https://github.com/microsoft/pyright)** (v1.1.408, Microsoft): Type checker powering Pylance/VSCode. No
+- **[pyright](https://github.com/microsoft/pyright)** (v1.1.411, Microsoft): Type checker powering Pylance/VSCode. No
   mypy plugin support—use typedframes standalone checker.
 
 ### Not Directly Comparable
@@ -1020,6 +1023,8 @@ MIT License - see [LICENSE](LICENSE)
 - [x] Aggressive column inference (untracked-dataframe/dropped-unknown-column warnings, method chain propagation)
 - [x] Function parameter contracts (`missing-column`), resolved transitively across chains of helper
   functions and cross-file calls; schema-annotated parameters take priority over body-scanning
+- [x] SQL / data-warehouse column inference (`SELECT` list parsing across Snowflake, BigQuery, Athena, Redshift,
+  Databricks, PySpark, DuckDB, SQLAlchemy Core/ORM, Feast, and T-SQL/Synapse/Fabric dialects)
 
 **Planned:**
 

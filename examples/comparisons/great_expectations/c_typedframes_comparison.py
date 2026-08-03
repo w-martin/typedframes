@@ -1,17 +1,11 @@
 """
 typedframes provides static analysis for type-safe column access.
 
-Unlike Great Expectations (runtime validation), typedframes is designed to catch
-column typos and wrong column names at lint time, before code runs.
+Unlike Great Expectations (runtime validation), typedframes catches column
+typos and wrong column names at lint time, before code runs.
 
-NOTE: The mypy plugin requires careful setup and mypy compatibility. This file
-demonstrates the concept and annotation pattern. In production, the plugin
-provides static type checking of column access.
-
-Try this:
+Run:
   uv run mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini 2>&1
-
-With proper plugin setup, output would show static type errors for column access mistakes.
 """
 
 from typing import Annotated
@@ -33,7 +27,7 @@ class OrderSchema(BaseSchema):
     shipped = Column(type=bool)
 
 
-def process_orders(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series[str]:
+def process_orders(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
     """Process orders DataFrame.
 
     Args:
@@ -43,11 +37,11 @@ def process_orders(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series[str]:
         Series of customer names.
     """
     # TYPO: should be "customer_name", not "custmer_name"
-    # With typedframes plugin, mypy would CATCH THIS
-    return df["custmer_name"]  # type: ignore[literal-required]
+    # The typedframes plugin catches this
+    return df["custmer_name"]
 
 
-def get_unit_cost(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series[float]:
+def get_unit_cost(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
     """Get unit costs.
 
     Args:
@@ -57,8 +51,8 @@ def get_unit_cost(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series[float]:
         Series of unit costs.
     """
     # WRONG NAME: should be "unit_price", not "unit_cost"
-    # With typedframes plugin, mypy would CATCH THIS
-    return df["unit_cost"]  # type: ignore[literal-required]
+    # The typedframes plugin catches this
+    return df["unit_cost"]
 
 
 if __name__ == "__main__":

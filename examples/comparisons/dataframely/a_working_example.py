@@ -25,11 +25,16 @@ def calculate_revenue(df: dy.DataFrame[OrderSchema]) -> float:
     Returns:
         Total revenue as sum of 'total' column.
     """
-    return df["total"].sum()
+    return float(df["total"].sum())
 
 
-def filter_shipped_orders(df: dy.DataFrame[OrderSchema]) -> dy.DataFrame[OrderSchema]:
+def filter_shipped_orders(df: dy.DataFrame[OrderSchema]) -> pl.DataFrame:
     """Filter to only shipped orders.
+
+    Note: as of dataframely 3.0, `.filter()` (inherited directly from polars,
+    with no dataframely-specific stub override) returns a plain `pl.DataFrame`,
+    not `dy.DataFrame[OrderSchema]` -- the schema-narrowed generic type does not
+    survive a filter call, unlike `.cast()`/`.create_empty()`/`.validate()`.
 
     Args:
         df: DataFrame with OrderSchema validation.
@@ -40,8 +45,11 @@ def filter_shipped_orders(df: dy.DataFrame[OrderSchema]) -> dy.DataFrame[OrderSc
     return df.filter(df["shipped"])
 
 
-def get_customer_names(df: dy.DataFrame[OrderSchema]) -> dy.Series[dy.String]:
+def get_customer_names(df: dy.DataFrame[OrderSchema]) -> pl.Series:
     """Extract customer names.
+
+    Note: dataframely 3.0 removed its own `dy.Series` type -- column subscript
+    access returns a plain `pl.Series`, same as `.filter()` above.
 
     Args:
         df: DataFrame with OrderSchema validation.

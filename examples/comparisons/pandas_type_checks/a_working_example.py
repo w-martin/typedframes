@@ -15,12 +15,14 @@ import pandas as pd
 from pandas_type_checks import DataFrameArgument, pandas_type_check
 
 # Define type specifications using DataFrameArgument
+# Note: string columns are "str", not "object" -- pandas 3.0 made its own native
+# string dtype the default for string columns instead of numpy object dtype.
 order_schema = DataFrameArgument(
     name="orders",
     dtype={
         "order_id": "int64",
-        "customer_name": "object",
-        "product_sku": "object",
+        "customer_name": "str",
+        "product_sku": "str",
         "quantity": "int64",
         "unit_price": "float64",
         "total": "float64",

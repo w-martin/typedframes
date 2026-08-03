@@ -10,7 +10,7 @@
 ## Key Findings
 
 ### Narwhals Version
-- `2.22.1`
+- `2.24.0`
 
 ### Test Results
 
@@ -38,25 +38,29 @@ Narwhals functions with column name errors pass mypy silently:
 
 #### Column Typos with Typedframes (c_typedframes_comparison.py)
 
-**Status**: Typedframes plugin integration with mypy is design-correct and documented in the examples/comparisons/pandas_type_checks example, but requires precise project configuration for the Rust checker to index annotations properly.
-
-The key principle demonstrated: **When properly configured**, typedframes can catch column access errors at lint-time by:
-1. Defining a schema with `BaseSchema` and `Column` types
-2. Annotating DataFrames as `Annotated[pd.DataFrame, OrderSchema]`
-3. Running mypy with the typedframes plugin
-
-Example of what typedframes can catch (from pandas_type_checks):
-```python
-class OrderSchema(BaseSchema):
-    customer_name = Column(type=str)
-    product_sku = Column(type=str)
-
-def process(orders: Annotated[pd.DataFrame, OrderSchema]):
-    orders_checked: Annotated[pd.DataFrame, OrderSchema] = orders
-    return orders_checked["sku"]  # ERROR: 'sku' does not exist (should be 'product_sku')
+Command:
+```bash
+uv run mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini 2>&1
 ```
 
-With plugin: mypy reports `Column 'sku' does not exist in OrderSchema`
+Result:
+```
+c_typedframes_comparison.py:67: error: Column 'sku' does not exist in OrderSchema (defined at line 64)  [misc]
+c_typedframes_comparison.py:83: error: Column 'nonexistent' does not exist in OrderSchema (defined at line 80)  [misc]
+Found 2 errors in 1 file (checked 1 source file)
+```
+
+**Requires `pandas-stubs`**: without it, mypy cannot resolve pandas subscript access
+(`df["col"]`) precisely enough for the typedframes plugin to hook in, and pandas-side
+column errors go undetected — only the polars-side error (`process_polars`, above) would
+be caught. `pandas-stubs>=3.0.0` is a direct dependency of this comparison for that reason.
+
+**One known gap, confirmed here**: the pandas-side typo in `process_pandas` —
+`df_checked.groupby("custmer_name")` — is **not** caught. typedframes currently tracks
+column names passed to subscript access (`df["col"]`) and `pl.col()`-style expressions,
+but not column names passed as `.groupby()` arguments. The two subscript-based errors
+(`process_polars`'s `df_checked["sku"]` and `process_completely_missing`'s
+`df_checked["nonexistent"]`) are both caught correctly.
 
 ---
 

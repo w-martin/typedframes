@@ -11,13 +11,18 @@ This directory contains comparison examples showing the differences between **da
 - `dy.DataFrame[OrderSchema]` vs `dy.DataFrame[OtherSchema]` are validated as different types by mypy
 - But `df["custmer_name"]` (typo) on a `dy.DataFrame[OrderSchema]` is completely silent in mypy
 - This is because the `DataFrame` class does not override `__getitem__`, so mypy uses polars' signature which returns `Any`
+- As of dataframely 3.0, that generic parameter doesn't even survive a `.filter()` call —
+  `df.filter(...)` returns a plain `pl.DataFrame`, not `dy.DataFrame[Schema]` — so the
+  narrowing dataframely does provide is narrower than before. `dy.Series` (a typed
+  Series wrapper) was also removed in 3.0; column subscript access now returns a plain
+  `pl.Series`.
 
 ## Environment
 
-- **dataframely**: 2.13.0
-- **polars**: 1.42.1
-- **mypy**: 2.2.0
-- **typedframes**: 0.3.1
+- **dataframely**: 3.0.0
+- **polars**: 1.43.2
+- **mypy**: 2.3.0
+- **typedframes**: 0.3.1 (published; see repo root for unreleased fixes)
 
 ## Files
 

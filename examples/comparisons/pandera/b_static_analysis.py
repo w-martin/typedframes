@@ -6,11 +6,11 @@ This module demonstrates the limitations of pandera's mypy plugin:
   - MISSES: Non-existent column access (df["unit_cost"] vs df["unit_price"])
 
 Expected mypy output (pandera.mypy plugin):
-  b_static_analysis.py:52: error: Argument 1 to "process_orders" has
+  b_static_analysis.py:94: error: Argument 1 to "process_orders" has
     incompatible type "DataFrame[WrongSchema]"; expected "DataFrame[OrderSchema]"
     [arg-type]
 
-Column name errors (lines 53-54) are NOT caught by pandera's mypy plugin.
+Column name errors (lines 98 and 102) are NOT caught by pandera's mypy plugin.
 
 Note: typedframes' *standalone* checker (`typedframes check`, no mypy involved)
 recognizes pandera's ``DataFrameModel``/``DataFrame[Schema]`` pattern natively
@@ -19,7 +19,7 @@ missing-column — see ``main()``.
 """
 
 import pandas as pd
-import pandera as pa
+import pandera.pandas as pa
 from pandera.typing import DataFrame
 
 
@@ -107,12 +107,12 @@ def main() -> None:
 # ============================================================================
 # $ uv run mypy b_static_analysis.py --config-file mypy.ini
 #
-# b_static_analysis.py:82: error: Argument 1 to "process_orders" has
+# b_static_analysis.py:94: error: Argument 1 to "process_orders" has
 #   incompatible type "DataFrame[WrongSchema]"; expected "DataFrame[OrderSchema]"
 #   [arg-type]
 # Found 1 error in 1 file (checked 1 source file)
 #
-# NOTE: The typo at line 85 (custmer_name) and wrong column at line 89
+# NOTE: The typo at line 98 (custmer_name) and wrong column at line 102
 # (unit_cost) are NOT caught by pandera's mypy plugin. These errors would
 # only be caught at runtime when the code runs and KeyError is raised.
 # ============================================================================

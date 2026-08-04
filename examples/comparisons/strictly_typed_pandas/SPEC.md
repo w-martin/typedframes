@@ -28,15 +28,15 @@ Success: no issues found in 1 source file
 ```
 $ uv run mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini
 
-c_typedframes_comparison.py:64: error: Column 'custmer_name' does not exist in
-  OrderSchema (defined at line 60) (did you mean 'customer_name'?)  [misc]
-c_typedframes_comparison.py:69: error: Column 'unit_cost' does not exist in
-  OrderSchema (defined at line 60)  [misc]
-c_typedframes_comparison.py:83: error: Column 'custmer_name' does not exist in
-  OrderSchema (defined at line 80) (did you mean 'customer_name'?)  [misc]
-c_typedframes_comparison.py:86: error: Column 'unit_cost' does not exist in
-  OrderSchema (defined at line 80)  [misc]
-Found 4 errors in 1 file
+c_typedframes_comparison.py:65: error: Column 'custmer_name' does not exist in
+  OrderSchema (defined at line 61) (did you mean 'customer_name'?)  [misc]
+c_typedframes_comparison.py:70: error: Column 'unit_cost' does not exist in
+  OrderSchema (defined at line 61)  [misc]
+c_typedframes_comparison.py:84: error: Column 'custmer_name' does not exist in
+  OrderSchema (defined at line 81) (did you mean 'customer_name'?)  [misc]
+c_typedframes_comparison.py:87: error: Column 'unit_cost' does not exist in
+  OrderSchema (defined at line 81)  [misc]
+Found 4 errors in 1 file (checked 1 source file)
 ```
 
 ## Comparison Matrix

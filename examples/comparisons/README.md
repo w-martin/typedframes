@@ -23,7 +23,18 @@ Run any directory's checks with:
 
 ```shell
 cd examples/comparisons/<name>
-uv run mypy --config-file mypy.ini --strict a_working_example.py
-uv run mypy --config-file mypy_typedframes.ini --strict c_typedframes_comparison.py
-uv run typedframes check .
+uv run mypy --config-file mypy.ini a_working_example.py
+uv run mypy --config-file mypy_typedframes.ini c_typedframes_comparison.py
+uv run typedframes check c_typedframes_comparison.py
 ```
+
+Note: each directory is its own `uv` project with its own `.venv`, and each depends on
+the **published PyPI release** of typedframes (currently 0.3.1), not this repo's local
+source. That published release does not yet exclude `.venv`/vendored directories from
+`typedframes check`, so running `typedframes check .` (or any bare directory target)
+here will also scan the venv's installed packages and produce a flood of unrelated
+findings — check individual files instead, as above, until a release with that
+exclusion ships. `--strict` isn't included in the mypy invocations above since some of
+these comparison files depend on the *other* library's own type stubs being complete
+enough for `--strict`, which isn't always true — see each directory's own SPEC.md and
+`mypy*.ini` files for the exact command that directory expects.

@@ -1,8 +1,13 @@
-"""Pandas example — Annotated type annotation with column validation.
+"""Pandas example: Annotated[pd.DataFrame, Schema] with column validation.
 
-Plain `pd.DataFrame` throughout — no `PandasFrame` subclass involved. `PandasFrame`
-is deprecated (see `docs/api/pandas.md`); `Annotated[pd.DataFrame, Schema]` is the
-only supported pattern going forward.
+Annotate a plain pandas DataFrame with a schema, then use ordinary string subscript
+access exactly as you already do -- the checker validates it against the schema at
+lint time, with zero runtime overhead. `.s` gives a refactor-safe column name from
+the schema descriptor instead of a bare string.
+
+(`PandasFrame` is a deprecated runtime subclass with the same static guarantees plus
+some extra runtime behavior -- see `docs/api/pandas.md` -- so this file sticks to a
+plain `pd.DataFrame` throughout.)
 """
 
 from typing import Annotated

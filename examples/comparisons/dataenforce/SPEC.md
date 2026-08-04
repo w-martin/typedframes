@@ -4,17 +4,24 @@
 
 ### dataenforce Status
 - **Version**: 0.1.2 (latest available)
-- **Package Status**: ❌ BROKEN on Python 3.13+ (and 3.14)
+- **Package Status**: ❌ BROKEN on Python 3.11 through 3.14 (every version this project supports)
 - **Error**: `ImportError: cannot import name '_TypingEmpty' from 'typing'`
-  - The package relies on internal typing module APIs (`_TypingEmpty`, `_tp_cache`) that were removed/changed in Python 3.13
-  - No newer versions available on PyPI
-  - This makes the package unusable on current Python versions
+  - The package relies on internal typing module APIs (`_TypingEmpty`, `_tp_cache`) that no
+    longer exist in current CPython; confirmed working only as far back as Python 3.9
+  - No newer versions available on PyPI (0.1.2 is the only release, last published years ago)
+  - This makes the package unusable on any currently-supported Python version
 
 ### Installation Report
 - **Installed successfully**: Yes (version 0.1.2 added to pyproject.toml)
 - **Runs on Python 3.14**: No (import error at runtime)
-- **Runs on Python 3.13**: No (same import error)
-- **Runs on Python 3.11**: Likely yes (not tested — workspace limited to Python 3.14)
+- **Runs on Python 3.12**: No (same import error, confirmed by direct test)
+- **Runs on Python 3.11**: No (same import error, confirmed by direct test — this project's
+  own `requires-python` floor)
+- **Runs on Python 3.9**: Yes, confirmed by direct test — but 3.9 is below this project's
+  supported range and long past upstream security support
+- dataenforce 0.1.2 is broken on every Python version this project (and any current project)
+  would realistically run on; there is no supported combination in which the working example
+  can execute
 
 ## Design Pattern Comparison
 
@@ -67,14 +74,15 @@ def process_orders(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
 - **Test File**: `c_typedframes_comparison.py`
 - **Mypy Output**:
   ```
-  c_typedframes_comparison.py:50: error: Column 'custmer_name' does not exist in OrderSchema (defined at line 38) (did you mean 'customer_name'?)  [misc]
-  c_typedframes_comparison.py:55: error: Column 'unit_cost' does not exist in OrderSchema (defined at line 38)  [misc]
-  Found 2 errors in 1 file (checked 1 source file)
+  c_typedframes_comparison.py:53: error: Column 'custmer_name' does not exist in OrderSchema (defined at line 39) (did you mean 'customer_name'?)  [misc]
+  c_typedframes_comparison.py:58: error: Column 'unit_cost' does not exist in OrderSchema (defined at line 39)  [misc]
+  c_typedframes_comparison.py:75: error: Column 'quanity' does not exist in RevenueSchema (defined at line 62) (did you mean 'quantity'?)  [misc]
+  Found 3 errors in 1 file (checked 1 source file)
   ```
 - **Findings**:
   - Column typos are caught with fuzzy suggestions ("did you mean 'customer_name'?")
   - Wrong column names are detected before runtime
-  - All direct column access errors are caught at lint-time
+  - All direct column access errors are caught at lint-time, across two separate schemas
 
 ## Key Differences
 
@@ -86,15 +94,17 @@ def process_orders(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
 | Error Detection | Function must be called with bad data | Caught at lint time |
 | IDE Integration | No schema hints | Full IDE schema hints |
 | Column Typos | Caught at runtime | Caught at lint time |
-| Package Status | Broken on Python 3.13+ | Works across Python 3.11-3.14 |
+| Package Status | Broken on Python 3.11-3.14 (only 3.9 confirmed working) | Works across Python 3.11-3.14 |
 
 ## Conclusion
 
 ### dataenforce
 - **Design**: Runtime-only validation via decorator on function signatures
-- **Current Status**: Broken on Python 3.13+ due to internal typing module API changes
-- **Practical Impact**: Cannot demonstrate the working example on Python 3.13/3.14 environments
-- **Limitation**: Only catches errors when functions are actually called with bad data; errors caught at runtime, not development time
+- **Current Status**: Broken on Python 3.11-3.14 due to internal typing module API changes;
+  confirmed working only on Python 3.9, which is well below this project's supported range
+- **Practical Impact**: Cannot demonstrate the working example (`a_working_example.py`) on any
+  currently-supported Python environment
+- **Limitation**: Even where it runs, only catches errors when functions are actually called with bad data; errors caught at runtime, not development time
 
 ### typedframes
 - **Design**: Static analysis via mypy plugin + optional runtime checks

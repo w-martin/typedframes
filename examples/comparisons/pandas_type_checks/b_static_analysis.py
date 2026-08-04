@@ -22,8 +22,8 @@ order_schema = DataFrameArgument(
     name="orders",
     dtype={
         "order_id": "int64",
-        "customer_name": "object",
-        "product_sku": "object",
+        "customer_name": "str",
+        "product_sku": "str",
         "quantity": "int64",
         "unit_price": "float64",
         "total": "float64",

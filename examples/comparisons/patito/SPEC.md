@@ -11,7 +11,6 @@
 patito provides runtime validation through `.validate()`:
 - **Polars**: Full support, catches missing columns and type mismatches at runtime
 - **Pandas**: Works via automatic conversion to Polars (requires undeclared pyarrow dependency)
-- **DuckDB**: **Broken** — crashes with `AttributeError: 'clone'` on validation attempt
 
 Example:
 ```python
@@ -46,7 +45,6 @@ y = validated["unit_cost"]      # Wrong column — mypy says nothing
 | Runtime validation | ✓ | ✓ (via validators) |
 | Polars support | ✓ | ✓ |
 | Pandas support | ✓ (via pyarrow) | ✓ |
-| DuckDB support | ✗ (broken) | ✓ |
 | Static type checking | ✗ | ✓ (mypy plugin) |
 | Column error detection | Runtime only | Lint-time |
 | Type hints provided | No | Yes |
@@ -55,9 +53,8 @@ y = validated["unit_cost"]      # Wrong column — mypy says nothing
 ### typedframes Advantages
 
 1. **Static Analysis**: Catches typos and missing columns at lint-time via mypy plugin
-2. **Better DuckDB Support**: Polars/DuckDB work identically
-3. **Type Safety**: Full type hint support for IDE autocomplete
-4. **Composable**: Use alongside runtime validators, not instead of
+2. **Type Safety**: Full type hint support for IDE autocomplete
+3. **Composable**: Use alongside runtime validators, not instead of
 
 ### patito Advantages
 
@@ -76,9 +73,9 @@ y = validated["unit_cost"]      # Wrong column — mypy says nothing
 
 ```
 $ mypy b_static_analysis.py --config-file mypy_strict.ini
-b_static_analysis.py:9: error: Skipping analyzing "patito":
-  module installed but missing library stubs or py.typed marker [import-untyped]
-Found 1 error
+b_static_analysis.py:9: error: Skipping analyzing "patito": module is
+  installed, but missing library stubs or py.typed marker [import-untyped]
+Found 1 error in 1 file (checked 1 source file)
 ```
 
 **Result**: Column access errors not caught. patito has no static analysis.
@@ -86,37 +83,31 @@ Found 1 error
 ### c_typedframes_comparison.py
 
 ```
-$ mypy c_typedframes_comparison_test.py --config-file mypy_typedframes.ini
-c_typedframes_comparison_test.py:41: error: Column 'custmer_name' does not exist
-  in OrderSchema (did you mean 'customer_name'?)  [misc]
-c_typedframes_comparison_test.py:45: error: Column 'unit_cost' does not exist
-  in OrderSchema  [misc]
-c_typedframes_comparison_test.py:49: error: Column 'completely_made_up' does
-  not exist in OrderSchema  [misc]
+$ mypy c_typedframes_comparison.py --config-file mypy_typedframes.ini
+c_typedframes_comparison.py:52: error: Column 'custmer_name' does not exist
+  in OrderSchema (defined at line 34) (did you mean 'customer_name'?)  [misc]
+c_typedframes_comparison.py:57: error: Column 'unit_cost' does not exist
+  in OrderSchema (defined at line 34)  [misc]
+c_typedframes_comparison.py:62: error: Column 'completely_made_up' does
+  not exist in OrderSchema (defined at line 34)  [misc]
+Found 3 errors in 1 file (checked 1 source file)
 ```
 
 **Result**: All three column access errors caught at lint-time by typedframes mypy plugin.
-
-### DuckDB Status
-
-```
-$ python test_duckdb.py
-✗ Validation failed
-  Error type: AttributeError
-  Message: This relation does not contain a column by the name of 'clone'
-```
-
-**Result**: DuckDB support is broken in patito 0.8.6. Crashes on `.clone()` call during validation.
 
 ## Summary
 
 patito is a good choice if you:
 - Need simple runtime validation with Polars/Pandas
-- Don't need DuckDB
 - Don't care about static analysis
 
 Use **typedframes** if you want:
 - Lint-time column error detection
 - Static type safety
-- DuckDB support
 - IDE autocomplete for DataFrame columns
+
+Note: an earlier version of this document claimed DuckDB support/status for
+both patito and typedframes, backed by a `test_duckdb.py` script that does not
+exist in this directory and never has (per git history). Neither library has
+DuckDB-specific support, so those claims have been removed rather than left
+unverifiable.

@@ -13,9 +13,10 @@ dependencies = [
     "mypy>=1.0.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "typedframes[mypy]>=0.2.1",
+    "pandas-stubs>=3.0.0",
 ]
 
 [tool.setuptools]

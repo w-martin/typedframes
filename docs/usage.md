@@ -366,6 +366,14 @@ enabled = false
 # Applies to every file not captured by a glob in [overrides] below.
 fail_under = 100.0
 
+# How much coverage detail to print after each check. One of:
+#   "summary"      one line (the default, unchanged from before this feature)
+#   "term-missing" per-file table plus the DataFrame sites lacking column info
+#   "json"         machine-readable document, for CI tooling
+# Independent of `enabled` — a detailed report is useful without a gate, and
+# vice versa. Overridden by `--coverage-report`.
+report = "summary"
+
 [tool.typedframes.coverage.overrides]
 # Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
 # than new code. Each glob is graded on its own files as a separate group, so a
@@ -386,6 +394,7 @@ The same settings work in a standalone `typedframes.toml` at the project root, w
 [coverage]
 enabled = false
 fail_under = 100.0
+report = "summary"
 
 [coverage.overrides]
 # "legacy/**" = 50.0
@@ -421,6 +430,86 @@ With 8/10 DataFrames resolved under `legacy/` and 5/8 elsewhere:
 rest of the project misses the 90% bar and fails the run. Each group is graded
 independently, which is the point of the overrides — the legacy exemption never
 silently improves the number the rest of your code is held to.
+
+### Reporting: seeing what's missing
+
+The default one-line summary gives a ratio but nothing to act on.
+`term-missing` — named after `coverage report -m` — adds a per-file table and names the
+DataFrames that cost coverage:
+
+```shell
+typedframes check src/ --coverage-report=term-missing
+```
+
+```
+Name           Typed  Total   Cover   Missing
+---------------------------------------------
+legacy/old.py      0      2      0%   old_one:2, old_two:3
+src/new.py         1      2     50%   bad:3
+---------------------------------------------
+TOTAL              1      4     25%
+```
+
+Each `Missing` entry is `variable:line`: the assignment where the checker recognized a
+DataFrame origin but couldn't resolve its columns. These are exactly the origins counted
+in the denominator but not the numerator, so the listing always reconciles with the
+table — the count of missing entries equals `Total - Typed` for every row.
+
+That reconciliation is why the sites are tracked by the checker itself rather than
+derived from `untracked-dataframe` warnings, which would not add up: some warnings are
+retracted once a call site resolves the columns cross-file, and `warnings = false`
+suppresses them entirely, while coverage is counted regardless.
+
+Files with no recognized DataFrames are omitted from the table — a `0/0` row says
+nothing about coverage and would only bury the rows that matter.
+
+For CI tooling, `json` emits the same data as a document:
+
+```shell
+typedframes check src/ --coverage-report=json
+```
+
+Combine it with `--output-format=json` and the coverage report is nested under a
+`coverage` key rather than printed separately, so stdout stays a single valid JSON
+document:
+
+```shell
+typedframes check src/ --output-format=json --coverage-report=json
+```
+
+Shape of the payload, with the `errors` list elided for brevity:
+
+```json
+{
+  "errors": [],
+  "stats": { "dataframes_total": 2, "dataframes_typed": 1 },
+  "coverage": {
+    "dataframes_total": 2,
+    "dataframes_typed": 1,
+    "percent": 50.0,
+    "files": [
+      {
+        "file": "load.py",
+        "dataframes_total": 2,
+        "dataframes_typed": 1,
+        "percent": 50.0,
+        "missing": [{ "var": "sales", "line": 3, "col": 1 }]
+      }
+    ]
+  }
+}
+```
+
+Percentages in the JSON report are left unrounded — a consumer deciding whether a gate
+passed needs the real ratio and can round for display itself. A file with no DataFrames
+reports `null` rather than a fabricated percentage.
+
+With no `--coverage-report` and no `report` key, the `coverage` key is absent and the
+JSON payload is exactly what it was before this feature existed.
+
+`report` is independent of `enabled`: you can get a detailed report with no threshold,
+or a threshold with only the one-line summary. The CLI flag wins over the config key, so
+a one-off `--coverage-report=term-missing` needs no config edit.
 
 ### Behaviour notes
 

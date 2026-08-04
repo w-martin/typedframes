@@ -101,6 +101,11 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
 _COVERAGE_DEFAULT_FAIL_UNDER = 100.0
 _COVERAGE_PCT_MAX = 100.0
 
+# Report detail levels, named after `coverage report` / `coverage report -m`.
+# "summary" is the pre-existing one-line message and the default, so an unconfigured
+# project sees exactly what it saw before.
+_COVERAGE_REPORTS = ("summary", "term-missing", "json")
+
 
 def _coverage_warn(message: str) -> None:
     """Warn about unusable DataFrame schema coverage config on stderr, keeping stdout clean.
@@ -122,6 +127,14 @@ class CoverageConfig:
     enabled: bool = False
     fail_under: float = _COVERAGE_DEFAULT_FAIL_UNDER
     overrides: tuple[tuple[str, float], ...] = ()
+
+    report: str = "summary"
+    """How much coverage detail to print.
+
+    Independent of `enabled`, which gates threshold *enforcement* only -- asking
+    for a detailed report is not the same as asking for a gate, and either is
+    useful without the other.
+    """
 
 
 def _parse_threshold(value: object, label: str) -> float | None:
@@ -172,6 +185,11 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
         if parsed is not None:
             fail_under = parsed
 
+    report = table.get("report", "summary")
+    if report not in _COVERAGE_REPORTS:
+        _coverage_warn(f"ignoring coverage.report: expected one of {', '.join(_COVERAGE_REPORTS)}")
+        report = "summary"
+
     raw_overrides = table.get("overrides", {})
     overrides: list[tuple[str, float]] = []
     if isinstance(raw_overrides, dict):
@@ -185,7 +203,12 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
         # type mistake worth reporting rather than silently treating as "none set".
         _coverage_warn("ignoring coverage.overrides: expected a table of glob = threshold")
 
-    return CoverageConfig(enabled=enabled, fail_under=fail_under, overrides=tuple(overrides))
+    return CoverageConfig(
+        enabled=enabled,
+        fail_under=fail_under,
+        overrides=tuple(overrides),
+        report=report,
+    )
 
 
 def _load_coverage_config(path: Path) -> CoverageConfig:
@@ -305,6 +328,11 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     and a ``per_file`` mapping of each file to its own ``(total, typed)`` tally --
     needed to attribute coverage to per-path threshold overrides, which grade
     subtrees separately rather than judging one project-wide ratio.
+
+    Also returns ``untyped_sites``: every DataFrame origin the checker recognized
+    but could not resolve columns for, with the file it came from attached. This
+    is the "missing" listing behind ``--coverage-report=term-missing``, the
+    counterpart to `coverage report -m`'s missing line numbers.
     """
     try:
         from typedframes._rust_checker import check_file  # ty: ignore[unresolved-import]
@@ -319,6 +347,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     all_errors = []
     totals = {"dataframes_total": 0, "dataframes_typed": 0}
     per_file: dict[str, tuple[int, int]] = {}
+    untyped_sites: list[dict] = []
     for file_path in files:
         try:
             result_json = check_file(str(file_path), index_bytes)
@@ -342,7 +371,8 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         per_file[str(file_path)] = (file_total, file_typed)
         totals["dataframes_total"] += file_total
         totals["dataframes_typed"] += file_typed
-    return all_errors, {**totals, "per_file": per_file}
+        untyped_sites.extend({**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", []))
+    return all_errors, {**totals, "per_file": per_file, "untyped_sites": untyped_sites}
 
 
 def _format_text(errors: list[dict], *, color: bool = False) -> str:
@@ -461,6 +491,17 @@ def main(argv: list[str] | None = None) -> None:
             "DataFrames have recognized column info. A total override: it applies one "
             "threshold everywhere and ignores [tool.typedframes.coverage] entirely, "
             "per-path overrides included."
+        ),
+    )
+    check_parser.add_argument(
+        "--coverage-report",
+        choices=list(_COVERAGE_REPORTS),
+        default=None,
+        dest="coverage_report",
+        help=(
+            "Coverage detail to print: summary (default, one line), term-missing "
+            "(per-file table plus the DataFrame sites lacking column info), or json. "
+            "Overrides the `report` key in [tool.typedframes.coverage]."
         ),
     )
 
@@ -595,6 +636,113 @@ def _coverage_failure_message(bucket: CoverageBucket) -> str:
     )
 
 
+def _format_term_missing(
+    per_file: dict[str, tuple[int, int]],
+    untyped_sites: list[dict],
+    root: Path,
+) -> str:
+    """Render the per-file coverage table plus the sites that cost coverage.
+
+    Modelled on `coverage report -m`: one row per file with its tally and
+    percentage, then the specific DataFrame assignments the checker could not
+    resolve -- the counterpart to coverage.py's missing line numbers, so the
+    report is actionable rather than just a number.
+
+    Files with no recognized DataFrames are omitted: a row of `0/0` says nothing
+    about coverage and would bury the files that do matter.
+    """
+    rows = [(name, total, typed) for name, (total, typed) in sorted(per_file.items()) if total > 0]
+    if not rows:
+        return "No DataFrames with recognized loads/schemas found to check"
+
+    sites_by_file: dict[str, list[dict]] = {}
+    for site in untyped_sites:
+        sites_by_file.setdefault(site["file"], []).append(site)
+
+    display = {name: _relative_posix(name, root) for name, _, _ in rows}
+    name_width = max(len("Name"), *(len(display[name]) for name, _, _ in rows))
+    header = f"{'Name'.ljust(name_width)}  Typed  Total   Cover   Missing"
+    lines = [header, "-" * len(header)]
+
+    for name, total, typed in rows:
+        pct = round(_COVERAGE_PCT_MAX * typed / total)
+        missing = ", ".join(
+            f"{site['var']}:{site['line']}" for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
+        )
+        lines.append(f"{display[name].ljust(name_width)}  {typed:>5}  {total:>5}  {pct:>5}%   {missing}".rstrip())
+
+    total_all = sum(total for _, total, _ in rows)
+    typed_all = sum(typed for _, _, typed in rows)
+    pct_all = round(_COVERAGE_PCT_MAX * typed_all / total_all)
+    lines.append("-" * len(header))
+    lines.append(f"{'TOTAL'.ljust(name_width)}  {typed_all:>5}  {total_all:>5}  {pct_all:>5}%")
+    return "\n".join(lines)
+
+
+def _coverage_json_payload(
+    per_file: dict[str, tuple[int, int]],
+    untyped_sites: list[dict],
+    root: Path,
+) -> dict:
+    """Build the machine-readable coverage document for `--coverage-report=json`.
+
+    Percentages are left unrounded here, unlike the human-facing table: a
+    consumer deciding whether a gate passed needs the real ratio, and can round
+    for display itself.
+    """
+    sites_by_file: dict[str, list[dict]] = {}
+    for site in untyped_sites:
+        sites_by_file.setdefault(site["file"], []).append(site)
+
+    files = []
+    for name, (total, typed) in sorted(per_file.items()):
+        files.append(
+            {
+                "file": _relative_posix(name, root),
+                "dataframes_total": total,
+                "dataframes_typed": typed,
+                "percent": (_COVERAGE_PCT_MAX * typed / total) if total else None,
+                "missing": [
+                    {"var": site["var"], "line": site["line"], "col": site["col"]}
+                    for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
+                ],
+            }
+        )
+
+    total_all = sum(total for total, _ in per_file.values())
+    typed_all = sum(typed for _, typed in per_file.values())
+    return {
+        "dataframes_total": total_all,
+        "dataframes_typed": typed_all,
+        "percent": (_COVERAGE_PCT_MAX * typed_all / total_all) if total_all else None,
+        "files": files,
+    }
+
+
+def _print_coverage_report(stats: dict, root: Path, *, report: str) -> None:
+    """Emit the richer coverage report requested by `--coverage-report`.
+
+    `summary` is the default and prints nothing extra -- the existing one-line
+    summary in `_print_results` already covers it, and keeping this a no-op is
+    what makes the default path byte-for-byte unchanged.
+
+    Only reached for text/GitHub output. Under `--output-format=json` the
+    coverage document is nested into the single payload by `_print_json_results`
+    instead, so stdout stays one valid JSON document.
+    """
+    if report == "summary":
+        return
+
+    per_file = stats.get("per_file", {})
+    untyped_sites = stats.get("untyped_sites", [])
+    if report == "json":
+        print(json.dumps(_coverage_json_payload(per_file, untyped_sites, root), indent=2))
+        return
+
+    print()
+    print(_format_term_missing(per_file, untyped_sites, root))
+
+
 def _print_coverage_failures(buckets: list[CoverageBucket], *, output_format: str) -> None:
     """Report failed thresholds without corrupting machine-readable output.
 
@@ -614,6 +762,21 @@ def _print_coverage_failures(buckets: list[CoverageBucket], *, output_format: st
             print(f"{_BOLD_RED}{message}{_RESET}" if use_color else message)
 
 
+def _print_json_results(all_errors: list[dict], stats: RunStats, coverage_detail: dict | None) -> None:
+    """Print the whole run as a single JSON document.
+
+    `coverage_detail`, when given, is nested under a `coverage` key rather than
+    printed separately, so stdout stays one valid document. `None` -- no richer
+    report requested -- leaves the payload byte-for-byte as it was before
+    coverage reporting existed.
+    """
+    stats_dict = {"dataframes_total": stats.dataframes_total, "dataframes_typed": stats.dataframes_typed}
+    payload: dict = {"errors": all_errors, "stats": stats_dict}
+    if coverage_detail is not None:
+        payload["coverage"] = coverage_detail
+    print(json.dumps(payload, indent=2))
+
+
 def _print_results(
     files: list[Path],
     all_errors: list[dict],
@@ -622,14 +785,13 @@ def _print_results(
     output_format: str,
     show_info: bool = True,
 ) -> None:
-    """Print check results in the requested format."""
+    """Print check results in the text or GitHub-annotation format.
+
+    JSON output is handled separately by `_print_json_results`, which has to
+    assemble one document rather than print progressively.
+    """
     errors_only = [e for e in all_errors if e.get("severity") not in ("warning", "info")]
     warnings = [e for e in all_errors if e.get("severity") == "warning"]
-
-    if output_format == "json":
-        stats_dict = {"dataframes_total": stats.dataframes_total, "dataframes_typed": stats.dataframes_typed}
-        print(json.dumps({"errors": all_errors, "stats": stats_dict}, indent=2))
-        return
 
     use_color = output_format == "text" and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
@@ -730,13 +892,26 @@ def _run_check(args: argparse.Namespace) -> None:
     all_errors = _apply_diagnostic_policy(all_errors, args)
 
     errors_only = [e for e in all_errors if e.get("severity") not in ("warning", "info")]
-    _print_results(
-        files,
-        all_errors,
-        stats,
-        output_format=args.output_format,
-        show_info=not args.no_info,
+    # The flag wins over the config key, so a one-off `--coverage-report` doesn't
+    # require editing (or temporarily undoing) project config.
+    report = args.coverage_report or coverage_config.report
+    coverage_detail = (
+        _coverage_json_payload(coverage.get("per_file", {}), coverage.get("untyped_sites", []), path)
+        if report != "summary" and args.output_format == "json"
+        else None
     )
+
+    if args.output_format == "json":
+        _print_json_results(all_errors, stats, coverage_detail)
+    else:
+        _print_results(
+            files,
+            all_errors,
+            stats,
+            output_format=args.output_format,
+            show_info=not args.no_info,
+        )
+        _print_coverage_report(coverage, path, report=report)
 
     # Coverage is a separate gate from --strict: --strict judges correctness (are
     # there errors?), the threshold judges annotation completeness (how much could

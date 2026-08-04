@@ -382,6 +382,9 @@ typedframes check src/ --no-warnings
 
 # Enforce minimum DataFrame schema coverage (see below)
 typedframes check src/ --fail-under=90
+
+# Show which DataFrames lack column info, per file
+typedframes check src/ --coverage-report=term-missing
 ```
 
 To suppress warnings project-wide, add to `pyproject.toml`:
@@ -415,6 +418,14 @@ enabled = false
 # Applies to every file not captured by a glob in [overrides] below.
 fail_under = 100.0
 
+# How much coverage detail to print after each check. One of:
+#   "summary"      one line (the default, unchanged from before this feature)
+#   "term-missing" per-file table plus the DataFrame sites lacking column info
+#   "json"         machine-readable document, for CI tooling
+# Independent of `enabled` — a detailed report is useful without a gate, and
+# vice versa. Overridden by `--coverage-report`.
+report = "summary"
+
 [tool.typedframes.coverage.overrides]
 # Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
 # than new code. Each glob is graded on its own files as a separate group, so a
@@ -436,6 +447,7 @@ Prefer to keep `pyproject.toml` clean? The same settings work in a standalone
 [coverage]
 enabled = false
 fail_under = 100.0
+report = "summary"
 
 [coverage.overrides]
 # "legacy/**" = 50.0
@@ -443,6 +455,36 @@ fail_under = 100.0
 
 If both files exist, `typedframes.toml` wins **entirely** — the two are never merged,
 so exactly one file explains the whole configuration.
+
+### Seeing What's Missing
+
+The default one-line summary tells you the ratio but not what to fix.
+`--coverage-report=term-missing` names the DataFrames that cost you coverage:
+
+```shell
+typedframes check src/ --coverage-report=term-missing
+```
+
+```
+Name           Typed  Total   Cover   Missing
+---------------------------------------------
+legacy/old.py      0      2      0%   old_one:2, old_two:3
+src/new.py         1      2     50%   bad:3
+---------------------------------------------
+TOTAL              1      4     25%
+```
+
+Each `Missing` entry is `variable:line` — the assignment where the checker recognized a
+DataFrame but couldn't resolve its columns. Fix those (add `usecols=`, name the columns
+in the `SELECT`, or annotate the variable) and coverage rises.
+
+For CI tooling, `--coverage-report=json` emits the same data as a document. Combine it
+with `--output-format=json` and the coverage report is nested under a `coverage` key so
+stdout stays a single valid JSON document:
+
+```shell
+typedframes check src/ --output-format=json --coverage-report=json
+```
 
 Notes:
 

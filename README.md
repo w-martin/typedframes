@@ -458,8 +458,8 @@ so exactly one file explains the whole configuration.
 
 ### Seeing What's Missing
 
-The default one-line summary tells you the ratio but not what to fix.
-`--coverage-report=term-missing` names the DataFrames that cost you coverage:
+The default one-line DataFrame schema coverage summary tells you the ratio but not what
+to fix. `--coverage-report=term-missing` names the DataFrames that cost you coverage:
 
 ```shell
 typedframes check src/ --coverage-report=term-missing

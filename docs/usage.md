@@ -433,9 +433,9 @@ silently improves the number the rest of your code is held to.
 
 ### Reporting: seeing what's missing
 
-The default one-line summary gives a ratio but nothing to act on.
-`term-missing` — named after `coverage report -m` — adds a per-file table and names the
-DataFrames that cost coverage:
+The default one-line DataFrame schema coverage summary gives a ratio but nothing to act
+on. `term-missing` — named after `coverage report -m` — adds a per-file table and names
+the DataFrames that cost coverage:
 
 ```shell
 typedframes check src/ --coverage-report=term-missing

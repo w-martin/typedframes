@@ -129,7 +129,7 @@ class CoverageConfig:
     overrides: tuple[tuple[str, float], ...] = ()
 
     report: str = "summary"
-    """How much coverage detail to print.
+    """How much DataFrame schema coverage detail to print.
 
     Independent of `enabled`, which gates threshold *enforcement* only -- asking
     for a detailed report is not the same as asking for a gate, and either is
@@ -499,7 +499,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         dest="coverage_report",
         help=(
-            "Coverage detail to print: summary (default, one line), term-missing "
+            "DataFrame schema coverage detail to print: summary (default, one line), term-missing "
             "(per-file table plus the DataFrame sites lacking column info), or json. "
             "Overrides the `report` key in [tool.typedframes.coverage]."
         ),
@@ -641,7 +641,7 @@ def _format_term_missing(
     untyped_sites: list[dict],
     root: Path,
 ) -> str:
-    """Render the per-file coverage table plus the sites that cost coverage.
+    """Render the per-file DataFrame schema coverage table plus the sites that cost coverage.
 
     Modelled on `coverage report -m`: one row per file with its tally and
     percentage, then the specific DataFrame assignments the checker could not
@@ -684,7 +684,7 @@ def _coverage_json_payload(
     untyped_sites: list[dict],
     root: Path,
 ) -> dict:
-    """Build the machine-readable coverage document for `--coverage-report=json`.
+    """Build the machine-readable DataFrame schema coverage document for `--coverage-report=json`.
 
     Percentages are left unrounded here, unlike the human-facing table: a
     consumer deciding whether a gate passed needs the real ratio, and can round
@@ -720,7 +720,7 @@ def _coverage_json_payload(
 
 
 def _print_coverage_report(stats: dict, root: Path, *, report: str) -> None:
-    """Emit the richer coverage report requested by `--coverage-report`.
+    """Emit the richer DataFrame schema coverage report requested by `--coverage-report`.
 
     `summary` is the default and prints nothing extra -- the existing one-line
     summary in `_print_results` already covers it, and keeping this a no-op is

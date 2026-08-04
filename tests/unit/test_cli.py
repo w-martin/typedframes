@@ -1,5 +1,6 @@
 """Unit tests for the typedframes CLI."""
 
+import argparse
 import builtins
 import json
 import tempfile
@@ -9,11 +10,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 from typedframes.cli import (
+    CoverageBucket,
+    CoverageConfig,
     _check_files,
     _collect_python_files,
+    _evaluate_coverage,
     _format_github,
     _format_text,
+    _glob_to_regex,
     _load_configured_excludes,
+    _load_coverage_config,
+    _override_for,
+    _percentage,
+    _relative_posix,
     main,
 )
 
@@ -1130,3 +1139,490 @@ class TestCli(unittest.TestCase):
 
             self.assertEqual(ctx.exception.code, 1)
             self.assertIn("Rust checker extension was not found", captured.getvalue())
+
+    def test_should_match_any_depth_beneath_a_double_star_glob(self) -> None:
+        """Test that `**` spans any number of path segments."""
+        # arrange
+        pattern = _glob_to_regex("legacy/**")
+
+        # act / assert
+        self.assertTrue(pattern.match("legacy/old.py"))
+        self.assertTrue(pattern.match("legacy/etl/deep/load.py"))
+        self.assertFalse(pattern.match("src/legacy/old.py"))
+
+    def test_should_not_let_single_star_cross_a_path_separator(self) -> None:
+        """Test that `*` matches within one path segment only."""
+        # arrange
+        pattern = _glob_to_regex("src/*.py")
+
+        # act / assert
+        self.assertTrue(pattern.match("src/a.py"))
+        self.assertFalse(pattern.match("src/nested/a.py"))
+
+    def test_should_match_root_level_file_with_leading_double_star(self) -> None:
+        """Test that `**/x.py` also matches `x.py` with no leading directory."""
+        # arrange
+        pattern = _glob_to_regex("**/conftest.py")
+
+        # act / assert
+        self.assertTrue(pattern.match("conftest.py"))
+        self.assertTrue(pattern.match("tests/unit/conftest.py"))
+
+    def test_should_prefer_the_most_specific_override_pattern(self) -> None:
+        """Test that the longest literal prefix wins when several globs match."""
+        # arrange
+        config = CoverageConfig(enabled=True, overrides=(("src/**", 50.0), ("src/new_module/**", 100.0)))
+
+        # act
+        match = _override_for("src/new_module/loader.py", config)
+
+        # assert
+        self.assertEqual(("src/new_module/**", 100.0), match)
+
+    def test_should_return_no_override_when_no_pattern_matches(self) -> None:
+        """Test that an unmatched file falls through to the global threshold."""
+        # arrange
+        config = CoverageConfig(enabled=True, overrides=(("legacy/**", 50.0),))
+
+        # act
+        match = _override_for("src/loader.py", config)
+
+        # assert
+        self.assertIsNone(match)
+
+    def test_should_report_failing_bucket_when_below_global_threshold(self) -> None:
+        """Test that coverage under the global fail_under produces a failing bucket."""
+        # arrange
+        per_file = {"/proj/a.py": (4, 1)}
+        config = CoverageConfig(enabled=True, fail_under=90.0)
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual(1, len(failing))
+        self.assertIsNone(failing[0].label)
+        self.assertEqual(25.0, failing[0].pct)
+
+    def test_should_report_no_failures_when_threshold_is_met(self) -> None:
+        """Test that coverage at or above the threshold passes."""
+        # arrange
+        per_file = {"/proj/a.py": (4, 4)}
+        config = CoverageConfig(enabled=True, fail_under=100.0)
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual([], failing)
+
+    def test_should_grade_override_bucket_separately_from_global_bucket(self) -> None:
+        """Test that a per-path override is judged on its own files, not the whole project."""
+        # arrange
+        per_file = {"/proj/legacy/old.py": (4, 0), "/proj/src/new.py": (2, 2)}
+        config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual([], failing)
+
+    def test_should_fail_only_the_override_bucket_that_misses_its_own_bar(self) -> None:
+        """Test that a failing override is named in the report while the global bucket passes."""
+        # arrange
+        per_file = {"/proj/legacy/old.py": (4, 1), "/proj/src/new.py": (2, 2)}
+        config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 50.0),))
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual(1, len(failing))
+        self.assertEqual("legacy/**", failing[0].label)
+
+    def test_should_pass_vacuously_when_a_bucket_has_no_dataframes(self) -> None:
+        """Test that 0/0 is treated as nothing to measure rather than a failure."""
+        # arrange
+        per_file = {"/proj/a.py": (0, 0)}
+        config = CoverageConfig(enabled=True, fail_under=100.0)
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual([], failing)
+
+    def test_should_ignore_path_overrides_when_fail_under_flag_is_given(self) -> None:
+        """Test that --fail-under is a total override, not merged with config overrides."""
+        # arrange
+        per_file = {"/proj/legacy/old.py": (4, 0)}
+        config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), 100.0)
+
+        # assert
+        self.assertEqual(1, len(failing))
+        self.assertIsNone(failing[0].label)
+
+    def test_should_return_disabled_coverage_config_when_nothing_configured(self) -> None:
+        """Test that a project with no config table gets no threshold."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # act
+            config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertFalse(config.enabled)
+            self.assertEqual((), config.overrides)
+
+    def test_should_load_coverage_config_from_pyproject_toml(self) -> None:
+        """Test that [tool.typedframes.coverage] is read from pyproject.toml."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "pyproject.toml").write_text(
+                "[tool.typedframes.coverage]\nenabled = true\nfail_under = 80.0\n\n"
+                '[tool.typedframes.coverage.overrides]\n"legacy/**" = 25.0\n'
+            )
+
+            # act
+            config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertTrue(config.enabled)
+            self.assertEqual(80.0, config.fail_under)
+            self.assertEqual((("legacy/**", 25.0),), config.overrides)
+
+    def test_should_prefer_standalone_typedframes_toml_over_pyproject(self) -> None:
+        """Test that typedframes.toml wins entirely rather than merging with pyproject.toml."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "pyproject.toml").write_text(
+                "[tool.typedframes.coverage]\nenabled = true\nfail_under = 99.0\n"
+            )
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 10.0\n")
+
+            # act
+            config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual(10.0, config.fail_under)
+
+    def test_should_disable_coverage_when_config_toml_is_malformed(self) -> None:
+        """Test that unparseable config warns and leaves enforcement off."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage\nenabled = true\n")
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertFalse(config.enabled)
+            self.assertIn("typedframes.toml", captured.getvalue())
+
+    def test_should_warn_and_fall_back_when_fail_under_is_not_a_number(self) -> None:
+        """Test that a non-numeric fail_under is reported rather than silently accepted."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nenabled = true\nfail_under = "ninety"\n')
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual(100.0, config.fail_under)
+            self.assertIn("coverage.fail_under", captured.getvalue())
+
+    def test_should_warn_and_fall_back_when_fail_under_is_out_of_range(self) -> None:
+        """Test that a percentage outside 0-100 is rejected."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 150.0\n")
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual(100.0, config.fail_under)
+            self.assertIn("0-100", captured.getvalue())
+
+    def test_should_reject_a_boolean_fail_under(self) -> None:
+        """Test that `fail_under = true` is a mistake, not 100%."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = true\n")
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertIn("expected a number", captured.getvalue())
+            self.assertEqual(100.0, config.fail_under)
+
+    def test_should_produce_identical_output_when_coverage_table_is_absent(self) -> None:
+        """Test the opt-in guarantee: no coverage table means behaviour is unchanged."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+
+            without_config = StringIO()
+            with patch("sys.stdout", without_config):
+                main(["check", tmpdir])
+
+            (Path(tmpdir) / "pyproject.toml").write_text("[tool.typedframes]\nenabled = true\n")
+
+            # act
+            with_config = StringIO()
+            with patch("sys.stdout", with_config):
+                main(["check", tmpdir])
+
+            # assert
+            self.assertEqual(without_config.getvalue(), with_config.getvalue())
+            self.assertNotIn("below the required", without_config.getvalue())
+
+    def test_should_not_enforce_threshold_when_coverage_is_disabled(self) -> None:
+        """Test that a present-but-disabled table leaves the run passing."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = false\nfail_under = 100.0\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir])
+
+            # assert
+            self.assertNotIn("below the required", captured.getvalue())
+
+    def test_should_exit_1_when_coverage_is_below_configured_threshold(self) -> None:
+        """Test that an enabled threshold fails the run end to end."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 100.0\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit) as ctx:
+                main(["check", tmpdir])
+
+            # assert
+            self.assertEqual(1, ctx.exception.code)
+            self.assertIn("below the required 100.0%", captured.getvalue())
+
+    def test_should_exit_1_when_fail_under_flag_is_not_met_without_any_config(self) -> None:
+        """Test that --fail-under enforces a threshold on an otherwise unconfigured project."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit) as ctx:
+                main(["check", tmpdir, "--fail-under", "50"])
+
+            # assert
+            self.assertEqual(1, ctx.exception.code)
+            self.assertIn("below the required 50.0%", captured.getvalue())
+
+    def test_should_exit_2_when_fail_under_flag_is_out_of_range(self) -> None:
+        """Test that an invalid --fail-under is a usage error, not a coverage failure."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text("x = 1\n")
+
+            # act / assert
+            with patch("sys.stderr", StringIO()), self.assertRaises(SystemExit) as ctx:
+                main(["check", tmpdir, "--fail-under", "150"])
+
+            self.assertEqual(2, ctx.exception.code)
+
+    def test_should_report_coverage_failure_without_corrupting_json_output(self) -> None:
+        """Test that the gate message goes to stderr so stdout stays valid JSON."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 100.0\n")
+
+            out, err = StringIO(), StringIO()
+
+            # act
+            with patch("sys.stdout", out), patch("sys.stderr", err), self.assertRaises(SystemExit):
+                main(["check", tmpdir, "--output-format", "json"])
+
+            # assert
+            json.loads(out.getvalue())
+            self.assertIn("below the required", err.getvalue())
+
+    def test_should_still_report_coverage_failure_when_info_is_suppressed(self) -> None:
+        """Test that --no-info hides the informational line but not a failed gate."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 100.0\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit):
+                main(["check", tmpdir, "--no-info"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertNotIn("coverage, not a pass/fail result", output)
+            self.assertIn("below the required", output)
+
+    def test_should_ignore_config_when_an_intermediate_key_is_not_a_table(self) -> None:
+        """Test that `tool.typedframes` holding a scalar can't crash config loading."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "pyproject.toml").write_text('[tool]\ntypedframes = "yes"\n')
+
+            # act
+            config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertFalse(config.enabled)
+
+    def test_should_warn_and_disable_when_enabled_is_not_a_boolean(self) -> None:
+        """Test that a non-boolean `enabled` is rejected rather than coerced."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nenabled = "true"\n')
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertFalse(config.enabled)
+            self.assertIn("coverage.enabled", captured.getvalue())
+
+    def test_should_keep_default_fail_under_when_key_is_omitted(self) -> None:
+        """Test that enabling coverage without naming a threshold uses the default."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\n")
+
+            # act
+            config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertTrue(config.enabled)
+            self.assertEqual(100.0, config.fail_under)
+
+    def test_should_drop_only_the_invalid_entry_from_the_overrides_table(self) -> None:
+        """Test that one bad override doesn't discard the valid ones beside it."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text(
+                '[coverage]\nenabled = true\n\n[coverage.overrides]\n"legacy/**" = "half"\n"src/**" = 75.0\n'
+            )
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual((("src/**", 75.0),), config.overrides)
+            self.assertIn("legacy/**", captured.getvalue())
+
+    def test_should_warn_when_overrides_is_not_a_table(self) -> None:
+        """Test that `overrides` given as a scalar is reported and ignored."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nenabled = true\noverrides = "legacy"\n')
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual((), config.overrides)
+            self.assertIn("coverage.overrides", captured.getvalue())
+
+    def test_should_match_exactly_one_character_for_a_question_mark_glob(self) -> None:
+        """Test that `?` matches a single character within one path segment."""
+        # arrange
+        pattern = _glob_to_regex("src/v?/load.py")
+
+        # act / assert
+        self.assertTrue(pattern.match("src/v1/load.py"))
+        self.assertFalse(pattern.match("src/v10/load.py"))
+
+    def test_should_treat_an_empty_bucket_as_fully_covered(self) -> None:
+        """Test that a bucket with no DataFrames reports 100% rather than dividing by zero."""
+        # arrange
+        bucket = CoverageBucket(label=None, threshold=100.0, total=0, typed=0)
+
+        # act
+        pct = bucket.pct
+
+        # assert
+        self.assertEqual(100.0, pct)
+
+    def test_should_fall_back_to_absolute_path_when_file_is_outside_the_root(self) -> None:
+        """Test that a file that isn't under the checked root still yields a matchable path."""
+        # arrange
+        root = Path("/proj")
+
+        # act
+        rel = _relative_posix("/elsewhere/mod.py", root)
+
+        # assert
+        self.assertEqual("/elsewhere/mod.py", rel)
+
+    def test_should_reject_a_non_numeric_fail_under_flag(self) -> None:
+        """Test that --fail-under=abc is a usage error rather than a crash."""
+        # act / assert
+        with self.assertRaises(argparse.ArgumentTypeError):
+            _percentage("abc")
+
+    def test_should_emit_github_error_annotation_for_a_failed_threshold(self) -> None:
+        """Test that github output format reports the gate as a workflow annotation."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 100.0\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit):
+                main(["check", tmpdir, "--output-format", "github"])
+
+            # assert
+            self.assertIn("::error title=typedframes coverage::DataFrame coverage", captured.getvalue())
+
+    def test_should_exit_0_when_enabled_threshold_is_satisfied(self) -> None:
+        """Test that an enabled but satisfied threshold leaves the run passing."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv", usecols=["a"])\n')
+            (Path(tmpdir) / "typedframes.toml").write_text("[coverage]\nenabled = true\nfail_under = 100.0\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir])
+
+            # assert
+            self.assertNotIn("below the required", captured.getvalue())

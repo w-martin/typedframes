@@ -380,7 +380,7 @@ typedframes check src/ --no-index
 # Suppress all warnings (untracked-dataframe, dropped-unknown-column)
 typedframes check src/ --no-warnings
 
-# Fail the run if under 90% of DataFrames have recognized column info
+# Enforce minimum DataFrame schema coverage (see below)
 typedframes check src/ --fail-under=90
 ```
 
@@ -391,12 +391,13 @@ enabled = true
 warnings = false
 ```
 
-### Coverage Thresholds (Opt-In)
+### DataFrame Schema Coverage Thresholds (Opt-In)
 
-`typedframes check` reports what fraction of DataFrames it could resolve column
-information for. That number is informational by default. If you want it enforced —
-failing the run when too much of your code is invisible to the checker — enable a
-threshold.
+**DataFrame schema coverage** is the fraction of DataFrames `typedframes check` could
+resolve column information for — the analogue of the "type coverage" reported by mypy,
+pyright, and pyre, and unrelated to test coverage. That number is informational by
+default. If you want it enforced — failing the run when too much of your code is
+invisible to the checker — enable a threshold.
 
 This is **entirely opt-in**. With no `[tool.typedframes.coverage]` table and no
 `--fail-under`, nothing changes: no threshold, no exit-code difference.

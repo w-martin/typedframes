@@ -376,7 +376,7 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertNotIn("::error", output)
             self.assertNotIn("::warning", output)
-            self.assertIn("::notice title=typedframes coverage::", output)
+            self.assertIn("::notice title=typedframes DataFrame schema coverage::", output)
 
     def test_should_suppress_github_notice_with_no_info_flag(self) -> None:
         """Test that --no-info suppresses the GitHub coverage notice annotation."""
@@ -1483,7 +1483,7 @@ class TestCli(unittest.TestCase):
 
             # assert
             output = captured.getvalue()
-            self.assertNotIn("coverage, not a pass/fail result", output)
+            self.assertNotIn("DataFrame schema coverage, not a pass/fail result", output)
             self.assertIn("below the required", output)
 
     def test_should_ignore_config_when_an_intermediate_key_is_not_a_table(self) -> None:
@@ -1609,7 +1609,10 @@ class TestCli(unittest.TestCase):
                 main(["check", tmpdir, "--output-format", "github"])
 
             # assert
-            self.assertIn("::error title=typedframes coverage::DataFrame coverage", captured.getvalue())
+            self.assertIn(
+                "::error title=typedframes DataFrame schema coverage::DataFrame schema coverage",
+                captured.getvalue(),
+            )
 
     def test_should_exit_0_when_enabled_threshold_is_satisfied(self) -> None:
         """Test that an enabled but satisfied threshold leaves the run passing."""

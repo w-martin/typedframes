@@ -92,7 +92,7 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
     return frozenset(entry for entry in exclude if isinstance(entry, str))
 
 
-# Coverage-threshold enforcement is entirely opt-in: with no
+# DataFrame schema coverage enforcement is entirely opt-in: with no
 # `[tool.typedframes.coverage]` table (or `[coverage]` in typedframes.toml) and no
 # `--fail-under`, no threshold is ever evaluated and `check` behaves exactly as it did
 # before the feature existed -- same output, same exit code. `_COVERAGE_DEFAULT_FAIL_UNDER`
@@ -103,7 +103,7 @@ _COVERAGE_PCT_MAX = 100.0
 
 
 def _coverage_warn(message: str) -> None:
-    """Warn about unusable coverage config on stderr, leaving stdout machine-readable.
+    """Warn about unusable DataFrame schema coverage config on stderr, keeping stdout clean.
 
     Bad config is reported rather than silently defaulted: a threshold the user
     believes is enforced but isn't is worse than a noisy run.
@@ -113,7 +113,7 @@ def _coverage_warn(message: str) -> None:
 
 @dataclass(frozen=True)
 class CoverageConfig:
-    """Resolved coverage-threshold settings for a single `check` invocation.
+    """Resolved DataFrame schema coverage threshold settings for one `check` invocation.
 
     The default instance is the "nothing configured" state -- disabled, so no
     threshold is evaluated at all.
@@ -189,7 +189,7 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
 
 
 def _load_coverage_config(path: Path) -> CoverageConfig:
-    """Read the opt-in coverage-threshold settings for the project at `path`.
+    """Read the opt-in DataFrame schema coverage settings for the project at `path`.
 
     Two sources, with ruff's precedence rule: a standalone `typedframes.toml` at
     the project root wins ENTIRELY over `[tool.typedframes]` in `pyproject.toml`
@@ -448,7 +448,7 @@ def main(argv: list[str] | None = None) -> None:
     check_parser.add_argument(
         "--no-info",
         action="store_true",
-        help="Suppress informational output: the DataFrame coverage summary and info-level diagnostics.",
+        help="Suppress informational output: the DataFrame schema coverage summary and info-level diagnostics.",
     )
     check_parser.add_argument(
         "--fail-under",
@@ -457,9 +457,10 @@ def main(argv: list[str] | None = None) -> None:
         dest="fail_under",
         metavar="N",
         help=(
-            "Exit 1 if fewer than N%% of DataFrames have recognized column info. "
-            "A total override: it applies one threshold everywhere and ignores "
-            "[tool.typedframes.coverage] entirely, per-path overrides included."
+            "Enforce a minimum DataFrame schema coverage: exit 1 if fewer than N%% of "
+            "DataFrames have recognized column info. A total override: it applies one "
+            "threshold everywhere and ignores [tool.typedframes.coverage] entirely, "
+            "per-path overrides included."
         ),
     )
 
@@ -474,7 +475,7 @@ def main(argv: list[str] | None = None) -> None:
 
 @dataclass
 class RunStats:
-    """Timing plus DataFrame coverage stats for a single `check` invocation."""
+    """Timing plus DataFrame schema coverage stats for a single `check` invocation."""
 
     elapsed: float
     dataframes_total: int
@@ -482,18 +483,20 @@ class RunStats:
 
 
 def _coverage_message(stats: RunStats) -> str:
-    """Build the low-key DataFrame coverage summary line.
+    """Build the low-key DataFrame schema coverage summary line.
 
     Framed as a signal of how much information the checker had, not a validation
     result \u2014 a low ratio means the check had little to validate, not that the
-    code is broken.
+    code is broken. Named in full ("DataFrame schema coverage") on the way out
+    because the surrounding CLI vocabulary is borrowed from coverage.py, and a
+    bare "coverage" here reads as test coverage to anyone skimming CI output.
     """
     if stats.dataframes_total == 0:
         return "\u2139 No DataFrames with recognized loads/schemas found to check"
     pct = round(100 * stats.dataframes_typed / stats.dataframes_total)
     return (
         f"\u2139 {stats.dataframes_typed}/{stats.dataframes_total} DataFrames had column info "
-        f"({pct}%) \u2014 coverage, not a pass/fail result"
+        f"({pct}%) \u2014 DataFrame schema coverage, not a pass/fail result"
     )
 
 
@@ -586,7 +589,7 @@ def _coverage_failure_message(bucket: CoverageBucket) -> str:
     """
     scope = f" for {bucket.label!r}" if bucket.label else ""
     return (
-        f"✗ DataFrame coverage {bucket.pct:.1f}% is below the required "
+        f"✗ DataFrame schema coverage {bucket.pct:.1f}% is below the required "
         f"{bucket.threshold:.1f}%{scope} "
         f"({bucket.typed}/{bucket.total} DataFrames had column info)"
     )
@@ -603,7 +606,7 @@ def _print_coverage_failures(buckets: list[CoverageBucket], *, output_format: st
     for bucket in buckets:
         message = _coverage_failure_message(bucket)
         if output_format == "github":
-            print(f"::error title=typedframes coverage::{message[2:]}")
+            print(f"::error title=typedframes DataFrame schema coverage::{message[2:]}")
         elif output_format == "json":
             print(message, file=sys.stderr)
         else:
@@ -634,7 +637,7 @@ def _print_results(
         if all_errors:
             print(_format_github(all_errors))
         if show_info:
-            print(f"::notice title=typedframes coverage::{_coverage_message(stats)[2:]}")
+            print(f"::notice title=typedframes DataFrame schema coverage::{_coverage_message(stats)[2:]}")
         return
 
     # text format

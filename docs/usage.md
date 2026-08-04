@@ -318,17 +318,22 @@ Suppress all warnings project-wide via `pyproject.toml`:
 warnings = false
 ```
 
-## DataFrame coverage thresholds
+## DataFrame schema coverage thresholds
 
-Every `check` run ends with a coverage line:
+Every `check` run ends with a DataFrame schema coverage line:
 
 ```
-ℹ 12/20 DataFrames had column info (60%) — coverage, not a pass/fail result
+ℹ 12/20 DataFrames had column info (60%) — DataFrame schema coverage, not a pass/fail result
 ```
 
-That is a measure of how much the checker could *see*, not how correct your code is: a
-low ratio means most DataFrames arrived without resolvable column information, so there
-was little to validate. It is informational by default.
+**DataFrame schema coverage** is the fraction of DataFrames the checker could resolve
+column information for. It is this project's analogue of the "type coverage" reported by
+mypy, pyright, and pyre, and has nothing to do with test coverage — worth stating plainly,
+because the vocabulary below (`fail_under`, `term-missing`) is borrowed from coverage.py.
+
+It measures how much the checker could *see*, not how correct your code is: a low ratio
+means most DataFrames arrived without resolvable column information, so there was little
+to validate. It is informational by default.
 
 To enforce it — failing CI when too much of the codebase is opaque to the checker —
 turn on a threshold. Enforcement is **entirely opt-in**: with no
@@ -409,7 +414,7 @@ fail_under = 90.0
 With 8/10 DataFrames resolved under `legacy/` and 5/8 elsewhere:
 
 ```
-✗ DataFrame coverage 62.5% is below the required 90.0% (5/8 DataFrames had column info)
+✗ DataFrame schema coverage 62.5% is below the required 90.0% (5/8 DataFrames had column info)
 ```
 
 `legacy/` passes on its own terms (80% against its 40% bar) and is not reported; the

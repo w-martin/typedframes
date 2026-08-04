@@ -40,7 +40,15 @@ rmp-serde = "1"
 anyhow = "1.0"
 toml = "0.8"
 sqlparser = "0.62"
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+# `extension-module` is deliberately NOT enabled here. maturin turns it on for the
+# builds that need it (`features = ["pyo3/extension-module"]` in pyproject.toml), and
+# enabling it unconditionally breaks `cargo test` on macOS: the feature tells pyo3 not
+# to link libpython, leaving the CPython symbols to be resolved by the interpreter that
+# loads the extension. `cargo test` also builds the cdylib, and macOS's linker rejects
+# a dylib with undefined symbols, so the whole test run failed with
+# "Undefined symbols ... _PyByteArray_AsString". Linux tolerates it, which is why CI
+# stayed green while local macOS runs did not.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -9,7 +9,7 @@ use crate::ast_extract;
 use crate::config::{load_linter_config, LinterConfig};
 use crate::constants::DEFAULT_EXCLUDED_DIRS;
 use crate::errors::{LintError, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME};
-use crate::{Linter, ParamGovernedTemplate};
+use crate::linter::{Linter, ParamGovernedTemplate};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, SourceCode};
@@ -1123,4 +1123,593 @@ pub(crate) fn find_first_return_expr(stmts: &[Stmt]) -> Option<&Expr> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LinterConfig;
+    use std::path::Path;
+
+    #[test]
+    fn test_should_not_hang_on_mutually_delegating_functions() {
+        // arrange: f and g delegate to each other — a cycle in the delegate graph.
+        // Resolution must terminate (cycle guard) rather than recursing forever.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def f(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["a"]
+    return g(df)
+
+def g(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["b"]
+    return f(df)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: both functions resolved without hanging, each contributing at
+        // least its own direct requirement.
+        let steps_path = root.join("steps.py").to_str().unwrap().to_string();
+        let entry = index.files.get(&steps_path).expect("steps.py indexed");
+        let f_requires = &entry.functions.get("f").expect("f indexed").requires;
+        let g_requires = &entry.functions.get("g").expect("g indexed").requires;
+        assert!(f_requires.contains(&"a".to_string()));
+        assert!(g_requires.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_should_prune_configured_exclude_directories_from_project_index() {
+        // A non-default directory (e.g. a vendored `third_party/`) isn't caught by
+        // DEFAULT_EXCLUDED_DIRS -- [tool.typedframes] exclude is what lets a project
+        // prune it (or any other named directory) explicitly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"third_party\"]",
+        )
+        .unwrap();
+        fs::create_dir(root.join("third_party")).unwrap();
+        fs::write(
+            root.join("third_party").join("vendored.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class VendoredSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert -- only app.py was indexed; third_party/ was pruned entirely
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.contains("third_party")),
+            "third_party/ should have been pruned: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("VendoredSchema"));
+    }
+
+    #[test]
+    fn test_should_prune_dot_claude_by_default_with_no_config_at_all() {
+        // .claude is in DEFAULT_EXCLUDED_DIRS -- pruned automatically with no
+        // [tool.typedframes] exclude configured at all, same as .venv/.git/etc.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".claude").join("worktrees").join("agent-1")).unwrap();
+        fs::write(
+            root.join(".claude")
+                .join("worktrees")
+                .join("agent-1")
+                .join("stale.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class StaleSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.contains(".claude")),
+            ".claude/ should have been pruned by default: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("StaleSchema"));
+    }
+
+    #[test]
+    fn test_should_replace_rather_than_add_to_default_excludes_when_configured() {
+        // Configuring [tool.typedframes] exclude REPLACES DEFAULT_EXCLUDED_DIRS
+        // entirely -- it does not add to it. A project that configures its own
+        // exclude list without re-listing .venv gets .venv walked again; that's the
+        // deliberate override semantics (matching ruff's own exclude, as opposed to
+        // extend-exclude), not a bug.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"custom_dir\"]",
+        )
+        .unwrap();
+        fs::create_dir(root.join("custom_dir")).unwrap();
+        fs::write(root.join("custom_dir").join("skipped.py"), "x = 1\n").unwrap();
+        fs::create_dir(root.join(".venv")).unwrap();
+        fs::write(
+            root.join(".venv").join("walked.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class VenvSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            !indexed.iter().any(|p| p.contains("custom_dir")),
+            "custom_dir/ should have been pruned (in the configured exclude list): {indexed:#?}"
+        );
+        assert!(
+            indexed.iter().any(|p| p.contains(".venv")),
+            ".venv/ should NOT be pruned once exclude is configured without re-listing \
+             it -- override, not union: {indexed:#?}"
+        );
+        assert!(index.all_schemas.contains_key("VenvSchema"));
+    }
+
+    #[test]
+    fn test_should_resolve_param_governed_call_site_across_files() {
+        // arrange: load_conv_rate is defined in helpers.py; pipeline.py calls it twice
+        // with different literals, same as the same-file test above, but now resolved
+        // through resolve_delegate_target's cross-file import resolution.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("helpers.py"),
+            r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from helpers import load_conv_rate
+
+load_conv_rate(store, entity_df, ["driver_stats:conv_rate"])
+load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
+"#;
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let pipeline_path_str = pipeline_path.to_str().unwrap().to_string();
+
+        // assert
+        let errors = index
+            .call_site_errors
+            .get(&pipeline_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert_eq!(errors[0].line, 5, "should be the SECOND call site only");
+        assert!(errors[0].message.contains("conv_rate"));
+        assert!(errors[0].message.contains("helpers.py"));
+    }
+
+    #[test]
+    fn test_should_resolve_call_site_argument_through_a_multi_hop_delegate_chain() {
+        // A call site doesn't have to pass the literal directly -- it can pass a call
+        // to a zero-arg helper, which itself just forwards to ANOTHER helper, which
+        // finally returns the literal. resolve_returns_literal_list must follow that
+        // whole chain (helper_a -> helper_b -> literal), not just one hop.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def helper_b() -> list[str]:
+    return ["driver_stats:acc_rate"]
+
+
+def helper_a() -> list[str]:
+    return helper_b()
+
+
+load_conv_rate(store, entity_df, helper_a())
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: helper_a resolves (through helper_b) to {acc_rate}, which does NOT
+        // satisfy load_conv_rate's print(df["conv_rate"]) -- caught two hops away.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("conv_rate"));
+        assert!(
+            index
+                .resolved_governed
+                .contains(&(file_path_str, "load_conv_rate".to_string())),
+            "load_conv_rate should be resolved_governed via the multi-hop chain"
+        );
+    }
+
+    #[test]
+    fn test_should_resolve_call_site_argument_through_literal_substitution_into_an_fstring() {
+        // A call site can pass a call like `feature_names("driver_stats")` -- a
+        // genuine argument, not a zero-arg forward -- whose callee builds its return
+        // value with an f-string that interpolates that very parameter. The evaluator
+        // must substitute the literal "driver_stats" for the callee's own parameter
+        // and evaluate the f-string with it, arriving at the same resolved feature list
+        // as if the call site had written the literal out directly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def feature_names(prefix: str) -> list[str]:
+    return [f"{prefix}:conv_rate"]
+
+
+load_conv_rate(store, entity_df, feature_names("driver_stats"))
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert: feature_names("driver_stats") resolves (via argument substitution
+        // into the f-string) to {"driver_stats:conv_rate"}, which DOES satisfy
+        // load_conv_rate's print(df["conv_rate"]) -- no error, and the callee's own
+        // untracked-dataframe warning is retracted.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+        assert!(
+            index
+                .resolved_governed
+                .contains(&(file_path_str, "load_conv_rate".to_string())),
+            "load_conv_rate should be resolved_governed via argument substitution"
+        );
+    }
+
+    #[test]
+    fn test_should_not_hang_on_a_self_delegating_return_chain() {
+        // Recursion protection: a function whose `return` shape delegates to itself
+        // (or a cycle of functions delegating to each other) must resolve to
+        // unresolvable rather than looping forever -- mirrors
+        // test_should_not_hang_on_mutually_delegating_functions's existing coverage
+        // for the *requires* side of this same cycle-protection pattern.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let source = r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+
+
+def cyclic_a() -> list[str]:
+    return cyclic_b()
+
+
+def cyclic_b() -> list[str]:
+    return cyclic_a()
+
+
+load_conv_rate(store, entity_df, cyclic_a())
+"#;
+        let file_path = root.join("pipeline.py");
+        fs::write(&file_path, source).unwrap();
+
+        // act -- must terminate (this test itself hanging is the failure mode)
+        let index = build_index_internal(root);
+
+        // assert: the argument is unresolvable (the cycle guard gives up), but the
+        // call site itself was still seen -- so its own untracked-dataframe
+        // diagnostic is reported right there, and load_conv_rate is in
+        // resolved_governed so the callee's own generic line is retracted.
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let errors = index
+            .call_site_errors
+            .get(&file_path_str)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert!(index
+            .resolved_governed
+            .contains(&(file_path_str, "load_conv_rate".to_string())));
+    }
+
+    #[test]
+    fn test_should_resolve_transitive_requires_through_plain_import_delegate() {
+        // arrange: transform() only forwards df to steps.postproc(df) via a plain
+        // `import steps` — the delegate-detection blind spot for attribute calls.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("steps.py"),
+            r#"
+import pandas as pd
+
+def postproc(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["c"]
+    return df
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("transforms.py"),
+            r#"
+import steps
+
+def transform(df):
+    return steps.postproc(df)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let transforms_path = root.join("transforms.py").to_str().unwrap().to_string();
+        let func = &index.files[&transforms_path].functions["transform"];
+
+        // assert: transform's own requires is the transitive union through the
+        // attribute-style delegate call, i.e. {c} — not empty, which is what it
+        // would be if the `steps.postproc(df)` call were never recognised as a
+        // delegate at all.
+        assert_eq!(func.requires, vec!["c".to_string()]);
+    }
+
+    fn write_import_heavy_project(root: &Path, num_files: usize) {
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        for hub in 0..5 {
+            fs::write(
+                root.join(format!("hub{hub}.py")),
+                format!(
+                    r#"
+import pandas as pd
+
+def load_hub{hub}(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, usecols=["a", "b", "c"])
+"#
+                ),
+            )
+            .unwrap();
+        }
+        for i in 0..num_files {
+            let hub = i % 5;
+            fs::write(
+                root.join(format!("mod_{i}.py")),
+                format!(
+                    r#"
+from hub{hub} import load_hub{hub}
+
+def process_{i}(path: str) -> None:
+    df = load_hub{hub}(path)
+    print(df["a"])
+"#
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_without_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, no .venv: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_with_venv_present_but_unused() {
+        // Same project, but with a real (populated-looking) .venv present --
+        // trace_external_packages is NOT set, so no external package should actually
+        // be indexed, but every import resolution still probes for a site-packages
+        // dir (cached after the first call -- this measures whether that caching
+        // actually keeps the cost negligible for the common case where the feature
+        // isn't in use at all).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        // A handful of unrelated installed packages, so the directory listing this
+        // benchmark exercises isn't unrealistically empty.
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+            fs::write(site_packages.join(pkg).join("__init__.py"), "").unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, .venv present (unused): {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_index_with_venv_and_allowlisted_package() {
+        // Same as above, but trace_external_packages actually names one of the fake
+        // installed packages -- measures the added cost of actually indexing an
+        // external package's files, not just probing for the directory.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+            fs::write(site_packages.join(pkg).join("__init__.py"), "").unwrap();
+        }
+        let internal_pkg = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&internal_pkg).unwrap();
+        fs::write(
+            internal_pkg.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    return pd.read_csv(query, usecols=["order_id", "amount"])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\ntrace_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let index = build_index_internal(root);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "build_index_internal, 300 files, .venv + allowlisted package: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_find_site_packages_dir_repeated_calls_uncached() {
+        // Directly measures what EVERY resolve_module_file call used to pay before
+        // SITE_PACKAGES_CACHE was added -- one read_dir per call, simulating roughly
+        // one import statement's worth of resolution per iteration.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        for pkg in ["numpy", "pandas", "requests", "urllib3", "certifi"] {
+            fs::create_dir_all(site_packages.join(pkg)).unwrap();
+        }
+
+        let iterations = 1000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = find_site_packages_dir_uncached(root);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "find_site_packages_dir_uncached x{iterations}: {:?} total, {:?}/call",
+            elapsed,
+            elapsed / iterations
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = find_site_packages_dir(root);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "find_site_packages_dir (cached) x{iterations}: {:?} total, {:?}/call",
+            elapsed,
+            elapsed / iterations
+        );
+    }
 }

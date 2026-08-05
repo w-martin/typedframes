@@ -5,7 +5,7 @@
 //! discovery, and `pl.col()` name collection. None of it touches linter state.
 
 use crate::constants::SQL_PRODUCING_METHODS;
-use crate::CaseFold;
+use crate::linter::CaseFold;
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use std::collections::HashMap;
 

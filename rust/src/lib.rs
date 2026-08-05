@@ -30,7 +30,26 @@
 //! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
 //! after all errors have been collected.
 
+mod config;
+mod constants;
+mod errors;
 mod sql;
+mod typo;
+
+pub use config::{find_project_root, is_enabled, LinterConfig};
+pub use errors::{FileStats, LintError, UntypedSite};
+
+use config::load_linter_config;
+use constants::{
+    CONNECTORX_MODULES, DEFAULT_EXCLUDED_DIRS, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS,
+    LOAD_MODULES, RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS,
+    SQL_LOAD_FUNCTIONS, SQL_PRODUCING_METHODS,
+};
+use errors::{
+    is_line_ignored, CheckFileResult, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN,
+    CODE_RESERVED_NAME, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME,
+};
+use typo::find_best_match;
 
 use pyo3::prelude::*;
 use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
@@ -44,6 +63,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
 /// Check a single Python file for DataFrame column errors.
 ///
 /// Accepts an optional MessagePack-serialised [`ProjectIndex`] (produced by
@@ -187,109 +207,6 @@ fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_file, m)?)?;
     m.add_function(wrap_pyfunction!(build_project_index, m)?)?;
     Ok(())
-}
-
-// Root deserialisation target for `pyproject.toml`.
-#[derive(serde::Deserialize)]
-struct Config {
-    tool: Option<ToolConfig>,
-}
-
-// `[tool]` section of `pyproject.toml`.
-#[derive(serde::Deserialize)]
-struct ToolConfig {
-    typedframes: Option<LinterConfig>,
-}
-
-// `[tool.typedframes]` configuration block.
-// All fields are optional; absent keys default as documented on each field.
-#[derive(serde::Deserialize)]
-pub struct LinterConfig {
-    enabled: Option<bool>,  // default: true
-    warnings: Option<bool>, // default: true
-    // Dialect name used to fold unquoted SQL identifier case when inferring columns
-    // from a literal SELECT list (e.g. "snowflake", "postgres", "bigquery"). Unknown or
-    // absent values fall back to `SqlDialect::Generic` (no folding) — see
-    // `SqlDialect::from_config_str`.
-    sql_dialect: Option<String>,
-    // Explicit allowlist of installed (non-project) package names whose own
-    // Annotated[...]/BaseSchema declarations and recognized transform patterns should
-    // be indexed the same way first-party files are -- e.g. an internal company
-    // package that wraps a SQL connector. Resolved from the project's own auto-detected
-    // `.venv` site-packages directory (see `find_site_packages_dir`); no editable-install
-    // support and no path override in this version. Deliberately an explicit allowlist
-    // rather than indexing all of site-packages, which would be both expensive and a
-    // much larger, unbounded trust surface.
-    trace_external_packages: Option<Vec<String>>,
-    // Directory names to prune when collecting `.py` files. When set, REPLACES the
-    // built-in default set (`DEFAULT_EXCLUDED_DIRS` -- `.git`, `.venv`, `node_modules`,
-    // `__pycache__`, `.claude`, etc.) entirely rather than adding to it, matching
-    // ruff's own `exclude` (as opposed to `extend-exclude`, which this checker doesn't
-    // have a separate option for) -- an explicit `exclude = []` means "prune nothing
-    // at all", a deliberate override, not "nothing configured". Matches by bare
-    // directory name, not a path/glob pattern. The Python CLI's own file collector
-    // (`_collect_python_files` in cli.py) reads this same key independently via
-    // `tomllib`, so both collectors stay in sync from one config value.
-    exclude: Option<Vec<String>>,
-}
-
-impl LinterConfig {
-    const EMPTY: Self = Self {
-        enabled: None,
-        warnings: None,
-        sql_dialect: None,
-        trace_external_packages: None,
-        exclude: None,
-    };
-}
-
-// Read `[tool.typedframes]` from `pyproject.toml` at `project_root`.
-// Returns a config with all fields `None` if the file is absent, unreadable, or has no
-// `[tool.typedframes]` section; callers use `.unwrap_or(true)` on each field.
-fn load_linter_config(project_root: &Path) -> LinterConfig {
-    let config_path = project_root.join("pyproject.toml");
-    if !config_path.exists() {
-        return LinterConfig::EMPTY;
-    }
-
-    let content = match fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(_) => return LinterConfig::EMPTY,
-    };
-
-    let config: Config = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => return LinterConfig::EMPTY,
-    };
-
-    config
-        .tool
-        .and_then(|t| t.typedframes)
-        .unwrap_or(LinterConfig::EMPTY)
-}
-
-/// Return `true` if the linter is enabled for `project_root` (default: `true`).
-pub fn is_enabled(project_root: &Path) -> bool {
-    load_linter_config(project_root).enabled.unwrap_or(true)
-}
-
-/// Walk up the directory tree from `start_path` until a `pyproject.toml` is found.
-///
-/// Returns the directory containing `pyproject.toml`, or `start_path` itself if no
-/// `pyproject.toml` exists anywhere in the ancestor chain (e.g. standalone scripts).
-pub fn find_project_root(start_path: &Path) -> PathBuf {
-    let mut current = start_path.to_path_buf();
-    if current.is_file() {
-        current.pop();
-    }
-    loop {
-        if current.join("pyproject.toml").exists() {
-            return current;
-        }
-        if !current.pop() {
-            return start_path.to_path_buf();
-        }
-    }
 }
 
 // ── Index structs ──────────────────────────────────────────────────────────────
@@ -436,42 +353,6 @@ fn compute_all_schema_locations(
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
-
-// Directories that should never be descended into when collecting `.py` files by
-// default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
-// trees. Mirrors ruff's default exclude list (and cli.py's own `_EXCLUDED_DIRS`,
-// which MUST be kept in sync with this) -- including ruff's own override semantics:
-// `[tool.typedframes] exclude` in pyproject.toml REPLACES this set entirely rather
-// than adding to it (see `collect_py_files`).
-const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
-    ".bzr",
-    ".claude",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".git-rewrite",
-    ".hg",
-    ".ipynb_checkpoints",
-    ".mypy_cache",
-    ".nox",
-    ".pants.d",
-    ".pytest_cache",
-    ".pytype",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    ".vscode",
-    ".idea",
-    "__pycache__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "site-packages",
-    "venv",
-];
 
 // Recursively collect all `.py` files under `dir`, skipping any name in
 // `resolved_excludes` -- the caller's job to resolve (see `build_index_internal`):
@@ -1414,235 +1295,6 @@ fn find_first_return_expr(stmts: &[Stmt]) -> Option<&Expr> {
     None
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Diagnostic codes
-// ──────────────────────────────────────────────────────────────────────────────
-
-const CODE_UNKNOWN_COLUMN: &str = "unknown-column";
-const CODE_RESERVED_NAME: &str = "reserved-name";
-const CODE_UNTRACKED_DATAFRAME: &str = "untracked-dataframe";
-const CODE_DROPPED_UNKNOWN_COLUMN: &str = "dropped-unknown-column";
-const CODE_MISSING_COLUMN: &str = "missing-column";
-
-// Return true if the source line at `line` (1-indexed) carries a
-// `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
-fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
-    let lines: Vec<&str> = source.lines().collect();
-    if line == 0 || line > lines.len() {
-        return false;
-    }
-    let line_text = lines[line - 1];
-    let marker = "# typedframes: ignore";
-    if let Some(pos) = line_text.find(marker) {
-        let after = &line_text[pos + marker.len()..];
-        // Bare ignore — suppress everything on this line
-        if after.trim_start().is_empty() || after.starts_with(char::is_whitespace) {
-            return true;
-        }
-        // Code-specific ignore: # typedframes: ignore[code1, code2]
-        if after.starts_with('[') {
-            if let Some(end) = after.find(']') {
-                let codes: Vec<&str> = after[1..end].split(',').map(str::trim).collect();
-                return codes.contains(&code);
-            }
-        }
-    }
-    false
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-
-// Reserved pandas/polars method names that shouldn't be used as column names
-const RESERVED_METHODS: &[&str] = &[
-    "shape",
-    "columns",
-    "index",
-    "iloc",
-    "loc",
-    "head",
-    "tail",
-    "describe",
-    "info",
-    "set_index",
-    "merge",
-    "concat",
-    "join",
-    "filter",
-    "select",
-    "with_columns",
-    "group_by",
-    "groupby",
-    "agg",
-    "sort",
-    "sort_values",
-    "drop",
-    "rename",
-    "apply",
-    "map",
-    "pipe",
-    "transform",
-    "to_pandas",
-    "to_df",
-    "schema",
-    "dtypes",
-    "dtype",
-    "cast",
-    "lazy",
-    "collect",
-    "to_dict",
-    "to_list",
-    "to_numpy",
-    "to_arrow",
-    "write_csv",
-    "write_parquet",
-    "clone",
-    "clear",
-    "extend",
-    "insert",
-    "item",
-    "n_chunks",
-    "null_count",
-    "estimated_size",
-    "width",
-    "height",
-    "rows",
-    "row",
-    "get_column",
-    "get_columns",
-    "explode",
-    "unnest",
-    "pivot",
-    "unpivot",
-    "melt",
-    "sample",
-    "slice",
-    "limit",
-    "unique",
-    "n_unique",
-    "value_counts",
-    "is_empty",
-    "is_duplicated",
-    "unique_counts",
-    "mean",
-    "sum",
-    "min",
-    "max",
-    "std",
-    "var",
-    "median",
-    "quantile",
-    "fill_null",
-    "fill_nan",
-    "interpolate",
-    "shift",
-    "diff",
-    "pct_change",
-    "rolling",
-    "ewm",
-    "count",
-    "first",
-    "last",
-    "len",
-    "all",
-    "any",
-    "copy",
-    "values",
-    "T",
-    "axes",
-    "empty",
-    "ndim",
-    "size",
-    "keys",
-    "items",
-    "pop",
-    "update",
-    "get",
-    "add",
-    "sub",
-    "mul",
-    "div",
-    "mod",
-    "pow",
-    "abs",
-    "round",
-    "floor",
-    "ceil",
-    "clip",
-    "corr",
-    "cov",
-];
-
-const LOAD_FUNCTIONS: &[&str] = &[
-    "read_csv",
-    "read_parquet",
-    "read_json",
-    "read_excel",
-    "read_sql",
-    "read_sql_query",
-    "read_sql_table",
-    "read_html",
-    "read_feather",
-    "read_hdf",
-    "read_orc",
-    "read_clipboard",
-    "read_ndjson",
-    "read_avro",
-    "read_ipc",
-    "scan_csv",
-    "scan_parquet",
-    "scan_json",
-    "scan_ndjson",
-    "scan_ipc",
-    "read_database",
-    "read_database_uri",
-    "read_gbq",
-];
-
-const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars"];
-
-// Load functions whose column set lives in a SQL SELECT list rather than a
-// usecols/columns/dtype/schema kwarg. `read_sql_table` is deliberately excluded: its
-// first positional argument is a table name, not SQL, so attempting to parse it as SQL
-// would just fail (harmlessly, but for the wrong reason) rather than being skipped
-// because we know better.
-const SQL_LOAD_FUNCTIONS: &[&str] = &[
-    "read_sql",
-    "read_sql_query",
-    "read_database",
-    "read_database_uri",
-    "read_gbq",
-];
-
-// Feast FeatureStore methods whose result eventually becomes a DataFrame via `.to_df()`
-// — either chained directly, or via an intermediate RetrievalJob/OnlineResponse
-// variable (the split form; see `retrieval_jobs`). Not gated on any particular receiver
-// name (e.g. `store`) — matched structurally by method name plus a literal `features=`
-// keyword, since the receiver is whatever variable the caller's FeatureStore happens to
-// be bound to.
-const FEAST_RETRIEVAL_METHODS: &[&str] = &["get_historical_features", "get_online_features"];
-
-// The `connectorx` package (conventionally imported `as cx`) exposes a `read_sql`
-// function with the SQL text as its SECOND positional argument
-// (`cx.read_sql(conn_uri, sql)`) — the reverse of pandas' `pd.read_sql(sql, conn)` —
-// so it needs its own argument-position handling rather than reusing
-// `extract_sql_literal`. Its own module list, separate from `LOAD_MODULES`
-// (pd/pl), since it isn't a DataFrame-library namespace itself.
-const CONNECTORX_MODULES: &[&str] = &["connectorx", "cx"];
-
-// DataFrame-materializing method that finalizes a connector call chain into an actual
-// DataFrame: google-cloud-bigquery's `.to_dataframe()`, PySpark/Databricks Connect's
-// `.toPandas()`, DuckDB's `.df()`/`.pl()`. Only dispatches when the call it's chained
-// onto is confirmed to be one of `SQL_PRODUCING_METHODS` — see
-// `sql_producing_call_args`, and its call sites for why "any receiver's `.df()`" isn't
-// enough on its own (that name in particular is common and unrelated most of the time).
-const SQL_FINALIZE_METHODS: &[&str] = &["to_dataframe", "toPandas", "df", "pl"];
-
-// Methods/bare functions whose first positional (or `sql=`/`query=` keyword) argument
-// is SQL text, chained into one of `SQL_FINALIZE_METHODS`: `client.query(sql)`
-// (BigQuery), `spark.sql(sql)`/`session.sql(sql)` (PySpark/Databricks Connect),
-// `duckdb.sql(sql)`/`duckdb.query(sql)`.
-const SQL_PRODUCING_METHODS: &[&str] = &["query", "sql"];
-
 // Which family of load a call belongs to — used only to phrase the
 // `untracked-dataframe` hint appropriately when extraction fails. Not persisted anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1719,128 +1371,6 @@ struct ParamGovernedAccess {
     line: usize,
     col: usize,
     column: String,
-}
-
-const ROW_PASSTHROUGH_METHODS: &[&str] = &[
-    "filter",
-    "query",
-    "head",
-    "tail",
-    "sample",
-    "sort_values",
-    "sort",
-    "reset_index",
-    "nlargest",
-    "nsmallest",
-    "fillna",
-    "dropna",
-    "ffill",
-    "bfill",
-];
-
-// Compute the Levenshtein edit distance between two strings using the Wagner–Fischer
-// dynamic-programming algorithm.  matrix[i][j] = minimum single-character edits
-// (insert, delete, substitute) to transform a[..i] into b[..j].
-// Time: O(|a| × |b|).  Space: O(|a| × |b|).
-// Ref: Wagner & Fischer (1974), doi:10.1145/321796.321811
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let a_len = a_chars.len();
-    let b_len = b_chars.len();
-    let mut matrix = vec![vec![0; b_len + 1]; a_len + 1];
-
-    for (i, row) in matrix.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in matrix[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-
-    for i in 1..=a_len {
-        for j in 1..=b_len {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
-            matrix[i][j] = std::cmp::min(
-                std::cmp::min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1),
-                matrix[i - 1][j - 1] + cost,
-            );
-        }
-    }
-    matrix[a_len][b_len]
-}
-
-// Find the closest candidate to `name` within Levenshtein distance ≤ 2.
-// The threshold catches common typos (transposed letters, off-by-one characters) while
-// avoiding spurious "did you mean?" hints for completely unrelated names.
-fn find_best_match<'a>(name: &str, candidates: &'a [String]) -> Option<&'a str> {
-    candidates
-        .iter()
-        .map(|c| (c, levenshtein(name, c)))
-        .filter(|(_, dist)| *dist <= 2)
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(c, _)| c.as_str())
-}
-
-/// A single diagnostic produced by the linter.
-///
-/// Serialises to JSON for the Python API and to the text/GitHub formats in the CLI.
-/// Line and column numbers are 1-indexed to match editor conventions and the output
-/// of `ruff_source_file::SourceCode::line_column` via `OneIndexed::get()`.
-/// Coverage stats for a single checked file: how many DataFrame origins the
-/// linter recognized (`dataframes_total`) and how many of those resolved to a
-/// known column set (`dataframes_typed`). This is informational — a low ratio
-/// means the check had little to validate, not that the file has fewer
-/// problems. See [`Linter::dataframes_total`] for exactly what is counted.
-#[derive(Debug, Serialize, Default)]
-pub struct FileStats {
-    pub dataframes_total: usize,
-    pub dataframes_typed: usize,
-    pub untyped_sites: Vec<UntypedSite>,
-}
-
-/// One DataFrame origin the linter recognized but could not resolve columns for.
-///
-/// The exact counterpart of `dataframes_total - dataframes_typed`: every origin
-/// that bumps the denominator without bumping the numerator records a site here,
-/// so `--coverage-report=term-missing` can point at the specific assignments that
-/// cost coverage rather than only reporting a ratio. Deliberately NOT derived from
-/// `untracked-dataframe` diagnostics, which don't reconcile: some are retracted
-/// once a call site resolves the columns cross-file (see the retraction logic in
-/// `check_file`), and `[tool.typedframes] warnings = false` suppresses them
-/// entirely, while coverage is counted regardless.
-///
-/// Line and column are 1-indexed, matching [`LintError`].
-#[derive(Debug, Serialize)]
-pub struct UntypedSite {
-    pub line: usize,
-    pub col: usize,
-    /// The assigned variable name where one was available, else a generic stand-in.
-    pub var: String,
-}
-
-/// The JSON payload returned by [`check_file`]: the diagnostics plus coverage stats.
-#[derive(Debug, Serialize)]
-struct CheckFileResult {
-    errors: Vec<LintError>,
-    stats: FileStats,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LintError {
-    /// 1-indexed source line.
-    pub line: usize,
-    /// 1-indexed source column.
-    pub col: usize,
-    /// Diagnostic code, e.g. `"unknown-column"`.  See the `CODE_*` constants.
-    pub code: String,
-    /// Human-readable description, optionally including a typo suggestion.
-    pub message: String,
-    /// `"error"` or `"warning"`.
-    pub severity: String,
 }
 
 /// AST visitor that tracks DataFrame schemas and validates column access.
@@ -6166,32 +5696,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_compute_levenshtein_distance() {
-        // arrange
-        let a = "email";
-        let b = "emai";
-
-        // act
-        let dist = levenshtein(a, b);
-
-        // assert
-        assert_eq!(dist, 1);
-    }
-
-    #[test]
-    fn test_should_find_best_match_for_typo() {
-        // arrange
-        let name = "emai";
-        let candidates = vec!["user_id".to_string(), "email".to_string()];
-
-        // act
-        let result = find_best_match(name, &candidates);
-
-        // assert
-        assert_eq!(result, Some("email"));
-    }
-
-    #[test]
     fn test_should_detect_base_schema_class() {
         // arrange/act/assert
         assert!(Linter::is_schema_base("BaseSchema"));
@@ -7420,92 +6924,6 @@ def process(path: str) -> None:
         assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
         assert_eq!(errors[0].code, "missing-column");
         assert!(errors[0].message.contains("required: {a, b, c}"));
-    }
-
-    #[test]
-    fn test_find_project_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let sub = root.join("a/b/c");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(root.join("pyproject.toml"), "").unwrap();
-
-        assert_eq!(find_project_root(&sub), root);
-        assert_eq!(find_project_root(root), root);
-    }
-
-    #[test]
-    fn test_is_enabled() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-
-        // Case 1: No pyproject.toml -> enabled by default
-        assert!(is_enabled(root));
-
-        // Case 2: pyproject.toml without tool section -> enabled by default
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.something]\nenabled = false",
-        )
-        .unwrap();
-        assert!(is_enabled(root));
-
-        // Case 3: pyproject.toml with tool.typedframes.enabled = false
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.typedframes]\nenabled = false",
-        )
-        .unwrap();
-        assert!(!is_enabled(root));
-
-        // Case 4: pyproject.toml with tool.typedframes.enabled = true
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.typedframes]\nenabled = true",
-        )
-        .unwrap();
-        assert!(is_enabled(root));
-    }
-
-    #[test]
-    fn test_load_linter_config_reads_sql_dialect() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-
-        // Absent entirely -> None, so `with_context` leaves the dialect at its
-        // Generic default rather than overwriting it.
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.typedframes]\nenabled = true",
-        )
-        .unwrap();
-        assert_eq!(load_linter_config(root).sql_dialect, None);
-
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.typedframes]\nsql_dialect = \"snowflake\"",
-        )
-        .unwrap();
-        assert_eq!(
-            load_linter_config(root).sql_dialect,
-            Some("snowflake".to_string())
-        );
-    }
-
-    #[test]
-    fn test_load_linter_config_reads_exclude_list() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.typedframes]\nexclude = [\".claude\", \"vendor\"]",
-        )
-        .unwrap();
-        assert_eq!(
-            load_linter_config(root).exclude,
-            Some(vec![".claude".to_string(), "vendor".to_string()])
-        );
     }
 
     #[test]
@@ -8765,15 +8183,6 @@ print(df["missing"])
 
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].message.contains("missing"));
-    }
-
-    #[test]
-    fn test_levenshtein() {
-        assert_eq!(levenshtein("kitten", "sitting"), 3);
-        assert_eq!(levenshtein("flaw", "lawn"), 2);
-        assert_eq!(levenshtein("", "abc"), 3);
-        assert_eq!(levenshtein("abc", ""), 3);
-        assert_eq!(levenshtein("equal", "equal"), 0);
     }
 
     #[test]

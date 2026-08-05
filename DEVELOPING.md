@@ -78,7 +78,37 @@ Runs `ruff check --fix` and `ruff format` to auto-fix issues.
 uv run inv test
 ```
 
-Runs pytest with branch coverage. Coverage must be 100% or the build fails.
+Runs pytest with branch coverage, then the Rust test suite. Coverage must be 100% or the
+build fails.
+
+The Rust tests can also be run on their own:
+
+```shell
+cd rust && cargo test
+```
+
+This needs the project virtualenv to exist, because pyo3 links against a real
+interpreter and the `abi3-py311` floor requires Python 3.11 or newer. Run `uv sync`
+first (see [Setup](#setup)) and `cargo test` picks it up automatically, via
+`PYO3_PYTHON` in `rust/.cargo/config.toml`.
+
+Without it you'll see one of:
+
+```
+error: failed to run the Python interpreter at .../rust/../.venv/bin/python: No such file or directory
+error: cannot set a minimum Python version 3.11 higher than the interpreter version 3.9
+```
+
+The first means the venv isn't there yet — run `uv sync`. The second means something
+else already set `PYO3_PYTHON`, or an older interpreter is being used; note that macOS
+ships Python 3.9 as its system `python3`.
+
+If your interpreter lives somewhere other than `.venv/`, set `PYO3_PYTHON` yourself and
+it takes precedence over the checked-in default:
+
+```shell
+PYO3_PYTHON=/path/to/python3.11 cargo test
+```
 
 ### Verify Licenses
 

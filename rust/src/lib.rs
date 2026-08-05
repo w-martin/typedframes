@@ -30,8 +30,10 @@
 //! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
 //! after all errors have been collected.
 
+mod ast_extract;
 mod config;
 mod constants;
+mod contract;
 mod errors;
 mod sql;
 mod typo;
@@ -43,7 +45,7 @@ use config::load_linter_config;
 use constants::{
     CONNECTORX_MODULES, DEFAULT_EXCLUDED_DIRS, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS,
     LOAD_MODULES, RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS,
-    SQL_LOAD_FUNCTIONS, SQL_PRODUCING_METHODS,
+    SQL_LOAD_FUNCTIONS,
 };
 use errors::{
     is_line_ignored, CheckFileResult, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN,
@@ -949,8 +951,9 @@ fn check_governed_call_site(
         files,
         &mut std::collections::HashSet::new(),
     );
-    let resolved_cols = raw_items
-        .and_then(|raw| Linter::feast_columns_from_raw_items(&raw, template.full_feature_names));
+    let resolved_cols = raw_items.and_then(|raw| {
+        ast_extract::feast_columns_from_raw_items(&raw, template.full_feature_names)
+    });
 
     // This call site is real -- it passes SOMETHING for the governed parameter, whether
     // or not that something is traceable to a literal -- so the callee's own generic
@@ -2028,295 +2031,6 @@ impl Linter {
     }
 
     // Check if a base class name indicates a typedframes schema
-    fn is_schema_base(name: &str) -> bool {
-        matches!(
-            name,
-            "BaseSchema" | "DataFrameModel" | "DataFrame" | "BaseFrame"
-        )
-    }
-
-    fn extract_string_literal(expr: &Expr) -> Option<&str> {
-        if let Expr::StringLiteral(s) = expr {
-            Some(s.value.to_str())
-        } else {
-            None
-        }
-    }
-
-    // `__tablename__ = "orders"` (or `__tablename__: str = "orders"`) in a class's own
-    // body — the structural signature of a SQLAlchemy declarative model, checked
-    // instead of base-class name since the declarative base is normally imported from a
-    // project-local module. Deliberately does not walk inherited/mixin base classes for
-    // this — an abstract mixin that itself has no `__tablename__` isn't recognized.
-    fn class_body_has_tablename(class_def: &ast::StmtClassDef) -> bool {
-        class_def.body.iter().any(|stmt| {
-            let (target, value) = match stmt {
-                Stmt::Assign(assign) => match assign.targets.as_slice() {
-                    [Expr::Name(n)] => (n.id.as_str(), Some(assign.value.as_ref())),
-                    _ => return false,
-                },
-                Stmt::AnnAssign(ann) => match ann.target.as_ref() {
-                    Expr::Name(n) => (n.id.as_str(), ann.value.as_deref()),
-                    _ => return false,
-                },
-                _ => return false,
-            };
-            target == "__tablename__" && value.and_then(Self::extract_string_literal).is_some()
-        })
-    }
-
-    // Class attribute names that never denote a mapped column, whatever they're
-    // assigned to.
-    const ORM_NON_COLUMN_ATTRS: &[&str] = &[
-        "__tablename__",
-        "__table_args__",
-        "__mapper_args__",
-        "__table__",
-        "metadata",
-        "registry",
-        "query",
-    ];
-
-    // Calls that construct a legitimate class attribute with no corresponding database
-    // column — excluded rather than swept in as a column the way the permissive
-    // typedframes-schema extractor's fallback (used for `is_schema_base` classes) would.
-    const ORM_NON_COLUMN_CALLS: &[&str] = &[
-        "relationship",
-        "column_property",
-        "association_proxy",
-        "declared_attr",
-        "query_expression",
-        "synonym",
-    ];
-
-    // Column extractor for a SQLAlchemy declarative model (see `class_body_has_tablename`).
-    // Deliberately separate from the typedframes-schema extractor above rather than
-    // sharing it: that extractor's fallback treats *any* annotated or assigned class
-    // attribute as a column, which on a real model would sweep in `__tablename__`,
-    // `__table_args__`, `relationship(...)` attributes, and `Mapped[list[...]]`
-    // to-many-relationship annotations. This one uses an allowlist instead: an
-    // attribute is a column only if it's a `Column(...)`/`mapped_column(...)` call
-    // (optionally wrapped in `deferred(...)`), or a bare `x: Mapped[T]` with no value
-    // where `T` isn't itself a relationship shape.
-    fn extract_orm_columns(class_def: &ast::StmtClassDef) -> Vec<String> {
-        let mut columns = Vec::new();
-        for body_stmt in &class_def.body {
-            match body_stmt {
-                Stmt::AnnAssign(ann) => {
-                    let Expr::Name(name) = ann.target.as_ref() else {
-                        continue;
-                    };
-                    let attr_name = name.id.as_str();
-                    if attr_name.starts_with('_') || Self::ORM_NON_COLUMN_ATTRS.contains(&attr_name)
-                    {
-                        continue;
-                    }
-                    match &ann.value {
-                        Some(value) => {
-                            if let Some(cols) = Self::orm_column_from_call(value, attr_name) {
-                                columns.extend(cols);
-                            }
-                        }
-                        None => {
-                            if !Self::is_relationship_annotation(&ann.annotation) {
-                                columns.push(attr_name.to_string());
-                            }
-                        }
-                    }
-                }
-                Stmt::Assign(assign) => {
-                    let [Expr::Name(name)] = assign.targets.as_slice() else {
-                        continue;
-                    };
-                    let attr_name = name.id.as_str();
-                    if attr_name.starts_with('_') || Self::ORM_NON_COLUMN_ATTRS.contains(&attr_name)
-                    {
-                        continue;
-                    }
-                    if let Some(cols) = Self::orm_column_from_call(&assign.value, attr_name) {
-                        columns.extend(cols);
-                    }
-                }
-                _ => {}
-            }
-        }
-        columns.sort();
-        columns.dedup();
-        columns
-    }
-
-    // `Column(...)` / `mapped_column(...)` / `deferred(Column(...))` → the resulting
-    // column name(s): the attribute name, plus a DB-name override from a leading
-    // positional string literal or a `name=` keyword when it differs from the
-    // attribute name — SQLAlchemy allows code to reference either spelling
-    // (`mapped_column("db_name", ...)` puts the real DB name in the first positional
-    // arg), so registering both avoids a spurious unknown-column on whichever one a
-    // caller writes. `relationship(...)` and friends (`ORM_NON_COLUMN_CALLS`) return
-    // `None` — excluded rather than swept in, unlike the permissive fallback the
-    // non-ORM schema extractor above uses.
-    fn orm_column_from_call(value: &Expr, attr_name: &str) -> Option<Vec<String>> {
-        let Expr::Call(call) = value else {
-            return None;
-        };
-        let fn_name = match &*call.func {
-            Expr::Name(n) => n.id.as_str(),
-            Expr::Attribute(a) => a.attr.as_str(),
-            _ => return None,
-        };
-        if fn_name == "deferred" {
-            return call
-                .arguments
-                .args
-                .first()
-                .and_then(|inner| Self::orm_column_from_call(inner, attr_name));
-        }
-        if Self::ORM_NON_COLUMN_CALLS.contains(&fn_name) {
-            return None;
-        }
-        if fn_name != "Column" && fn_name != "mapped_column" {
-            return None;
-        }
-
-        let mut names = vec![attr_name.to_string()];
-        if let Some(db_name) = call
-            .arguments
-            .args
-            .first()
-            .and_then(Self::extract_string_literal)
-        {
-            if db_name != attr_name {
-                names.push(db_name.to_string());
-            }
-        }
-        for keyword in &call.arguments.keywords {
-            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("name") {
-                if let Some(db_name) = Self::extract_string_literal(&keyword.value) {
-                    if db_name != attr_name && !names.iter().any(|n| n == db_name) {
-                        names.push(db_name.to_string());
-                    }
-                }
-            }
-        }
-        Some(names)
-    }
-
-    // `Mapped[list[...]]` / `Mapped[List[...]]` / `Mapped[Set[...]]` (a to-many
-    // relationship's typing shape) or `Mapped["OtherModel"]` (a quoted forward
-    // reference — the idiom for a to-one relationship typed without importing the
-    // referenced class) — never a real column, whatever the bare-annotation fallback
-    // in `extract_orm_columns` would otherwise assume.
-    fn is_relationship_annotation(annotation: &Expr) -> bool {
-        let Expr::Subscript(sub) = annotation else {
-            return false;
-        };
-        let is_mapped = match &*sub.value {
-            Expr::Name(n) => n.id.as_str() == "Mapped",
-            Expr::Attribute(a) => a.attr.as_str() == "Mapped",
-            _ => false,
-        };
-        if !is_mapped {
-            return false;
-        }
-        match &*sub.slice {
-            Expr::StringLiteral(_) => true,
-            Expr::Subscript(inner) => {
-                let collection_name = match &*inner.value {
-                    Expr::Name(n) => Some(n.id.as_str()),
-                    Expr::Attribute(a) => Some(a.attr.as_str()),
-                    _ => None,
-                };
-                matches!(
-                    collection_name,
-                    Some("list" | "List" | "set" | "Set" | "Sequence")
-                )
-            }
-            _ => false,
-        }
-    }
-
-    // Check if a type name is a DataFrame/Frame type
-    fn is_frame_type(name: &str) -> bool {
-        name == "DataFrame"
-    }
-
-    // Extract schema name from a type annotation like DataFrame[Schema] or Annotated[pd.DataFrame, Schema]
-    fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
-        match expr {
-            Expr::Subscript(subscript) => {
-                let type_name = match &*subscript.value {
-                    Expr::Name(name) => Some(name.id.as_str()),
-                    Expr::Attribute(attr) => Some(attr.attr.as_str()),
-                    _ => None,
-                };
-                if let Some(name) = type_name {
-                    if Self::is_frame_type(name) {
-                        if let Expr::Name(schema_name) = &*subscript.slice {
-                            return Some(schema_name.id.as_str());
-                        }
-                    }
-                    // Handle Annotated[pd.DataFrame, Schema] — schema is second tuple element
-                    if name == "Annotated" {
-                        if let Expr::Tuple(tuple) = &*subscript.slice {
-                            if tuple.elts.len() >= 2 {
-                                if let Expr::Name(schema_name) = &tuple.elts[1] {
-                                    return Some(schema_name.id.as_str());
-                                }
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            Expr::StringLiteral(s) => {
-                let text = s.value.to_str();
-                if text.contains("DataFrame[") {
-                    if let Some(start) = text.find('[') {
-                        if let Some(end) = text.rfind(']') {
-                            let schema = text[start + 1..end].trim();
-                            if !schema.is_empty() && !schema.contains(',') {
-                                return Some(schema);
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    // Extract a list of string literals from a `["a", "b", ...]` list expression.
-    // Returns None if the expression is not a list or any element is not a string literal.
-    fn extract_string_list(expr: &Expr) -> Option<Vec<String>> {
-        if let Expr::List(list) = expr {
-            let mut result = Vec::new();
-            for el in &list.elts {
-                if let Expr::StringLiteral(s) = el {
-                    result.push(s.value.to_str().to_string());
-                } else {
-                    return None;
-                }
-            }
-            Some(result)
-        } else {
-            None
-        }
-    }
-
-    // Extract columns from a list or single string expression.
-    fn extract_string_list_or_single(expr: &Expr) -> Option<Vec<String>> {
-        match expr {
-            Expr::List(_) => Self::extract_string_list(expr),
-            Expr::StringLiteral(s) => Some(vec![s.value.to_str().to_string()]),
-            _ => None,
-        }
-    }
-
-    // Extract column names from a load function call: `usecols`/`columns` kwarg,
-    // `dtype`/`schema` dict keys, or — for SQL-shaped load functions — the SELECT list
-    // of a literal SQL string. Returns the columns alongside which family satisfied the
-    // extraction, so the caller can phrase a kind-appropriate `untracked-dataframe` hint
-    // when extraction fails.
     fn extract_load_columns(
         &self,
         func_name: &str,
@@ -2326,7 +2040,7 @@ impl Linter {
             let kw_name = keyword.arg.as_ref().map(|s| s.as_str());
             match kw_name {
                 Some("usecols") | Some("columns") => {
-                    if let Some(cols) = Self::extract_string_list(&keyword.value) {
+                    if let Some(cols) = ast_extract::extract_string_list(&keyword.value) {
                         return (Some(cols), LoadKind::File);
                     }
                 }
@@ -2336,7 +2050,7 @@ impl Linter {
                             .items
                             .iter()
                             .filter_map(|item| item.key.as_ref())
-                            .filter_map(|k| Self::extract_string_literal(k))
+                            .filter_map(|k| ast_extract::extract_string_literal(k))
                             .map(|s| s.to_string())
                             .collect();
                         if !keys.is_empty() {
@@ -2411,7 +2125,7 @@ impl Linter {
     // `check_file_internal`'s `LoadKind::Sql` untracked-dataframe hint for how that's
     // surfaced to the user instead of silently guessing.
     fn extract_sql_expr(&self, expr: &Expr) -> Option<String> {
-        if let Some(s) = Self::extract_string_literal(expr) {
+        if let Some(s) = ast_extract::extract_string_literal(expr) {
             return Some(s.to_string());
         }
         if let Expr::Name(name) = expr {
@@ -2518,7 +2232,7 @@ impl Linter {
                         .arguments
                         .args
                         .first()
-                        .and_then(Self::extract_string_literal)?;
+                        .and_then(ast_extract::extract_string_literal)?;
                     return Some(alias.to_string());
                 }
             }
@@ -2583,7 +2297,7 @@ impl Linter {
             None => false,
         };
 
-        Self::feast_columns_from_list_expr(features_list, full_feature_names)
+        ast_extract::feast_columns_from_list_expr(features_list, full_feature_names)
     }
 
     // Shared by `extract_feast_feature_columns` above (the `features=` keyword found
@@ -2591,52 +2305,6 @@ impl Linter {
     // found at a call site elsewhere, substituted in for a parameter that governed the
     // original call) — both need the exact same "view:feature" splitting and
     // `full_feature_names` formatting applied to a literal list expression.
-    fn feast_columns_from_list_expr(
-        features_list: &Expr,
-        full_feature_names: bool,
-    ) -> Option<Vec<String>> {
-        let Expr::List(list) = features_list else {
-            return None;
-        };
-        let mut raw = Vec::with_capacity(list.elts.len());
-        for elt in &list.elts {
-            raw.push(Self::extract_string_literal(elt)?.to_string());
-        }
-        Self::feast_columns_from_raw_items(&raw, full_feature_names)
-    }
-
-    // The "view:feature" splitting and full_feature_names formatting shared by
-    // feast_columns_from_list_expr (a literal AST list) and eval_feast_string_expr
-    // (raw strings recovered by evaluating a callee's `return [...]`, possibly with
-    // call-site arguments substituted in — see eval_feast_call).
-    fn feast_columns_from_raw_items(
-        raw: &[String],
-        full_feature_names: bool,
-    ) -> Option<Vec<String>> {
-        let mut columns = Vec::with_capacity(raw.len());
-        for literal in raw {
-            let (view, feature) = literal.split_once(':')?;
-            // `feature` still contains any colon after the first (split_once only
-            // splits on the first match), so this rejects anything but exactly one `:`
-            // in the whole ref.
-            if view.is_empty() || feature.is_empty() || feature.contains(':') {
-                return None;
-            }
-            columns.push(if full_feature_names {
-                format!("{view}__{feature}")
-            } else {
-                feature.to_string()
-            });
-        }
-        Some(columns)
-    }
-
-    // Detects `df = <recv>.get_historical_features(..., features=<param>, ...).to_df()`
-    // (the chained form only — see ParamGovernedTemplate's doc comment) as a direct
-    // top-level statement in `func_def`'s own body, where `<param>` is a bare name
-    // matching one of the function's own parameters, followed later in the same body by
-    // at least one `<target>["col"]` access. Returns `None` if no such shape is found,
-    // or if the shape is found but nothing subscripts its result (nothing to check).
     fn find_param_governed_feast_template(
         &self,
         func_def: &ast::StmtFunctionDef,
@@ -2818,7 +2486,7 @@ impl Linter {
         if let Expr::Subscript(sub) = expr {
             if let Expr::Name(recv) = &*sub.value {
                 if recv.id.as_str() == target_var {
-                    if let Some(col) = Self::extract_string_literal(&sub.slice) {
+                    if let Some(col) = ast_extract::extract_string_literal(&sub.slice) {
                         let (line, col_num) = self.source_location(expr.range().start());
                         out.push(ParamGovernedAccess {
                             line,
@@ -2940,23 +2608,6 @@ impl Linter {
     // folding straight into column extraction) so the chained-finalize dispatch below
     // can tell "not our pattern at all" (stay silent) apart from "our pattern, but the
     // SQL didn't resolve" (worth an untracked-dataframe hint) — see its call site.
-    fn sql_producing_call(expr: &Expr) -> Option<&ast::ExprCall> {
-        let Expr::Call(call) = expr else {
-            return None;
-        };
-        let fn_name = match &*call.func {
-            Expr::Name(n) => n.id.as_str(),
-            Expr::Attribute(a) => a.attr.as_str(),
-            _ => return None,
-        };
-        SQL_PRODUCING_METHODS.contains(&fn_name).then_some(call)
-    }
-
-    // Register `target_names` as a DataFrame with an ordinary (exact-match) schema
-    // inferred from a literal SQL string, or an untracked-dataframe warning if `sql`
-    // couldn't be resolved to one. Shared by the chained-finalize
-    // (`client.query(sql).to_dataframe()`) and cursor (`cursor.fetch_pandas_all()`)
-    // connector patterns, which differ only in how they locate the SQL text.
     fn register_sql_dataframe(
         &mut self,
         sql: Option<&str>,
@@ -3012,7 +2663,7 @@ impl Linter {
         current_file: &Path,
         reads_used: &mut u32,
     ) -> Option<String> {
-        if let Some(s) = Self::extract_string_literal(expr) {
+        if let Some(s) = ast_extract::extract_string_literal(expr) {
             return Some(s.to_string());
         }
         if let Expr::Call(call) = expr {
@@ -3056,7 +2707,7 @@ impl Linter {
                     .args
                     .iter()
                     .chain(inner.arguments.keywords.iter().map(|k| &k.value))
-                    .any(|a| matches!(Self::extract_string_literal(a), Some(m) if m.contains('b')));
+                    .any(|a| matches!(ast_extract::extract_string_literal(a), Some(m) if m.contains('b')));
                 if binary_mode {
                     return None;
                 }
@@ -3082,7 +2733,7 @@ impl Linter {
     // linear pre-pass, so doing that safely would need a fixed-point resolution loop;
     // out of scope while call sites overwhelmingly pass the path inline.
     fn resolve_path_expr(&self, expr: &Expr, current_file: &Path) -> Option<PathBuf> {
-        if let Some(s) = Self::extract_string_literal(expr) {
+        if let Some(s) = ast_extract::extract_string_literal(expr) {
             return Some(PathBuf::from(s));
         }
         if let Expr::Call(call) = expr {
@@ -3096,13 +2747,13 @@ impl Linter {
                     .arguments
                     .args
                     .first()
-                    .and_then(Self::extract_string_literal)
+                    .and_then(ast_extract::extract_string_literal)
                     .map(PathBuf::from);
             }
         }
         if let Expr::BinOp(binop) = expr {
-            if binop.op == ast::Operator::Div && Self::is_file_parent_expr(&binop.left) {
-                if let Some(s) = Self::extract_string_literal(&binop.right) {
+            if binop.op == ast::Operator::Div && ast_extract::is_file_parent_expr(&binop.left) {
+                if let Some(s) = ast_extract::extract_string_literal(&binop.right) {
                     return current_file.parent().map(|dir| dir.join(s));
                 }
             }
@@ -3111,41 +2762,6 @@ impl Linter {
     }
 
     // Matches `Path(__file__).parent` (with or without a `pathlib.` prefix on `Path`).
-    fn is_file_parent_expr(expr: &Expr) -> bool {
-        let Expr::Attribute(attr) = expr else {
-            return false;
-        };
-        if attr.attr.as_str() != "parent" {
-            return false;
-        }
-        let Expr::Call(call) = &*attr.value else {
-            return false;
-        };
-        let is_path_ctor = match &*call.func {
-            Expr::Name(n) => n.id.as_str() == "Path",
-            Expr::Attribute(a) => a.attr.as_str() == "Path",
-            _ => false,
-        };
-        is_path_ctor
-            && matches!(
-                call.arguments.args.first(),
-                Some(Expr::Name(n)) if n.id.as_str() == "__file__"
-            )
-    }
-
-    // Safety-checked read of a `.sql` file traced back from a load call. The real
-    // security boundary is project-root containment, checked below AFTER
-    // canonicalizing both sides (which also catches symlink escapes, since
-    // canonicalization follows symlinks) — NOT rejecting absolute paths outright, since
-    // `resolve_path_arg`'s `Path(__file__).parent / "x.sql"` case legitimately produces
-    // an absolute path whenever the file being checked was itself passed in as an
-    // absolute path (the normal case for every real caller). An absolute path a user
-    // wrote directly, e.g. `Path("/etc/passwd")`, still gets rejected: it canonicalizes
-    // to itself, which isn't under the project root. Also refuses: any extension other
-    // than `.sql`; a budget of more than `MAX_SQL_FILE_READS_PER_FILE` reads per file
-    // checked; files over `MAX_SQL_FILE_BYTES`; and anything that isn't a plain file (a
-    // FIFO under the project root would otherwise hang the linter, since reading one
-    // blocks until a writer opens it).
     fn read_sql_file(&self, path: &Path, reads_used: &mut u32) -> Option<String> {
         const MAX_SQL_FILE_BYTES: u64 = 256 * 1024;
         const MAX_SQL_FILE_READS_PER_FILE: u32 = 32;
@@ -3213,145 +2829,6 @@ impl Linter {
     }
 
     // Extract dropped column names from a drop() call.
-    fn extract_drop_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
-        // Check `columns=` kwarg first (pandas pattern — always correct for column drops)
-        for keyword in &call.arguments.keywords {
-            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("columns") {
-                return Self::extract_string_list_or_single(&keyword.value);
-            }
-        }
-
-        // Check for axis kwarg
-        let axis_kwarg = call
-            .arguments
-            .keywords
-            .iter()
-            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("axis"));
-
-        if let Some(axis_kw) = axis_kwarg {
-            // axis kwarg present — only drop columns when axis=1
-            if let Expr::NumberLiteral(n) = &axis_kw.value {
-                if let ast::Number::Int(ref i) = n.value {
-                    if i.as_u64() == Some(1) {
-                        if let Some(first_arg) = call.arguments.args.first() {
-                            return Self::extract_string_list_or_single(first_arg);
-                        }
-                    }
-                }
-            }
-            return None; // axis present but not 1 → row drop
-        }
-
-        // No axis kwarg → polars pattern, use first positional arg
-        if let Some(first_arg) = call.arguments.args.first() {
-            return Self::extract_string_list_or_single(first_arg);
-        }
-
-        None
-    }
-
-    // Extract rename mapping from a rename() call: {"old": "new", ...}.
-    fn extract_rename_mapping(call: &ast::ExprCall) -> Option<HashMap<String, String>> {
-        // Check `columns={"old": "new"}` kwarg (pandas)
-        for keyword in &call.arguments.keywords {
-            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("columns") {
-                if let Expr::Dict(dict) = &keyword.value {
-                    return Self::extract_string_dict(dict);
-                }
-            }
-        }
-        // Fall back to first positional arg dict (polars)
-        if let Some(Expr::Dict(dict)) = call.arguments.args.first() {
-            return Self::extract_string_dict(dict);
-        }
-        None
-    }
-
-    // `str.lower` / `str.upper` referenced bare (not called) — the shape `rename(...)`
-    // takes as its `columns=`/first-positional argument to case-fold every column,
-    // rather than remap specific ones by name.
-    fn expr_as_str_case_fold(expr: &Expr) -> Option<CaseFold> {
-        if let Expr::Attribute(attr) = expr {
-            if let Expr::Name(name) = &*attr.value {
-                if name.id.as_str() == "str" {
-                    return match attr.attr.as_str() {
-                        "lower" => Some(CaseFold::Lower),
-                        "upper" => Some(CaseFold::Upper),
-                        _ => None,
-                    };
-                }
-            }
-        }
-        None
-    }
-
-    // Extract a case-fold from a rename() call: `.rename(columns=str.lower)` (pandas)
-    // or `.rename(str.lower)` (polars' first-positional convention, mirroring
-    // extract_rename_mapping's dict handling above).
-    fn extract_rename_case_fold(call: &ast::ExprCall) -> Option<CaseFold> {
-        for keyword in &call.arguments.keywords {
-            if keyword.arg.as_ref().map(|s| s.as_str()) == Some("columns") {
-                return Self::expr_as_str_case_fold(&keyword.value);
-            }
-        }
-        if let Some(first_arg) = call.arguments.args.first() {
-            return Self::expr_as_str_case_fold(first_arg);
-        }
-        None
-    }
-
-    // `df.columns.str.lower()` / `.str.upper()` — the RHS shape of
-    // `df.columns = df.columns.str.lower()`. Returns the receiver's variable name
-    // (so the caller can confirm it matches the assignment target) and the fold.
-    fn extract_columns_str_fold(value: &Expr) -> Option<(String, CaseFold)> {
-        let Expr::Call(call) = value else {
-            return None;
-        };
-        let Expr::Attribute(fold_attr) = &*call.func else {
-            return None;
-        };
-        let fold = match fold_attr.attr.as_str() {
-            "lower" => CaseFold::Lower,
-            "upper" => CaseFold::Upper,
-            _ => return None,
-        };
-        let Expr::Attribute(str_attr) = &*fold_attr.value else {
-            return None;
-        };
-        if str_attr.attr.as_str() != "str" {
-            return None;
-        }
-        let Expr::Attribute(columns_attr) = &*str_attr.value else {
-            return None;
-        };
-        if columns_attr.attr.as_str() != "columns" {
-            return None;
-        }
-        let Expr::Name(recv) = &*columns_attr.value else {
-            return None;
-        };
-        Some((recv.id.to_string(), fold))
-    }
-
-    fn extract_string_dict(dict: &ast::ExprDict) -> Option<HashMap<String, String>> {
-        let mut map = HashMap::new();
-        for item in &dict.items {
-            if let Some(key) = &item.key {
-                match (
-                    Self::extract_string_literal(key),
-                    Self::extract_string_literal(&item.value),
-                ) {
-                    (Some(k), Some(v)) => {
-                        map.insert(k.to_string(), v.to_string());
-                    }
-                    _ => return None, // Non-literal key or value
-                }
-            }
-        }
-        Some(map)
-    }
-
-    // Create a synthetic inferred schema and register it. Returns the schema name.
     fn make_inferred_schema(&mut self, cols: Vec<String>, var: &str, line: usize) -> String {
         let name = format!("__inferred_{}_at_{}", var, line);
         self.schemas.insert(name.clone(), cols);
@@ -3383,281 +2860,6 @@ impl Linter {
     }
 
     // Extract a column name from a `pl.col("name")` or `col("name")` call expression.
-    fn extract_pl_col_name(expr: &Expr) -> Option<String> {
-        if let Expr::Call(call) = expr {
-            let is_col_call = match &*call.func {
-                Expr::Attribute(attr) => {
-                    attr.attr.as_str() == "col"
-                        && matches!(&*attr.value, Expr::Name(n) if matches!(n.id.as_str(), "pl" | "polars"))
-                }
-                Expr::Name(n) => n.id.as_str() == "col",
-                _ => false,
-            };
-            if is_col_call {
-                return call
-                    .arguments
-                    .args
-                    .first()
-                    .and_then(|a| Self::extract_string_literal(a))
-                    .map(|s| s.to_string());
-            }
-        }
-        None
-    }
-
-    // Recursively collect all column names referenced via `pl.col("name")` / `col("name")`
-    // in an expression tree. Handles chained calls, lists, tuples, comparisons, and binary ops.
-    fn collect_pl_col_names(expr: &Expr) -> Vec<String> {
-        if let Some(name) = Self::extract_pl_col_name(expr) {
-            return vec![name];
-        }
-        match expr {
-            Expr::Call(call) => {
-                let mut names = Vec::new();
-                if let Expr::Attribute(attr) = &*call.func {
-                    names.extend(Self::collect_pl_col_names(&attr.value));
-                }
-                for arg in &call.arguments.args {
-                    names.extend(Self::collect_pl_col_names(arg));
-                }
-                for kw in &call.arguments.keywords {
-                    names.extend(Self::collect_pl_col_names(&kw.value));
-                }
-                names
-            }
-            Expr::List(list) => list
-                .elts
-                .iter()
-                .flat_map(Self::collect_pl_col_names)
-                .collect(),
-            Expr::Tuple(tuple) => tuple
-                .elts
-                .iter()
-                .flat_map(Self::collect_pl_col_names)
-                .collect(),
-            Expr::Compare(compare) => {
-                let mut names = Self::collect_pl_col_names(&compare.left);
-                for comp in compare.comparators.iter() {
-                    names.extend(Self::collect_pl_col_names(comp));
-                }
-                names
-            }
-            Expr::BinOp(binop) => {
-                let mut names = Self::collect_pl_col_names(&binop.left);
-                names.extend(Self::collect_pl_col_names(&binop.right));
-                names
-            }
-            Expr::BoolOp(boolop) => boolop
-                .values
-                .iter()
-                .flat_map(Self::collect_pl_col_names)
-                .collect(),
-            Expr::UnaryOp(unary) => Self::collect_pl_col_names(&unary.operand),
-            _ => Vec::new(),
-        }
-    }
-
-    // Does `expr` produce a value derived from a tainted variable — i.e. should its
-    // assignment target also be considered tainted?  Two forms: a plain alias
-    // (`x = df`) and a delegate call forwarding a tainted variable as the first
-    // positional argument (`x = preproc(df)`, `x = infer(step1)`, …). This is what
-    // lets taint follow a `step1 = preproc(df); step2 = infer(step1)` chain.
-    //
-    // Deliberately does NOT treat `x = df[["a", "b"]]` (a literal list/string slice)
-    // as tainting `x`: that expression already produces a *fully known* schema for
-    // `x` via the existing multi-column-subscript tracking in the Assign handler
-    // above (make_inferred_schema), independent of this heuristic. A later
-    // `x["bad_col"]` is therefore an outright, certain unknown-column bug local to
-    // this function — caught directly by visit_expr against that inferred schema —
-    // not an ambiguous "maybe missing from the caller" requirement to add to `df`'s
-    // contract. Folding it in here would double-report the same bug two ways.
-    fn expr_forwards_tainted(tainted: &std::collections::HashSet<String>, expr: &Expr) -> bool {
-        match expr {
-            Expr::Name(n) => tainted.contains(n.id.as_str()),
-            Expr::Call(call) => call
-                .arguments
-                .args
-                .first()
-                .is_some_and(|a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str()))),
-            _ => false,
-        }
-    }
-
-    // Recursively scan `expr` for two things, given the current set of variable names
-    // considered aliases of the function's own first parameter:
-    //   - `direct`: columns subscripted directly off a tainted variable, both a single
-    //     string (`tainted["col"]`) and a list (`tainted[["a", "b"]]`)
-    //   - `delegates`: names of functions called with a tainted variable as their first
-    //     positional argument — candidates for transitive requirement resolution
-    //     (see resolve_transitive_requires), since the parameter itself carries no
-    //     schema here and we can't validate the access ourselves, only record it.
-    fn scan_expr_for_contract(
-        tainted: &std::collections::HashSet<String>,
-        expr: &Expr,
-        direct: &mut Vec<String>,
-        delegates: &mut Vec<String>,
-    ) {
-        match expr {
-            Expr::Subscript(subscript) => {
-                if let Expr::Name(base) = &*subscript.value {
-                    if tainted.contains(base.id.as_str()) {
-                        if let Some(cols) = Self::extract_string_list_or_single(&subscript.slice) {
-                            direct.extend(cols);
-                        }
-                    }
-                }
-                Self::scan_expr_for_contract(tainted, &subscript.value, direct, delegates);
-                Self::scan_expr_for_contract(tainted, &subscript.slice, direct, delegates);
-            }
-            Expr::Attribute(attr) => {
-                Self::scan_expr_for_contract(tainted, &attr.value, direct, delegates);
-            }
-            Expr::Call(call) => {
-                let first_arg_tainted =
-                    call.arguments.args.first().is_some_and(
-                        |a| matches!(a, Expr::Name(n) if tainted.contains(n.id.as_str())),
-                    );
-                match &*call.func {
-                    Expr::Name(func_name) if first_arg_tainted => {
-                        delegates.push(func_name.id.to_string());
-                    }
-                    // `module.func(df)` via a plain `import module` — record the bare
-                    // attribute name as a delegate candidate the same way a bare-name
-                    // call would be (resolve_delegate_target follows it back to the
-                    // module). Guarded on `base` not itself being tainted so an actual
-                    // DataFrame method call (`df.merge(df)`) is never misread as a
-                    // delegate to a function literally named `merge`.
-                    Expr::Attribute(attr) if first_arg_tainted => {
-                        if let Expr::Name(base) = &*attr.value {
-                            if !tainted.contains(base.id.as_str()) {
-                                delegates.push(attr.attr.to_string());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                Self::scan_expr_for_contract(tainted, &call.func, direct, delegates);
-                for arg in &call.arguments.args {
-                    Self::scan_expr_for_contract(tainted, arg, direct, delegates);
-                }
-                for kw in &call.arguments.keywords {
-                    Self::scan_expr_for_contract(tainted, &kw.value, direct, delegates);
-                }
-            }
-            Expr::BinOp(binop) => {
-                Self::scan_expr_for_contract(tainted, &binop.left, direct, delegates);
-                Self::scan_expr_for_contract(tainted, &binop.right, direct, delegates);
-            }
-            Expr::BoolOp(boolop) => {
-                for v in &boolop.values {
-                    Self::scan_expr_for_contract(tainted, v, direct, delegates);
-                }
-            }
-            Expr::UnaryOp(unary) => {
-                Self::scan_expr_for_contract(tainted, &unary.operand, direct, delegates);
-            }
-            Expr::Compare(compare) => {
-                Self::scan_expr_for_contract(tainted, &compare.left, direct, delegates);
-                for comp in compare.comparators.iter() {
-                    Self::scan_expr_for_contract(tainted, comp, direct, delegates);
-                }
-            }
-            Expr::List(list) => {
-                for el in &list.elts {
-                    Self::scan_expr_for_contract(tainted, el, direct, delegates);
-                }
-            }
-            Expr::Tuple(tuple) => {
-                for el in &tuple.elts {
-                    Self::scan_expr_for_contract(tainted, el, direct, delegates);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Statement-level counterpart to scan_expr_for_contract — covers the handful of
-    // statement shapes that appear in typical single-purpose transform functions
-    // (return, bare expr, assign, if/for/while/with). Not an exhaustive AST walk;
-    // deeply nested control flow may under-report requirements/delegates. `tainted`
-    // grows as assignments are discovered, so later statements in the same body see
-    // earlier aliasing — this is a single top-to-bottom pass, not full control-flow
-    // analysis: taint picked up inside an `if`/`for` body is visible afterwards, and
-    // both branches of an `if` contribute to the same taint set (conservative).
-    fn analyze_stmt_for_contract(
-        stmt: &Stmt,
-        tainted: &mut std::collections::HashSet<String>,
-        direct: &mut Vec<String>,
-        delegates: &mut Vec<String>,
-    ) {
-        match stmt {
-            Stmt::Return(ret) => {
-                if let Some(value) = &ret.value {
-                    Self::scan_expr_for_contract(tainted, value, direct, delegates);
-                }
-            }
-            Stmt::Expr(expr_stmt) => {
-                Self::scan_expr_for_contract(tainted, &expr_stmt.value, direct, delegates);
-            }
-            Stmt::Assign(assign) => {
-                Self::scan_expr_for_contract(tainted, &assign.value, direct, delegates);
-                if Self::expr_forwards_tainted(tainted, &assign.value) {
-                    for target in &assign.targets {
-                        if let Expr::Name(t) = target {
-                            tainted.insert(t.id.to_string());
-                        }
-                    }
-                }
-            }
-            Stmt::AnnAssign(ann_assign) => {
-                if let Some(value) = &ann_assign.value {
-                    Self::scan_expr_for_contract(tainted, value, direct, delegates);
-                    if Self::expr_forwards_tainted(tainted, value) {
-                        if let Expr::Name(t) = &*ann_assign.target {
-                            tainted.insert(t.id.to_string());
-                        }
-                    }
-                }
-            }
-            Stmt::If(if_stmt) => {
-                Self::scan_expr_for_contract(tainted, &if_stmt.test, direct, delegates);
-                for s in &if_stmt.body {
-                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
-                }
-                for clause in &if_stmt.elif_else_clauses {
-                    for s in &clause.body {
-                        Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
-                    }
-                }
-            }
-            Stmt::For(for_stmt) => {
-                Self::scan_expr_for_contract(tainted, &for_stmt.iter, direct, delegates);
-                for s in &for_stmt.body {
-                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
-                }
-            }
-            Stmt::While(while_stmt) => {
-                Self::scan_expr_for_contract(tainted, &while_stmt.test, direct, delegates);
-                for s in &while_stmt.body {
-                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
-                }
-            }
-            Stmt::With(with_stmt) => {
-                for item in &with_stmt.items {
-                    Self::scan_expr_for_contract(tainted, &item.context_expr, direct, delegates);
-                }
-                for s in &with_stmt.body {
-                    Self::analyze_stmt_for_contract(s, tainted, direct, delegates);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Validate a call to a function with a known parameter contract (`self.param_requires`)
-    // against the tracked schema of its first positional argument.  Fires at the call
-    // site — pipeline.py, not inside the function itself — because that's where the
-    // argument's actual inferred schema is known.
     fn check_call_requirements(
         &self,
         func_name: &str,
@@ -3730,12 +2932,12 @@ impl Linter {
             .arguments
             .args
             .iter()
-            .flat_map(Self::collect_pl_col_names)
+            .flat_map(ast_extract::collect_pl_col_names)
             .chain(
                 call.arguments
                     .keywords
                     .iter()
-                    .flat_map(|kw| Self::collect_pl_col_names(&kw.value)),
+                    .flat_map(|kw| ast_extract::collect_pl_col_names(&kw.value)),
             )
             .collect();
         for col_name in col_names {
@@ -3824,9 +3026,9 @@ impl Linter {
             Stmt::ClassDef(class_def) => {
                 let (class_def_line, _) = self.source_location(class_def.range().start());
                 let is_schema = class_def.bases().iter().any(|base| match base {
-                    Expr::Attribute(attr) => Self::is_schema_base(attr.attr.as_str()),
+                    Expr::Attribute(attr) => ast_extract::is_schema_base(attr.attr.as_str()),
                     Expr::Name(name) => {
-                        Self::is_schema_base(name.id.as_str())
+                        ast_extract::is_schema_base(name.id.as_str())
                             || self.schemas.contains_key(name.id.as_str())
                     }
                     _ => false,
@@ -3873,7 +3075,7 @@ impl Linter {
                                                         == Some("alias")
                                                     {
                                                         if let Some(s) =
-                                                            Self::extract_string_literal(
+                                                            ast_extract::extract_string_literal(
                                                                 &keyword.value,
                                                             )
                                                         {
@@ -3894,7 +3096,7 @@ impl Linter {
                                                         if let Expr::List(list) = &keyword.value {
                                                             for el in &list.elts {
                                                                 if let Some(s) =
-                                                                    Self::extract_string_literal(el)
+                                                                    ast_extract::extract_string_literal(el)
                                                                 {
                                                                     columns.push(s.to_string());
                                                                 } else if let Expr::Name(n) = el {
@@ -3932,7 +3134,7 @@ impl Linter {
                                                         == Some("alias")
                                                     {
                                                         if let Some(s) =
-                                                            Self::extract_string_literal(
+                                                            ast_extract::extract_string_literal(
                                                                 &keyword.value,
                                                             )
                                                         {
@@ -3953,7 +3155,7 @@ impl Linter {
                                                         if let Expr::List(list) = &keyword.value {
                                                             for el in &list.elts {
                                                                 if let Some(s) =
-                                                                    Self::extract_string_literal(el)
+                                                                    ast_extract::extract_string_literal(el)
                                                                 {
                                                                     columns.push(s.to_string());
                                                                 } else if let Expr::Name(n) = el {
@@ -3998,7 +3200,7 @@ impl Linter {
                         class_def.name.to_string(),
                         (self.file_display.clone(), class_def_line),
                     );
-                } else if Self::class_body_has_tablename(class_def) {
+                } else if ast_extract::class_body_has_tablename(class_def) {
                     // SQLAlchemy declarative model: `class Order(Base): __tablename__ =
                     // "orders"; ...`. Detected structurally, via `__tablename__` in the
                     // class's own body, rather than by base-class name — the declarative
@@ -4009,7 +3211,7 @@ impl Linter {
                     // `extract_orm_columns` for why (its "any annotated attribute is a
                     // column" fallback would sweep in `relationship(...)` attributes,
                     // `__table_args__`, etc., which aren't real database columns).
-                    let columns = Self::extract_orm_columns(class_def);
+                    let columns = ast_extract::extract_orm_columns(class_def);
                     // Deliberately no RESERVED_METHODS conflict check here: that
                     // warning is authoring advice for typedframes-native schemas
                     // ("rename the column"), but a mapped class's column names come
@@ -4027,7 +3229,8 @@ impl Linter {
 
                 // Track return type annotations like -> DataFrame[Schema]
                 if let Some(returns) = &func_def.returns {
-                    if let Some(schema_name) = Self::extract_schema_from_annotation(returns) {
+                    if let Some(schema_name) = ast_extract::extract_schema_from_annotation(returns)
+                    {
                         self.functions
                             .insert(func_def.name.to_string(), schema_name.to_string());
                     }
@@ -4047,7 +3250,8 @@ impl Linter {
                     .chain(func_def.parameters.kwonlyargs.iter())
                 {
                     if let Some(annotation) = &p.parameter.annotation {
-                        if let Some(schema_name) = Self::extract_schema_from_annotation(annotation)
+                        if let Some(schema_name) =
+                            ast_extract::extract_schema_from_annotation(annotation)
                         {
                             self.variables.insert(
                                 p.parameter.name.id.to_string(),
@@ -4121,7 +3325,7 @@ impl Linter {
                     let mut required = Vec::new();
                     let mut delegates = Vec::new();
                     for body_stmt in &func_def.body {
-                        Self::analyze_stmt_for_contract(
+                        contract::analyze_stmt_for_contract(
                             body_stmt,
                             &mut tainted,
                             &mut required,
@@ -4138,7 +3342,7 @@ impl Linter {
                         .parameter
                         .annotation
                         .as_ref()
-                        .and_then(|a| Self::extract_schema_from_annotation(a))
+                        .and_then(|a| ast_extract::extract_schema_from_annotation(a))
                         .map(|s| s.to_string());
                     if let Some(name) = &annotation_schema_name {
                         self.param_schema_names
@@ -4189,7 +3393,7 @@ impl Linter {
                                 self.variables.get(name.id.as_str())
                             {
                                 if let Some(col_name) =
-                                    Self::extract_string_literal(&subscript.slice)
+                                    ast_extract::extract_string_literal(&subscript.slice)
                                 {
                                     let schema_name = schema_name.clone();
                                     let defined_line = *defined_line;
@@ -4232,7 +3436,8 @@ impl Linter {
                         let Expr::Name(target_recv) = &*target_attr.value else {
                             continue;
                         };
-                        let Some((rhs_recv, fold)) = Self::extract_columns_str_fold(&assign.value)
+                        let Some((rhs_recv, fold)) =
+                            ast_extract::extract_columns_str_fold(&assign.value)
                         else {
                             continue;
                         };
@@ -4261,7 +3466,7 @@ impl Linter {
                 if let Expr::Subscript(sub) = &*assign.value {
                     if let Expr::Name(base_name) = &*sub.value {
                         let base_str = base_name.id.as_str();
-                        match Self::extract_string_list(&sub.slice) {
+                        match ast_extract::extract_string_list(&sub.slice) {
                             Some(cols) => {
                                 let base_info =
                                     self.variables.get(base_str).map(|(s, l)| (s.clone(), *l));
@@ -4631,7 +3836,7 @@ impl Linter {
                                         .arguments
                                         .args
                                         .first()
-                                        .and_then(Self::extract_string_list);
+                                        .and_then(ast_extract::extract_string_list);
                                     match selected_cols {
                                         Some(cols) => {
                                             if let Some(ref bc) = base_cols {
@@ -4771,7 +3976,9 @@ impl Linter {
                                 // alone are too generic a signal (plenty of unrelated
                                 // code has methods by those names) to count or warn on
                                 // by name alone.
-                                if let Some(inner_call) = Self::sql_producing_call(&attr.value) {
+                                if let Some(inner_call) =
+                                    ast_extract::sql_producing_call(&attr.value)
+                                {
                                     let sql = self.extract_sql_literal(inner_call);
                                     let target_names: Vec<String> = assign
                                         .targets
@@ -4836,7 +4043,7 @@ impl Linter {
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
-                                    let dropped = Self::extract_drop_columns(call);
+                                    let dropped = ast_extract::extract_drop_columns(call);
                                     match (base_cols, dropped) {
                                         (Some(base_cols), Some(dropped_cols)) => {
                                             for col in &dropped_cols {
@@ -4911,9 +4118,9 @@ impl Linter {
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
-                                    let mapping = Self::extract_rename_mapping(call);
+                                    let mapping = ast_extract::extract_rename_mapping(call);
                                     let case_fold = if mapping.is_none() {
-                                        Self::extract_rename_case_fold(call)
+                                        ast_extract::extract_rename_case_fold(call)
                                     } else {
                                         None
                                     };
@@ -5067,7 +4274,7 @@ impl Linter {
                                         .arguments
                                         .args
                                         .first()
-                                        .and_then(|a| Self::extract_string_literal(a))
+                                        .and_then(|a| ast_extract::extract_string_literal(a))
                                     {
                                         self.remove_column_inplace(
                                             recv.id.as_str(),
@@ -5087,7 +4294,7 @@ impl Linter {
                                         .arguments
                                         .args
                                         .get(1)
-                                        .and_then(|a| Self::extract_string_literal(a))
+                                        .and_then(|a| ast_extract::extract_string_literal(a))
                                     {
                                         self.add_column_inplace(
                                             recv.id.as_str(),
@@ -5388,7 +4595,7 @@ impl Linter {
                                     .arguments
                                     .args
                                     .first()
-                                    .and_then(|a| Self::extract_string_literal(a))
+                                    .and_then(|a| ast_extract::extract_string_literal(a))
                                 {
                                     self.remove_column_inplace(
                                         recv.id.as_str(),
@@ -5406,7 +4613,7 @@ impl Linter {
                                     .arguments
                                     .args
                                     .get(1)
-                                    .and_then(|a| Self::extract_string_literal(a))
+                                    .and_then(|a| ast_extract::extract_string_literal(a))
                                 {
                                     self.add_column_inplace(recv.id.as_str(), col_name, line);
                                 }
@@ -5470,7 +4677,9 @@ impl Linter {
                 for target in &delete.targets {
                     if let Expr::Subscript(subscript) = target {
                         if let Expr::Name(recv) = &*subscript.value {
-                            if let Some(col_name) = Self::extract_string_literal(&subscript.slice) {
+                            if let Some(col_name) =
+                                ast_extract::extract_string_literal(&subscript.slice)
+                            {
                                 let (line, col) = self.source_location(subscript.range().start());
                                 self.remove_column_inplace(
                                     recv.id.as_str(),
@@ -5603,7 +4812,9 @@ impl Linter {
                     if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str())
                     {
                         if let Some(columns) = self.schemas.get(schema_name) {
-                            if let Some(col_name) = Self::extract_string_literal(&subscript.slice) {
+                            if let Some(col_name) =
+                                ast_extract::extract_string_literal(&subscript.slice)
+                            {
                                 if !self.schema_has_column(schema_name, col_name) {
                                     let (line, col) =
                                         self.source_location(subscript.range().start());
@@ -5694,16 +4905,6 @@ impl Linter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_should_detect_base_schema_class() {
-        // arrange/act/assert
-        assert!(Linter::is_schema_base("BaseSchema"));
-        assert!(Linter::is_schema_base("DataFrameModel"));
-        assert!(Linter::is_schema_base("DataFrame"));
-        assert!(Linter::is_schema_base("BaseFrame"));
-        assert!(!Linter::is_schema_base("SomeOtherClass"));
-    }
 
     #[test]
     fn test_should_lint_base_schema_column_access() {
@@ -8183,19 +7384,6 @@ print(df["missing"])
 
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].message.contains("missing"));
-    }
-
-    #[test]
-    fn test_extract_schema_from_annotation() {
-        let source = "x: DataFrame[MySchema] = df";
-        let parsed = parse_module(source).unwrap();
-        let stmt = &parsed.into_syntax().body[0];
-        if let Stmt::AnnAssign(ann) = stmt {
-            let schema = Linter::extract_schema_from_annotation(&ann.annotation);
-            assert_eq!(schema, Some("MySchema"));
-        } else {
-            panic!("Expected AnnAssign");
-        }
     }
 
     #[test]

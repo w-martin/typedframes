@@ -1723,7 +1723,7 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             py_file = Path(tmpdir) / "load.py"
             py_file.write_text(
-                'import pandas as pd\n'
+                "import pandas as pd\n"
                 'good = pd.read_csv("a.csv", usecols=["a"])\n'
                 'bad_one = pd.read_csv("b.csv")\n'
                 'bad_two = pd.read_csv("c.csv")\n'

@@ -1,0 +1,21 @@
+# Point pyo3's build script at the project's uv-managed virtualenv.
+#
+# Since `extension-module` is no longer forced on (see Cargo.toml), pyo3 links
+# against a real interpreter and needs to find one at build time. Left to itself
+# it takes the first `python3` on PATH -- on macOS that's the system 3.9, which
+# fails the `abi3-py311` floor with "cannot set a minimum Python version 3.11
+# higher than the interpreter version 3.9". Contributors hit that on a bare
+# `cargo test` even though the repo's own 3.11+ venv is sitting right there.
+#
+# `relative = true` resolves the path against this file's directory, so it works
+# in any checkout rather than hard-coding one machine's layout. `uv sync` (the
+# documented setup step in DEVELOPING.md) creates that venv.
+#
+# Safe for maturin: cargo's `[env]` does not override a variable already present
+# in the environment -- that would need `force = true` -- and maturin always sets
+# its own `PYO3_PYTHON`. So `inv build` keeps using the interpreter maturin
+# picked, and this only fills the gap when nothing else has chosen one. The same
+# escape hatch works for contributors whose interpreter lives elsewhere: set
+# `PYO3_PYTHON` yourself and this value is ignored.
+[env]
+PYO3_PYTHON = { value = "../.venv/bin/python", relative = true }

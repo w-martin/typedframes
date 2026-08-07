@@ -21,6 +21,19 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # uv must run before any step that compiles the crate. pyo3 needs a real
+      # interpreter at build time (the `extension-module` feature is no longer
+      # forced on), and rust/.cargo/config.toml points PYO3_PYTHON at the venv
+      # `uv sync` creates -- so clippy and the Rust tests below both depend on
+      # that venv already existing.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
       - name: Rust format check
         run: cargo fmt --all -- --check
         working-directory: rust
@@ -32,14 +45,6 @@ jobs:
       - name: Rust tests
         run: cargo test
         working-directory: rust
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: 3.11
-
-      - name: Install dependencies
-        run: uv sync --all-extras
 
       - name: Python format check
         run: uv run inv format-check

@@ -130,6 +130,7 @@ fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<Strin
         stats: FileStats {
             dataframes_total: linter.dataframes_total,
             dataframes_typed: linter.dataframes_typed,
+            untyped_sites: std::mem::take(&mut linter.untyped_sites),
         },
     };
 
@@ -1798,6 +1799,27 @@ fn find_best_match<'a>(name: &str, candidates: &'a [String]) -> Option<&'a str> 
 pub struct FileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    pub untyped_sites: Vec<UntypedSite>,
+}
+
+/// One DataFrame origin the linter recognized but could not resolve columns for.
+///
+/// The exact counterpart of `dataframes_total - dataframes_typed`: every origin
+/// that bumps the denominator without bumping the numerator records a site here,
+/// so `--coverage-report=term-missing` can point at the specific assignments that
+/// cost coverage rather than only reporting a ratio. Deliberately NOT derived from
+/// `untracked-dataframe` diagnostics, which don't reconcile: some are retracted
+/// once a call site resolves the columns cross-file (see the retraction logic in
+/// `check_file`), and `[tool.typedframes] warnings = false` suppresses them
+/// entirely, while coverage is counted regardless.
+///
+/// Line and column are 1-indexed, matching [`LintError`].
+#[derive(Debug, Serialize)]
+pub struct UntypedSite {
+    pub line: usize,
+    pub col: usize,
+    /// The assigned variable name where one was available, else a generic stand-in.
+    pub var: String,
 }
 
 /// The JSON payload returned by [`check_file`]: the diagnostics plus coverage stats.
@@ -1877,6 +1899,10 @@ pub struct Linter {
     // with unrelated calls.
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    // Every origin counted in `dataframes_total` that did NOT resolve to a column
+    // set, recorded so the CLI can report which assignments cost coverage. Kept in
+    // step with the counters at each counting site rather than reconstructed later.
+    pub untyped_sites: Vec<UntypedSite>,
     // Dialect used to fold unquoted SQL identifier case when inferring columns from a
     // literal SELECT list. Defaults to `Generic` (no folding); set from
     // `[tool.typedframes] sql_dialect` in pyproject.toml via `with_context`.
@@ -2178,6 +2204,7 @@ impl Linter {
             file_display: String::new(),
             dataframes_total: 0,
             dataframes_typed: 0,
+            untyped_sites: Vec::new(),
             sql_dialect: sql::SqlDialect::Generic,
             project_root: None,
             string_var_candidates: HashMap::new(),
@@ -3325,6 +3352,18 @@ impl Linter {
         }
     }
 
+    // Record a DataFrame origin that was counted in `dataframes_total` but whose
+    // columns could not be resolved. Called at every counting site that does not
+    // bump `dataframes_typed`, so `untyped_sites.len()` always equals
+    // `dataframes_total - dataframes_typed`.
+    fn record_untyped_site(&mut self, var_hint: &str, current_line: usize, current_col: usize) {
+        self.untyped_sites.push(UntypedSite {
+            line: current_line,
+            col: current_col,
+            var: var_hint.to_string(),
+        });
+    }
+
     // Register `target_names` as a DataFrame materialized from a Feast retrieval
     // (`.to_df()` on a `get_historical_features`/`get_online_features` result), with an
     // *open* schema over `cols` when resolved. See `open_schemas`'s docs for why exact
@@ -3350,6 +3389,7 @@ impl Linter {
                 }
             }
             None => {
+                self.record_untyped_site(var_hint, current_line, current_col);
                 errors.push(LintError {
                     line: current_line,
                     col: current_col,
@@ -3413,6 +3453,7 @@ impl Linter {
                 }
             }
             None => {
+                self.record_untyped_site(var_hint, current_line, current_col);
                 errors.push(LintError {
                     line: current_line,
                     col: current_col,
@@ -4891,6 +4932,22 @@ impl Linter {
                                                 }
                                             }
                                             None => {
+                                                let var_name = assign
+                                                    .targets
+                                                    .iter()
+                                                    .find_map(|t| {
+                                                        if let Expr::Name(n) = t {
+                                                            Some(n.id.to_string())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .unwrap_or_else(|| "df".to_string());
+                                                self.record_untyped_site(
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
+                                                );
                                                 let hint = match load_kind {
                                                     LoadKind::Sql => {
                                                         "name the columns in the `SELECT` list \
@@ -4982,6 +5039,22 @@ impl Linter {
                                                 }
                                             }
                                             None => {
+                                                let var_name = assign
+                                                    .targets
+                                                    .iter()
+                                                    .find_map(|t| {
+                                                        if let Expr::Name(n) = t {
+                                                            Some(n.id.to_string())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .unwrap_or_else(|| "df".to_string());
+                                                self.record_untyped_site(
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
+                                                );
                                                 errors.push(LintError {
                                                     line: current_line,
                                                     col: current_col,
@@ -6393,6 +6466,75 @@ print(df["a"])
         assert_eq!(linter.dataframes_typed, 0);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "untracked-dataframe");
+    }
+
+    #[test]
+    fn test_should_record_untyped_site_with_variable_name_and_position() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+sales = pd.read_csv("data.csv")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the site names the variable that cost coverage, so the CLI can
+        // point at the assignment rather than only reporting a ratio
+        assert_eq!(linter.untyped_sites.len(), 1);
+        assert_eq!(linter.untyped_sites[0].var, "sales");
+        assert_eq!(linter.untyped_sites[0].line, 4);
+    }
+
+    #[test]
+    fn test_should_record_no_untyped_sites_when_every_dataframe_resolves() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("data.csv", usecols=["a", "b"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(linter.untyped_sites.is_empty());
+    }
+
+    #[test]
+    fn test_should_keep_untyped_site_count_equal_to_total_minus_typed() {
+        // arrange: a mix of resolved and unresolved origins, including a SELECT *
+        // that resolves as a load rather than an inferable column list
+        let source = r#"
+import pandas as pd
+
+good = pd.read_csv("a.csv", usecols=["a"])
+bare = pd.read_csv("b.csv")
+star = pd.read_sql("SELECT * FROM t", conn)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the invariant term-missing reporting depends on -- every origin
+        // counted in the denominator but not the numerator has a recorded site
+        assert_eq!(
+            linter.untyped_sites.len(),
+            linter.dataframes_total - linter.dataframes_typed
+        );
+        assert!(linter.dataframes_typed > 0);
+        assert!(!linter.untyped_sites.is_empty());
     }
 
     #[test]

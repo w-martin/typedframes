@@ -14,8 +14,10 @@ from typedframes.cli import (
     CoverageConfig,
     _check_files,
     _collect_python_files,
+    _coverage_json_payload,
     _evaluate_coverage,
     _format_github,
+    _format_term_missing,
     _format_text,
     _glob_to_regex,
     _load_configured_excludes,
@@ -1629,3 +1631,234 @@ class TestCli(unittest.TestCase):
 
             # assert
             self.assertNotIn("below the required", captured.getvalue())
+
+    def test_should_render_per_file_table_with_missing_sites(self) -> None:
+        """Test that term-missing lists each file's tally and the sites lacking column info."""
+        # arrange
+        per_file = {"/proj/src/new.py": (2, 1), "/proj/legacy/old.py": (2, 0)}
+        sites = [
+            {"file": "/proj/legacy/old.py", "line": 2, "col": 1, "var": "old_one"},
+            {"file": "/proj/src/new.py", "line": 3, "col": 1, "var": "bad"},
+        ]
+
+        # act
+        table = _format_term_missing(per_file, sites, Path("/proj"))
+
+        # assert
+        self.assertIn("legacy/old.py", table)
+        self.assertIn("old_one:2", table)
+        self.assertIn("bad:3", table)
+        self.assertIn("TOTAL", table)
+
+    def test_should_omit_files_with_no_dataframes_from_the_table(self) -> None:
+        """Test that a 0/0 file is left out rather than padding the report."""
+        # arrange
+        per_file = {"/proj/empty.py": (0, 0), "/proj/real.py": (1, 1)}
+
+        # act
+        table = _format_term_missing(per_file, [], Path("/proj"))
+
+        # assert
+        self.assertNotIn("empty.py", table)
+        self.assertIn("real.py", table)
+
+    def test_should_report_nothing_to_measure_when_no_file_has_dataframes(self) -> None:
+        """Test that an entirely DataFrame-free run says so rather than printing an empty table."""
+        # arrange
+        per_file = {"/proj/a.py": (0, 0)}
+
+        # act
+        table = _format_term_missing(per_file, [], Path("/proj"))
+
+        # assert
+        self.assertEqual("No DataFrames with recognized loads/schemas found to check", table)
+
+    def test_should_build_json_coverage_payload_with_unrounded_percentages(self) -> None:
+        """Test that the JSON report keeps the exact ratio for machine consumers."""
+        # arrange
+        per_file = {"/proj/a.py": (3, 1)}
+        sites = [
+            {"file": "/proj/a.py", "line": 5, "col": 1, "var": "x"},
+            {"file": "/proj/a.py", "line": 4, "col": 1, "var": "y"},
+        ]
+
+        # act
+        payload = _coverage_json_payload(per_file, sites, Path("/proj"))
+
+        # assert
+        self.assertAlmostEqual(100 / 3, payload["percent"])
+        self.assertEqual("a.py", payload["files"][0]["file"])
+        self.assertEqual([4, 5], [m["line"] for m in payload["files"][0]["missing"]])
+
+    def test_should_use_null_percent_when_a_file_has_no_dataframes(self) -> None:
+        """Test that the JSON report reports null rather than dividing by zero."""
+        # arrange
+        per_file = {"/proj/a.py": (0, 0)}
+
+        # act
+        payload = _coverage_json_payload(per_file, [], Path("/proj"))
+
+        # assert
+        self.assertIsNone(payload["percent"])
+        self.assertIsNone(payload["files"][0]["percent"])
+
+    def test_should_attach_untyped_sites_to_their_source_file(self) -> None:
+        """Test that _check_files tags each untyped site with the file it came from."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "load.py"
+            py_file.write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+
+            # act
+            _errors, stats = _check_files([py_file])
+
+            # assert
+            self.assertEqual(1, len(stats["untyped_sites"]))
+            self.assertEqual(str(py_file), stats["untyped_sites"][0]["file"])
+            self.assertEqual("sales", stats["untyped_sites"][0]["var"])
+
+    def test_should_keep_untyped_site_count_matching_the_coverage_shortfall(self) -> None:
+        """Test the invariant term-missing relies on: sites == total - typed."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "load.py"
+            py_file.write_text(
+                "import pandas as pd\n"
+                'good = pd.read_csv("a.csv", usecols=["a"])\n'
+                'bad_one = pd.read_csv("b.csv")\n'
+                'bad_two = pd.read_csv("c.csv")\n'
+            )
+
+            # act
+            _errors, stats = _check_files([py_file])
+
+            # assert
+            shortfall = stats["dataframes_total"] - stats["dataframes_typed"]
+            self.assertEqual(shortfall, len(stats["untyped_sites"]))
+
+    def test_should_print_term_missing_table_end_to_end(self) -> None:
+        """Test that --coverage-report=term-missing prints the per-file breakdown."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-report", "term-missing"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("Missing", output)
+            self.assertIn("sales:2", output)
+
+    def test_should_print_standalone_json_coverage_report_in_text_mode(self) -> None:
+        """Test that --coverage-report=json emits a coverage document."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--no-info", "--coverage-report", "json"])
+
+            # assert
+            payload = json.loads(captured.getvalue().split("\n", 1)[1])
+            self.assertEqual("sales", payload["files"][0]["missing"][0]["var"])
+
+    def test_should_nest_coverage_detail_inside_json_output_format(self) -> None:
+        """Test that json output stays one document when a coverage report is requested."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--output-format", "json", "--coverage-report", "json"])
+
+            # assert
+            payload = json.loads(captured.getvalue())
+            self.assertIn("coverage", payload)
+            self.assertEqual("sales", payload["coverage"]["files"][0]["missing"][0]["var"])
+
+    def test_should_omit_coverage_key_from_json_output_by_default(self) -> None:
+        """Test that the default JSON payload is unchanged by this feature."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--output-format", "json"])
+
+            # assert
+            payload = json.loads(captured.getvalue())
+            self.assertEqual(["errors", "stats"], sorted(payload))
+
+    def test_should_read_report_mode_from_config(self) -> None:
+        """Test that the `report` key selects a report mode without a CLI flag."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nreport = "term-missing"\n')
+
+            # act
+            config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual("term-missing", config.report)
+
+    def test_should_warn_and_fall_back_when_report_mode_is_unknown(self) -> None:
+        """Test that an unrecognized report mode is reported rather than silently accepted."""
+        # arrange
+        captured = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nreport = "html"\n')
+
+            # act
+            with patch("sys.stderr", captured):
+                config = _load_coverage_config(Path(tmpdir))
+
+            # assert
+            self.assertEqual("summary", config.report)
+            self.assertIn("coverage.report", captured.getvalue())
+
+    def test_should_let_the_flag_override_the_configured_report_mode(self) -> None:
+        """Test that --coverage-report wins over the `report` config key."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nreport = "term-missing"\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-report", "summary"])
+
+            # assert
+            self.assertNotIn("Missing", captured.getvalue())
+
+    def test_should_report_detail_without_enabling_enforcement(self) -> None:
+        """Test that `report` is independent of `enabled`: detail without a gate."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nenabled = false\nreport = "term-missing"\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("sales:2", output)
+            self.assertNotIn("below the required", output)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
+import re
 import sys
 import time
 import tomllib
@@ -90,6 +92,188 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
     return frozenset(entry for entry in exclude if isinstance(entry, str))
 
 
+# DataFrame schema coverage enforcement is entirely opt-in: with no
+# `[tool.typedframes.coverage]` table (or `[coverage]` in typedframes.toml) and no
+# `--fail-under`, no threshold is ever evaluated and `check` behaves exactly as it did
+# before the feature existed -- same output, same exit code. `_COVERAGE_DEFAULT_FAIL_UNDER`
+# is therefore the default only once enforcement has been switched on; it is NOT a
+# threshold applied to unconfigured projects.
+_COVERAGE_DEFAULT_FAIL_UNDER = 100.0
+_COVERAGE_PCT_MAX = 100.0
+
+
+def _coverage_warn(message: str) -> None:
+    """Warn about unusable DataFrame schema coverage config on stderr, keeping stdout clean.
+
+    Bad config is reported rather than silently defaulted: a threshold the user
+    believes is enforced but isn't is worse than a noisy run.
+    """
+    print(f"typedframes: {message}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class CoverageConfig:
+    """Resolved DataFrame schema coverage threshold settings for one `check` invocation.
+
+    The default instance is the "nothing configured" state -- disabled, so no
+    threshold is evaluated at all.
+    """
+
+    enabled: bool = False
+    fail_under: float = _COVERAGE_DEFAULT_FAIL_UNDER
+    overrides: tuple[tuple[str, float], ...] = ()
+
+
+def _parse_threshold(value: object, label: str) -> float | None:
+    """Coerce a configured threshold to a percentage, or warn and return `None`."""
+    # bool is a subclass of int, and `fail_under = true` is a mistake, not 100%.
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        _coverage_warn(f"ignoring {label}: expected a number, got {type(value).__name__}")
+        return None
+    pct = float(value)
+    if not 0.0 <= pct <= _COVERAGE_PCT_MAX:
+        _coverage_warn(f"ignoring {label}: {pct} is outside the 0-100 range")
+        return None
+    return pct
+
+
+def _read_toml_table(config_path: Path, keys: tuple[str, ...]) -> dict | None:
+    """Read a nested table out of a TOML file, or `None` if it isn't there.
+
+    A missing file is silent (nothing was configured); a malformed one warns,
+    since the user clearly meant to configure something.
+    """
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        _coverage_warn(f"ignoring {config_path}: {e}")
+        return None
+    table: object = data
+    for key in keys:
+        if not isinstance(table, dict):
+            return None
+        table = table.get(key)
+    return table if isinstance(table, dict) else None
+
+
+def _coverage_config_from_table(table: dict) -> CoverageConfig:
+    """Build a `CoverageConfig` from a raw TOML table, dropping unusable values."""
+    enabled = table.get("enabled", False)
+    if not isinstance(enabled, bool):
+        _coverage_warn("ignoring coverage.enabled: expected true or false")
+        enabled = False
+
+    fail_under = _COVERAGE_DEFAULT_FAIL_UNDER
+    if "fail_under" in table:
+        parsed = _parse_threshold(table["fail_under"], "coverage.fail_under")
+        if parsed is not None:
+            fail_under = parsed
+
+    raw_overrides = table.get("overrides", {})
+    overrides: list[tuple[str, float]] = []
+    if isinstance(raw_overrides, dict):
+        for pattern, value in raw_overrides.items():
+            parsed = _parse_threshold(value, f"coverage.overrides[{pattern!r}]")
+            if parsed is not None:
+                overrides.append((pattern, parsed))
+    else:
+        # `overrides` defaults to an empty dict above, so reaching here means the key
+        # was present with a non-table value -- including `overrides = []`, which is a
+        # type mistake worth reporting rather than silently treating as "none set".
+        _coverage_warn("ignoring coverage.overrides: expected a table of glob = threshold")
+
+    return CoverageConfig(enabled=enabled, fail_under=fail_under, overrides=tuple(overrides))
+
+
+def _load_coverage_config(path: Path) -> CoverageConfig:
+    """Read the opt-in DataFrame schema coverage settings for the project at `path`.
+
+    Two sources, with ruff's precedence rule: a standalone `typedframes.toml` at
+    the project root wins ENTIRELY over `[tool.typedframes]` in `pyproject.toml`
+    -- the two are never merged, so exactly one file explains the whole
+    configuration. In `typedframes.toml` the `[tool.typedframes]` prefix is
+    dropped, exactly as `ruff.toml` drops `[tool.ruff]`, making the table
+    `[coverage]` rather than `[tool.typedframes.coverage]`.
+
+    Only looks at `path`, and only when it is a directory -- no walking up the
+    ancestor chain -- matching `_load_configured_excludes` and
+    `_build_index_bytes`, which already treat `path` as the project root.
+    Checking a single file therefore never picks up a config file; `--fail-under`
+    covers that case.
+
+    Returns the disabled default whenever nothing is configured or the config is
+    unusable, which is what keeps the opt-in guarantee: no table, no threshold.
+    """
+    if not path.is_dir():
+        return CoverageConfig()
+
+    standalone = path / "typedframes.toml"
+    if standalone.is_file():
+        table = _read_toml_table(standalone, ("coverage",))
+    else:
+        table = _read_toml_table(path / "pyproject.toml", ("tool", "typedframes", "coverage"))
+
+    if table is None:
+        return CoverageConfig()
+    return _coverage_config_from_table(table)
+
+
+@functools.cache
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a project-relative path glob to an anchored regex.
+
+    `**` spans any number of path segments; `*` and `?` never cross a `/`;
+    everything else is literal. Paths are matched in project-relative POSIX form
+    (`legacy/etl/load.py`), so `legacy/**` matches every file beneath `legacy/`
+    at any depth.
+
+    Hand-rolled because neither available alternative fits: `PurePath.full_match`
+    needs Python 3.13 and this package supports 3.11, and `pathspec` would be the
+    first runtime dependency in a package that deliberately has none.
+    """
+    parts: list[str] = []
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "*":
+            star_end = i
+            while star_end < len(pattern) and pattern[star_end] == "*":
+                star_end += 1
+            if pattern.startswith("**", i):
+                # `**/` consumes the separator too, so `**/x.py` still matches a
+                # bare `x.py` at the root rather than requiring a leading directory.
+                if star_end < len(pattern) and pattern[star_end] == "/":
+                    parts.append("(?:.*/)?")
+                    star_end += 1
+                else:
+                    parts.append(".*")
+            else:
+                parts.append("[^/]*")
+            i = star_end
+        elif char == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(char))
+            i += 1
+    return re.compile("".join(parts) + r"\Z")
+
+
+def _pattern_specificity(pattern: str) -> tuple[int, int, str]:
+    """Rank an override pattern for most-specific-match-wins resolution.
+
+    Specificity is the length of the literal prefix before the first glob
+    metacharacter -- so `src/new_module/**` (15) beats `src/**` (4) for a file
+    under both -- then total pattern length, then the pattern itself so that ties
+    resolve deterministically instead of by table iteration order.
+    """
+    literal_prefix = re.split(r"[*?]", pattern, maxsplit=1)[0]
+    return (len(literal_prefix), len(pattern), pattern)
+
+
 def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
     """Collect all .py files from a path (file or directory).
 
@@ -117,7 +301,10 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     """Run the Rust checker on each file.
 
     Returns all errors with file paths attached, plus coverage stats
-    (``dataframes_total``/``dataframes_typed``) aggregated across every file checked.
+    (``dataframes_total``/``dataframes_typed``) aggregated across every file checked,
+    and a ``per_file`` mapping of each file to its own ``(total, typed)`` tally --
+    needed to attribute coverage to per-path threshold overrides, which grade
+    subtrees separately rather than judging one project-wide ratio.
     """
     try:
         from typedframes._rust_checker import check_file  # ty: ignore[unresolved-import]
@@ -130,7 +317,8 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         sys.exit(1)
 
     all_errors = []
-    stats = {"dataframes_total": 0, "dataframes_typed": 0}
+    totals = {"dataframes_total": 0, "dataframes_typed": 0}
+    per_file: dict[str, tuple[int, int]] = {}
     for file_path in files:
         try:
             result_json = check_file(str(file_path), index_bytes)
@@ -149,9 +337,12 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         for error in errors:
             error["file"] = str(file_path)
         all_errors.extend(errors)
-        stats["dataframes_total"] += result["stats"]["dataframes_total"]
-        stats["dataframes_typed"] += result["stats"]["dataframes_typed"]
-    return all_errors, stats
+        file_total = result["stats"]["dataframes_total"]
+        file_typed = result["stats"]["dataframes_typed"]
+        per_file[str(file_path)] = (file_total, file_typed)
+        totals["dataframes_total"] += file_total
+        totals["dataframes_typed"] += file_typed
+    return all_errors, {**totals, "per_file": per_file}
 
 
 def _format_text(errors: list[dict], *, color: bool = False) -> str:
@@ -199,6 +390,19 @@ def _format_github(errors: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _percentage(value: str) -> float:
+    """Argparse type for a 0-100 percentage, so bad input exits 2 like any usage error."""
+    try:
+        pct = float(value)
+    except ValueError as e:
+        msg = f"invalid percentage: {value!r}"
+        raise argparse.ArgumentTypeError(msg) from e
+    if not 0.0 <= pct <= _COVERAGE_PCT_MAX:
+        msg = f"percentage must be between 0 and 100, got {pct}"
+        raise argparse.ArgumentTypeError(msg)
+    return pct
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the typedframes CLI."""
     parser = argparse.ArgumentParser(prog="typedframes", description="Static analysis for DataFrame column schemas.")
@@ -244,7 +448,20 @@ def main(argv: list[str] | None = None) -> None:
     check_parser.add_argument(
         "--no-info",
         action="store_true",
-        help="Suppress informational output: the DataFrame coverage summary and info-level diagnostics.",
+        help="Suppress informational output: the DataFrame schema coverage summary and info-level diagnostics.",
+    )
+    check_parser.add_argument(
+        "--fail-under",
+        type=_percentage,
+        default=None,
+        dest="fail_under",
+        metavar="N",
+        help=(
+            "Enforce a minimum DataFrame schema coverage: exit 1 if fewer than N%% of "
+            "DataFrames have recognized column info. A total override: it applies one "
+            "threshold everywhere and ignores [tool.typedframes.coverage] entirely, "
+            "per-path overrides included."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -258,7 +475,7 @@ def main(argv: list[str] | None = None) -> None:
 
 @dataclass
 class RunStats:
-    """Timing plus DataFrame coverage stats for a single `check` invocation."""
+    """Timing plus DataFrame schema coverage stats for a single `check` invocation."""
 
     elapsed: float
     dataframes_total: int
@@ -266,19 +483,135 @@ class RunStats:
 
 
 def _coverage_message(stats: RunStats) -> str:
-    """Build the low-key DataFrame coverage summary line.
+    """Build the low-key DataFrame schema coverage summary line.
 
     Framed as a signal of how much information the checker had, not a validation
     result \u2014 a low ratio means the check had little to validate, not that the
-    code is broken.
+    code is broken. Named in full ("DataFrame schema coverage") on the way out
+    because the surrounding CLI vocabulary is borrowed from coverage.py, and a
+    bare "coverage" here reads as test coverage to anyone skimming CI output.
     """
     if stats.dataframes_total == 0:
         return "\u2139 No DataFrames with recognized loads/schemas found to check"
     pct = round(100 * stats.dataframes_typed / stats.dataframes_total)
     return (
         f"\u2139 {stats.dataframes_typed}/{stats.dataframes_total} DataFrames had column info "
-        f"({pct}%) \u2014 coverage, not a pass/fail result"
+        f"({pct}%) \u2014 DataFrame schema coverage, not a pass/fail result"
     )
+
+
+@dataclass(frozen=True)
+class CoverageBucket:
+    """One threshold and the aggregate DataFrame tally it is judged against."""
+
+    label: str | None
+    """The override glob this bucket came from, or `None` for the global threshold."""
+
+    threshold: float
+    total: int
+    typed: int
+
+    @property
+    def pct(self) -> float:
+        """Coverage percentage, unrounded so a near miss isn't displayed as a pass."""
+        if self.total == 0:
+            return _COVERAGE_PCT_MAX
+        return _COVERAGE_PCT_MAX * self.typed / self.total
+
+
+def _relative_posix(file_str: str, root: Path) -> str:
+    """Project-relative POSIX form of a checked file, the form globs match against."""
+    try:
+        return Path(file_str).relative_to(root).as_posix()
+    except ValueError:
+        return Path(file_str).as_posix()
+
+
+def _override_for(rel_path: str, config: CoverageConfig) -> tuple[str, float] | None:
+    """Pick the most specific override matching `rel_path`, or `None` for the global bucket."""
+    matches = [
+        (pattern, threshold) for pattern, threshold in config.overrides if _glob_to_regex(pattern).match(rel_path)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: _pattern_specificity(item[0]))
+
+
+def _evaluate_coverage(
+    per_file: dict[str, tuple[int, int]],
+    config: CoverageConfig,
+    root: Path,
+    cli_fail_under: float | None,
+) -> list[CoverageBucket]:
+    """Group checked files by the threshold that governs them and return the failures.
+
+    Each file lands in exactly one bucket -- the most specific matching override,
+    else the global `fail_under` -- and each bucket is graded on its own
+    aggregate ratio, so a legacy subtree held to 50% cannot drag down (or be
+    rescued by) the rest of the project.
+
+    `--fail-under` is a TOTAL override: one threshold for every file, per-path
+    overrides ignored, so a one-off `--fail-under=100` really does mean 100
+    everywhere rather than being quietly capped by a legacy exemption in config.
+
+    A bucket with no recognized DataFrames passes vacuously: 0/0 means the
+    checker found nothing to measure there, not that the code failed, which is
+    the same reading `_coverage_message` already gives an empty run.
+    """
+    tallies: dict[str | None, tuple[float, int, int]] = {}
+    for file_str, (total, typed) in sorted(per_file.items()):
+        if cli_fail_under is not None:
+            label, threshold = None, cli_fail_under
+        else:
+            override = _override_for(_relative_posix(file_str, root), config)
+            label, threshold = override if override is not None else (None, config.fail_under)
+        _, prev_total, prev_typed = tallies.get(label, (threshold, 0, 0))
+        tallies[label] = (threshold, prev_total + total, prev_typed + typed)
+
+    failing = []
+    for label, (threshold, total, typed) in tallies.items():
+        if total == 0:
+            continue
+        bucket = CoverageBucket(label=label, threshold=threshold, total=total, typed=typed)
+        if bucket.pct < threshold:
+            failing.append(bucket)
+
+    # Global bucket first, then overrides alphabetically, so output is stable.
+    return sorted(failing, key=lambda b: (b.label is not None, b.label or ""))
+
+
+def _coverage_failure_message(bucket: CoverageBucket) -> str:
+    """Explain one failed threshold: what was required, what was measured, and where.
+
+    The percentage is shown to one decimal rather than rounded to a whole number
+    like the informational summary line: 99.6% against a `fail_under = 100` gate
+    has to read as a failure, not as a baffling "100% is below the required 100%".
+    """
+    scope = f" for {bucket.label!r}" if bucket.label else ""
+    return (
+        f"✗ DataFrame schema coverage {bucket.pct:.1f}% is below the required "
+        f"{bucket.threshold:.1f}%{scope} "
+        f"({bucket.typed}/{bucket.total} DataFrames had column info)"
+    )
+
+
+def _print_coverage_failures(buckets: list[CoverageBucket], *, output_format: str) -> None:
+    """Report failed thresholds without corrupting machine-readable output.
+
+    Text goes to stdout alongside the other results, `github` gets a workflow
+    error annotation, and `json` diverts to stderr so stdout stays a single valid
+    JSON document. Never suppressed by `--no-info`: a failed gate is a result,
+    not the informational coverage line that flag exists to silence.
+    """
+    for bucket in buckets:
+        message = _coverage_failure_message(bucket)
+        if output_format == "github":
+            print(f"::error title=typedframes DataFrame schema coverage::{message[2:]}")
+        elif output_format == "json":
+            print(message, file=sys.stderr)
+        else:
+            use_color = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+            print(f"{_BOLD_RED}{message}{_RESET}" if use_color else message)
 
 
 def _print_results(
@@ -304,7 +637,7 @@ def _print_results(
         if all_errors:
             print(_format_github(all_errors))
         if show_info:
-            print(f"::notice title=typedframes coverage::{_coverage_message(stats)[2:]}")
+            print(f"::notice title=typedframes DataFrame schema coverage::{_coverage_message(stats)[2:]}")
         return
 
     # text format
@@ -378,6 +711,10 @@ def _run_check(args: argparse.Namespace) -> None:
             print(f"Error: path does not exist: {original!r} (resolved to {path})", file=sys.stderr)
         sys.exit(2)
 
+    # Loaded before the run so an unusable config is reported up front rather than
+    # after a long check.
+    coverage_config = _load_coverage_config(path)
+
     index_bytes = _build_index_bytes(path, args)
 
     files = _collect_python_files(path, _load_configured_excludes(path))
@@ -401,5 +738,20 @@ def _run_check(args: argparse.Namespace) -> None:
         show_info=not args.no_info,
     )
 
-    if args.strict and errors_only:
+    # Coverage is a separate gate from --strict: --strict judges correctness (are
+    # there errors?), the threshold judges annotation completeness (how much could
+    # the checker see?). Enforcing one has never implied the other, and enabling
+    # coverage must not silently change what --strict means.
+    failing_buckets: list[CoverageBucket] = []
+    if args.fail_under is not None or coverage_config.enabled:
+        failing_buckets = _evaluate_coverage(
+            coverage.get("per_file", {}),
+            coverage_config,
+            path,
+            args.fail_under,
+        )
+        if failing_buckets:
+            _print_coverage_failures(failing_buckets, output_format=args.output_format)
+
+    if failing_buckets or (args.strict and errors_only):
         sys.exit(1)

@@ -379,6 +379,9 @@ typedframes check src/ --no-index
 
 # Suppress all warnings (untracked-dataframe, dropped-unknown-column)
 typedframes check src/ --no-warnings
+
+# Enforce minimum DataFrame schema coverage (see below)
+typedframes check src/ --fail-under=90
 ```
 
 To suppress warnings project-wide, add to `pyproject.toml`:
@@ -387,6 +390,71 @@ To suppress warnings project-wide, add to `pyproject.toml`:
 enabled = true
 warnings = false
 ```
+
+### DataFrame Schema Coverage Thresholds (Opt-In)
+
+**DataFrame schema coverage** is the fraction of DataFrames `typedframes check` could
+resolve column information for — the analogue of the "type coverage" reported by mypy,
+pyright, and pyre, and unrelated to test coverage. That number is informational by
+default. If you want it enforced — failing the run when too much of your code is
+invisible to the checker — enable a threshold.
+
+This is **entirely opt-in**. With no `[tool.typedframes.coverage]` table and no
+`--fail-under`, nothing changes: no threshold, no exit-code difference.
+
+Every supported key, at its default value:
+
+```toml
+[tool.typedframes.coverage]
+# Master switch. Coverage enforcement is off unless this is true, so adding this
+# table without setting it changes nothing.
+enabled = false
+
+# Minimum percentage of DataFrames that must have recognized column/schema info
+# before `typedframes check` exits 1. Only consulted when `enabled = true`.
+# Applies to every file not captured by a glob in [overrides] below.
+fail_under = 100.0
+
+[tool.typedframes.coverage.overrides]
+# Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
+# than new code. Each glob is graded on its own files as a separate group, so a
+# lenient legacy bucket can't drag down (or rescue) the rest of the project.
+# Paths are matched project-relative: `**` spans any number of directories,
+# `*` and `?` stay within one path segment.
+# When several globs match one file the most specific wins — longest literal
+# prefix before the first `*` or `?`. Files matching no glob use `fail_under`.
+# "legacy/**" = 50.0
+# "src/new_module/**" = 100.0
+```
+
+Prefer to keep `pyproject.toml` clean? The same settings work in a standalone
+`typedframes.toml` at the project root, with the `[tool.typedframes]` prefix dropped
+(the way `ruff.toml` drops `[tool.ruff]`):
+
+```toml
+# typedframes.toml
+[coverage]
+enabled = false
+fail_under = 100.0
+
+[coverage.overrides]
+# "legacy/**" = 50.0
+```
+
+If both files exist, `typedframes.toml` wins **entirely** — the two are never merged,
+so exactly one file explains the whole configuration.
+
+Notes:
+
+- Coverage is a **separate gate from `--strict`**. `--strict` fails on errors
+  (correctness); a threshold fails on missing column information (completeness).
+  Enabling one never implies the other.
+- `--fail-under=N` is a **total override**: it applies one threshold everywhere and
+  ignores the config table, per-path overrides included. Handy for a one-off CI run.
+- A group with no recognized DataFrames passes: 0/0 means there was nothing to
+  measure, not that something failed.
+- A failed threshold exits **1** and is reported even under `--no-info` — that flag
+  silences the informational summary line, not a gate result.
 
 ### Option 2: Mypy Plugin (Comprehensive)
 

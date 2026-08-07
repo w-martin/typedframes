@@ -318,6 +318,131 @@ Suppress all warnings project-wide via `pyproject.toml`:
 warnings = false
 ```
 
+## DataFrame schema coverage thresholds
+
+Every `check` run ends with a DataFrame schema coverage line:
+
+```
+ℹ 12/20 DataFrames had column info (60%) — DataFrame schema coverage, not a pass/fail result
+```
+
+**DataFrame schema coverage** is the fraction of DataFrames the checker could resolve
+column information for. It is this project's analogue of the "type coverage" reported by
+mypy, pyright, and pyre, and has nothing to do with test coverage — worth stating plainly,
+because the vocabulary below (`fail_under`, `term-missing`) is borrowed from coverage.py.
+
+It measures how much the checker could *see*, not how correct your code is: a low ratio
+means most DataFrames arrived without resolvable column information, so there was little
+to validate. It is informational by default.
+
+To enforce it — failing CI when too much of the codebase is opaque to the checker —
+turn on a threshold. Enforcement is **entirely opt-in**: with no
+`[tool.typedframes.coverage]` table and no `--fail-under`, no threshold is evaluated
+and the exit code is exactly what it was before.
+
+### One-off enforcement
+
+```shell
+typedframes check src/ --fail-under=90
+```
+
+Exits `1` if under 90% of DataFrames had column info. `--fail-under` is a **total
+override**: one threshold for every file, ignoring the config table entirely (per-path
+overrides included), so `--fail-under=100` really does mean 100% everywhere and can't
+be quietly capped by a legacy exemption in config.
+
+### Project configuration
+
+Every supported key, shown at its default value:
+
+```toml
+[tool.typedframes.coverage]
+# Master switch. Coverage enforcement is off unless this is true, so adding this
+# table without setting it changes nothing.
+enabled = false
+
+# Minimum percentage of DataFrames that must have recognized column/schema info
+# before `typedframes check` exits 1. Only consulted when `enabled = true`.
+# Applies to every file not captured by a glob in [overrides] below.
+fail_under = 100.0
+
+[tool.typedframes.coverage.overrides]
+# Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
+# than new code. Each glob is graded on its own files as a separate group, so a
+# lenient legacy bucket can't drag down (or rescue) the rest of the project.
+# Paths are matched project-relative: `**` spans any number of directories,
+# `*` and `?` stay within one path segment.
+# When several globs match one file the most specific wins — longest literal
+# prefix before the first `*` or `?`. Files matching no glob use `fail_under`.
+# "legacy/**" = 50.0
+# "src/new_module/**" = 100.0
+```
+
+The same settings work in a standalone `typedframes.toml` at the project root, with the
+`[tool.typedframes]` prefix dropped — the way `ruff.toml` drops `[tool.ruff]`:
+
+```toml
+# typedframes.toml
+[coverage]
+enabled = false
+fail_under = 100.0
+
+[coverage.overrides]
+# "legacy/**" = 50.0
+```
+
+If both files exist, `typedframes.toml` wins **entirely**. The two are never merged, so
+exactly one file always explains the whole configuration.
+
+Config is read from the directory you point `check` at, and only that directory — there
+is no walking up the ancestor chain, matching how `exclude` and the cross-file index
+already treat that path as the project root. Checking a single file
+(`typedframes check src/pipeline.py`) therefore picks up no config file; use
+`--fail-under` there.
+
+### A worked example
+
+```toml
+[tool.typedframes.coverage]
+enabled = true
+fail_under = 90.0
+
+[tool.typedframes.coverage.overrides]
+"legacy/**" = 40.0
+```
+
+With 8/10 DataFrames resolved under `legacy/` and 5/8 elsewhere:
+
+```
+✗ DataFrame schema coverage 62.5% is below the required 90.0% (5/8 DataFrames had column info)
+```
+
+`legacy/` passes on its own terms (80% against its 40% bar) and is not reported; the
+rest of the project misses the 90% bar and fails the run. Each group is graded
+independently, which is the point of the overrides — the legacy exemption never
+silently improves the number the rest of your code is held to.
+
+### Behaviour notes
+
+- **Separate from `--strict`.** `--strict` fails on errors (correctness); a coverage
+  threshold fails on missing column information (completeness). They measure different
+  things, and enabling one never implies the other.
+- **Exit code `1`** on a failed threshold, the same code `--strict` uses for errors.
+  (`2` stays reserved for usage errors, including an out-of-range `--fail-under`.)
+- **Empty groups pass.** A group with no recognized DataFrames is 0/0 — nothing to
+  measure, not a failure — matching how the summary line already reports an empty run.
+- **`--no-info` doesn't hide failures.** That flag silences the informational coverage
+  line; a failed gate is a result, so it is still reported.
+- **Machine-readable output stays clean.** With `--output-format=json` the failure
+  message goes to stderr so stdout remains a single valid JSON document; with
+  `--output-format=github` it becomes a workflow error annotation.
+- **Unusable config is reported, not ignored.** A malformed file or an out-of-range
+  value warns on stderr and falls back to the default, on the grounds that a threshold
+  you believe is enforced but isn't is worse than a noisy run.
+- Percentages in failure messages are shown to one decimal place rather than rounded to
+  a whole number, so a 99.6% run against `fail_under = 100.0` doesn't read as
+  "100.0% is below the required 100.0%".
+
 ## Call-site argument tracing (Feast `features=`)
 
 Some functions take their column-determining argument as a *parameter* rather than a

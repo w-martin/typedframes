@@ -37,6 +37,7 @@ mod contract;
 mod errors;
 mod index;
 mod linter;
+mod notebook;
 mod pyapi;
 mod sql;
 mod typo;
@@ -50,6 +51,7 @@ use pyo3::prelude::*;
 #[pymodule]
 fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pyapi::check_file, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::check_notebook, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::build_project_index, m)?)?;
     Ok(())
 }

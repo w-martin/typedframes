@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -297,8 +298,10 @@ def _pattern_specificity(pattern: str) -> tuple[int, int, str]:
     return (len(literal_prefix), len(pattern), pattern)
 
 
-def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
-    """Collect all .py files from a path (file or directory).
+def _collect_files_with_suffix(
+    path: Path, suffix: str, configured_excludes: frozenset[str] | None
+) -> list[Path]:
+    """Collect all files with the given suffix from a path (file or directory).
 
     Prunes descent into vendored/VCS/cache directories: `configured_excludes` (see
     `_load_configured_excludes`) REPLACES the built-in default set (``_EXCLUDED_DIRS``)
@@ -308,7 +311,7 @@ def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None
     pruning the built-in default set alone.
     """
     if path.is_file():
-        if path.suffix == ".py":
+        if path.suffix == suffix:
             return [path]
         return []
 
@@ -316,12 +319,81 @@ def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None
     found = []
     for dirpath, dirnames, filenames in os.walk(path):
         dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
-        found.extend(Path(dirpath) / filename for filename in filenames if filename.endswith(".py"))
+        found.extend(Path(dirpath) / filename for filename in filenames if filename.endswith(suffix))
     return sorted(found)
 
 
+def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
+    """Collect all .py files from a path (file or directory). See `_collect_files_with_suffix`."""
+    return _collect_files_with_suffix(path, ".py", configured_excludes)
+
+
+def _collect_notebook_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
+    """Collect all .ipynb files from a path (file or directory). See `_collect_files_with_suffix`."""
+    return _collect_files_with_suffix(path, ".ipynb", configured_excludes)
+
+
+# One file's check outcome: (errors, dataframes_total, dataframes_typed, untyped_sites).
+_FileCheckResult = tuple[list[dict], int, int, list[dict]]
+_CheckFileFn = Callable[[str, bytes | None], str]
+
+
+def _check_python_file(file_path: Path, check_file: _CheckFileFn, index_bytes: bytes | None) -> _FileCheckResult | None:
+    """Run the Rust checker on one `.py` file, or return `None` if it had to be skipped."""
+    try:
+        result_json = check_file(str(file_path), index_bytes)
+    except OSError as e:
+        print(f"{file_path}: skipped, {e}", file=sys.stderr)
+        return None
+    except RuntimeError as e:
+        # check_file_internal's only failure path is a parse_module() error (see
+        # rust/src/lib.rs), i.e. this file's source isn't valid Python syntax --
+        # not an internal linter bug -- so it's safe to skip and keep going, same
+        # as the OSError case above.
+        print(f"{file_path}: skipped, {e}", file=sys.stderr)
+        return None
+
+    result = json.loads(result_json)
+    errors = result["errors"]
+    for error in errors:
+        error["file"] = str(file_path)
+    sites = [{**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", [])]
+    return errors, result["stats"]["dataframes_total"], result["stats"]["dataframes_typed"], sites
+
+
+def _check_notebook_file(
+    file_path: Path, check_notebook: _CheckFileFn, index_bytes: bytes | None
+) -> _FileCheckResult | None:
+    """Run the Rust checker on one `.ipynb` file.
+
+    Mirrors `_check_python_file`, but calls the `check_notebook` entry point: the
+    notebook's code cells are parsed and concatenated entirely in Rust (via
+    `ruff_notebook`, the same crate Ruff and Pyrefly use for their own notebook
+    linting), so every error/site already carries a `cell` field and cell-relative
+    `line` by the time it reaches Python -- no synthetic file, no remapping here.
+    """
+    try:
+        result_json = check_notebook(str(file_path), index_bytes)
+    except OSError as e:
+        print(f"{file_path}: skipped, {e}", file=sys.stderr)
+        return None
+    except RuntimeError as e:
+        # Covers a genuine syntax error unrelated to magics, malformed notebook
+        # JSON, and a non-Python-kernel notebook -- see check_notebook in
+        # rust/src/pyapi.rs for exactly which of those map here.
+        print(f"{file_path}: skipped, {e}", file=sys.stderr)
+        return None
+
+    result = json.loads(result_json)
+    errors = result["errors"]
+    for error in errors:
+        error["file"] = str(file_path)
+    sites = [{**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", [])]
+    return errors, result["stats"]["dataframes_total"], result["stats"]["dataframes_typed"], sites
+
+
 def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tuple[list[dict], dict]:
-    """Run the Rust checker on each file.
+    """Run the Rust checker on each file, dispatching `.ipynb` notebooks through `_check_notebook_file`.
 
     Returns all errors with file paths attached, plus coverage stats
     (``dataframes_total``/``dataframes_typed``) aggregated across every file checked,
@@ -335,7 +407,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     counterpart to `coverage report -m`'s missing line numbers.
     """
     try:
-        from typedframes._rust_checker import check_file  # ty: ignore[unresolved-import]
+        from typedframes._rust_checker import check_file, check_notebook  # ty: ignore[unresolved-import]
     except ImportError:
         msg = (
             "The Rust checker extension was not found. "
@@ -344,35 +416,31 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         print(msg, file=sys.stderr)
         sys.exit(1)
 
-    all_errors = []
+    all_errors: list[dict] = []
     totals = {"dataframes_total": 0, "dataframes_typed": 0}
     per_file: dict[str, tuple[int, int]] = {}
     untyped_sites: list[dict] = []
     for file_path in files:
-        try:
-            result_json = check_file(str(file_path), index_bytes)
-        except OSError as e:
-            print(f"{file_path}: skipped, {e}", file=sys.stderr)
+        if file_path.suffix == ".ipynb":
+            outcome = _check_notebook_file(file_path, check_notebook, index_bytes)
+        else:
+            outcome = _check_python_file(file_path, check_file, index_bytes)
+        if outcome is None:
             continue
-        except RuntimeError as e:
-            # check_file_internal's only failure path is a parse_module() error (see
-            # rust/src/lib.rs), i.e. this file's source isn't valid Python syntax --
-            # not an internal linter bug -- so it's safe to skip and keep going, same
-            # as the OSError case above.
-            print(f"{file_path}: skipped, {e}", file=sys.stderr)
-            continue
-        result = json.loads(result_json)
-        errors = result["errors"]
-        for error in errors:
-            error["file"] = str(file_path)
+        errors, file_total, file_typed, sites = outcome
         all_errors.extend(errors)
-        file_total = result["stats"]["dataframes_total"]
-        file_typed = result["stats"]["dataframes_typed"]
         per_file[str(file_path)] = (file_total, file_typed)
         totals["dataframes_total"] += file_total
         totals["dataframes_typed"] += file_typed
-        untyped_sites.extend({**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", []))
+        untyped_sites.extend(sites)
     return all_errors, {**totals, "per_file": per_file, "untyped_sites": untyped_sites}
+
+
+def _error_location(error: dict) -> str:
+    """Render an error's position: `line:col`, or `cell N:line:col` for a notebook error."""
+    cell = error.get("cell")
+    prefix = f"cell {cell}:" if cell is not None else ""
+    return f"{prefix}{error['line']}:{error['col']}"
 
 
 def _format_text(errors: list[dict], *, color: bool = False) -> str:
@@ -382,8 +450,7 @@ def _format_text(errors: list[dict], *, color: bool = False) -> str:
         severity = error.get("severity", "error")
         code = error.get("code", "")
         file_ = error["file"]
-        line = error["line"]
-        col = error["col"]
+        location = _error_location(error)
         message = error["message"]
         code_part = f"[{code}]" if code else ""
         if color:
@@ -393,9 +460,9 @@ def _format_text(errors: list[dict], *, color: bool = False) -> str:
                 sev_colored = f"{_BOLD_YELLOW}warning{_RESET}"
             else:
                 sev_colored = f"{_DIM}info{_RESET}"
-            lines.append(f"{_BOLD}{file_}{_RESET}:{line}:{col}: {sev_colored}{code_part} {message}")
+            lines.append(f"{_BOLD}{file_}{_RESET}:{location}: {sev_colored}{code_part} {message}")
         else:
-            lines.append(f"{file_}:{line}:{col}: {severity}{code_part} {message}")
+            lines.append(f"{file_}:{location}: {severity}{code_part} {message}")
     return "\n".join(lines)
 
 
@@ -405,7 +472,15 @@ _GITHUB_SEVERITY = {"error": "error", "warning": "warning", "info": "notice"}
 
 
 def _format_github(errors: list[dict]) -> str:
-    """Format errors as GitHub Actions workflow commands."""
+    """Format errors as GitHub Actions workflow commands.
+
+    GitHub annotations only understand real file line numbers, which a notebook
+    doesn't have -- `.ipynb` is JSON, not source text. For a notebook error,
+    `line`/`col` stay cell-relative (the position a viewer would need to look
+    up inside that cell) and the cell number is folded into the title instead,
+    so the annotation is still attributable even though it won't land on the
+    exact right raw-JSON line in GitHub's diff view.
+    """
     lines = []
     for error in errors:
         severity = error.get("severity", "error")
@@ -416,6 +491,9 @@ def _format_github(errors: list[dict]) -> str:
         col = error["col"]
         message = error["message"]
         title = code or severity
+        cell = error.get("cell")
+        if cell is not None:
+            title = f"{title} (notebook cell {cell})"
         lines.append(f"::{gh_severity} file={file_},line={line},col={col},title={title}::{message}")
     return "\n".join(lines)
 
@@ -636,6 +714,13 @@ def _coverage_failure_message(bucket: CoverageBucket) -> str:
     )
 
 
+def _missing_label(site: dict) -> str:
+    """Render one coverage 'Missing' entry: `var:line`, or `cell N:var:line` for a notebook site."""
+    cell = site.get("cell")
+    prefix = f"cell {cell}:" if cell is not None else ""
+    return f"{prefix}{site['var']}:{site['line']}"
+
+
 def _format_term_missing(
     per_file: dict[str, tuple[int, int]],
     untyped_sites: list[dict],
@@ -667,7 +752,7 @@ def _format_term_missing(
     for name, total, typed in rows:
         pct = round(_COVERAGE_PCT_MAX * typed / total)
         missing = ", ".join(
-            f"{site['var']}:{site['line']}" for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
+            _missing_label(site) for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
         )
         lines.append(f"{display[name].ljust(name_width)}  {typed:>5}  {total:>5}  {pct:>5}%   {missing}".rstrip())
 
@@ -703,7 +788,12 @@ def _coverage_json_payload(
                 "dataframes_typed": typed,
                 "percent": (_COVERAGE_PCT_MAX * typed / total) if total else None,
                 "missing": [
-                    {"var": site["var"], "line": site["line"], "col": site["col"]}
+                    {
+                        "var": site["var"],
+                        "line": site["line"],
+                        "col": site["col"],
+                        **({"cell": site["cell"]} if "cell" in site else {}),
+                    }
                     for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
                 ],
             }
@@ -879,7 +969,10 @@ def _run_check(args: argparse.Namespace) -> None:
 
     index_bytes = _build_index_bytes(path, args)
 
-    files = _collect_python_files(path, _load_configured_excludes(path))
+    configured_excludes = _load_configured_excludes(path)
+    files = sorted(
+        _collect_python_files(path, configured_excludes) + _collect_notebook_files(path, configured_excludes)
+    )
     start = time.perf_counter()
     all_errors, coverage = _check_files(files, index_bytes=index_bytes)
     elapsed = time.perf_counter() - start

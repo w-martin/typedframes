@@ -6,8 +6,10 @@
 use crate::config::{find_project_root, load_linter_config};
 use crate::errors::{CheckFileResult, FileStats, LintError, CODE_UNTRACKED_DATAFRAME};
 use crate::index::{build_index_internal, ProjectIndex};
+use crate::notebook::{self, NotebookCheckResult, NotebookFileStats};
 use crate::Linter;
 use pyo3::prelude::*;
+use ruff_notebook::{Notebook, NotebookError};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -102,6 +104,103 @@ pub(crate) fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyR
             untyped_sites: std::mem::take(&mut linter.untyped_sites),
         },
     };
+
+    serde_json::to_string(&result)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+}
+
+/// Check a single Jupyter notebook (`.ipynb`) for DataFrame column errors.
+///
+/// Mirrors [`check_file`], but the source comes from `ruff_notebook::Notebook` --
+/// the same crate Ruff and Pyrefly use for their own notebook linting -- instead of
+/// reading the path directly: the notebook's code cells are parsed as JSON and
+/// concatenated in memory, then checked exactly like a regular file's contents
+/// (`Linter::check_notebook_internal` parses in Jupyter/IPython mode so magics don't
+/// break the parse). Every diagnostic's line/col and any "(defined at ...)" message
+/// reference are translated back from that concatenated source to the notebook
+/// cell/line they actually came from before returning.
+#[pyfunction]
+#[pyo3(signature = (file_path, index_bytes = None))]
+pub(crate) fn check_notebook(file_path: String, index_bytes: Option<Vec<u8>>) -> PyResult<String> {
+    let path = Path::new(&file_path);
+    let project_root = find_project_root(path);
+    let config = load_linter_config(&project_root);
+
+    if !config.enabled.unwrap_or(true) {
+        let empty = NotebookCheckResult {
+            errors: Vec::new(),
+            stats: NotebookFileStats::default(),
+        };
+        return serde_json::to_string(&empty)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)));
+    }
+
+    let notebook = Notebook::from_path(path).map_err(|e| match e {
+        NotebookError::Io(io_err) => {
+            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("{}", io_err))
+        }
+        other => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", other)),
+    })?;
+    if !notebook.is_python_notebook() {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "not a Python notebook (kernel is not Python)",
+        ));
+    }
+    let source = notebook.source_code();
+    let file_display = path.display().to_string();
+
+    let mut linter = Linter::new();
+    linter.with_context(project_root.clone(), &config);
+
+    // See check_file's identical block for why call_site_errors/index are tracked
+    // across the whole function. A notebook can never itself be the TARGET of a
+    // cross-file call or import (Python can't `import` a `.ipynb`), so these will
+    // always end up empty/no-op here -- kept for structural parity with check_file
+    // rather than special-cased away, in case indexing ever covers notebooks too.
+    let mut call_site_errors: Vec<LintError> = Vec::new();
+    let mut index: Option<Arc<ProjectIndex>> = None;
+    if let Some(bytes) = index_bytes {
+        if let Some(idx) = get_cached_index(&bytes) {
+            linter.load_cross_file_symbols_notebook(&idx, source, &project_root);
+            if let Some(extra) = idx.call_site_errors.get(&file_path) {
+                call_site_errors = extra.clone();
+            }
+            index = Some(idx);
+        }
+    }
+
+    let mut errors = linter
+        .check_notebook_internal(source, path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    if let Some(index) = &index {
+        for (func_name, template) in &linter.param_governed_templates {
+            if index
+                .resolved_governed
+                .contains(&(file_path.clone(), func_name.clone()))
+            {
+                errors.retain(|e| {
+                    !(e.line == template.governing_line
+                        && e.col == template.governing_col
+                        && e.code == CODE_UNTRACKED_DATAFRAME)
+                });
+            }
+        }
+    }
+
+    errors.extend(call_site_errors);
+    errors.sort_by_key(|e| (e.line, e.col));
+
+    if !config.warnings.unwrap_or(true) {
+        errors.retain(|e| e.severity != "warning");
+    }
+
+    let stats = FileStats {
+        dataframes_total: linter.dataframes_total,
+        dataframes_typed: linter.dataframes_typed,
+        untyped_sites: std::mem::take(&mut linter.untyped_sites),
+    };
+    let result = notebook::translate_result(errors, stats, &file_display, notebook.index());
 
     serde_json::to_string(&result)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))

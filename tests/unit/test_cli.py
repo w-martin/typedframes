@@ -13,6 +13,8 @@ from typedframes.cli import (
     CoverageBucket,
     CoverageConfig,
     _check_files,
+    _check_notebook_file,
+    _collect_notebook_files,
     _collect_python_files,
     _coverage_json_payload,
     _evaluate_coverage,
@@ -27,6 +29,29 @@ from typedframes.cli import (
     _relative_posix,
     main,
 )
+
+
+def _write_notebook(path: Path, cells: list[str]) -> None:
+    """Write a minimal valid .ipynb file with one code cell per entry in `cells`."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "metadata": {},
+                "execution_count": None,
+                "outputs": [],
+                "source": source.splitlines(keepends=True),
+            }
+            for source in cells
+        ],
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    path.write_text(json.dumps(notebook))
 
 
 class TestCli(unittest.TestCase):
@@ -1862,3 +1887,329 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("sales:2", output)
             self.assertNotIn("below the required", output)
+
+    def test_should_collect_single_notebook_file(self) -> None:
+        """Test collecting a single .ipynb file."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "test.ipynb"
+            _write_notebook(nb_file, ["x = 1"])
+
+            # act
+            result = _collect_notebook_files(nb_file)
+
+            # assert
+            self.assertEqual(result, [nb_file])
+
+    def test_should_skip_non_notebook_file_when_collecting_notebooks(self) -> None:
+        """Test that _collect_notebook_files skips non-.ipynb files."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "test.py"
+            py_file.write_text("x = 1")
+
+            # act
+            result = _collect_notebook_files(py_file)
+
+            # assert
+            self.assertEqual(result, [])
+
+    def test_should_collect_notebook_files_from_directory(self) -> None:
+        """Test recursive collection of .ipynb files from a directory."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_notebook(root / "a.ipynb", ["x = 1"])
+            (root / "b.py").write_text("y = 2")
+            sub = root / "sub"
+            sub.mkdir()
+            _write_notebook(sub / "c.ipynb", ["z = 3"])
+
+            # act
+            result = _collect_notebook_files(root)
+
+            # assert
+            names = [f.name for f in result]
+            self.assertEqual(sorted(names), ["a.ipynb", "c.ipynb"])
+
+    def test_should_report_notebook_column_error_with_cell_relative_location(self) -> None:
+        """Test that a notebook error is reported against the notebook path with cell-relative line/col."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "analysis.ipynb"
+            _write_notebook(
+                nb_file,
+                [
+                    "from typedframes import BaseSchema, Column\n\nclass S(BaseSchema):\n    x = Column(type=int)",
+                    'df: "DataFrame[S]" = load()\ndf["wrong"]',
+                ],
+            )
+
+            # act
+            all_errors, _stats = _check_files([nb_file])
+
+            # assert
+            self.assertEqual(1, len(all_errors))
+            error = all_errors[0]
+            self.assertEqual(str(nb_file), error["file"])
+            self.assertEqual(2, error["cell"])
+            self.assertEqual(2, error["line"])
+
+    def test_should_point_defined_at_reference_at_the_notebook_not_a_synthetic_file(self) -> None:
+        """Test that a same-notebook schema's "(defined at ...)" reference names the notebook.
+
+        The Rust `check_notebook` entry point checks the notebook's concatenated code-cell
+        source directly (via `ruff_notebook`) and translates results back to cell/line itself
+        -- this is a regression test for that translation, not for any Python-side rewriting.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "analysis.ipynb"
+            _write_notebook(
+                nb_file,
+                [
+                    "from typedframes import BaseSchema, Column\n\nclass S(BaseSchema):\n    x = Column(type=int)",
+                    'df: "DataFrame[S]" = load()\ndf["wrong"]',
+                ],
+            )
+
+            # act
+            all_errors, _stats = _check_files([nb_file])
+
+            # assert
+            message = all_errors[0]["message"]
+            self.assertIn(f"defined at {nb_file} cell 1:3", message)
+            self.assertNotIn(".py", message)
+
+    def test_should_remap_every_error_when_a_notebook_has_more_than_one(self) -> None:
+        """Test that cell/line remapping applies to every error, not just the first."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "two_bugs.ipynb"
+            _write_notebook(
+                nb_file,
+                [
+                    "from typedframes import BaseSchema, Column\n\nclass S(BaseSchema):\n    x = Column(type=int)",
+                    'df: "DataFrame[S]" = load()\ndf["wrong"]\ndf["also_wrong"]',
+                ],
+            )
+
+            # act
+            all_errors, _stats = _check_files([nb_file])
+
+            # assert
+            self.assertEqual(2, len(all_errors))
+            self.assertEqual([(2, 2), (2, 3)], sorted((e["cell"], e["line"]) for e in all_errors))
+
+    def test_should_attach_cell_to_untyped_dataframe_sites_too(self) -> None:
+        """Test that untyped-DataFrame coverage sites, not just errors, also carry a `cell`.
+
+        A bare `pd.read_csv(...)` produces both an untracked-dataframe warning (an error with
+        a `message`) and a plain coverage site entry (no `message`) -- both must come back
+        cell-tagged.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "untyped.ipynb"
+            _write_notebook(nb_file, ["import pandas as pd\ndf = pd.read_csv('x.csv')"])
+
+            # act
+            all_errors, stats = _check_files([nb_file], index_bytes=None)
+
+            # assert
+            self.assertEqual(1, len(all_errors))
+            self.assertEqual(1, all_errors[0]["cell"])
+            untyped_sites = stats["untyped_sites"]
+            self.assertEqual(1, len(untyped_sites))
+            self.assertEqual(1, untyped_sites[0]["cell"])
+            self.assertNotIn("message", untyped_sites[0])
+
+    def test_should_not_report_dataframes_from_a_clean_notebook(self) -> None:
+        """Test that a notebook with no column errors produces none."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "clean.ipynb"
+            _write_notebook(nb_file, ["x = 1"])
+
+            # act
+            all_errors, _stats = _check_files([nb_file])
+
+            # assert
+            self.assertEqual([], all_errors)
+
+    def test_should_tolerate_ipython_magic_in_notebook_cell(self) -> None:
+        """Test that a line magic doesn't stop the rest of the cell from being checked."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "magic.ipynb"
+            _write_notebook(
+                nb_file,
+                [
+                    "from typedframes import BaseSchema, Column\n\nclass S(BaseSchema):\n    x = Column(type=int)",
+                    '%matplotlib inline\ndf: "DataFrame[S]" = load()\ndf["wrong"]',
+                ],
+            )
+
+            # act
+            all_errors, _stats = _check_files([nb_file])
+
+            # assert
+            self.assertEqual(1, len(all_errors))
+            self.assertEqual(3, all_errors[0]["line"])
+
+    def test_should_skip_malformed_notebook_and_continue(self) -> None:
+        """Test that a notebook that isn't valid notebook JSON is skipped, not fatal."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_nb = Path(tmpdir) / "bad.ipynb"
+            bad_nb.write_text("{not valid json")
+
+            good_file = Path(tmpdir) / "good.py"
+            good_file.write_text(
+                "from typedframes import BaseSchema, Column\n"
+                "\n"
+                "class S(BaseSchema):\n"
+                "    x = Column(type=int)\n"
+                "\n"
+                'df: "DataFrame[S]" = load()\n'
+                'df["wrong"]\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stderr", captured):
+                all_errors, _stats = _check_files([bad_nb, good_file])
+
+            # assert
+            self.assertTrue(any(e["file"] == str(good_file) for e in all_errors))
+            self.assertIn(f"{bad_nb}: skipped,", captured.getvalue())
+
+    def test_should_exit_1_when_strict_and_notebook_has_errors(self) -> None:
+        """Test the full main() path for a single .ipynb given directly on the command line."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "bad.ipynb"
+            _write_notebook(
+                nb_file,
+                [
+                    "from typedframes import BaseSchema, Column\n\nclass S(BaseSchema):\n    x = Column(type=int)",
+                    'df: "DataFrame[S]" = load()\ndf["wrong"]',
+                ],
+            )
+
+            # act / assert
+            with self.assertRaises(SystemExit) as ctx:
+                main(["check", str(nb_file), "--strict"])
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_should_check_directory_containing_both_python_and_notebook_files(self) -> None:
+        """Test that `check` on a directory picks up both .py and .ipynb files."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "clean.py").write_text("x = 1\n")
+            _write_notebook(root / "clean.ipynb", ["y = 2"])
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(root)])
+
+            # assert
+            self.assertIn("✓ Checked 2 files", captured.getvalue())
+
+    def test_should_format_text_with_cell_location_for_notebook_errors(self) -> None:
+        """Test that text formatting renders `cell N:line:col` for notebook errors."""
+        # arrange
+        errors = [
+            {
+                "file": "analysis.ipynb",
+                "cell": 3,
+                "line": 2,
+                "col": 5,
+                "severity": "error",
+                "code": "unknown-column",
+                "message": "Column 'wrong' not in S",
+            }
+        ]
+
+        # act
+        result = _format_text(errors)
+
+        # assert
+        self.assertEqual(
+            "analysis.ipynb:cell 3:2:5: error[unknown-column] Column 'wrong' not in S",
+            result,
+        )
+
+    def test_should_format_github_annotation_title_with_notebook_cell(self) -> None:
+        """Test that a notebook error's cell number is folded into the GitHub annotation title."""
+        # arrange
+        errors = [
+            {
+                "file": "analysis.ipynb",
+                "cell": 2,
+                "line": 2,
+                "col": 1,
+                "code": "unknown-column",
+                "message": "Column 'wrong' not in S",
+                "severity": "error",
+            }
+        ]
+
+        # act
+        result = _format_github(errors)
+
+        # assert
+        self.assertIn("title=unknown-column (notebook cell 2)", result)
+
+    def test_should_skip_notebook_on_runtime_error_from_check_notebook(self) -> None:
+        """Test that a RuntimeError from check_notebook is a skip, not fatal.
+
+        Covers a genuine syntax error, malformed notebook JSON, or a non-Python kernel --
+        see check_notebook in rust/src/pyapi.rs. Uses dependency injection (a fake
+        `check_notebook`) rather than patching the real Rust function.
+        """
+
+        # arrange
+        def _failing_check_notebook(_path: str, _index_bytes: bytes | None) -> str:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "nb.ipynb"
+            _write_notebook(nb_file, ["x = 1"])
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stderr", captured):
+                result = _check_notebook_file(nb_file, _failing_check_notebook, None)
+
+            # assert
+            self.assertIsNone(result)
+            self.assertIn(f"{nb_file}: skipped, boom", captured.getvalue())
+
+    def test_should_skip_notebook_on_os_error_from_check_notebook(self) -> None:
+        """Test that an OSError from check_notebook (e.g. the file can't be read) is a skip too."""
+
+        # arrange
+        def _failing_check_notebook(_path: str, _index_bytes: bytes | None) -> str:
+            msg = "permission denied"
+            raise OSError(msg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb_file = Path(tmpdir) / "nb.ipynb"
+            _write_notebook(nb_file, ["x = 1"])
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stderr", captured):
+                result = _check_notebook_file(nb_file, _failing_check_notebook, None)
+
+            # assert
+            self.assertIsNone(result)
+            self.assertIn(f"{nb_file}: skipped, permission denied", captured.getvalue())

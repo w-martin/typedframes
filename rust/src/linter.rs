@@ -18,8 +18,8 @@ use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
 use crate::typo::find_best_match;
 use crate::{ast_extract, contract, sql};
 use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
-use ruff_python_ast::{self as ast, Expr, Stmt};
-use ruff_python_parser::parse_module;
+use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
+use ruff_python_parser::{parse, parse_module, Mode, ParseOptions};
 use ruff_source_file::{LineIndex, SourceCode};
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
@@ -540,11 +540,43 @@ impl Linter {
         source: &str,
         path: &Path,
     ) -> Result<Vec<LintError>, anyhow::Error> {
+        let parsed = parse_module(source).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(self.check_parsed_module(&parsed.into_syntax(), source, path))
+    }
+
+    // Same as `check_file_internal`, but parses in Jupyter/IPython mode so magics
+    // (`%foo`) and shell escapes (`!foo`) tokenize as `Stmt::IpyEscapeCommand` nodes
+    // instead of causing a syntax error -- the AST walk below simply doesn't match
+    // that variant, so it's a no-op for schema/column tracking. `source` is expected
+    // to be a notebook's concatenated code-cell source (see `notebook.rs` and
+    // `ruff_notebook::Notebook::source_code`), not a `.ipynb` file's raw JSON.
+    pub fn check_notebook_internal(
+        &mut self,
+        source: &str,
+        path: &Path,
+    ) -> Result<Vec<LintError>, anyhow::Error> {
+        let parsed =
+            parse(source, ParseOptions::from(Mode::Ipython)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let module = parsed
+            .try_into_module()
+            .expect("Mode::Ipython always parses to a ModModule")
+            .into_syntax();
+        Ok(self.check_parsed_module(&module, source, path))
+    }
+
+    // Shared by `check_file_internal` and `check_notebook_internal`: everything
+    // after parsing succeeds -- schema/variable tracking via the AST walk, then
+    // filtering out any diagnostic whose line carries a `# typedframes: ignore`
+    // comment.
+    fn check_parsed_module(
+        &mut self,
+        module: &ModModule,
+        source: &str,
+        path: &Path,
+    ) -> Vec<LintError> {
         self.source = source.to_string();
         self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
-        let parsed = parse_module(source).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let module = parsed.into_syntax();
         self.string_var_candidates = self.collect_string_var_candidates(&module.body, path);
         let mut errors = Vec::new();
 
@@ -554,7 +586,7 @@ impl Linter {
 
         errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
 
-        Ok(errors)
+        errors
     }
 
     // Load schemas and functions from cross-file index based on import statements.
@@ -563,6 +595,38 @@ impl Linter {
         index: &ProjectIndex,
         source: &str,
         _file_path: &Path,
+        project_root: &Path,
+    ) {
+        let Ok(parsed) = parse_module(source) else {
+            return;
+        };
+        self.load_cross_file_symbols_from_module(index, &parsed.into_syntax(), project_root);
+    }
+
+    // Same as `load_cross_file_symbols`, but parses `source` in Jupyter/IPython mode
+    // -- a notebook's concatenated code-cell source may contain magics/shell escapes
+    // anywhere, which would make the strict-Python `parse_module` above fail on the
+    // WHOLE file (silently disabling cross-file symbol loading, not just for the
+    // cell containing the magic).
+    pub(crate) fn load_cross_file_symbols_notebook(
+        &mut self,
+        index: &ProjectIndex,
+        source: &str,
+        project_root: &Path,
+    ) {
+        let Ok(parsed) = parse(source, ParseOptions::from(Mode::Ipython)) else {
+            return;
+        };
+        let Some(module) = parsed.try_into_module() else {
+            return;
+        };
+        self.load_cross_file_symbols_from_module(index, &module.into_syntax(), project_root);
+    }
+
+    fn load_cross_file_symbols_from_module(
+        &mut self,
+        index: &ProjectIndex,
+        module: &ModModule,
         project_root: &Path,
     ) {
         // A function's return-type schema (or a parameter's schema annotation) may be
@@ -580,10 +644,6 @@ impl Linter {
         let all_schemas = &index.all_schemas;
         let all_schema_locations = &index.all_schema_locations;
 
-        let Ok(parsed) = parse_module(source) else {
-            return;
-        };
-        let module = parsed.into_syntax();
         for stmt in &module.body {
             let Stmt::ImportFrom(import_from) = stmt else {
                 continue;
@@ -3090,6 +3150,12 @@ impl Linter {
 
                     if is_merge_or_concat {
                         if let Some((s1, s2)) = merge_schema {
+                            // The merged/concatenated result has a fully known schema by
+                            // construction -- both inputs were already tracked DataFrames --
+                            // so it's a new, fully-typed DataFrame origin in its own right.
+                            self.dataframes_total += 1;
+                            self.dataframes_typed += 1;
+
                             // Union semantics: the result of merge/concat contains every
                             // column from both inputs.  Sort + dedup gives a stable,
                             // canonical column order and eliminates duplicates that arise
@@ -3131,6 +3197,10 @@ impl Linter {
                             let type_name = name.id.as_str();
                             if type_name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
+                                    // The constructor names the schema directly -- always
+                                    // fully typed.
+                                    self.dataframes_total += 1;
+                                    self.dataframes_typed += 1;
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3148,6 +3218,10 @@ impl Linter {
                         if let Expr::Call(inner_call) = current_expr {
                             if let Expr::Name(schema_name) = &*inner_call.func {
                                 if self.schemas.contains_key(schema_name.id.as_str()) {
+                                    // Constructed from a known schema class -- always fully
+                                    // typed, regardless of which method was chained onto it.
+                                    self.dataframes_total += 1;
+                                    self.dataframes_typed += 1;
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3210,6 +3284,14 @@ impl Linter {
             }
             Stmt::AnnAssign(ann_assign) => {
                 let (current_line, _) = self.source_location(ann_assign.range().start());
+                // An annotated assignment's schema is always fully known once resolved --
+                // there's no "partially typed" case here, unlike a load call whose columns
+                // might not parse. Both the value-side and annotation-side checks below can
+                // independently resolve the SAME variable (e.g. `df: DataFrame[S] =
+                // DataFrame[S](data)`), so track one flag and count once at the end rather
+                // than at each `self.variables.insert` site, to avoid double-counting one
+                // statement producing one DataFrame.
+                let mut schema_resolved = false;
 
                 if let Some(value) = &ann_assign.value {
                     if let Expr::Call(call) = &**value {
@@ -3223,6 +3305,7 @@ impl Linter {
                                                 target_name.id.to_string(),
                                                 (schema_name.id.to_string(), current_line),
                                             );
+                                            schema_resolved = true;
                                         }
                                     }
                                 }
@@ -3237,6 +3320,7 @@ impl Linter {
                                                 target_name.id.to_string(),
                                                 (schema_name.id.to_string(), current_line),
                                             );
+                                            schema_resolved = true;
                                         }
                                     }
                                 }
@@ -3264,6 +3348,7 @@ impl Linter {
                                             target_name.id.to_string(),
                                             (schema_name.id.to_string(), current_line),
                                         );
+                                        schema_resolved = true;
                                     }
                                 }
                             } else if name == "Annotated" {
@@ -3291,6 +3376,7 @@ impl Linter {
                                                         target_name.id.to_string(),
                                                         (schema_name.id.to_string(), current_line),
                                                     );
+                                                    schema_resolved = true;
                                                 }
                                             }
                                         }
@@ -3299,11 +3385,22 @@ impl Linter {
                             }
                         }
                     }
-                    Expr::StringLiteral(s) => {
-                        // Handle quoted type hints: df: "DataFrame[UserSchema]"
-                        self.parse_quoted_type_hint(s.value.to_str(), ann_assign, current_line);
+                    // Handle quoted type hints: df: "DataFrame[UserSchema]"
+                    Expr::StringLiteral(s)
+                        if self.parse_quoted_type_hint(
+                            s.value.to_str(),
+                            ann_assign,
+                            current_line,
+                        ) =>
+                    {
+                        schema_resolved = true;
                     }
                     _ => {}
+                }
+
+                if schema_resolved {
+                    self.dataframes_total += 1;
+                    self.dataframes_typed += 1;
                 }
 
                 self.visit_expr(&ann_assign.target, errors);
@@ -3436,12 +3533,15 @@ impl Linter {
         }
     }
 
+    // Returns whether a schema was actually resolved and attached to the target
+    // variable, so the caller (AnnAssign handling) can count it toward DataFrame
+    // schema coverage exactly once.
     fn parse_quoted_type_hint(
         &mut self,
         s: &str,
         ann_assign: &ast::StmtAnnAssign,
         current_line: usize,
-    ) {
+    ) -> bool {
         // Handle patterns like "DataFrame[Schema]"
         // and "Annotated[DataFrame, Schema]", "Annotated[pl.DataFrame, Schema]"
 
@@ -3460,10 +3560,11 @@ impl Linter {
                             target_name.id.to_string(),
                             (schema.to_string(), current_line),
                         );
+                        return true;
                     }
                 }
             }
-            return;
+            return false;
         }
 
         // Handle Annotated pattern
@@ -3480,11 +3581,13 @@ impl Linter {
                                 target_name.id.to_string(),
                                 (schema.to_string(), current_line),
                             );
+                            return true;
                         }
                     }
                 }
             }
         }
+        false
     }
 
     // Validate column access expressions against known schemas.
@@ -3662,6 +3765,144 @@ print(df["name"])
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("name"));
         assert!(errors[0].message.contains("UserSchema"));
+    }
+
+    #[test]
+    fn test_should_catch_unknown_column_via_check_notebook_internal() {
+        // Sanity check that switching the parse mode to Jupyter/IPython for notebooks
+        // doesn't change behavior on ordinary magic-free source.
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_notebook_internal(source, Path::new("nb.ipynb"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("name"));
+    }
+
+    #[test]
+    fn test_should_tolerate_line_magic_in_notebook_mode() {
+        // A bare `parse_module` (Python-only mode) would fail outright on the
+        // `%matplotlib inline` line; Jupyter/IPython mode tokenizes it as an
+        // IpyEscapeCommand statement instead, and the real error below it is still
+        // caught.
+        let source = r#"
+%matplotlib inline
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_notebook_internal(source, Path::new("nb.ipynb"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("name"));
+    }
+
+    #[test]
+    fn test_should_tolerate_shell_escape_in_notebook_mode() {
+        let source = r#"
+!pip install pandas
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_notebook_internal(source, Path::new("nb.ipynb"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_should_return_err_for_syntax_error_unrelated_to_magics_in_notebook_mode() {
+        // A genuine Python syntax error (not a magic/shell escape) must still be
+        // reported as a parse failure, same as check_file_internal would for a .py file.
+        let source = "def f(:\n    pass\n";
+        let mut linter = Linter::new();
+
+        // act
+        let result = linter.check_notebook_internal(source, Path::new("nb.ipynb"));
+
+        // assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_should_resolve_cross_file_schema_import_past_a_leading_magic() {
+        // A magic line before the `from schemas import ...` statement must not
+        // prevent cross-file symbol loading for the rest of the notebook -- this is
+        // exactly the case load_cross_file_symbols_notebook exists to handle (a plain
+        // parse_module on this source would fail outright on the magic line and
+        // silently skip cross-file resolution for the whole file).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+"#,
+        )
+        .unwrap();
+        let notebook_source = r#"
+%matplotlib inline
+from schemas import UserSchema
+
+df: DataFrame[UserSchema] = load()
+print(df["name"])
+"#;
+        let notebook_path = root.join("analysis.ipynb");
+
+        // act
+        let index = build_index_internal(root);
+        let index_bytes = rmp_serde::to_vec(&index).unwrap();
+        let index = get_cached_index(&index_bytes).unwrap();
+        let mut linter = Linter::new();
+        linter.load_cross_file_symbols_notebook(&index, notebook_source, root);
+        let errors = linter
+            .check_notebook_internal(notebook_source, &notebook_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(
+            errors[0].message.contains("user_id"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]
@@ -4027,6 +4268,182 @@ print(df["user_id"])
         // assert: `df = load_users()` resolves via the known return schema
         assert_eq!(linter.dataframes_total, 1);
         assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_annotated_assignment() {
+        // An `Annotated[pd.DataFrame, Schema]`-annotated variable has a fully known
+        // schema by construction -- the annotation IS the resolution -- so it must
+        // count toward coverage even though the RHS itself (a bare `load()` call) is
+        // not a recognized load pattern.
+        let source = r#"
+from typing import Annotated
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: Annotated[pd.DataFrame, UserSchema] = load()
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_bracket_annotated_assignment() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = load()
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_quoted_annotated_assignment() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: "DataFrame[UserSchema]" = load()
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_not_double_count_annotated_assignment_whose_value_also_resolves() {
+        // The annotation (`DataFrame[UserSchema]`) and the value
+        // (`DataFrame[UserSchema](...)` instantiation) both independently resolve the
+        // same variable's schema -- this must still count as ONE DataFrame origin, not
+        // two, since it's one statement producing one DataFrame.
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = DataFrame[UserSchema](data)
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_bracket_instantiation() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df = DataFrame[UserSchema](data)
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_schema_constructor_method_chain() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df = UserSchema().read_csv("users.csv")
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_merge_result() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+
+users: DataFrame[UserSchema] = load()
+orders: DataFrame[OrderSchema] = load()
+merged = users.merge(orders)
+print(merged["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: 2 from the annotated `users`/`orders` assignments, 1 more for `merged`
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 3);
     }
 
     #[test]

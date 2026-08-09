@@ -1135,6 +1135,8 @@ MIT License - see [LICENSE](LICENSE)
   functions and cross-file calls; schema-annotated parameters take priority over body-scanning
 - [x] SQL / data-warehouse column inference (`SELECT` list parsing across Snowflake, BigQuery, Athena, Redshift,
   Databricks, PySpark, DuckDB, SQLAlchemy Core/ORM, Feast, and T-SQL/Synapse/Fabric dialects)
+- [x] Jupyter notebook (`.ipynb`) checking — code cells are checked directly, with errors reported as
+  `notebook.ipynb:cell N:line:col`
 
 **Planned:**
 

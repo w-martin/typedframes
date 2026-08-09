@@ -30,16 +30,16 @@ all = { level = "deny", priority = -1 }
 unwrap_used = "warn"
 
 [dependencies]
-ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }
-ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }
-ruff_source_file = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }
-ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }
-ruff_notebook = { git = "https://github.com/astral-sh/ruff", tag = "0.15.0" }
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_source_file = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_notebook = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rmp-serde = "1"
 anyhow = "1.0"
-toml = "0.8"
+toml = "1.1"
 sqlparser = "0.62"
 # `extension-module` is deliberately NOT enabled here. maturin turns it on for the
 # builds that need it (`features = ["pyo3/extension-module"]` in pyproject.toml), and
@@ -53,7 +53,7 @@ pyo3 = { version = "0.29", features = ["abi3-py311"] }
 
 [dev-dependencies]
 tempfile = "3.8"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "parser_bench"

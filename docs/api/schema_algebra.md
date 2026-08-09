@@ -8,16 +8,20 @@ for join results, enriched views, or any DataFrame that combines columns from mu
 ```python
 from typedframes import BaseSchema, Column
 
+
 class OrderSchema(BaseSchema):
-    order_id   = Column(type=int)
-    amount     = Column(type=float)
+    order_id = Column(type=int)
+    amount = Column(type=float)
+
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
-    name        = Column(type=str)
+    name = Column(type=str)
+
 
 class ReportSchema(OrderSchema, CustomerSchema):
     """Inherits all columns from both parents."""
+
     region = Column(type=str)  # add extra columns
 ```
 
@@ -45,11 +49,9 @@ import pandas as pd
 
 JoinedSchema = OrderSchema + CustomerSchema
 
-left:   Annotated[pd.DataFrame, OrderSchema]   = pd.read_csv("orders.csv")
-right:  Annotated[pd.DataFrame, CustomerSchema] = pd.read_csv("customers.csv")
-merged: Annotated[pd.DataFrame, JoinedSchema]  = left.merge(
-    right, on=OrderSchema.order_id.s
-)
+left: Annotated[pd.DataFrame, OrderSchema] = pd.read_csv("orders.csv")
+right: Annotated[pd.DataFrame, CustomerSchema] = pd.read_csv("customers.csv")
+merged: Annotated[pd.DataFrame, JoinedSchema] = left.merge(right, on=OrderSchema.order_id.s)
 ```
 
 ---

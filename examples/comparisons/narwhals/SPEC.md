@@ -86,8 +86,10 @@ class OrderSchema(BaseSchema):
     customer_name = Column(type=str)
     total = Column(type=float)
 
+
 # Narwhals handles backend portability
 import narwhals as nw
+
 
 def process(df: Annotated[nw.DataFrame, OrderSchema]) -> nw.DataFrame:
     # Typedframes catches column errors before runtime

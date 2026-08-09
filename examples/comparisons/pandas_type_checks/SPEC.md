@@ -62,9 +62,11 @@ from typing import Annotated
 import pandas as pd
 from typedframes import BaseSchema, Column
 
+
 class OrderSchema(BaseSchema):
     order_id = Column(type=int)
     customer_name = Column(type=str)
+
 
 def process_orders(orders: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
     orders_checked: Annotated[pd.DataFrame, OrderSchema] = orders

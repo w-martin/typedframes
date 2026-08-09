@@ -84,13 +84,15 @@ from typing import Annotated
 import pandas as pd
 from typedframes import BaseSchema, Column
 
+
 class OrderSchema(BaseSchema):
     order_id = Column(type=int)
     customer_name = Column(type=str)
 
+
 def process(df: Annotated[pd.DataFrame, OrderSchema]) -> None:
     # Caught by mypy plugin ✅
-    df['custmer_name']  # ERROR: did you mean 'customer_name'?
+    df["custmer_name"]  # ERROR: did you mean 'customer_name'?
 ```
 
 ### With StaticFrame:
@@ -98,10 +100,11 @@ def process(df: Annotated[pd.DataFrame, OrderSchema]) -> None:
 ```python
 import static_frame as sf
 
+
 def process(frame: sf.Frame) -> None:
     # NOT caught by mypy ❌
     # Column names are runtime strings, not statically typed
-    frame['custmer_name']  # Runtime KeyError, not type error
+    frame["custmer_name"]  # Runtime KeyError, not type error
 ```
 
 ---
@@ -189,7 +192,7 @@ d_checker_demo.py:41:15: error[unknown-column] Column 'revenue' does not exist i
 
 ```python
 df_annot: Annotated[pd.DataFrame, OrderSchema] = df  # Triggers checker
-result = df_annot['custmer_name']  # ERROR: detected
+result = df_annot["custmer_name"]  # ERROR: detected
 ```
 
 ---

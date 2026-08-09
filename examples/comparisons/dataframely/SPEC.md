@@ -46,10 +46,12 @@ class OrderSchema(dy.Schema):
     customer_name = dy.String()
     # ...
 
+
 def process(df: dy.DataFrame[OrderSchema]) -> None:
-    x = df["custmer_name"]   # TYPO — mypy is SILENT
-    y = df["unit_cost"]      # WRONG NAME — mypy is SILENT
+    x = df["custmer_name"]  # TYPO — mypy is SILENT
+    y = df["unit_cost"]  # WRONG NAME — mypy is SILENT
     z = df["customer_name"]  # CORRECT — not validated by mypy
+
 
 def wrong_schema(df: dy.DataFrame[OtherSchema]) -> None:
     process(df)  # mypy CATCHES THIS (generic parameter mismatch)
@@ -76,11 +78,12 @@ class OrderSchema(BaseSchema):
     unit_price = Column(type=float)
     # ...
 
+
 def process_orders_with_typos() -> None:
     df: Annotated[pl.DataFrame, OrderSchema] = pl.DataFrame({...})
 
-    x = df["custmer_name"]   # TYPO — caught by plugin
-    y = df["unit_cost"]      # WRONG — caught by plugin
+    x = df["custmer_name"]  # TYPO — caught by plugin
+    y = df["unit_cost"]  # WRONG — caught by plugin
 ```
 
 **Mypy output** (with typedframes plugin):

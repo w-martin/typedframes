@@ -18,6 +18,7 @@ class OrderModel(pt.Model):
     order_id: int
     customer_name: str
 
+
 df = pl.DataFrame({...})
 validated = OrderModel.validate(df)  # Raises DataFrameValidationError if invalid
 ```
@@ -34,8 +35,8 @@ validated = OrderModel.validate(df)  # Raises DataFrameValidationError if invali
 Example of missed errors:
 ```python
 validated = OrderModel.validate(df)
-x = validated["custmer_name"]   # Typo — mypy says nothing
-y = validated["unit_cost"]      # Wrong column — mypy says nothing
+x = validated["custmer_name"]  # Typo — mypy says nothing
+y = validated["unit_cost"]  # Wrong column — mypy says nothing
 ```
 
 ## Comparison with typedframes

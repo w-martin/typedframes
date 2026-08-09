@@ -298,9 +298,7 @@ def _pattern_specificity(pattern: str) -> tuple[int, int, str]:
     return (len(literal_prefix), len(pattern), pattern)
 
 
-def _collect_files_with_suffix(
-    path: Path, suffix: str, configured_excludes: frozenset[str] | None
-) -> list[Path]:
+def _collect_files_with_suffix(path: Path, suffix: str, configured_excludes: frozenset[str] | None) -> list[Path]:
     """Collect all files with the given suffix from a path (file or directory).
 
     Prunes descent into vendored/VCS/cache directories: `configured_excludes` (see

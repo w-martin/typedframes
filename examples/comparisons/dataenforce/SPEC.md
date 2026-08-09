@@ -32,6 +32,7 @@
 ```python
 from dataenforce import Dataset, validate
 
+
 @validate
 def process_orders(df: Dataset["order_id":int, "customer_name":str]):
     return df["customer_name"]
@@ -46,9 +47,11 @@ from typing import Annotated
 import pandas as pd
 from typedframes import BaseSchema, Column
 
+
 class OrderSchema(BaseSchema):
     order_id = Column(type=int)
     customer_name = Column(type=str)
+
 
 def process_orders(df: Annotated[pd.DataFrame, OrderSchema]) -> pd.Series:
     return df["customer_name"]

@@ -26,7 +26,7 @@ typedframes check src/
 import pandas as pd
 
 orders = pd.read_csv("orders.csv", usecols=["order_id", "amount", "status"])
-print(orders["amount"])   # ✓ OK
+print(orders["amount"])  # ✓ OK
 print(orders["revenue"])  # ✗ unknown-column — 'revenue' not in inferred set
 ```
 
@@ -58,9 +58,9 @@ from typedframes import BaseSchema, Column
 
 
 class OrderSchema(BaseSchema):
-    order_id   = Column(type=int)
-    amount     = Column(type=float)
-    status     = Column(type=str)
+    order_id = Column(type=int)
+    amount = Column(type=float)
+    status = Column(type=str)
 
 
 def load_orders(path: str) -> Annotated[pd.DataFrame, OrderSchema]:
@@ -82,12 +82,12 @@ from typedframes import BaseSchema, Column
 
 class UserSchema(BaseSchema):
     user_id = Column(type=int)
-    email   = Column(type=str)
-    region  = Column(type=str)
+    email = Column(type=str)
+    region = Column(type=str)
 
 
 df: Annotated[pd.DataFrame, UserSchema] = pd.read_csv("users.csv")
-print(df["user_id"])   # ✓ validated by checker
+print(df["user_id"])  # ✓ validated by checker
 print(df["username"])  # ✗ unknown-column: 'username' not in UserSchema
 
 # Refactor-safe access via .s descriptor (returns the column name as str)
@@ -103,12 +103,12 @@ The checker tracks schema through method chains:
 # rename — checker updates the column set
 renamed = df.rename(columns={"region": "country"})
 print(renamed["country"])  # ✓ OK — renamed
-print(renamed["region"])   # ✗ unknown-column — renamed to 'country'
+print(renamed["region"])  # ✗ unknown-column — renamed to 'country'
 
 # drop — checker removes the column
 slim = df.drop(columns=["region"])
-print(slim["user_id"])     # ✓ OK
-print(slim["region"])      # ✗ unknown-column — was dropped
+print(slim["user_id"])  # ✓ OK
+print(slim["region"])  # ✗ unknown-column — was dropped
 
 # assign — checker adds the new column
 enriched = df.assign(domain=df["email"].str.split("@").str[1])
@@ -166,20 +166,20 @@ from typedframes import BaseSchema, Column
 
 
 class EventSchema(BaseSchema):
-    event_id  = Column(type=int)
-    user_id   = Column(type=int)
+    event_id = Column(type=int)
+    user_id = Column(type=int)
     timestamp = Column(type=str)
 
 
 df: Annotated[pl.DataFrame, EventSchema] = pl.read_csv("events.csv")
 
 # Subscript access — validated
-print(df["event_id"])   # ✓ OK
-print(df["typo"])        # ✗ unknown-column
+print(df["event_id"])  # ✓ OK
+print(df["typo"])  # ✗ unknown-column
 
 # pl.col() references — also validated
-df.select(pl.col("event_id"))           # ✓ OK
-df.filter(pl.col("typo").is_not_null()) # ✗ unknown-column
+df.select(pl.col("event_id"))  # ✓ OK
+df.filter(pl.col("typo").is_not_null())  # ✗ unknown-column
 
 # Descriptor .col access — refactor-safe polars expressions
 df.filter(EventSchema.user_id.col > 100)
@@ -193,17 +193,21 @@ Build merged schemas for joins using inheritance or the `+` operator:
 ```python
 from typedframes import BaseSchema, Column, combine_schemas
 
+
 class OrderSchema(BaseSchema):
-    order_id   = Column(type=int)
-    amount     = Column(type=float)
+    order_id = Column(type=int)
+    amount = Column(type=float)
+
 
 class CustomerSchema(BaseSchema):
     customer_id = Column(type=int)
-    name        = Column(type=str)
+    name = Column(type=str)
+
 
 # Multiple inheritance
 class ReportSchema(OrderSchema, CustomerSchema):
     region = Column(type=str)
+
 
 # Or use the + operator
 ReportSchema = OrderSchema + CustomerSchema
@@ -260,6 +264,7 @@ needs, not just the ones its body happens to subscript directly.
 from typing import Annotated
 import pandas as pd
 
+
 def contact_label(customers: Annotated[pd.DataFrame, CustomerSchema]):
     print(customers["name"])
     # 'email' is declared on CustomerSchema but never subscripted here directly —
@@ -278,13 +283,16 @@ def preprocess(df):
     x = df["a"]
     return df
 
+
 def enrich(df):
     y = df["b"]
     return df
 
+
 def finalize(df):
     z = df["c"]
     return df
+
 
 def transform(df):
     step1 = preprocess(df)
@@ -551,7 +559,7 @@ def load_feature(store, entity_df, feature_names: list[str]):
 from feast_helpers import load_feature
 
 load_feature(store, entity_df, ["driver_stats:conv_rate"])  # ✓ OK -- resolved cleanly here
-load_feature(store, entity_df, ["driver_stats:acc_rate"])   # ✗ unknown-column, reported HERE
+load_feature(store, entity_df, ["driver_stats:acc_rate"])  # ✗ unknown-column, reported HERE
 ```
 
 Both calls run the exact same `print(df["conv_rate"])` line inside `load_feature` — but
@@ -583,11 +591,13 @@ to put it.
 The literal doesn't have to be written out at the call site itself, either:
 
 ```python
-def get_conv_rate_features():        # zero-arg, returns the literal directly
+def get_conv_rate_features():  # zero-arg, returns the literal directly
     return ["driver_stats:conv_rate"]
 
-def get_conv_rate_features_via():    # zero-arg, just forwards to the one above
+
+def get_conv_rate_features_via():  # zero-arg, just forwards to the one above
     return get_conv_rate_features()
+
 
 load_feature(store, entity_df, get_conv_rate_features_via())  # ✓ OK -- resolved through 2 hops
 ```
@@ -601,13 +611,14 @@ zero-arg forwarding, either — a **literal argument** passed to the helper is
 substituted for the helper's own parameter and carried into its return expression:
 
 ```python
-def get_features(prefix: str):       # takes a real argument
-    return [f"{prefix}:conv_rate"]   # builds its return value with an f-string
+def get_features(prefix: str):  # takes a real argument
+    return [f"{prefix}:conv_rate"]  # builds its return value with an f-string
+
 
 load_feature(store, entity_df, get_features("driver_stats"))  # ✓ OK -- "driver_stats"
-                                                                #    substituted for
-                                                                #    `prefix`, f-string
-                                                                #    evaluated with it
+#    substituted for
+#    `prefix`, f-string
+#    evaluated with it
 ```
 
 The literal has to actually reach the helper as a literal, though — a call site
@@ -639,7 +650,7 @@ than a `usecols=`/`columns=` kwarg:
 ```python
 df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
 print(df["order_id"])  # OK
-print(df["revenue"])   # unknown-column: not in {order_id, amount}
+print(df["revenue"])  # unknown-column: not in {order_id, amount}
 ```
 
 The query text is also traced back through a variable assigned exactly once

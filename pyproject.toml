@@ -87,6 +87,7 @@ ignore = [
     "PT027",  # Using unittest.TestCase
     "PLC0415",  # Lazy imports for optional dependencies (polars/pandas)
     "ANN401",  # Any needed for pandas compatibility and Python protocols
+    "CPY001", # Project does not use copyright header notices
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -117,34 +118,34 @@ convention = "google"
 
 [dependency-groups]
 docs = [
-    "mkdocs-material>=9.5",
-    "mkdocstrings-python>=1.10",
+    "mkdocs-material>=9.7.7",
+    "mkdocstrings-python>=2.0.5",
 ]
 dev = [
-    "pandas>=3.0.1",
-    "pandera>=0.29.0",
-    "pip-audit>=2.7",
-    "polars>=1.38.1",
-    "bandit>=1.9.3",
-    "complexipy>=5.2.0",
+    "pandas>=3.0.5",
+    "pandera>=0.32.1",
+    "pip-audit>=2.10.1",
+    "polars>=1.43.2",
+    "bandit>=1.9.4",
+    "complexipy>=6.2.0",
     "coverage-threshold>=0.6.2",
-    "invoke>=2.2.1",
+    "invoke>=3.0.3",
     "licensecheck>=2025.1.0",
-    "maturin>=1.11.5",
-    "pre-commit>=4.5.1",
-    "pyrefly>=0.54.0",
-    "pyright>=1.1.408",
-    "pytest>=9.0.2",
-    "pytest-cov>=7.0.0",
+    "maturin>=1.14.1",
+    "pre-commit>=4.6.1",
+    "pyrefly>=1.2.0",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "pytest-xdist>=3.8.0",
-    "ruff>=0.15.0",
-    "ty>=0.0.19",
+    "ruff>=0.16.2",
+    "ty>=0.0.69",
     "openpyxl>=3.1.5",
-    "pyarrow>=23.0.0",
+    "pyarrow>=25.0.0",
     "xlsxwriter>=3.2.9",
-    "fastexcel>=0.19.0",
-    "pandas-stubs>=3.0.0.260204",
-    "mypy>=1.19.1",
+    "fastexcel>=0.20.2",
+    "pandas-stubs>=3.0.5.260730",
+    "mypy>=2.3.0",
 ]
 
 [tool.bandit]

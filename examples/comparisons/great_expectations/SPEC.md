@@ -65,12 +65,15 @@ from typing import Annotated
 import pandas as pd
 from typedframes import BaseSchema, Column
 
+
 class AgeSchema(BaseSchema):
     age = Column(type=int)
+
 
 def get_age(df: Annotated[pd.DataFrame, AgeSchema]) -> pd.Series:
     return df["age"]  # OK
     return df["agee"]  # mypy ERROR: typo caught at lint time
+
 
 # typedframes catches this before code runs
 ```

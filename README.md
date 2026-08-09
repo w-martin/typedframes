@@ -27,8 +27,8 @@ class UserData(BaseSchema):
 
 
 df: Annotated[pd.DataFrame, UserData] = pd.read_csv("users.csv")
-df['user_id']    # ✓ Validated by checker
-df['username']   # ✗ unknown-column: Column 'username' not in UserData
+df["user_id"]  # ✓ Validated by checker
+df["username"]  # ✗ unknown-column: Column 'username' not in UserData
 ```
 
 **Descriptors as a bridge:** define once in `Column(type=int)`, access as `df[UserData.user_id.s]` (pandas string
@@ -100,7 +100,7 @@ import pandas as pd
 
 # Checker infers {order_id, amount, status} from usecols=
 orders = pd.read_csv("orders.csv", usecols=["order_id", "amount", "status"])
-print(orders["amount"])   # ✓ OK
+print(orders["amount"])  # ✓ OK
 print(orders["revenue"])  # ✗ unknown-column — 'revenue' not in inferred set
 ```
 
@@ -141,17 +141,17 @@ import pandas as pd
 df: Annotated[pd.DataFrame, SalesData] = pd.read_csv("sales.csv")
 
 # String access — validated by the standalone checker
-print(df['revenue'].sum())
-print(df['profit'])  # ✗ unknown-column: Column 'profit' not in SalesData
+print(df["revenue"].sum())
+print(df["profit"])  # ✗ unknown-column: Column 'profit' not in SalesData
 
 # .s gives a refactor-safe string name from the descriptor
-print(df[SalesData.revenue.s].sum())   # same as df['revenue'].sum()
+print(df[SalesData.revenue.s].sum())  # same as df['revenue'].sum()
 
 
 # Type-safe function signature
 def analyze(data: Annotated[pd.DataFrame, SalesData]) -> float:
-    data['revenue']  # ✓ Validated by checker
-    data['profit']   # ✗ unknown-column: 'profit' not in SalesData
+    data["revenue"]  # ✓ Validated by checker
+    data["profit"]  # ✗ unknown-column: 'profit' not in SalesData
     return data[SalesData.revenue.s].mean()
 ```
 
@@ -165,12 +165,12 @@ import polars as pl
 df: Annotated[pl.DataFrame, SalesData] = pl.read_csv("sales.csv")
 
 # pl.col() references are now validated by the standalone checker
-print(df.filter(pl.col('revenue') > 1000))
-print(df.select(pl.col('profit')))  # ✗ unknown-column: Column 'profit' not in SalesData
+print(df.filter(pl.col("revenue") > 1000))
+print(df.select(pl.col("profit")))  # ✗ unknown-column: Column 'profit' not in SalesData
 
 # .col gives a refactor-safe polars expression from the descriptor
 filtered = df.filter(SalesData.revenue.col > 1000)
-grouped = df.group_by('customer_id').agg(SalesData.revenue.col.sum())
+grouped = df.group_by("customer_id").agg(SalesData.revenue.col.sum())
 ```
 
 ---
@@ -190,7 +190,7 @@ and validates all subscript access against it — no schema annotation required:
 ```python
 # Checker infers {user_id, email} from usecols= — no annotation needed
 df = pd.read_csv("users.csv", usecols=["user_id", "email"])
-print(df["user_id"])   # ✓ OK — in usecols
+print(df["user_id"])  # ✓ OK — in usecols
 # print(df["age"])     # ✗ Error: 'age' not in inferred column set
 ```
 
@@ -200,6 +200,7 @@ unchanged. Structural operations update it:
 
 ```python
 from typing import Annotated
+
 df: Annotated[pd.DataFrame, UserData] = pd.read_csv("users.csv")
 
 # Subscript slice — inferred column set {user_id, email}
@@ -245,6 +246,7 @@ df = pd.read_csv("users.csv")
 Fix option 1 — annotate with a schema:
 ```python
 from typing import Annotated
+
 df: Annotated[pd.DataFrame, UserData] = pd.read_csv("users.csv")
 ```
 
@@ -259,6 +261,7 @@ Emitted when `drop(columns=[...])` names a column that isn't in the inferred set
 
 ```python
 from typing import Annotated
+
 df: Annotated[pd.DataFrame, UserData] = pd.read_csv("users.csv")
 trimmed = df.drop(columns=["nonexistent"])
 # ⚠ dropped-unknown-column: Dropped column 'nonexistent' does not exist in UserData
@@ -588,12 +591,12 @@ class UserData(BaseSchema):
 
 # Pandas pipeline - type checker knows pandas methods
 def pandas_analyze(df: Annotated[pd.DataFrame, UserData]) -> Annotated[pd.DataFrame, UserData]:
-    return df[df['user_id'] > 100]  # ✓ Pandas syntax
+    return df[df["user_id"] > 100]  # ✓ Pandas syntax
 
 
 # Polars pipeline - type checker knows polars methods
 def polars_analyze(df: Annotated[pl.DataFrame, UserData]) -> Annotated[pl.DataFrame, UserData]:
-    return df.filter(pl.col('user_id') > 100)  # ✓ Polars syntax
+    return df.filter(pl.col("user_id") > 100)  # ✓ Polars syntax
 
 
 # Use native types throughout
@@ -633,7 +636,7 @@ class OrderSchema(BaseSchema):
 
 # Schema preserved through filtering
 def get_active_users(df: Annotated[pd.DataFrame, UserSchema]) -> Annotated[pd.DataFrame, UserSchema]:
-    return df[df['user_id'] > 100]  # ✓ Validated by checker
+    return df[df["user_id"] > 100]  # ✓ Validated by checker
 
 
 # Schema preserved through merges
@@ -650,7 +653,7 @@ import polars as pl
 
 # Schema columns work in filter expressions
 def filter_users(df: Annotated[pl.DataFrame, UserSchema]) -> pl.DataFrame:
-    return df.filter(pl.col('user_id') > 100)
+    return df.filter(pl.col("user_id") > 100)
 
 
 # Schema columns work in join expressions
@@ -689,7 +692,7 @@ class SensorReadings(BaseSchema):
 
 
 df: Annotated[pd.DataFrame, SensorReadings] = pd.read_csv("readings.csv")
-df[SensorReadings.sensors.s].mean()    # ✓ Expands to df[["sensor_1", "sensor_2", "sensor_3"]].mean()
+df[SensorReadings.sensors.s].mean()  # ✓ Expands to df[["sensor_1", "sensor_2", "sensor_3"]].mean()
 ```
 
 For logical grouping across multiple ColumnSets:
@@ -740,6 +743,7 @@ class Orders(BaseSchema):
 # Combine via multiple inheritance
 class UserOrders(UserPublic, Orders):
     """Type checkers see all columns from both parents."""
+
     ...
 
 
@@ -894,9 +898,9 @@ import pandas as pd
 
 
 class UserData(BaseSchema):
-  user_id = Column(type=int)
-  email = Column(type=str)
-  age = Column(type=int, nullable=True)
+    user_id = Column(type=int)
+    email = Column(type=str)
+    age = Column(type=int, nullable=True)
 
 
 # Convert to pandera schema
@@ -934,7 +938,7 @@ class Orders(BaseSchema):
 
 
 def calculate_revenue(orders: Annotated[pd.DataFrame, Orders]) -> float:
-    return orders['total'].sum()
+    return orders["total"].sum()
 
 
 df: Annotated[pd.DataFrame, Orders] = pd.read_csv("orders.csv")
@@ -986,11 +990,17 @@ class AggregatedSales(BaseSchema):
 
 
 def aggregate_daily(df: Annotated[pd.DataFrame, RawSales]) -> Annotated[pd.DataFrame, AggregatedSales]:
-    result = df.groupby(RawSales.date.s).agg({
-        RawSales.price.s: 'sum',
-        RawSales.quantity.s: 'sum',
-    }).reset_index()
-    result.columns = pd.Index(['date', 'total_revenue', 'total_quantity'])
+    result = (
+        df.groupby(RawSales.date.s)
+        .agg(
+            {
+                RawSales.price.s: "sum",
+                RawSales.quantity.s: "sum",
+            }
+        )
+        .reset_index()
+    )
+    result.columns = pd.Index(["date", "total_revenue", "total_quantity"])
     return result  # type: ignore[return-value]
 
 
@@ -1001,8 +1011,8 @@ aggregated = aggregate_daily(raw)
 
 # Type checker validates schema transformations
 def analyze(df: Annotated[pd.DataFrame, AggregatedSales]) -> float:
-    df['total_revenue']  # ✓ OK
-    df['price']          # ✗ Error: 'price' not in AggregatedSales
+    df["total_revenue"]  # ✓ OK
+    df["price"]  # ✗ Error: 'price' not in AggregatedSales
     return df[AggregatedSales.total_revenue.s].mean()
 ```
 
@@ -1021,11 +1031,7 @@ class LargeDataset(BaseSchema):
 
 
 def efficient_aggregation(df: Annotated[pl.DataFrame, LargeDataset]) -> pl.DataFrame:
-    return (
-        df.filter(pl.col('value') > 100)
-        .group_by('category')
-        .agg(pl.col('value').mean())
-    )
+    return df.filter(pl.col("value") > 100).group_by("category").agg(pl.col("value").mean())
 
 
 # Polars handles large files efficiently
@@ -1077,6 +1083,7 @@ However, abstraction layers don't provide column-level type safety:
 ```python
 import narwhals as nw
 
+
 def process(df: nw.DataFrame) -> nw.DataFrame:
     # No static checking - "revenue" typo won't be caught until runtime
     return df.filter(nw.col("revnue") > 100)  # Typo: "revnue" vs "revenue"
@@ -1091,11 +1098,13 @@ from typing import Annotated
 import polars as pl
 from typedframes import BaseSchema, Column
 
+
 class SalesData(BaseSchema):
     revenue = Column(type=float)
 
+
 def process(df: Annotated[pl.DataFrame, SalesData]) -> pl.DataFrame:
-    return df.filter(pl.col('revnue') > 100)  # ✗ Error at lint-time: 'revnue' not in SalesData
+    return df.filter(pl.col("revnue") > 100)  # ✗ Error at lint-time: 'revnue' not in SalesData
 ```
 
 **Use narwhals when:** You're writing a library that needs to work with multiple DataFrame backends.

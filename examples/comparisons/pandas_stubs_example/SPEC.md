@@ -34,8 +34,8 @@ Success: no issues found in 1 source file
 However, at runtime:
 
 ```python
-y = df["custmer_name"]        # TYPO: missing 'o'
-z = df["unit_cost"]           # WRONG NAME (should be unit_price)
+y = df["custmer_name"]  # TYPO: missing 'o'
+z = df["unit_cost"]  # WRONG NAME (should be unit_price)
 w = df["completely_made_up"]  # NONEXISTENT COLUMN
 ```
 

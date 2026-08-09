@@ -11,17 +11,19 @@ from typing import Annotated
 import polars as pl
 from typedframes import BaseSchema, Column
 
+
 class EventSchema(BaseSchema):
-    event_id  = Column(type=int)
-    user_id   = Column(type=int)
+    event_id = Column(type=int)
+    user_id = Column(type=int)
     timestamp = Column(type=str)
+
 
 df: Annotated[pl.DataFrame, EventSchema] = pl.read_csv("events.csv")
 
 # Native polars — both forms validated by checker
-print(df.select(pl.col("event_id")))             # ✓ pl.col() validated
+print(df.select(pl.col("event_id")))  # ✓ pl.col() validated
 print(df.filter(pl.col("timestamp").is_not_null()))  # ✓ pl.col() in filter
-print(df.select(pl.col("typo")))                  # ✗ unknown-column — 'typo' not in EventSchema
+print(df.select(pl.col("typo")))  # ✗ unknown-column — 'typo' not in EventSchema
 
 # Descriptor access — refactor-safe polars expressions
 df.select(EventSchema.event_id.col, EventSchema.user_id.col)
@@ -47,8 +49,10 @@ df.filter(EventSchema.user_id.col > 100)
 from typedframes.polars import PolarsFrame
 from typedframes import BaseSchema, Column
 
+
 class EventSchema(BaseSchema):
     event_id = Column(type=int)
+
 
 # Deprecated -- emits a DeprecationWarning; prefer Annotated[pl.DataFrame, Schema]
 df: PolarsFrame[EventSchema] = pl.read_csv("events.csv")

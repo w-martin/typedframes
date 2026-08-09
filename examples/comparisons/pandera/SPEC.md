@@ -22,8 +22,8 @@ Pandera allows defining reusable schemas for DataFrame validation:
 
 ✅ **Wrong schema type passed to function**
 ```python
-def process_orders(df: DataFrame[OrderSchema]) -> pd.Series:
-    ...
+def process_orders(df: DataFrame[OrderSchema]) -> pd.Series: ...
+
 
 wrong_df: DataFrame[WrongSchema] = ...
 process_orders(wrong_df)  # ✅ mypy CATCHES this

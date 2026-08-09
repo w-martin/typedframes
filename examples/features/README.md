@@ -123,9 +123,13 @@ convention `ruff_notebook`'s own `NotebookIndex` uses — so a code cell's numbe
 position in the notebook, not "the Nth code cell".
 
 This notebook defines a schema and a valid `orders` DataFrame, uses an IPython magic
-alongside real code to show it's tolerated, then ends with one intentional bug —
-`orders["revenue"]` where the real column is `amount` — left unexecuted since running it
-would raise `KeyError`.
+alongside real code to show it's tolerated, then demonstrates every diagnostic severity
+the checker produces: an `untracked-dataframe` warning (`pd.read_csv(...)` with no
+`usecols=`/schema), a `dropped-unknown-column` warning (`drop(columns=[...])` naming a
+column `Orders` doesn't have), and finally an `unknown-column` error
+(`orders["revenue"]`, where the real column is `amount`). The three flagged cells are
+left unexecuted, since running any of them would raise at runtime — that's the whole
+point: the checker catches all three without running anything.
 
 ```shell
 uv run typedframes check ipynb_example.ipynb

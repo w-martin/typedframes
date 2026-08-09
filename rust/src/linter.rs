@@ -3150,6 +3150,12 @@ impl Linter {
 
                     if is_merge_or_concat {
                         if let Some((s1, s2)) = merge_schema {
+                            // The merged/concatenated result has a fully known schema by
+                            // construction -- both inputs were already tracked DataFrames --
+                            // so it's a new, fully-typed DataFrame origin in its own right.
+                            self.dataframes_total += 1;
+                            self.dataframes_typed += 1;
+
                             // Union semantics: the result of merge/concat contains every
                             // column from both inputs.  Sort + dedup gives a stable,
                             // canonical column order and eliminates duplicates that arise
@@ -3191,6 +3197,10 @@ impl Linter {
                             let type_name = name.id.as_str();
                             if type_name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
+                                    // The constructor names the schema directly -- always
+                                    // fully typed.
+                                    self.dataframes_total += 1;
+                                    self.dataframes_typed += 1;
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3208,6 +3218,10 @@ impl Linter {
                         if let Expr::Call(inner_call) = current_expr {
                             if let Expr::Name(schema_name) = &*inner_call.func {
                                 if self.schemas.contains_key(schema_name.id.as_str()) {
+                                    // Constructed from a known schema class -- always fully
+                                    // typed, regardless of which method was chained onto it.
+                                    self.dataframes_total += 1;
+                                    self.dataframes_typed += 1;
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3270,6 +3284,14 @@ impl Linter {
             }
             Stmt::AnnAssign(ann_assign) => {
                 let (current_line, _) = self.source_location(ann_assign.range().start());
+                // An annotated assignment's schema is always fully known once resolved --
+                // there's no "partially typed" case here, unlike a load call whose columns
+                // might not parse. Both the value-side and annotation-side checks below can
+                // independently resolve the SAME variable (e.g. `df: DataFrame[S] =
+                // DataFrame[S](data)`), so track one flag and count once at the end rather
+                // than at each `self.variables.insert` site, to avoid double-counting one
+                // statement producing one DataFrame.
+                let mut schema_resolved = false;
 
                 if let Some(value) = &ann_assign.value {
                     if let Expr::Call(call) = &**value {
@@ -3283,6 +3305,7 @@ impl Linter {
                                                 target_name.id.to_string(),
                                                 (schema_name.id.to_string(), current_line),
                                             );
+                                            schema_resolved = true;
                                         }
                                     }
                                 }
@@ -3297,6 +3320,7 @@ impl Linter {
                                                 target_name.id.to_string(),
                                                 (schema_name.id.to_string(), current_line),
                                             );
+                                            schema_resolved = true;
                                         }
                                     }
                                 }
@@ -3324,6 +3348,7 @@ impl Linter {
                                             target_name.id.to_string(),
                                             (schema_name.id.to_string(), current_line),
                                         );
+                                        schema_resolved = true;
                                     }
                                 }
                             } else if name == "Annotated" {
@@ -3351,6 +3376,7 @@ impl Linter {
                                                         target_name.id.to_string(),
                                                         (schema_name.id.to_string(), current_line),
                                                     );
+                                                    schema_resolved = true;
                                                 }
                                             }
                                         }
@@ -3359,11 +3385,22 @@ impl Linter {
                             }
                         }
                     }
-                    Expr::StringLiteral(s) => {
-                        // Handle quoted type hints: df: "DataFrame[UserSchema]"
-                        self.parse_quoted_type_hint(s.value.to_str(), ann_assign, current_line);
+                    // Handle quoted type hints: df: "DataFrame[UserSchema]"
+                    Expr::StringLiteral(s)
+                        if self.parse_quoted_type_hint(
+                            s.value.to_str(),
+                            ann_assign,
+                            current_line,
+                        ) =>
+                    {
+                        schema_resolved = true;
                     }
                     _ => {}
+                }
+
+                if schema_resolved {
+                    self.dataframes_total += 1;
+                    self.dataframes_typed += 1;
                 }
 
                 self.visit_expr(&ann_assign.target, errors);
@@ -3496,12 +3533,15 @@ impl Linter {
         }
     }
 
+    // Returns whether a schema was actually resolved and attached to the target
+    // variable, so the caller (AnnAssign handling) can count it toward DataFrame
+    // schema coverage exactly once.
     fn parse_quoted_type_hint(
         &mut self,
         s: &str,
         ann_assign: &ast::StmtAnnAssign,
         current_line: usize,
-    ) {
+    ) -> bool {
         // Handle patterns like "DataFrame[Schema]"
         // and "Annotated[DataFrame, Schema]", "Annotated[pl.DataFrame, Schema]"
 
@@ -3520,10 +3560,11 @@ impl Linter {
                             target_name.id.to_string(),
                             (schema.to_string(), current_line),
                         );
+                        return true;
                     }
                 }
             }
-            return;
+            return false;
         }
 
         // Handle Annotated pattern
@@ -3540,11 +3581,13 @@ impl Linter {
                                 target_name.id.to_string(),
                                 (schema.to_string(), current_line),
                             );
+                            return true;
                         }
                     }
                 }
             }
         }
+        false
     }
 
     // Validate column access expressions against known schemas.
@@ -4225,6 +4268,182 @@ print(df["user_id"])
         // assert: `df = load_users()` resolves via the known return schema
         assert_eq!(linter.dataframes_total, 1);
         assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_annotated_assignment() {
+        // An `Annotated[pd.DataFrame, Schema]`-annotated variable has a fully known
+        // schema by construction -- the annotation IS the resolution -- so it must
+        // count toward coverage even though the RHS itself (a bare `load()` call) is
+        // not a recognized load pattern.
+        let source = r#"
+from typing import Annotated
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: Annotated[pd.DataFrame, UserSchema] = load()
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_bracket_annotated_assignment() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = load()
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_quoted_annotated_assignment() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: "DataFrame[UserSchema]" = load()
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_not_double_count_annotated_assignment_whose_value_also_resolves() {
+        // The annotation (`DataFrame[UserSchema]`) and the value
+        // (`DataFrame[UserSchema](...)` instantiation) both independently resolve the
+        // same variable's schema -- this must still count as ONE DataFrame origin, not
+        // two, since it's one statement producing one DataFrame.
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df: DataFrame[UserSchema] = DataFrame[UserSchema](data)
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_bracket_instantiation() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df = DataFrame[UserSchema](data)
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_schema_constructor_method_chain() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+df = UserSchema().read_csv("users.csv")
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_merge_result() {
+        let source = r#"
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+
+users: DataFrame[UserSchema] = load()
+orders: DataFrame[OrderSchema] = load()
+merged = users.merge(orders)
+print(merged["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: 2 from the annotated `users`/`orders` assignments, 1 more for `merged`
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 3);
     }
 
     #[test]

@@ -10,30 +10,30 @@
 >
 > `typedframes` (v0.4.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
-> schema validation over production-grade stability.
+> column checking over production-grade stability.
 >
-**Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime.**
+**A Rust-fast linter for pandas and polars DataFrames. Catches column errors at lint-time, and gates CI on how
+much of your codebase it can actually see — no schema classes required to start.**
 
 ```python
-from typing import Annotated
 import pandas as pd
-from typedframes import BaseSchema, Column
 
-
-class UserData(BaseSchema):
-    user_id = Column(type=int)
-    email = Column(type=str)
-    signup_date = Column(type=str)
-
-
-df: Annotated[pd.DataFrame, UserData] = pd.read_csv("users.csv")
-df["user_id"]  # ✓ Validated by checker
-df["username"]  # ✗ unknown-column: Column 'username' not in UserData
+# Checker infers {order_id, amount, status} from usecols= — no schema class needed
+orders = pd.read_csv("orders.csv", usecols=["order_id", "amount", "status"])
+print(orders["amount"])  # ✓ OK
+print(orders["revenue"])  # ✗ unknown-column — 'revenue' not in inferred column set
 ```
 
-**Descriptors as a bridge:** define once in `Column(type=int)`, access as `df[UserData.user_id.s]` (pandas string
-access) or `df.select(UserData.revenue.col)` (polars expression). Refactor by changing the descriptor definition —
-all `.s` and `.col` references update automatically. No find-and-replace across string literals.
+```shell
+typedframes check src/ --fail-under=90
+# src/pipeline.py:7:8: error[unknown-column] Column 'revenue' does not exist in inferred column set (defined at line 6)
+# ✗ Found 1 error in 12 files (0.0s)
+# ✗ DataFrame schema coverage 82.0% is below the required 90.0% (9/11 DataFrames had column info)
+```
+
+`--fail-under=N` is the same idea as a test-coverage or mypy type-coverage gate, applied to how many DataFrames
+the checker can resolve columns for — see [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
+Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete — see [Quick Start](#quick-start).
 
 ---
 
@@ -44,6 +44,7 @@ all `.s` and `.col` references update automatically. No find-and-replace across 
 - [Quick Start](#quick-start)
 - [Column Inference](#column-inference)
 - [Static Analysis](#static-analysis)
+- [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in)
 - [Static Analysis Performance](#static-analysis-performance)
 - [Type Safety With Multiple Backends](#type-safety-with-multiple-backends)
 - [Advanced Usage](#advanced-usage)
@@ -57,15 +58,21 @@ all `.s` and `.col` references update automatically. No find-and-replace across 
 
 ## Why typedframes?
 
-**The problem:** Many pandas bugs are column mismatches. You access a column that doesn't exist, pass the wrong schema to a function, or make a typo. These errors only surface at runtime, often in production.
+**The problem:** Many pandas bugs are column mismatches — you access a column that doesn't exist, pass a
+DataFrame missing a column a function needs, or make a typo. These errors only surface at runtime, often in
+production, and it's hard to know how much of a codebase is actually protected against them.
 
-**The solution:** Define your DataFrame schemas as Python classes. Get static type checking that catches column errors before you even run your code.
+**The solution:** A fast standalone linter that infers column sets from your existing code (`usecols=`,
+`dtype=`, method chains) and catches mismatches at lint-time — plus an opt-in coverage threshold so CI fails
+when too much of the codebase is invisible to the checker. Add `BaseSchema` classes where you want cross-file
+tracking and IDE autocomplete; they're a progressive enhancement, not a prerequisite.
 
 **What you get:**
 
 - ✅ **Works without schema annotations** - Column inference from `usecols=`, `dtype=`, and method chains catches errors on unannotated code
+- ✅ **CI gate via coverage threshold** - `--fail-under=N` fails the build when too much of your codebase is invisible to the checker, the same way you'd gate on test coverage or a type checker's type-coverage number
+- ✅ **Rust-fast** - Milliseconds, not seconds, even on hundreds of files; fast enough for pre-commit hooks and CI (see [benchmarks](#static-analysis-performance))
 - ✅ **Cross-file awareness** - Add `BaseSchema` and typed return annotations to follow schemas across module boundaries
-- ✅ **Static analysis** - Catch column errors at lint-time with mypy or the standalone checker
 - ✅ **Refactor-safe access** - `df[Schema.column_group.s].mean()` (pandas) or `df.select(Schema.col.col)` (polars) instead of scattered string literals
 - ✅ **Works with pandas AND polars** - Same schema API, native backend types
 - ✅ **Dynamic column matching** - Regex-based ColumnSets for time-series data
@@ -116,7 +123,11 @@ classes at all.
 ### Define Your Schema (Once)
 
 Add `BaseSchema` classes when you want cross-file awareness and IDE autocomplete. Schemas travel with function return
-types across module boundaries — the checker validates call sites even in files that have no `usecols=` of their own:
+types across module boundaries — the checker validates call sites even in files that have no `usecols=` of their own.
+
+**Descriptors as a bridge:** define once in `Column(type=int)`, access as `df[UserData.user_id.s]` (pandas string
+access) or `df.select(UserData.revenue.col)` (polars expression). Refactor by changing the descriptor definition —
+all `.s` and `.col` references update automatically. No find-and-replace across string literals.
 
 ```python
 from typedframes import BaseSchema, Column, ColumnSet
@@ -375,7 +386,7 @@ typedframes check src/
 typedframes check src/ --strict
 
 # JSON output
-typedframes check src/ --json
+typedframes check src/ --output-format=json
 
 # Skip cross-file index (single-file mode, faster for quick checks)
 typedframes check src/ --no-index
@@ -397,7 +408,47 @@ enabled = true
 warnings = false
 ```
 
-### DataFrame Schema Coverage Thresholds (Opt-In)
+### Option 2: Mypy Plugin (Comprehensive)
+
+```shell
+# Add to pyproject.toml
+[tool.mypy]
+plugins = ["typedframes.mypy"]
+
+# Or mypy.ini
+[mypy]
+plugins = typedframes.mypy
+
+# Run mypy
+mypy src/
+```
+
+**Features:**
+- Full type checking across your codebase
+- Catches column errors AND regular type errors
+- IDE integration (VSCode, PyCharm)
+- Works with existing mypy configuration
+
+**Use this for:**
+- Comprehensive type checking
+- Integration with existing mypy setup
+- IDE error highlighting
+
+### Supported Operations
+
+The checker tracks schema changes through `rename`, `drop`, `assign`, `select`, `pop`,
+`insert`, `del`, subscript assignment, `merge`, and `concat`. Row-passthrough operations
+like `filter`, `query`, `head`, `sort_values`, and `dropna` are validated without schema
+changes. Operations with runtime-dependent output (`join`, `pivot`, `melt`, `groupby`,
+`apply`, etc.) are left untracked to avoid false positives.
+
+See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method-matrix/)
+for the complete list of tracked, passthrough, and untracked operations, plus the error
+code reference.
+
+---
+
+## DataFrame Schema Coverage Thresholds (Opt-In)
 
 **DataFrame schema coverage** is the fraction of DataFrames `typedframes check` could
 resolve column information for — the analogue of the "type coverage" reported by mypy,
@@ -501,62 +552,22 @@ Notes:
 - A failed threshold exits **1** and is reported even under `--no-info` — that flag
   silences the informational summary line, not a gate result.
 
-### Option 2: Mypy Plugin (Comprehensive)
-
-```shell
-# Add to pyproject.toml
-[tool.mypy]
-plugins = ["typedframes.mypy"]
-
-# Or mypy.ini
-[mypy]
-plugins = typedframes.mypy
-
-# Run mypy
-mypy src/
-```
-
-**Features:**
-- Full type checking across your codebase
-- Catches column errors AND regular type errors
-- IDE integration (VSCode, PyCharm)
-- Works with existing mypy configuration
-
-**Use this for:**
-- Comprehensive type checking
-- Integration with existing mypy setup
-- IDE error highlighting
-
-### Supported Operations
-
-The checker tracks schema changes through `rename`, `drop`, `assign`, `select`, `pop`,
-`insert`, `del`, subscript assignment, `merge`, and `concat`. Row-passthrough operations
-like `filter`, `query`, `head`, `sort_values`, and `dropna` are validated without schema
-changes. Operations with runtime-dependent output (`join`, `pivot`, `melt`, `groupby`,
-`apply`, etc.) are left untracked to avoid false positives.
-
-See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method-matrix/)
-for the complete list of tracked, passthrough, and untracked operations, plus the error
-code reference.
-
----
-
 ## Static Analysis Performance
 
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-08-03 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
+*2026-08-12 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
 
 | Tool | Version | What it does | typedframes (13 files) | great_expectations (482 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.4.0 | DataFrame column checker | 48ms ±873µs (IQR 2ms) | 216ms ±3ms (IQR 6ms) |
-| ruff | 0.15.21 | Linter (no type checking) | 29ms ±698µs (IQR 1ms) | 190ms ±4ms (IQR 5ms) |
-| ty | 0.0.58 | Type checker | 76ms ±2ms (IQR 2ms) | 188ms ±12ms (IQR 22ms) |
-| pyrefly | 1.1.1 | Type checker | 112ms ±2ms (IQR 2ms) | 557ms ±11ms (IQR 22ms) |
-| mypy | 2.2.0 | Type checker (no plugin) | 2.92s ±20ms (IQR 18ms) | 4.68s ±295ms (IQR 607ms) |
-| mypy + typedframes | 2.2.0 | Type checker + column checker | 2.96s ±14ms (IQR 19ms) | 5.18s ±38ms (IQR 31ms) |
-| pyright | 1.1.411 | Type checker | 762ms ±7ms (IQR 8ms) | 3.96s ±43ms (IQR 57ms) |
+| typedframes | 0.4.0 | DataFrame column checker | 47ms ±998µs (IQR 1ms) | 183ms ±2ms (IQR 2ms) |
+| ruff | 0.16.2 | Linter (no type checking) | 29ms ±677µs (IQR 729µs) | 208ms ±2ms (IQR 3ms) |
+| ty | 0.0.69 | Type checker | 74ms ±900µs (IQR 1ms) | 941ms ±14ms (IQR 18ms) |
+| pyrefly | 1.2.0 | Type checker | 96ms ±2ms (IQR 2ms) | 275ms ±7ms (IQR 14ms) |
+| mypy | 2.3.0 | Type checker (no plugin) | 2.78s ±47ms (IQR 84ms) | 4.25s ±48ms (IQR 76ms) |
+| mypy + typedframes | 2.3.0 | Type checker + column checker | 2.74s ±29ms (IQR 34ms) | 4.44s ±54ms (IQR 105ms) |
+| pyright | 1.1.411 | Type checker | 808ms ±24ms (IQR 21ms) | 3.45s ±93ms (IQR 138ms) |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -775,7 +786,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
 | Mypy plugin                     | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ✅ Yes        | ❌ No        | ❌ No               | ⚠️ Basic         | ❌ No     | ❌ No             | ❌ No             |
-| Standalone checker              | ✅ Rust (~1ms)          | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
+| Standalone checker              | ✅ Rust (ms-scale)      | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
@@ -847,13 +858,13 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 These are general Python type checkers. They don't validate DataFrame column names, but they can be used alongside
 typedframes for comprehensive type checking:
 
-- **[mypy](https://mypy-lang.org/)** (v2.2.0): The original Python type checker. typedframes provides a mypy plugin for
+- **[mypy](https://mypy-lang.org/)** (v2.3.0): The original Python type checker. typedframes provides a mypy plugin for
   column checking. See [performance benchmarks](#static-analysis-performance).
 
-- **[ty](https://github.com/astral-sh/ty)** (v0.0.58, Astral): New Rust-based type checker, 10-60x faster than mypy on
+- **[ty](https://github.com/astral-sh/ty)** (v0.0.69, Astral): New Rust-based type checker, faster than mypy on
   large codebases. Does not support mypy plugins—use typedframes standalone checker.
 
-- **[pyrefly](https://pyrefly.org/)** (v1.1.1, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,
+- **[pyrefly](https://pyrefly.org/)** (v1.2.0, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,
   but no DataFrame column checking.
 
 - **[pyright](https://github.com/microsoft/pyright)** (v1.1.411, Microsoft): Type checker powering Pylance/VSCode. No

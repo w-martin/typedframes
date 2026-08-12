@@ -20,7 +20,7 @@ import pandas as pd
 
 # Checker infers {order_id, amount, status} from usecols= — no schema class needed
 orders = pd.read_csv("orders.csv", usecols=["order_id", "amount", "status"])
-print(orders["amount"])   # ✓ OK
+print(orders["amount"])  # ✓ OK
 print(orders["revenue"])  # ✗ unknown-column — 'revenue' not in inferred column set
 ```
 

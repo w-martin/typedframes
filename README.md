@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.4.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.5.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -557,17 +557,17 @@ Notes:
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-08-12 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.9.3*
+*2026-08-18 · Darwin 25.6.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.20.0*
 
-| Tool | Version | What it does | typedframes (13 files) | great_expectations (482 files) |
+| Tool | Version | What it does | typedframes (13 files) | great_expectations (485 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.4.0 | DataFrame column checker | 47ms ±998µs (IQR 1ms) | 183ms ±2ms (IQR 2ms) |
-| ruff | 0.16.2 | Linter (no type checking) | 29ms ±677µs (IQR 729µs) | 208ms ±2ms (IQR 3ms) |
-| ty | 0.0.69 | Type checker | 74ms ±900µs (IQR 1ms) | 941ms ±14ms (IQR 18ms) |
-| pyrefly | 1.2.0 | Type checker | 96ms ±2ms (IQR 2ms) | 275ms ±7ms (IQR 14ms) |
-| mypy | 2.3.0 | Type checker (no plugin) | 2.78s ±47ms (IQR 84ms) | 4.25s ±48ms (IQR 76ms) |
-| mypy + typedframes | 2.3.0 | Type checker + column checker | 2.74s ±29ms (IQR 34ms) | 4.44s ±54ms (IQR 105ms) |
-| pyright | 1.1.411 | Type checker | 808ms ±24ms (IQR 21ms) | 3.45s ±93ms (IQR 138ms) |
+| typedframes | 0.5.0 | DataFrame column checker | 50ms ±932µs (IQR 1ms) | 195ms ±1ms (IQR 2ms) |
+| ruff | 0.16.3 | Linter (no type checking) | 30ms ±1ms (IQR 2ms) | 230ms ±2ms (IQR 3ms) |
+| ty | 0.0.72 | Type checker | 74ms ±889µs (IQR 1ms) | 813ms ±12ms (IQR 19ms) |
+| pyrefly | 1.2.0 | Type checker | 103ms ±2ms (IQR 2ms) | 277ms ±8ms (IQR 9ms) |
+| mypy | 2.3.1 | Type checker (no plugin) | 3.07s ±40ms (IQR 31ms) | 4.58s ±31ms (IQR 41ms) |
+| mypy + typedframes | 2.3.1 | Type checker + column checker | 3.05s ±17ms (IQR 31ms) | 4.82s ±19ms (IQR 34ms) |
+| pyright | 1.1.411 | Type checker | 775ms ±4ms (IQR 6ms) | 3.45s ±18ms (IQR 23ms) |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -781,7 +781,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.4.0                  | 0.32.1      | 1.19.1             | 0.3.7                 | 3.0.5        | 0.1.2       | 1.1.3              | 5.0.0            | 2.24.0   | 3.0.0            | 0.8.6            |
+| **Version tested**              | 0.5.0                  | 0.32.1      | 1.20.0             | 0.3.7                 | 3.0.5        | 0.1.2       | 1.1.3              | 5.1.1            | 2.24.0   | 3.0.0            | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
@@ -826,7 +826,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 - **[pandas-type-checks](https://pypi.org/project/pandas-type-checks/)** (v1.1.3): Runtime validation decorator. No
   static analysis.
 
-- **[StaticFrame](https://github.com/static-frame/static-frame)** (v5.0.0): Alternative immutable DataFrame library.
+- **[StaticFrame](https://github.com/static-frame/static-frame)** (v5.1.1): Alternative immutable DataFrame library.
   Not compatible with pandas/polars — requires a full rewrite to StaticFrame's own API. Column access is still
   string-based; mypy does not catch column name typos. Type safety comes from immutability guarantees, not schema checking.
 
@@ -835,7 +835,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   type safety. See [Why Abstraction Layers Don't Solve Type Safety](#why-abstraction-layers-dont-solve-type-safety)
   below.
 
-- **[Great Expectations](https://greatexpectations.io/)** (v1.19.1): Comprehensive data quality framework. Defines
+- **[Great Expectations](https://greatexpectations.io/)** (v1.20.0): Comprehensive data quality framework. Defines
   "expectations" (assertions) about data values, distributions, and schema properties. Excellent for runtime
   validation, data documentation, and data quality monitoring. No static analysis or column-level type checking in
   code. Supports pandas, Spark, and SQL backends.
@@ -858,10 +858,10 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 These are general Python type checkers. They don't validate DataFrame column names, but they can be used alongside
 typedframes for comprehensive type checking:
 
-- **[mypy](https://mypy-lang.org/)** (v2.3.0): The original Python type checker. typedframes provides a mypy plugin for
+- **[mypy](https://mypy-lang.org/)** (v2.3.1): The original Python type checker. typedframes provides a mypy plugin for
   column checking. See [performance benchmarks](#static-analysis-performance).
 
-- **[ty](https://github.com/astral-sh/ty)** (v0.0.69, Astral): New Rust-based type checker, faster than mypy on
+- **[ty](https://github.com/astral-sh/ty)** (v0.0.72, Astral): New Rust-based type checker, faster than mypy on
   large codebases. Does not support mypy plugins—use typedframes standalone checker.
 
 - **[pyrefly](https://pyrefly.org/)** (v1.2.0, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,

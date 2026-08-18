@@ -1731,9 +1731,7 @@ class TestCli(unittest.TestCase):
         message = _coverage_message(stats)
 
         # assert
-        self.assertEqual(
-            "\u2139 No DataFrames with recognized loads/schemas found to check", message
-        )
+        self.assertEqual("\u2139 No DataFrames with recognized loads/schemas found to check", message)
 
     def test_should_build_json_coverage_payload_with_unrounded_percentages(self) -> None:
         """Test that the JSON report keeps the exact ratio for machine consumers."""

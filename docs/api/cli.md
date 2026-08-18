@@ -159,8 +159,8 @@ the signal.
 # your project's own code — no config needed for this to get traced
 from internal_snowflake_pkg import load_orders
 
-orders = load_orders(query)   # unrecognized call...
-print(orders["order_id"])     # ...but subscripted like a DataFrame — traced automatically
+orders = load_orders(query)  # unrecognized call...
+print(orders["order_id"])  # ...but subscripted like a DataFrame — traced automatically
 ```
 
 Auto-discovery only ever considers packages your own code actually imports and calls

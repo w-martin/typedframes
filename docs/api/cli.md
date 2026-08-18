@@ -144,30 +144,65 @@ Synapse, Fabric Warehouse) alongside standard `"double-quoted"` ones, regardless
 
 ### Tracing installed (non-project) packages
 
-By default, only files under the project itself are indexed — nothing inside `.venv`
-or any other installed-dependency location. `trace_external_packages` is an explicit
-allowlist of installed package names whose `Annotated[...]`/`BaseSchema` declarations
-and recognized transform patterns (rename, drop, case-fold, etc. — the same fixed set
-already applied to first-party code) should also be indexed. This is the mechanism a
-company-internal package (e.g. one that wraps a SQL connector) needs for its callers'
-column access to be validated cross-file, the same as any project-local helper.
+Only files under the project itself are indexed by default — nothing inside `.venv` or
+any other installed-dependency location — *except* an installed package whose function
+your own first-party code calls in a way that looks like a DataFrame source: the
+result of an unrecognized call is later subscripted, or has a pandas/polars method
+called on it. That package's `Annotated[...]`/`BaseSchema` declarations and recognized
+transform patterns (rename, drop, case-fold, etc. — the same fixed set already applied
+to first-party code) are then indexed automatically, the same as any project-local
+helper. This is what makes a company-internal package (e.g. one that wraps a SQL
+connector) traceable with no configuration: your own code calling it in that shape is
+the signal.
+
+```python
+# your project's own code — no config needed for this to get traced
+from internal_snowflake_pkg import load_orders
+
+orders = load_orders(query)   # unrecognized call...
+print(orders["order_id"])     # ...but subscripted like a DataFrame — traced automatically
+```
+
+Auto-discovery only ever considers packages your own code actually imports and calls
+this way — it never scans the whole `site-packages` tree, so pandas/polars/numpy/etc.
+being installed (and never having a call site of their own left unresolved, since
+`pd.read_csv`-style calls are always recognized directly) never triggers tracing into
+their own, often enormous, internal source. Auto-discovered candidates are also capped
+at 20 packages per project, so a codebase that happens to call many different external
+packages in DataFrame-shaped ways can't balloon index-build cost; `trace_external_packages`
+entries are never subject to that cap.
+
+Two settings give you explicit control over this:
 
 ```toml
 [tool.typedframes]
-trace_external_packages = ["internal_snowflake_pkg"]
+trace_external_packages = ["internal_snowflake_pkg"]      # force-trace, even if auto-discovery wouldn't catch it
+excluded_external_packages = ["some_huge_or_untrusted_pkg"] # opt out, even if auto-discovery would have traced it
 ```
 
+- `trace_external_packages` always wins — a package named there is traced regardless
+  of `excluded_external_packages` or the auto-discovery cap. Use it for a package whose
+  usage pattern is too indirect for auto-discovery to catch (e.g. passed as a callback
+  rather than called directly).
+- `excluded_external_packages` only suppresses *auto-discovered* candidates. It has no
+  effect on a package also named in `trace_external_packages`.
 - The package's install location is auto-detected from the project's own `.venv`
   (`lib/pythonX.Y/site-packages` on Unix, `Lib/site-packages` on Windows) — there is no
   path override in this version, and no other virtualenv-manager layout is searched.
-- Only the named packages' own directories are walked — never the whole
-  `site-packages` tree, which would be both expensive and a far larger, unbounded
-  trust surface than an explicit opt-in list.
+- Only the resolved packages' own directories are walked — never the whole
+  `site-packages` tree.
 - **Editable installs are not supported in this version.** A package installed via
   `pip install -e` (or `uv`'s equivalent) resolves through a `.pth`/`direct_url.json`
   redirect rather than living directly under `site-packages`, and isn't found by the
   current auto-detection. Install the package normally (a real, non-editable install)
   for it to be traced.
+- Indexing an external package means trusting its source enough to run static analysis
+  over it. Auto-discovery only ever adds packages your own project's code demonstrably
+  calls in a DataFrame-shaped way, never anything installed but unused this way — but
+  if you want a hard guarantee that nothing outside the project is ever indexed without
+  an explicit name, list the specific packages to keep out in
+  `excluded_external_packages`. There is no single setting to disable auto-discovery
+  project-wide in this version; exclusion is by exact package name.
 
 ### Excluding directories
 

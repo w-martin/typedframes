@@ -36,6 +36,14 @@ pub struct LinterConfig {
     // rather than indexing all of site-packages, which would be both expensive and a
     // much larger, unbounded trust surface.
     pub(crate) trace_external_packages: Option<Vec<String>>,
+    // Opt-out counterpart to the default-on candidate tracing (see
+    // `discover_external_package_candidates` in index.rs): a package named here is
+    // never traced, even if the project's own code calls it in a way that looks
+    // DataFrame-shaped. Does NOT affect `trace_external_packages` -- an explicit
+    // force-include there always wins, since naming a package in both lists is a
+    // contradiction the user should resolve, not one this checker should silently
+    // arbitrate.
+    pub(crate) excluded_external_packages: Option<Vec<String>>,
     // Directory names to prune when collecting `.py` files. When set, REPLACES the
     // built-in default set (`DEFAULT_EXCLUDED_DIRS` -- `.git`, `.venv`, `node_modules`,
     // `__pycache__`, `.claude`, etc.) entirely rather than adding to it, matching
@@ -54,6 +62,7 @@ impl LinterConfig {
         warnings: None,
         sql_dialect: None,
         trace_external_packages: None,
+        excluded_external_packages: None,
         exclude: None,
     };
 }
@@ -194,6 +203,29 @@ mod tests {
         assert_eq!(
             load_linter_config(root).exclude,
             Some(vec![".claude".to_string(), "vendor".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_load_linter_config_reads_excluded_external_packages() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = true",
+        )
+        .unwrap();
+        assert_eq!(load_linter_config(root).excluded_external_packages, None);
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexcluded_external_packages = [\"huge_untrusted_pkg\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(root).excluded_external_packages,
+            Some(vec!["huge_untrusted_pkg".to_string()])
         );
     }
 }

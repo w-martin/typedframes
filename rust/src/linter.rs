@@ -104,6 +104,19 @@ pub(crate) struct ParamGovernedAccess {
     pub(crate) column: String,
 }
 
+// An `x = call(...)` assignment where `call` wasn't recognized as any DataFrame
+// origin, but `x` is later used the way a DataFrame is used. `name` is the raw
+// identifier at the call site: the receiver for an attribute call (`mod.func(...)` ->
+// "mod"), or the callee itself for a bare call (`func(...)` -> "func") — `index.rs`
+// resolves this name against that same file's own `module_aliases`/`imports` maps
+// (whichever applies, per `is_attribute_call`) to find the module it came from. See
+// `Linter::unresolved_dataframe_shaped_calls`.
+#[derive(Debug, Clone)]
+pub(crate) struct UnresolvedDataframeShapedCall {
+    pub(crate) name: String,
+    pub(crate) is_attribute_call: bool,
+}
+
 /// AST visitor that tracks DataFrame schemas and validates column access.
 ///
 /// # State model
@@ -164,6 +177,25 @@ pub struct Linter {
     // set, recorded so the CLI can report which assignments cost coverage. Kept in
     // step with the counters at each counting site rather than reconstructed later.
     pub untyped_sites: Vec<UntypedSite>,
+    // Every bare-Name variable subscripted (`x["col"]`) or method-called with a
+    // RESERVED_METHODS name (`x.groupby(...)`) anywhere in the module. Populated by a
+    // whole-module pre-pass (see DataFrameShapedUsageCollector), same timing as
+    // `string_var_candidates` and for the same reason: a name used this way further
+    // down the file still needs to be recognized when its assignment is visited
+    // earlier. Consulted only when recording `unresolved_dataframe_shaped_calls`.
+    pub(crate) dataframe_shaped_usage: std::collections::HashSet<String>,
+    // Every `x = call(...)` assignment where `call` didn't match any recognized
+    // DataFrame origin pattern, but `x` is later used the way a DataFrame is used
+    // (per `dataframe_shaped_usage`). Purely a data-collection side channel — does
+    // NOT affect `dataframes_total`, `untyped_sites`, or emit any `LintError` (an
+    // earlier version of this did exactly that and had to be reverted: it clashed
+    // with an intentionally-silent default and had real false positives, e.g.
+    // `logger.info(...)` matching RESERVED_METHODS' `info`). This field exists purely
+    // so `index.rs` can discover, from the project's own first-party code, which
+    // externally-imported packages are plausible candidates for on-demand external
+    // tracing (see `discover_external_package_candidates`) — a lint-time decision
+    // never sees this field at all.
+    pub(crate) unresolved_dataframe_shaped_calls: Vec<UnresolvedDataframeShapedCall>,
     // Dialect used to fold unquoted SQL identifier case when inferring columns from a
     // literal SELECT list. Defaults to `Generic` (no folding); set from
     // `[tool.typedframes] sql_dialect` in pyproject.toml via `with_context`.
@@ -442,6 +474,41 @@ impl<'a> Visitor<'a> for StringBindingCollector<'a> {
     }
 }
 
+// AST visitor collecting every bare-Name variable subscripted (`x["col"]`) or having a
+// RESERVED_METHODS-named method called on it (`x.groupby(...)`) anywhere in the module
+// — see `Linter::dataframe_shaped_usage`. Implements `Visitor` for the same reason as
+// `StringBindingCollector`: nested bodies (if/for/while/with/try) are covered by the
+// trait's default recursion for free. Flat and file-wide rather than scope-aware,
+// matching `string_var_candidates`'s own tradeoff (see its docs) — a name collision
+// across scopes can only make this signal slightly noisier, never silently miss a
+// genuine one.
+struct DataFrameShapedUsageCollector {
+    names: std::collections::HashSet<String>,
+}
+
+impl<'a> Visitor<'a> for DataFrameShapedUsageCollector {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        match expr {
+            Expr::Subscript(subscript) => {
+                if let Expr::Name(base) = &*subscript.value {
+                    self.names.insert(base.id.to_string());
+                }
+            }
+            Expr::Call(call) => {
+                if let Expr::Attribute(attr) = &*call.func {
+                    if let Expr::Name(base) = &*attr.value {
+                        if RESERVED_METHODS.contains(&attr.attr.as_str()) {
+                            self.names.insert(base.id.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
+}
+
 impl Default for Linter {
     fn default() -> Self {
         Self::new()
@@ -466,6 +533,8 @@ impl Linter {
             dataframes_total: 0,
             dataframes_typed: 0,
             untyped_sites: Vec::new(),
+            dataframe_shaped_usage: std::collections::HashSet::new(),
+            unresolved_dataframe_shaped_calls: Vec::new(),
             sql_dialect: sql::SqlDialect::Generic,
             project_root: None,
             string_var_candidates: HashMap::new(),
@@ -578,6 +647,13 @@ impl Linter {
         self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
         self.string_var_candidates = self.collect_string_var_candidates(&module.body, path);
+        let mut df_usage_collector = DataFrameShapedUsageCollector {
+            names: std::collections::HashSet::new(),
+        };
+        for stmt in &module.body {
+            df_usage_collector.visit_stmt(stmt);
+        }
+        self.dataframe_shaped_usage = df_usage_collector.names;
         let mut errors = Vec::new();
 
         for stmt in &module.body {
@@ -1350,6 +1426,54 @@ impl Linter {
         });
     }
 
+    // Called at the end of the `x = call(...)` origin dispatch in the Assign handler,
+    // after every recognized pattern (pd.read_csv/read_sql, connectorx, Feast,
+    // SQL_PRODUCING_METHODS+SQL_FINALIZE_METHODS, Schema.from_pandas, a same-repo
+    // function with a known return schema, ...) has had its chance to match. If none
+    // did (`dataframes_total` is unchanged from before the dispatch) and the assigned
+    // variable is later used somewhere in this file the way a DataFrame is used, per
+    // `dataframe_shaped_usage`, records the call's receiver (attribute call) or callee
+    // name (bare call) into `unresolved_dataframe_shaped_calls` — see that field's
+    // docs for why this is silent bookkeeping only, never a diagnostic.
+    fn maybe_record_unresolved_dataframe_shaped_call(
+        &mut self,
+        assign: &ast::StmtAssign,
+        call: &ast::ExprCall,
+        dataframes_total_before: usize,
+    ) {
+        if self.dataframes_total != dataframes_total_before {
+            return;
+        }
+        if assign.targets.len() != 1 {
+            return;
+        }
+        let Expr::Name(target) = &assign.targets[0] else {
+            return;
+        };
+        if !self.dataframe_shaped_usage.contains(target.id.as_str()) {
+            return;
+        }
+        match &*call.func {
+            Expr::Attribute(attr) => {
+                if let Expr::Name(base) = &*attr.value {
+                    self.unresolved_dataframe_shaped_calls
+                        .push(UnresolvedDataframeShapedCall {
+                            name: base.id.to_string(),
+                            is_attribute_call: true,
+                        });
+                }
+            }
+            Expr::Name(func_name) => {
+                self.unresolved_dataframe_shaped_calls
+                    .push(UnresolvedDataframeShapedCall {
+                        name: func_name.id.to_string(),
+                        is_attribute_call: false,
+                    });
+            }
+            _ => {}
+        }
+    }
+
     // Register `target_names` as a DataFrame materialized from a Feast retrieval
     // (`.to_df()` on a `get_historical_features`/`get_online_features` result), with an
     // *open* schema over `cols` when resolved. See `open_schemas`'s docs for why exact
@@ -1800,6 +1924,15 @@ impl Linter {
         }
     }
 
+    // Visit every statement in a nested body (function/class/if/for/while/with/try) in
+    // order. Pulled out as its own method since every one of those statement kinds
+    // needs exactly this loop over one or more of its own `Vec<Stmt>` fields.
+    fn visit_body(&mut self, body: &[Stmt], errors: &mut Vec<LintError>) {
+        for stmt in body {
+            self.visit_stmt(stmt, errors);
+        }
+    }
+
     // Walk a statement node, updating linter state and collecting diagnostics.
     //
     // ClassDef      — detect BaseSchema subclasses; collect inherited + declared columns.
@@ -1809,6 +1942,7 @@ impl Linter {
     // AnnAssign     — handle `df: Annotated[pd.DataFrame, S]` and quoted annotations.
     // Expr          — delegate column-access checks to visit_expr.
     // Delete        — handle `del df["col"]` in-place mutations.
+    // If/For/While/With/Try — recurse into every nested body (see visit_body).
     fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
@@ -2010,6 +2144,20 @@ impl Linter {
                         (self.file_display.clone(), class_def_line),
                     );
                 }
+
+                // Visit the class body regardless of which branch above matched (or
+                // none did). A schema/ORM class's body is a declarative column list
+                // that the branches above already extracted -- re-visiting it as
+                // ordinary statements is a no-op for those (Column(...)-style
+                // AnnAssigns don't match any DataFrame/Annotated annotation shape).
+                // For every other class -- which is most business-logic code, the
+                // shape Protocol implementations and DI-style service classes take --
+                // this is the ONLY way its methods are ever seen: without it, a
+                // `pd.read_csv(...)` or a `self, df` method body sitting inside a
+                // plain `class Loader:` is invisible to the entire rest of this
+                // checker, the same way it would be if the file were never linted at
+                // all.
+                self.visit_body(&class_def.body, errors);
             }
             Stmt::FunctionDef(func_def) => {
                 let (fn_def_line, _) = self.source_location(func_def.range().start());
@@ -2049,9 +2197,7 @@ impl Linter {
                     }
                 }
 
-                for body_stmt in &func_def.body {
-                    self.visit_stmt(body_stmt, errors);
-                }
+                self.visit_body(&func_def.body, errors);
                 // Detect a parameter feeding a Feast features= call whose result is
                 // subscripted in this same body — see ParamGovernedTemplate's doc
                 // comment and resolve_param_governed_call_sites. Whether the
@@ -2101,12 +2247,24 @@ impl Linter {
                 // only a best-effort proxy used when no such contract exists. Delegates are
                 // still collected and unioned in as usual: columns a forwarded call needs
                 // only make the contract stricter, never wrong.
-                if let Some(first_param) = func_def
+                // A leading `self`/`cls` is never the DataFrame being passed around --
+                // it's the instance/class the method is bound to -- so it must not be
+                // the parameter tainted below. Skipping past it (rather than, say,
+                // requiring an explicit annotation to disambiguate) is what makes this
+                // heuristic work at all for the extremely common case of a DataFrame
+                // passed as an instance method's second parameter.
+                let mut candidate_params = func_def
                     .parameters
                     .posonlyargs
-                    .first()
-                    .or_else(|| func_def.parameters.args.first())
-                {
+                    .iter()
+                    .chain(func_def.parameters.args.iter());
+                let first_param = match candidate_params.next() {
+                    Some(p) if matches!(p.parameter.name.id.as_str(), "self" | "cls") => {
+                        candidate_params.next()
+                    }
+                    other => other,
+                };
+                if let Some(first_param) = first_param {
                     let param_name = first_param.parameter.name.id.as_str();
                     let mut tainted = std::collections::HashSet::new();
                     tainted.insert(param_name.to_string());
@@ -2331,6 +2489,7 @@ impl Linter {
                 }
 
                 if let Expr::Call(call) = &*assign.value {
+                    let dataframes_total_before_call_dispatch = self.dataframes_total;
                     // Handle stmt = select(Order.id, Order.amount) — and the same
                     // chained onto .where(...)/.order_by(...)/etc, see
                     // SELECT_CHAIN_METHODS — so a later pd.read_sql(stmt, engine) can
@@ -3276,6 +3435,12 @@ impl Linter {
                             errors,
                         );
                     }
+
+                    self.maybe_record_unresolved_dataframe_shaped_call(
+                        assign,
+                        call,
+                        dataframes_total_before_call_dispatch,
+                    );
                 }
                 for target in &assign.targets {
                     self.visit_expr(target, errors);
@@ -3528,6 +3693,47 @@ impl Linter {
                 if let Some(value) = &ret.value {
                     self.visit_expr(value, errors);
                 }
+            }
+            // If/For/While/With/Try — a DataFrame origin or column access reached only
+            // through control flow is exactly as real as one at the top level of a
+            // function body; a linear top-to-bottom walk that skips these bodies
+            // entirely (as this match used to, via the `_ => {}` fallback) misses
+            // virtually every SQL/connection call in practice, since those are almost
+            // always wrapped in a `with <connection>:` and/or `try`/`except`.
+            Stmt::If(if_stmt) => {
+                self.visit_expr(&if_stmt.test, errors);
+                self.visit_body(&if_stmt.body, errors);
+                for clause in &if_stmt.elif_else_clauses {
+                    if let Some(test) = &clause.test {
+                        self.visit_expr(test, errors);
+                    }
+                    self.visit_body(&clause.body, errors);
+                }
+            }
+            Stmt::For(for_stmt) => {
+                self.visit_expr(&for_stmt.iter, errors);
+                self.visit_body(&for_stmt.body, errors);
+                self.visit_body(&for_stmt.orelse, errors);
+            }
+            Stmt::While(while_stmt) => {
+                self.visit_expr(&while_stmt.test, errors);
+                self.visit_body(&while_stmt.body, errors);
+                self.visit_body(&while_stmt.orelse, errors);
+            }
+            Stmt::With(with_stmt) => {
+                for item in &with_stmt.items {
+                    self.visit_expr(&item.context_expr, errors);
+                }
+                self.visit_body(&with_stmt.body, errors);
+            }
+            Stmt::Try(try_stmt) => {
+                self.visit_body(&try_stmt.body, errors);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    self.visit_body(&h.body, errors);
+                }
+                self.visit_body(&try_stmt.orelse, errors);
+                self.visit_body(&try_stmt.finalbody, errors);
             }
             _ => {}
         }
@@ -4123,6 +4329,229 @@ print(df["a"])
     }
 
     #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_class_method() {
+        // arrange: the exact same load call as
+        // test_should_count_typed_dataframe_for_load_call_with_usecols, but written
+        // inside an ordinary (non-BaseSchema, non-ORM) class's method body rather than
+        // at module level. `Loader` doesn't inherit from BaseSchema and has no
+        // `__tablename__`, so nothing marks it as schema-bearing -- it's just a plain
+        // class, the shape most OO/DI-style codebases actually use to group loaders.
+        let source = r#"
+import pandas as pd
+
+class Loader:
+    def load(self):
+        df = pd.read_csv("data.csv", usecols=["a", "b"])
+        print(df["a"])
+        return df
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the load call is inside a class method body, but must be seen just
+        // as if it were at module level or inside a free function
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_resolve_dataframe_returned_through_a_protocol_typed_call() {
+        // arrange: SOLID/DI-style structural typing -- `process` takes a
+        // `DataSource` Protocol (an interface, never instantiated) and calls its
+        // `load()` method; the concrete return schema lives on `SqlDataSource`, a
+        // wholly separate, unrelated-by-inheritance class. This only works at all
+        // because the checker's function-name resolution is name-based rather than
+        // type-based throughout (the same mechanism that resolves
+        // `module.trim_customers(customers)`), so a class body being visited (see
+        // test_should_count_typed_dataframe_for_load_call_inside_class_method) is
+        // both necessary and sufficient -- no Protocol-specific handling needed.
+        let source = r#"
+from typing import Protocol
+import pandas as pd
+
+class DataSource(Protocol):
+    def load(self) -> pd.DataFrame: ...
+
+class SqlDataSource:
+    def load(self) -> pd.DataFrame:
+        df = pd.read_csv("data.csv", usecols=["a", "b"])
+        return df
+
+def process(source: DataSource) -> None:
+    df = source.load()
+    print(df["a"])
+    print(df["c"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: 'c' isn't in the {a, b} schema inferred from SqlDataSource.load's
+        // body, and must be caught at the Protocol-typed call site.
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "unknown-column");
+        assert!(errors[0].message.contains("'c'"));
+        assert!(errors[0].message.contains("{a, b}"));
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_if_block() {
+        // arrange: the same load call, but reached only through an `if` branch --
+        // no nesting beyond that. Not a "deeply nested control flow" edge case.
+        let source = r#"
+import pandas as pd
+
+def load(flag):
+    if flag:
+        df = pd.read_csv("data.csv", usecols=["a", "b"])
+        print(df["a"])
+        return df
+    return None
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_if_else_branch() {
+        // arrange: the load lives in the `else` arm (an ElifElseClause), not the `if`
+        // arm -- a distinct AST path from the test above.
+        let source = r#"
+import pandas as pd
+
+def load(flag):
+    if flag:
+        return None
+    else:
+        df = pd.read_csv("data.csv", usecols=["a", "b"])
+        print(df["a"])
+        return df
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_with_block() {
+        // arrange: the pattern a real SQL connection almost always uses -- a
+        // context-managed connection/cursor wrapping the actual read call.
+        let source = r#"
+import pandas as pd
+
+def load(engine):
+    with engine.connect() as conn:
+        df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+        print(df["order_id"])
+        return df
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_try_and_except() {
+        // arrange: a load call in the `try` body, and a second in the `except`
+        // fallback -- both bodies must be visited.
+        let source = r#"
+import pandas as pd
+
+def load(path):
+    try:
+        df = pd.read_csv(path, usecols=["a", "b"])
+    except FileNotFoundError:
+        df = pd.read_csv("fallback.csv", usecols=["a", "b"])
+    return df
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: two independent load call sites, each its own origin
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_for_loop() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+def load(paths):
+    for path in paths:
+        df = pd.read_csv(path, usecols=["a", "b"])
+        print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_load_call_inside_while_loop() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+def load(has_more):
+    while has_more():
+        df = pd.read_csv("data.csv", usecols=["a", "b"])
+        print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
     fn test_should_count_untyped_dataframe_for_bare_load_call() {
         // arrange: no usecols/columns, so the checker has no column information
         let source = r#"
@@ -4143,6 +4572,112 @@ print(df["a"])
         assert_eq!(linter.dataframes_typed, 0);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "untracked-dataframe");
+    }
+
+    #[test]
+    fn test_should_record_unresolved_call_for_attribute_call_used_like_a_dataframe() {
+        // arrange: `internal_db.run_query` isn't any recognized load pattern, but `df`
+        // is subscripted afterward exactly the way a DataFrame would be. Must be
+        // recorded silently -- no error, no dataframes_total/untyped_sites change.
+        let source = r#"
+import internal_db
+
+df = internal_db.run_query("orders.sql", conn)
+print(df["order_id"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 0);
+        assert!(linter.untyped_sites.is_empty());
+        assert!(errors.is_empty());
+        assert_eq!(linter.unresolved_dataframe_shaped_calls.len(), 1);
+        assert_eq!(
+            linter.unresolved_dataframe_shaped_calls[0].name,
+            "internal_db"
+        );
+        assert!(linter.unresolved_dataframe_shaped_calls[0].is_attribute_call);
+    }
+
+    #[test]
+    fn test_should_record_unresolved_call_for_bare_call_used_like_a_dataframe() {
+        // arrange: `from internal_db import run_query; df = run_query(...)` -- same
+        // scenario, but the callee is a bare name, not an attribute access.
+        let source = r#"
+from internal_db import run_query
+
+df = run_query("orders.sql", conn)
+print(df["order_id"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.unresolved_dataframe_shaped_calls.len(), 1);
+        assert_eq!(
+            linter.unresolved_dataframe_shaped_calls[0].name,
+            "run_query"
+        );
+        assert!(!linter.unresolved_dataframe_shaped_calls[0].is_attribute_call);
+    }
+
+    #[test]
+    fn test_should_not_record_unresolved_call_never_used_like_a_dataframe() {
+        // arrange: same unrecognized call, but the result is never subscripted or
+        // DataFrame-method-called -- e.g. a logger. Must not be recorded just because
+        // the function name isn't on any allowlist.
+        let source = r#"
+import logging
+
+logger = logging.getLogger("app")
+logger.debug("hello")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(linter.unresolved_dataframe_shaped_calls.is_empty());
+    }
+
+    #[test]
+    fn test_should_not_record_unresolved_call_for_recognized_pandas_and_polars_loads() {
+        // arrange: normal, fully-recognized pd/pl usage -- every one of these is
+        // resolved directly by the existing load-call dispatch, so none should ever
+        // reach the unresolved-call fallback. Guards against pandas/polars themselves
+        // ever being swept into external-package candidate discovery: LOAD_MODULES
+        // calls always bump dataframes_total, so they short-circuit before the
+        // unresolved-call check even runs.
+        let source = r#"
+import pandas as pd
+import polars as pl
+
+df = pd.read_csv("data.csv", usecols=["a", "b"])
+print(df["a"])
+lazy = pl.read_csv("other.csv", columns=["x", "y"])
+print(lazy["x"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(linter.unresolved_dataframe_shaped_calls.is_empty());
     }
 
     #[test]
@@ -4524,6 +5059,73 @@ def process(path: str) -> None:
         assert!(errors[0].message.contains("available: {a, b}"));
         assert!(errors[0].message.contains("required: {c}"));
         assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    #[test]
+    fn test_should_detect_missing_column_at_call_site_for_free_function() {
+        // arrange: same-file baseline for the instance-method comparison test below --
+        // contact_label's own body accesses {name, email} off its bare parameter, but
+        // the loader only provides {customer_id, name}.
+        let source = r#"
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=str)
+    name = Column(type=str)
+
+def contact_label(customers):
+    return customers["name"] + customers["email"]
+
+customers = pd.read_csv("customers.csv", usecols=["customer_id", "name"])
+contact_label(customers)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("passed to contact_label"));
+    }
+
+    #[test]
+    fn test_should_detect_missing_column_at_call_site_for_instance_method() {
+        // arrange: identical to test_should_detect_missing_column_at_call_site_for_free_function
+        // except contact_label is now an instance method (self, customers) -- the
+        // shape SOLID/DI-style codebases actually use. The contract-inference pass
+        // must taint `customers`, the real DataFrame parameter, not `self`.
+        let source = r#"
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+class CustomerSchema(BaseSchema):
+    customer_id = Column(type=str)
+    name = Column(type=str)
+
+class Labeler:
+    def contact_label(self, customers):
+        return customers["name"] + customers["email"]
+
+customers = pd.read_csv("customers.csv", usecols=["customer_id", "name"])
+labeler = Labeler()
+labeler.contact_label(customers)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, "missing-column");
+        assert!(errors[0].message.contains("passed to contact_label"));
     }
 
     #[test]
@@ -4923,6 +5525,7 @@ def process(query: str) -> None:
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                excluded_external_packages: None,
                 exclude: None,
             },
         );
@@ -4939,15 +5542,15 @@ def process(query: str) -> None:
     }
 
     #[test]
-    fn test_should_trace_an_allowlisted_package_installed_in_venv_site_packages() {
-        // arrange: same scenario as the cross-file case-fold test above, but this time
-        // the case-folding helper genuinely lives OUTSIDE the project tree, in a fake
-        // .venv/lib/pythonX.Y/site-packages/internal_snowflake_pkg/ -- simulating a real
-        // pip-installed internal package, not just another first-party file. Without
-        // `trace_external_packages` naming it, this must NOT be indexed at all (today's
-        // behavior: pipeline.py's call site is untraceable, load_orders' return type is
-        // simply unknown); with it, the same post-fold propagation must work across
-        // that install boundary.
+    fn test_should_trace_an_explicitly_allowlisted_package_installed_in_venv_site_packages() {
+        // arrange: the case-folding helper genuinely lives OUTSIDE the project tree,
+        // in a fake .venv/lib/pythonX.Y/site-packages/internal_snowflake_pkg/ --
+        // simulating a real pip-installed internal package, not just another
+        // first-party file. `trace_external_packages` forces it to be indexed
+        // regardless of whether the default on-demand candidate detection would also
+        // have caught it (see test_should_auto_trace_an_external_package_used_in_a_dataframe_shaped_way_by_default
+        // for that case) -- the post-fold return schema must propagate across that
+        // install boundary either way.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let site_packages = root
@@ -4988,33 +5591,9 @@ def process(query: str) -> None:
             warnings: None,
             sql_dialect: Some("snowflake".to_string()),
             trace_external_packages: Some(vec!["internal_snowflake_pkg".to_string()]),
+            excluded_external_packages: None,
             exclude: None,
         };
-
-        // act: without the allowlist, nothing outside the project tree is indexed.
-        fs::write(
-            root.join("pyproject.toml"),
-            "[tool.typedframes]\nsql_dialect = \"snowflake\"\n",
-        )
-        .unwrap();
-        let index_without_allowlist = build_index_internal(root);
-        let mut linter_without = Linter::new();
-        linter_without.with_context(root.to_path_buf(), &config_with_allowlist);
-        let pipeline_path = root.join("pipeline.py");
-        linter_without.load_cross_file_symbols(
-            &index_without_allowlist,
-            pipeline_source,
-            &pipeline_path,
-            root,
-        );
-        let errors_without = linter_without
-            .check_file_internal(pipeline_source, &pipeline_path)
-            .unwrap();
-        assert_eq!(
-            errors_without.len(),
-            0,
-            "load_orders' return type must be untraceable without the allowlist: {errors_without:?}"
-        );
 
         // act: with the allowlist, the external package is indexed and its post-fold
         // return schema is picked up at pipeline.py's call site.
@@ -5026,6 +5605,7 @@ def process(query: str) -> None:
         let index_with_allowlist = build_index_internal(root);
         let mut linter_with = Linter::new();
         linter_with.with_context(root.to_path_buf(), &config_with_allowlist);
+        let pipeline_path = root.join("pipeline.py");
         linter_with.load_cross_file_symbols(
             &index_with_allowlist,
             pipeline_source,
@@ -5044,6 +5624,229 @@ def process(query: str) -> None:
         );
         assert_eq!(errors_with[0].code, CODE_UNKNOWN_COLUMN);
         assert!(errors_with[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_auto_trace_an_external_package_used_in_a_dataframe_shaped_way_by_default() {
+        // arrange: the exact same fixture as
+        // test_should_trace_an_explicitly_allowlisted_package_installed_in_venv_site_packages,
+        // but with NO `trace_external_packages` configured at all. `load_orders`'s
+        // result (`orders`) is subscripted in pipeline.py -- a DataFrame-shaped usage
+        // of an unresolved call to a plainly-imported external package -- which must
+        // be enough to auto-discover and trace `internal_snowflake_pkg` by default.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    conn = connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    df.columns = df.columns.str.lower()
+    return df
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_snowflake_pkg import load_orders
+
+def process(query: str) -> None:
+    orders = load_orders(query)
+    print(orders["order_id"])
+    print(orders["ORDER_ID"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"\n",
+        )
+        .unwrap();
+
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: Some("snowflake".to_string()),
+            trace_external_packages: None,
+            excluded_external_packages: None,
+            exclude: None,
+        };
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &config);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_respect_excluded_external_packages_opt_out() {
+        // arrange: same auto-trace-eligible fixture, but the package is named in
+        // `excluded_external_packages` -- must stay untraced even though usage looks
+        // exactly as DataFrame-shaped as the default-on test above.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+def load_orders(query: str) -> pd.DataFrame:
+    conn = connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, amount FROM orders")
+    df = cursor.fetch_pandas_all()
+    return df
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_snowflake_pkg import load_orders
+
+def process(query: str) -> None:
+    orders = load_orders(query)
+    print(orders["order_id"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexcluded_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: None,
+            trace_external_packages: None,
+            excluded_external_packages: Some(vec!["internal_snowflake_pkg".to_string()]),
+            exclude: None,
+        };
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &config);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: load_orders' return type stays unknown -- opted out despite looking
+        // exactly like an auto-trace candidate
+        assert_eq!(
+            errors.len(),
+            0,
+            "excluded_external_packages should have kept this untraced: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_resolve_sql_loaded_from_file_inside_a_traced_external_package() {
+        // arrange: the exact shape reported in production use -- an internal,
+        // pip-installed package that executes SQL loaded from a `.sql` file sitting
+        // next to its own source, not an inline string literal. Same
+        // trace_external_packages allowlist mechanism as
+        // test_should_trace_an_allowlisted_package_installed_in_venv_site_packages,
+        // but load_orders resolves its query via
+        // `Path(__file__).parent / "orders.sql"` -- the path must anchor to the
+        // EXTERNAL package's own directory, not the caller's.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_snowflake_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("orders.sql"),
+            "SELECT order_id, amount FROM orders",
+        )
+        .unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+from pathlib import Path
+import pandas as pd
+
+def load_orders(conn) -> pd.DataFrame:
+    sql = (Path(__file__).parent / "orders.sql").read_text()
+    df = pd.read_sql(sql, conn)
+    return df
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_snowflake_pkg import load_orders
+
+def process(conn) -> None:
+    orders = load_orders(conn)
+    print(orders["order_id"])
+    print(orders["customer_id"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\ntrace_external_packages = [\"internal_snowflake_pkg\"]\n",
+        )
+        .unwrap();
+
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: None,
+            trace_external_packages: Some(vec!["internal_snowflake_pkg".to_string()]),
+            excluded_external_packages: None,
+            exclude: None,
+        };
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &config);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: load_orders' return schema should resolve to {order_id, amount} via
+        // the .sql file, so 'customer_id' -- not in that set -- should be flagged.
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("customer_id"));
     }
 
     #[test]
@@ -5249,6 +6052,7 @@ def process(path: str) -> None:
             warnings: None,
             sql_dialect: Some("snowflake".to_string()),
             trace_external_packages: None,
+            excluded_external_packages: None,
             exclude: None,
         };
         linter.with_context(PathBuf::from("/project"), &config);
@@ -5281,6 +6085,7 @@ print(df["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                excluded_external_packages: None,
                 exclude: None,
             },
         );
@@ -5340,6 +6145,7 @@ print(lowered["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                excluded_external_packages: None,
                 exclude: None,
             },
         );
@@ -5373,6 +6179,7 @@ print(df["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                excluded_external_packages: None,
                 exclude: None,
             },
         );
@@ -5407,6 +6214,7 @@ print(lowered["ORDER_ID"])
                 warnings: None,
                 sql_dialect: Some("snowflake".to_string()),
                 trace_external_packages: None,
+                excluded_external_packages: None,
                 exclude: None,
             },
         );

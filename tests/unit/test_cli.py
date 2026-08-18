@@ -12,11 +12,13 @@ from unittest.mock import patch
 from typedframes.cli import (
     CoverageBucket,
     CoverageConfig,
+    RunStats,
     _check_files,
     _check_notebook_file,
     _collect_notebook_files,
     _collect_python_files,
     _coverage_json_payload,
+    _coverage_message,
     _evaluate_coverage,
     _format_github,
     _format_term_missing,
@@ -1697,6 +1699,41 @@ class TestCli(unittest.TestCase):
 
         # assert
         self.assertEqual("No DataFrames with recognized loads/schemas found to check", table)
+
+    def test_should_report_ratio_once_any_dataframe_is_counted(self) -> None:
+        """Test the exact wording once dataframes_total>0.
+
+        The detection fixes in the Rust checker (control-flow bodies, class-method
+        bodies, and Protocol/structural-typing call sites all being visited) turn many
+        former "0 found" runs into a real, non-zero denominator; this locks in that
+        once that happens, the message reports an honest ratio rather than staying
+        silent.
+        """
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=15, dataframes_typed=0)
+
+        # act
+        message = _coverage_message(stats)
+
+        # assert
+        self.assertIn("0/15 DataFrames had column info", message)
+        self.assertIn("(0%)", message)
+
+    def test_should_report_no_dataframes_found_only_when_denominator_is_zero(self) -> None:
+        """Test that the "nothing found" message requires a genuinely empty denominator.
+
+        Not conflated with "found some, none had derivable schemas".
+        """
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=0, dataframes_typed=0)
+
+        # act
+        message = _coverage_message(stats)
+
+        # assert
+        self.assertEqual(
+            "\u2139 No DataFrames with recognized loads/schemas found to check", message
+        )
 
     def test_should_build_json_coverage_payload_with_unrounded_percentages(self) -> None:
         """Test that the JSON report keeps the exact ratio for machine consumers."""

@@ -199,11 +199,18 @@ jobs:
 
       - name: Install published package
         run: |
+          # 20 attempts / 30s apart = up to 10 minutes. Was 10 attempts (5 min):
+          # too tight for PyPI's Fastly CDN, which can serve a stale simple-index
+          # page from a not-yet-invalidated edge node for several minutes after a
+          # publish -- seen in practice on the v0.4.1 release, where this job alone
+          # (of five running the same install within the same second) kept missing
+          # the new version for the full 5-minute window while its matrix siblings
+          # found it on their first attempt.
           VERSION="${GITHUB_REF#refs/tags/v}"
-          for i in {1..10}; do
+          for i in {1..20}; do
             pip install typedframes==${VERSION} && break
-            if [ "$i" -eq 10 ]; then
-              echo "Error: typedframes==${VERSION} not available on PyPI after 10 attempts (5 minutes)"
+            if [ "$i" -eq 20 ]; then
+              echo "Error: typedframes==${VERSION} not available on PyPI after 20 attempts (10 minutes)"
               exit 1
             fi
             echo "Attempt $i failed, retrying in 30s..."

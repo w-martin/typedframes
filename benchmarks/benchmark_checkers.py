@@ -51,7 +51,7 @@ GE_REPO_URL = "https://github.com/great-expectations/great_expectations.git"
 # that produced the committed README numbers -- part of why the v0.2.1->v0.2.2
 # README jump (285ms -> 1.79s) turned out not to correspond to any code change
 # at all. Bump deliberately when GE ships a new release, not silently.
-GE_COMMIT = "1.9.3"
+GE_COMMIT = "1.20.0"
 
 
 @dataclass

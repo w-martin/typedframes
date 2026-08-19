@@ -5,7 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
     "pandas>=3.0.1",
-    "pandera[mypy]>=0.29.0",
+    "pandera[mypy]>=0.32.1",
 ]
 
 [dependency-groups]

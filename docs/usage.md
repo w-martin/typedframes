@@ -139,8 +139,10 @@ helper function that queries a SQL connector and then case-folds the result befo
 `return`ing it gets its post-fold schema followed at every call site, with no
 annotation required. If that helper lives in a genuinely separate, installed package
 (a company-internal Snowflake wrapper, say) rather than your own project's source
-tree, it isn't indexed by default — see [`trace_external_packages`](api/cli.md#tracing-installed-non-project-packages)
-to opt a specific installed package in.
+tree, it's traced automatically as soon as your own code calls it and uses the result
+like a DataFrame — see
+[Tracing installed (non-project) packages](api/cli.md#tracing-installed-non-project-packages)
+for exactly what triggers this and how to force-include or exclude a specific package.
 
 **Only these specific shapes are recognized — not arbitrary transform functions.**
 `df.rename(columns=my_company_pkg.normalize_columns)` or any other custom

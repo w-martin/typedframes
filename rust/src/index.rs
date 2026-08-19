@@ -262,18 +262,17 @@ pub(crate) fn find_site_packages_dir_uncached(project_root: &Path) -> Option<Pat
     None
 }
 
-// Collect `.py` files for each explicitly allowlisted external package (see
-// LinterConfig::trace_external_packages), resolved from the project's own
-// site-packages directory. Deliberately narrow: only the allowlisted packages' own
-// directories are walked — never the whole site-packages tree, which would be both
-// expensive and a far larger, unbounded trust surface than an explicit opt-in list.
+// Collect `.py` files for each named external package, resolved from the project's
+// own site-packages directory. `packages` is the already-merged, already-filtered set
+// -- see `resolve_traced_external_packages` for how `trace_external_packages`
+// (explicit force-include), auto-discovered candidates, and `excluded_external_packages`
+// combine into it. Deliberately narrow: only the named packages' own directories are
+// walked — never the whole site-packages tree, which would be both expensive and a far
+// larger, unbounded trust surface than a bounded, explainable package list.
 pub(crate) fn collect_external_package_files(
     project_root: &Path,
-    config: &LinterConfig,
+    packages: &[String],
 ) -> Vec<PathBuf> {
-    let Some(packages) = config.trace_external_packages.as_ref() else {
-        return Vec::new();
-    };
     if packages.is_empty() {
         return Vec::new();
     }
@@ -305,11 +304,18 @@ pub(crate) fn collect_external_package_files(
 // Runs the linter in index mode (diagnostics discarded) to collect schemas and
 // functions, then separately parses `__all__` assignments and `from X import Y`
 // statements for wildcard-import support and delegate-target resolution respectively.
+// Returns the file's `IndexEntry` plus the top-level package names of any external
+// (non-first-party) imports it called in an unresolved, DataFrame-shaped way (see
+// `Linter::unresolved_dataframe_shaped_calls`) -- candidates for on-demand external
+// package tracing, resolved by `discover_external_package_candidates` in
+// `build_index_internal`. This file's own imports/module_aliases are exactly what's
+// needed to resolve each candidate's raw call-site name to a module, so it's done
+// here rather than requiring a second pass over the same file.
 pub(crate) fn index_file(
     path: &Path,
     project_root: &Path,
     config: &LinterConfig,
-) -> Option<IndexEntry> {
+) -> Option<(IndexEntry, Vec<String>)> {
     let source = fs::read_to_string(path).ok()?;
 
     let mut linter = Linter::new();
@@ -420,17 +426,97 @@ pub(crate) fn index_file(
         }
     }
 
-    Some(IndexEntry {
-        schemas,
-        schema_locations,
-        functions,
-        exports,
-        imports,
-        module_aliases,
-    })
+    // Resolve each recorded unresolved-call name (an attribute-call receiver or a
+    // bare-call callee) to the module it was imported from, then take that module's
+    // top-level package name -- matching the same dotted-import-binds-first-segment
+    // convention as the `Stmt::Import` handling above. A name that isn't a plain
+    // import at all (a local variable, a class instance, a closure) simply has no
+    // entry in `imports`/`module_aliases` and is silently dropped here, same as any
+    // other unresolvable name elsewhere in this module.
+    let external_package_candidates: Vec<String> = linter
+        .unresolved_dataframe_shaped_calls
+        .iter()
+        .filter_map(|call| {
+            let module_name = if call.is_attribute_call {
+                module_aliases.get(&call.name)
+            } else {
+                imports.get(&call.name)
+            }?;
+            module_name.split('.').next().map(str::to_string)
+        })
+        .collect();
+
+    Some((
+        IndexEntry {
+            schemas,
+            schema_locations,
+            functions,
+            exports,
+            imports,
+            module_aliases,
+        },
+        external_package_candidates,
+    ))
 }
 
-// Build a ProjectIndex by indexing every `.py` file under `project_root`.
+// Ceiling on how many AUTO-discovered candidate packages (see
+// `discover_external_package_candidates`) get traced by default. Never applies to
+// `trace_external_packages` -- an explicit force-include is never capped, since the
+// user opted into it deliberately and by name. Bounds the worst case for a project
+// whose first-party code happens to call many different external packages in
+// DataFrame-shaped ways, in the same spirit as the MAX_SQL_FILE_READS_PER_FILE /
+// MAX_SQL_FILE_BYTES guardrails in linter.rs's own `read_sql_file`.
+pub(crate) const MAX_AUTO_TRACED_PACKAGES: usize = 20;
+
+// Merge `trace_external_packages` (forced, uncapped, exempt from
+// `excluded_external_packages`), auto-discovered candidates (capped at
+// MAX_AUTO_TRACED_PACKAGES, alphabetically for determinism, filtered by
+// `excluded_external_packages` and by not already being a first-party module), into
+// the final list of package names to trace.
+pub(crate) fn resolve_traced_external_packages(
+    config: &LinterConfig,
+    discovered_candidates: std::collections::HashSet<String>,
+    project_root: &Path,
+    first_party_files: &HashMap<String, IndexEntry>,
+) -> Vec<String> {
+    let forced: std::collections::HashSet<String> = config
+        .trace_external_packages
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let excluded: std::collections::HashSet<String> = config
+        .excluded_external_packages
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let mut auto_candidates: Vec<String> = discovered_candidates
+        .into_iter()
+        .filter(|name| !forced.contains(name))
+        .filter(|name| !excluded.contains(name))
+        // A candidate that resolves to a first-party module isn't external at all --
+        // e.g. a plain `import utils` inside a `src/` layout project can look exactly
+        // like an unresolved external call before cross-file symbols are loaded.
+        .filter(|name| resolve_module_file(name, project_root, first_party_files).is_none())
+        .collect();
+    auto_candidates.sort();
+    auto_candidates.truncate(MAX_AUTO_TRACED_PACKAGES);
+
+    let mut result: Vec<String> = forced.into_iter().collect();
+    result.extend(auto_candidates);
+    result.sort();
+    result.dedup();
+    result
+}
+
+// Build a ProjectIndex by indexing every `.py` file under `project_root`. Two-phase:
+// first-party files are indexed on their own (collecting external-package candidates
+// along the way, see `index_file`), THEN the resolved external-package list is indexed
+// and merged in — see `resolve_traced_external_packages`. This ordering is required,
+// not just convenient: deciding which external packages are worth tracing depends on
+// having already seen every first-party file's own imports and DataFrame-shaped usage.
 pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
     // Loaded once and threaded into every per-file `Linter`, so index-time inference
     // (this function) and check-time inference (`check_file`) agree on `sql_dialect` —
@@ -446,16 +532,30 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
             .map(|s| s.to_string())
             .collect(),
     };
-    let mut py_files = collect_py_files(project_root, &resolved_excludes);
-    py_files.extend(collect_external_package_files(project_root, &config));
+    let py_files = collect_py_files(project_root, &resolved_excludes);
+
     let mut files = HashMap::new();
-    for file_path in py_files {
-        if let Some(entry) = index_file(&file_path, project_root, &config) {
+    let mut discovered_candidates: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for file_path in &py_files {
+        if let Some((entry, candidates)) = index_file(file_path, project_root, &config) {
+            discovered_candidates.extend(candidates);
             if let Some(path_str) = file_path.to_str() {
                 files.insert(path_str.to_string(), entry);
             }
         }
     }
+
+    let traced_packages =
+        resolve_traced_external_packages(&config, discovered_candidates, project_root, &files);
+    for file_path in collect_external_package_files(project_root, &traced_packages) {
+        if let Some((entry, _candidates)) = index_file(&file_path, project_root, &config) {
+            if let Some(path_str) = file_path.to_str() {
+                files.insert(path_str.to_string(), entry);
+            }
+        }
+    }
+
     let all_schemas = compute_all_schemas(&files);
     let all_schema_locations = compute_all_schema_locations(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
@@ -1130,6 +1230,97 @@ mod tests {
     use super::*;
     use crate::config::LinterConfig;
     use std::path::Path;
+
+    #[test]
+    fn test_should_cap_auto_discovered_candidates_but_never_force_included_ones() {
+        // arrange: 25 auto-discovered candidates (more than MAX_AUTO_TRACED_PACKAGES),
+        // plus one package named in trace_external_packages that would sort dead last
+        // alphabetically -- it must still appear in the result, uncapped.
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: None,
+            trace_external_packages: Some(vec!["zzz_forced_pkg".to_string()]),
+            excluded_external_packages: None,
+            exclude: None,
+        };
+        let candidates: std::collections::HashSet<String> =
+            (0..25).map(|i| format!("pkg_{i:02}")).collect();
+        let dir = tempfile::tempdir().unwrap();
+
+        // act
+        let result =
+            resolve_traced_external_packages(&config, candidates, dir.path(), &HashMap::new());
+
+        // assert: forced package present regardless of the cap ...
+        assert!(result.contains(&"zzz_forced_pkg".to_string()));
+        // ... and the auto-discovered portion is capped at MAX_AUTO_TRACED_PACKAGES,
+        // keeping the alphabetically-first candidates for determinism.
+        let auto_portion: Vec<&String> = result
+            .iter()
+            .filter(|name| *name != "zzz_forced_pkg")
+            .collect();
+        assert_eq!(auto_portion.len(), MAX_AUTO_TRACED_PACKAGES);
+        assert!(auto_portion.contains(&&"pkg_00".to_string()));
+        assert!(!auto_portion.contains(&&format!("pkg_{:02}", 24)));
+    }
+
+    #[test]
+    fn test_should_respect_excluded_external_packages_in_resolve_traced_external_packages() {
+        // arrange
+        let config = LinterConfig {
+            enabled: None,
+            warnings: None,
+            sql_dialect: None,
+            trace_external_packages: None,
+            excluded_external_packages: Some(vec!["untrusted_pkg".to_string()]),
+            exclude: None,
+        };
+        let candidates: std::collections::HashSet<String> =
+            ["untrusted_pkg".to_string(), "fine_pkg".to_string()]
+                .into_iter()
+                .collect();
+        let dir = tempfile::tempdir().unwrap();
+
+        // act
+        let result =
+            resolve_traced_external_packages(&config, candidates, dir.path(), &HashMap::new());
+
+        // assert
+        assert!(!result.contains(&"untrusted_pkg".to_string()));
+        assert!(result.contains(&"fine_pkg".to_string()));
+    }
+
+    #[test]
+    fn test_should_never_treat_a_first_party_module_as_an_external_candidate() {
+        // arrange: "utils" resolves to a real first-party file already in the index --
+        // a bare `import utils` looking momentarily unresolved (before cross-file
+        // symbols are loaded) must never be treated as an external-tracing candidate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = LinterConfig::EMPTY;
+        let mut first_party_files = HashMap::new();
+        first_party_files.insert(
+            root.join("utils.py").to_str().unwrap().to_string(),
+            IndexEntry {
+                schemas: HashMap::new(),
+                schema_locations: HashMap::new(),
+                functions: HashMap::new(),
+                exports: Vec::new(),
+                imports: HashMap::new(),
+                module_aliases: HashMap::new(),
+            },
+        );
+        let candidates: std::collections::HashSet<String> =
+            ["utils".to_string()].into_iter().collect();
+
+        // act
+        let result =
+            resolve_traced_external_packages(&config, candidates, root, &first_party_files);
+
+        // assert
+        assert!(result.is_empty());
+    }
 
     #[test]
     fn test_should_not_hang_on_mutually_delegating_functions() {

@@ -22,6 +22,23 @@ typedframes check src/ --lenient-ingest
 typedframes check src/ --output-format text    # default — ty-style, auto-colored in terminal
 typedframes check src/ --output-format json    # machine-readable JSON
 typedframes check src/ --output-format github  # GitHub Actions annotations
+
+# Fail on any error — for CI (errors always exit non-zero standalone; --strict
+# additionally fails a run that only produced warnings)
+typedframes check src/ --strict
+
+# Suppress all warnings (untracked-dataframe, dropped-unknown-column)
+typedframes check src/ --no-warnings
+
+# Silence the informational summary line (a failed gate is still reported)
+typedframes check src/ --no-info
+
+# Enforce a minimum DataFrame schema coverage threshold — see
+# [DataFrame schema coverage thresholds](../usage.md#dataframe-schema-coverage-thresholds)
+typedframes check src/ --fail-under=90
+
+# Show which DataFrames lack column info, per file ("term-missing") or as JSON
+typedframes check src/ --coverage-report=term-missing
 ```
 
 ## Supported file formats

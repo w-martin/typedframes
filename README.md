@@ -91,7 +91,13 @@ or
 uv add typedframes
 ```
 
-The Rust-based checker is included — no separate install needed.
+The Rust-based checker is included — no separate install needed. `typedframes` itself has
+no required dependencies; add the extra for whichever backend(s) your code uses:
+
+```shell
+pip install typedframes[pandas]   # includes pandas
+pip install typedframes[polars]   # includes polars
+```
 
 ---
 
@@ -454,103 +460,26 @@ code reference.
 resolve column information for — the analogue of the "type coverage" reported by mypy,
 pyright, and pyre, and unrelated to test coverage. That number is informational by
 default. If you want it enforced — failing the run when too much of your code is
-invisible to the checker — enable a threshold.
-
-This is **entirely opt-in**. With no `[tool.typedframes.coverage]` table and no
-`--fail-under`, nothing changes: no threshold, no exit-code difference.
-
-Every supported key, at its default value:
+invisible to the checker — enable a threshold:
 
 ```toml
 [tool.typedframes.coverage]
-# Master switch. Coverage enforcement is off unless this is true, so adding this
-# table without setting it changes nothing.
-enabled = false
-
-# Minimum percentage of DataFrames that must have recognized column/schema info
-# before `typedframes check` exits 1. Only consulted when `enabled = true`.
-# Applies to every file not captured by a glob in [overrides] below.
-fail_under = 100.0
-
-# How much coverage detail to print after each check. One of:
-#   "summary"      one line (the default, unchanged from before this feature)
-#   "term-missing" per-file table plus the DataFrame sites lacking column info
-#   "json"         machine-readable document, for CI tooling
-# Independent of `enabled` — a detailed report is useful without a gate, and
-# vice versa. Overridden by `--coverage-report`.
-report = "summary"
-
-[tool.typedframes.coverage.overrides]
-# Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
-# than new code. Each glob is graded on its own files as a separate group, so a
-# lenient legacy bucket can't drag down (or rescue) the rest of the project.
-# Paths are matched project-relative: `**` spans any number of directories,
-# `*` and `?` stay within one path segment.
-# When several globs match one file the most specific wins — longest literal
-# prefix before the first `*` or `?`. Files matching no glob use `fail_under`.
-# "legacy/**" = 50.0
-# "src/new_module/**" = 100.0
+enabled = true
+fail_under = 90.0
 ```
 
-Prefer to keep `pyproject.toml` clean? The same settings work in a standalone
-`typedframes.toml` at the project root, with the `[tool.typedframes]` prefix dropped
-(the way `ruff.toml` drops `[tool.ruff]`):
-
-```toml
-# typedframes.toml
-[coverage]
-enabled = false
-fail_under = 100.0
-report = "summary"
-
-[coverage.overrides]
-# "legacy/**" = 50.0
-```
-
-If both files exist, `typedframes.toml` wins **entirely** — the two are never merged,
-so exactly one file explains the whole configuration.
-
-### Seeing What's Missing
-
-The default one-line DataFrame schema coverage summary tells you the ratio but not what
-to fix. `--coverage-report=term-missing` names the DataFrames that cost you coverage:
+or as a one-off, without touching config:
 
 ```shell
-typedframes check src/ --coverage-report=term-missing
+typedframes check src/ --fail-under=90
 ```
 
-```
-Name           Typed  Total   Cover   Missing
----------------------------------------------
-legacy/old.py      0      2      0%   old_one:2, old_two:3
-src/new.py         1      2     50%   bad:3
----------------------------------------------
-TOTAL              1      4     25%
-```
-
-Each `Missing` entry is `variable:line` — the assignment where the checker recognized a
-DataFrame but couldn't resolve its columns. Fix those (add `usecols=`, name the columns
-in the `SELECT`, or annotate the variable) and coverage rises.
-
-For CI tooling, `--coverage-report=json` emits the same data as a document. Combine it
-with `--output-format=json` and the coverage report is nested under a `coverage` key so
-stdout stays a single valid JSON document:
-
-```shell
-typedframes check src/ --output-format=json --coverage-report=json
-```
-
-Notes:
-
-- Coverage is a **separate gate from `--strict`**. `--strict` fails on errors
-  (correctness); a threshold fails on missing column information (completeness).
-  Enabling one never implies the other.
-- `--fail-under=N` is a **total override**: it applies one threshold everywhere and
-  ignores the config table, per-path overrides included. Handy for a one-off CI run.
-- A group with no recognized DataFrames passes: 0/0 means there was nothing to
-  measure, not that something failed.
-- A failed threshold exits **1** and is reported even under `--no-info` — that flag
-  silences the informational summary line, not a gate result.
+This is **entirely opt-in** — with no `[tool.typedframes.coverage]` table and no
+`--fail-under`, nothing changes: no threshold, no exit-code difference. Per-path
+overrides (e.g. a lower bar for `legacy/**`), a `--coverage-report=term-missing` /
+`=json` breakdown of exactly which DataFrames cost you coverage, and the full config
+reference all live in the
+[DataFrame schema coverage thresholds guide](docs/usage.md#dataframe-schema-coverage-thresholds).
 
 ## Static Analysis Performance
 
@@ -790,6 +719,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
+| Coverage gate (`--fail-under`)  | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | **Runtime Validation**          |
 | Data validation                 | ❌ No                   | ✅ Excellent | ✅ Excellent        | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |
 | Value constraints               | ❌ No                   | ✅ Yes       | ✅ Excellent        | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |
@@ -933,122 +863,23 @@ The conversion maps:
 
 ## Examples
 
-### Basic CSV Processing
+Runnable versions of everything shown in [Quick Start](#quick-start) and
+[Advanced Usage](#advanced-usage) live under [`examples/features/`](examples/features/):
 
-```python
-from typing import Annotated
-import pandas as pd
-from typedframes import BaseSchema, Column
-
-
-class Orders(BaseSchema):
-    order_id = Column(type=int)
-    customer_id = Column(type=int)
-    total = Column(type=float)
-    date = Column(type=str)
-
-
-def calculate_revenue(orders: Annotated[pd.DataFrame, Orders]) -> float:
-    return orders["total"].sum()
-
-
-df: Annotated[pd.DataFrame, Orders] = pd.read_csv("orders.csv")
-revenue = calculate_revenue(df)
-```
-
-### Time Series Analysis
-
-```python
-from typing import Annotated
-import pandas as pd
-from typedframes import BaseSchema, Column, ColumnSet, ColumnGroup
-
-
-class SensorData(BaseSchema):
-    timestamp = Column(type=str)
-    temperature = ColumnSet(type=float, members=["temp_1", "temp_2", "temp_3"])
-    humidity = ColumnSet(type=float, members=["humidity_1", "humidity_2"])
-
-    all_sensors = ColumnGroup(members=[temperature, humidity])
-
-
-df: Annotated[pd.DataFrame, SensorData] = pd.read_csv("sensors.csv")
-
-# Clean, type-safe operations using .s for column name lists
-avg_temp_per_row = df[SensorData.temperature.s].mean(axis=1)
-all_readings_stats = df[SensorData.all_sensors.s].describe()
-```
-
-### Multi-Step Pipeline
-
-```python
-from typing import Annotated
-import pandas as pd
-from typedframes import BaseSchema, Column
-
-
-class RawSales(BaseSchema):
-    date = Column(type=str)
-    product_id = Column(type=int)
-    quantity = Column(type=int)
-    price = Column(type=float)
-
-
-class AggregatedSales(BaseSchema):
-    date = Column(type=str)
-    total_revenue = Column(type=float)
-    total_quantity = Column(type=int)
-
-
-def aggregate_daily(df: Annotated[pd.DataFrame, RawSales]) -> Annotated[pd.DataFrame, AggregatedSales]:
-    result = (
-        df.groupby(RawSales.date.s)
-        .agg(
-            {
-                RawSales.price.s: "sum",
-                RawSales.quantity.s: "sum",
-            }
-        )
-        .reset_index()
-    )
-    result.columns = pd.Index(["date", "total_revenue", "total_quantity"])
-    return result  # type: ignore[return-value]
-
-
-# Type-safe pipeline
-raw: Annotated[pd.DataFrame, RawSales] = pd.read_csv("sales.csv")
-aggregated = aggregate_daily(raw)
-
-
-# Type checker validates schema transformations
-def analyze(df: Annotated[pd.DataFrame, AggregatedSales]) -> float:
-    df["total_revenue"]  # ✓ OK
-    df["price"]  # ✗ Error: 'price' not in AggregatedSales
-    return df[AggregatedSales.total_revenue.s].mean()
-```
-
-### Polars Performance Pipeline
-
-```python
-from typing import Annotated
-import polars as pl
-from typedframes import BaseSchema, Column
-
-
-class LargeDataset(BaseSchema):
-    id = Column(type=int)
-    value = Column(type=float)
-    category = Column(type=str)
-
-
-def efficient_aggregation(df: Annotated[pl.DataFrame, LargeDataset]) -> pl.DataFrame:
-    return df.filter(pl.col("value") > 100).group_by("category").agg(pl.col("value").mean())
-
-
-# Polars handles large files efficiently
-df: Annotated[pl.DataFrame, LargeDataset] = pl.read_csv("huge_file.csv")
-result = efficient_aggregation(df)
-```
+- [`annotated_pandas_example.py`](examples/features/annotated_pandas_example.py) —
+  `Annotated[pd.DataFrame, Schema]` with string and `.s` descriptor column access
+- [`annotated_polars_example.py`](examples/features/annotated_polars_example.py) —
+  the same, with `pl.col()` and `.col` descriptor expressions
+- [`typedframes_example.py`](examples/features/typedframes_example.py) — pandas and
+  polars side by side against one shared schema
+- [`schema_algebra_example.py`](examples/features/schema_algebra_example.py) —
+  composing schemas via inheritance and the `+` operator
+- [`inference_example.py`](examples/features/inference_example.py) — all four
+  column-inference modes with annotated ✓/✗ comments, no `BaseSchema` at all
+- [`multi_file_inference/`](examples/features/multi_file_inference/) and
+  [`multi_file_with_schema/`](examples/features/multi_file_with_schema/) — the same
+  cross-file pipeline checked with and without schemas, see
+  [`examples/features/README.md`](examples/features/README.md) for what each one catches
 
 ---
 
@@ -1133,35 +964,6 @@ runtime validation is genuinely necessary.
 ## License
 
 MIT License - see [LICENSE](LICENSE)
-
----
-
-## Roadmap
-
-**Shipped:**
-- [x] Schema definition API
-- [x] Pandas support
-- [x] Polars support
-- [x] Mypy plugin
-- [x] Standalone checker (Rust)
-- [x] Explicit backend types
-- [x] Merge/join schema preservation
-- [x] Schema Composition (multiple inheritance, `SchemaA + SchemaB`)
-- [x] Column name collision warnings
-- [x] Pandera integration (`to_pandera_schema()`)
-- [x] Cross-file schema inference (project-level index, `--no-index` flag)
-- [x] Aggressive column inference (untracked-dataframe/dropped-unknown-column warnings, method chain propagation)
-- [x] Function parameter contracts (`missing-column`), resolved transitively across chains of helper
-  functions and cross-file calls; schema-annotated parameters take priority over body-scanning
-- [x] SQL / data-warehouse column inference (`SELECT` list parsing across Snowflake, BigQuery, Athena, Redshift,
-  Databricks, PySpark, DuckDB, SQLAlchemy Core/ORM, Feast, and T-SQL/Synapse/Fabric dialects)
-- [x] Jupyter notebook (`.ipynb`) checking — code cells are checked directly, with errors reported as
-  `notebook.ipynb:cell N:line:col`
-
-**Planned:**
-
-- [ ] **Opt-in data loading constraints** - `Field` class with constraints (`gt`, `ge`, `lt`, `le`), strictly isolated
-  to `from_schema()` ingestion boundaries
 
 ---
 

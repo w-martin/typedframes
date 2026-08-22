@@ -2,7 +2,10 @@
 
 ## Package Structure
 
-- Import pattern: `from typedframes.pandas import PandasFrame`, `from typedframes.polars import PolarsFrame`
+- Import pattern: `from typedframes import BaseSchema, Column`, then annotate native
+  DataFrames with `Annotated[pd.DataFrame, Schema]` / `Annotated[pl.DataFrame, Schema]`
+- `PandasFrame`/`PolarsFrame` (`typedframes.pandas`/`typedframes.polars`) are deprecated
+  wrapper classes — don't use them in new code or examples
 
 ## Code Style
 - Custom exceptions with descriptive messages

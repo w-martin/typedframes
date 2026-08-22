@@ -81,7 +81,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
             **kwargs: Additional arguments passed to pd.DataFrame.
 
         """
-        super().__init__(data, **kwargs)  # ty: ignore[too-many-positional-arguments]
+        super().__init__(data, **kwargs)
         self._schema_class = schema
         self._column_consumed_map = column_consumed_map or {}
 
@@ -109,7 +109,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         if column_consumed_map is None:
             _, column_consumed_map = schema.compute_column_map(list(df.columns))
 
-        return cls(df, schema=schema, column_consumed_map=column_consumed_map)  # ty: ignore[no-matching-overload]
+        return cls(df, schema=schema, column_consumed_map=column_consumed_map)
 
     @classmethod
     def read_csv(cls, filepath_or_buffer: Any, schema: type[SchemaT], **kwargs: Any) -> PandasFrame[SchemaT]:
@@ -195,7 +195,7 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         @overload
         def __getitem__(self, key: pd.Series) -> PandasFrame[SchemaT]: ...
 
-    def __getitem__(  # ty: ignore[invalid-method-override]
+    def __getitem__(
         self,
         key: Column | ColumnSet | ColumnGroup | str | list[str] | pd.Series,
     ) -> pd.Series | pd.DataFrame:
@@ -235,11 +235,11 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
                 if isinstance(result, list):
                     resolved.extend(result)
                 else:
-                    resolved.append(result)  # ty: ignore[invalid-argument-type]
+                    resolved.append(result)
             return resolved
         return by
 
-    def groupby(self, by: Any = None, **kwargs: Any) -> Any:  # ty: ignore[invalid-method-override]
+    def groupby(self, by: Any = None, **kwargs: Any) -> Any:
         """Group by schema descriptors, strings, or mixed lists.
 
         Accepts ``Column``, ``ColumnSet``, ``ColumnGroup`` descriptors
@@ -260,14 +260,14 @@ class PandasFrame(pd.DataFrame, Generic[SchemaT]):
         """Return constructor for slicing/operations to preserve PandasFrame type."""
 
         def constructor(data: Any, **kwargs: Any) -> PandasFrame[SchemaT]:
-            return PandasFrame(  # ty: ignore[no-matching-overload]
+            return PandasFrame(
                 data,
                 schema=self._schema_class,
                 column_consumed_map=self._column_consumed_map,
                 **kwargs,
             )
 
-        return constructor  # ty: ignore[invalid-return-type]
+        return constructor
 
     @property
     def _constructor_sliced(self) -> type[pd.Series]:

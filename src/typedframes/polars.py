@@ -133,7 +133,7 @@ else:
             return Annotated[pl.DataFrame, schema]
 
         @classmethod
-        def read_csv(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:  # noqa: ARG003
+        def read_csv(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:
             """
             Read a CSV file into a polars DataFrame.
 
@@ -157,7 +157,7 @@ else:
             return pl.read_csv(source, **kwargs)
 
         @classmethod
-        def read_parquet(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:  # noqa: ARG003
+        def read_parquet(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:
             """
             Read a Parquet file into a polars DataFrame.
 
@@ -181,7 +181,7 @@ else:
             return pl.read_parquet(source, **kwargs)
 
         @classmethod
-        def read_json(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:  # noqa: ARG003
+        def read_json(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:
             """
             Read a JSON file into a polars DataFrame.
 
@@ -205,7 +205,7 @@ else:
             return pl.read_json(source, **kwargs)
 
         @classmethod
-        def read_excel(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:  # noqa: ARG003
+        def read_excel(cls, source: Any, schema: type[SchemaT], **kwargs: Any) -> Any:
             """
             Read an Excel file into a polars DataFrame.
 

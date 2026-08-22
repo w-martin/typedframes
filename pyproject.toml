@@ -109,6 +109,11 @@ ignore = [
 "tasks.py" = ["T201"]
 "src/typedframes/cli.py" = ["T201"]
 "benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]
+# Deprecated PolarsFrame classmethod stubs (read_csv/read_parquet/read_json/read_excel)
+# intentionally don't use `source`/`schema` -- they exist only to raise a deprecation
+# warning and forward to the real pandas/polars call, matching the real signatures
+# they stand in for.
+"src/typedframes/polars.py" = ["ARG003"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
@@ -213,6 +218,20 @@ include = ["benchmarks/**/*.py"]
 
 [tool.ty.overrides.rules]
 no-matching-overload = "ignore"
+
+# PandasFrame is deprecated (see its module docstring): it subclasses pd.DataFrame to
+# attach schema-aware __getitem__/groupby overrides, which structurally can't satisfy
+# pd.DataFrame's own signatures -- that mismatch is the reason the class is deprecated
+# in favor of Annotated[pd.DataFrame, Schema], not a bug to work around case-by-case.
+[[tool.ty.overrides]]
+include = ["src/typedframes/pandas.py"]
+
+[tool.ty.overrides.rules]
+invalid-method-override = "ignore"
+no-matching-overload = "ignore"
+invalid-argument-type = "ignore"
+too-many-positional-arguments = "ignore"
+invalid-return-type = "ignore"
 
 [tool.typedframes]
 enabled = true

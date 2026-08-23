@@ -62,7 +62,9 @@ Runs all linters:
 - `ruff check` - Python linting
 - `ty check` - Type checking
 - `bandit` - Security linting
-- `complexipy` - Complexity checking (max complexity: 8)
+- `complexipy` - Complexity checking on `src/` (fails a function above 50); a separate,
+  stricter mccabe check runs inside `ruff check` (fails above 10) and covers both `src/`
+  and `rust/`'s Python-facing glue
 
 ### Fix Linting Issues
 

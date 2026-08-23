@@ -55,7 +55,7 @@ class TypedFramesPlugin(Plugin):
         key = str(project_root)
         if key not in self._index_bytes_by_root:
             try:
-                from typedframes._rust_checker import build_project_index  # ty: ignore[unresolved-import]
+                from typedframes._rust_checker import build_project_index
 
                 self._index_bytes_by_root[key] = build_project_index(str(project_root))
             except ImportError:
@@ -64,7 +64,7 @@ class TypedFramesPlugin(Plugin):
 
     def _run_via_extension(self, file_path: str, index_bytes: bytes | None) -> list[dict[str, Any]]:
         """Run the checker via the Rust extension module."""
-        from typedframes._rust_checker import check_file  # ty: ignore[unresolved-import]
+        from typedframes._rust_checker import check_file
 
         result_json = str(check_file(file_path, index_bytes))
         result: dict[str, Any] = json.loads(result_json)

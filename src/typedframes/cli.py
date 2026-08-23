@@ -405,7 +405,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     counterpart to `coverage report -m`'s missing line numbers.
     """
     try:
-        from typedframes._rust_checker import check_file, check_notebook  # ty: ignore[unresolved-import]
+        from typedframes._rust_checker import check_file, check_notebook
     except ImportError:
         msg = (
             "The Rust checker extension was not found. "
@@ -942,7 +942,7 @@ def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
     if not path.is_dir() or args.no_index:
         return None
     try:
-        from typedframes._rust_checker import build_project_index  # ty: ignore[unresolved-import]
+        from typedframes._rust_checker import build_project_index
 
         return build_project_index(str(path))
     except ImportError:

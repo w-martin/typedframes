@@ -1283,7 +1283,7 @@ class TestCli(unittest.TestCase):
         self.assertEqual([], failing)
 
     def test_should_ignore_path_overrides_when_fail_under_flag_is_given(self) -> None:
-        """Test that --fail-under is a total override, not merged with config overrides."""
+        """Test that --coverage-fail-under is a total override, not merged with config overrides."""
         # arrange
         per_file = {"/proj/legacy/old.py": (4, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
@@ -1453,7 +1453,7 @@ class TestCli(unittest.TestCase):
             self.assertIn("below the required 100.0%", captured.getvalue())
 
     def test_should_exit_1_when_fail_under_flag_is_not_met_without_any_config(self) -> None:
-        """Test that --fail-under enforces a threshold on an otherwise unconfigured project."""
+        """Test that --coverage-fail-under enforces a threshold on an otherwise unconfigured project."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "load.py").write_text('import pandas as pd\ndf = pd.read_csv("a.csv")\n')
@@ -1462,21 +1462,21 @@ class TestCli(unittest.TestCase):
 
             # act
             with patch("sys.stdout", captured), self.assertRaises(SystemExit) as ctx:
-                main(["check", tmpdir, "--fail-under", "50"])
+                main(["check", tmpdir, "--coverage-fail-under", "50"])
 
             # assert
             self.assertEqual(1, ctx.exception.code)
             self.assertIn("below the required 50.0%", captured.getvalue())
 
     def test_should_exit_2_when_fail_under_flag_is_out_of_range(self) -> None:
-        """Test that an invalid --fail-under is a usage error, not a coverage failure."""
+        """Test that an invalid --coverage-fail-under is a usage error, not a coverage failure."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "load.py").write_text("x = 1\n")
 
             # act / assert
             with patch("sys.stderr", StringIO()), self.assertRaises(SystemExit) as ctx:
-                main(["check", tmpdir, "--fail-under", "150"])
+                main(["check", tmpdir, "--coverage-fail-under", "150"])
 
             self.assertEqual(2, ctx.exception.code)
 
@@ -1619,7 +1619,7 @@ class TestCli(unittest.TestCase):
         self.assertEqual("/elsewhere/mod.py", rel)
 
     def test_should_reject_a_non_numeric_fail_under_flag(self) -> None:
-        """Test that --fail-under=abc is a usage error rather than a crash."""
+        """Test that --coverage-fail-under=abc is a usage error rather than a crash."""
         # act / assert
         with self.assertRaises(argparse.ArgumentTypeError):
             _percentage("abc")

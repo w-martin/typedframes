@@ -347,18 +347,18 @@ to validate. It is informational by default.
 
 To enforce it — failing CI when too much of the codebase is opaque to the checker —
 turn on a threshold. Enforcement is **entirely opt-in**: with no
-`[tool.typedframes.coverage]` table and no `--fail-under`, no threshold is evaluated
+`[tool.typedframes.coverage]` table and no `--coverage-fail-under`, no threshold is evaluated
 and the exit code is exactly what it was before.
 
 ### One-off enforcement
 
 ```shell
-typedframes check src/ --fail-under=90
+typedframes check src/ --coverage-fail-under=90
 ```
 
-Exits `1` if under 90% of DataFrames had column info. `--fail-under` is a **total
+Exits `1` if under 90% of DataFrames had column info. `--coverage-fail-under` is a **total
 override**: one threshold for every file, ignoring the config table entirely (per-path
-overrides included), so `--fail-under=100` really does mean 100% everywhere and can't
+overrides included), so `--coverage-fail-under=100` really does mean 100% everywhere and can't
 be quietly capped by a legacy exemption in config.
 
 ### Project configuration
@@ -417,7 +417,7 @@ Config is read from the directory you point `check` at, and only that directory 
 is no walking up the ancestor chain, matching how `exclude` and the cross-file index
 already treat that path as the project root. Checking a single file
 (`typedframes check src/pipeline.py`) therefore picks up no config file; use
-`--fail-under` there.
+`--coverage-fail-under` there.
 
 ### A worked example
 
@@ -527,7 +527,7 @@ a one-off `--coverage-report=term-missing` needs no config edit.
   threshold fails on missing column information (completeness). They measure different
   things, and enabling one never implies the other.
 - **Exit code `1`** on a failed threshold, the same code `--strict` uses for errors.
-  (`2` stays reserved for usage errors, including an out-of-range `--fail-under`.)
+  (`2` stays reserved for usage errors, including an out-of-range `--coverage-fail-under`.)
 - **Empty groups pass.** A group with no recognized DataFrames is 0/0 — nothing to
   measure, not a failure — matching how the summary line already reports an empty run.
 - **`--no-info` doesn't hide failures.** That flag silences the informational coverage

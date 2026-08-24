@@ -95,7 +95,7 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
 
 # DataFrame schema coverage enforcement is entirely opt-in: with no
 # `[tool.typedframes.coverage]` table (or `[coverage]` in typedframes.toml) and no
-# `--fail-under`, no threshold is ever evaluated and `check` behaves exactly as it did
+# `--coverage-fail-under`, no threshold is ever evaluated and `check` behaves exactly as it did
 # before the feature existed -- same output, same exit code. `_COVERAGE_DEFAULT_FAIL_UNDER`
 # is therefore the default only once enforcement has been switched on; it is NOT a
 # threshold applied to unconfigured projects.
@@ -225,7 +225,7 @@ def _load_coverage_config(path: Path) -> CoverageConfig:
     Only looks at `path`, and only when it is a directory -- no walking up the
     ancestor chain -- matching `_load_configured_excludes` and
     `_build_index_bytes`, which already treat `path` as the project root.
-    Checking a single file therefore never picks up a config file; `--fail-under`
+    Checking a single file therefore never picks up a config file; `--coverage-fail-under`
     covers that case.
 
     Returns the disabled default whenever nothing is configured or the config is
@@ -557,7 +557,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Suppress informational output: the DataFrame schema coverage summary and info-level diagnostics.",
     )
     check_parser.add_argument(
-        "--fail-under",
+        "--coverage-fail-under",
         type=_percentage,
         default=None,
         dest="fail_under",
@@ -667,8 +667,8 @@ def _evaluate_coverage(
     aggregate ratio, so a legacy subtree held to 50% cannot drag down (or be
     rescued by) the rest of the project.
 
-    `--fail-under` is a TOTAL override: one threshold for every file, per-path
-    overrides ignored, so a one-off `--fail-under=100` really does mean 100
+    `--coverage-fail-under` is a TOTAL override: one threshold for every file, per-path
+    overrides ignored, so a one-off `--coverage-fail-under=100` really does mean 100
     everywhere rather than being quietly capped by a legacy exemption in config.
 
     A bucket with no recognized DataFrames passes vacuously: 0/0 means the

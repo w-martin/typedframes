@@ -35,7 +35,7 @@ typedframes check src/ --no-info
 
 # Enforce a minimum DataFrame schema coverage threshold — see
 # [DataFrame schema coverage thresholds](../usage.md#dataframe-schema-coverage-thresholds)
-typedframes check src/ --fail-under=90
+typedframes check src/ --coverage-fail-under=90
 
 # Show which DataFrames lack column info, per file ("term-missing") or as JSON
 typedframes check src/ --coverage-report=term-missing

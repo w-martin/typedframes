@@ -25,13 +25,13 @@ print(orders["revenue"])  # ✗ unknown-column — 'revenue' not in inferred col
 ```
 
 ```shell
-typedframes check src/ --fail-under=90
+typedframes check src/ --coverage-fail-under=90
 # src/pipeline.py:7:8: error[unknown-column] Column 'revenue' does not exist in inferred column set (defined at line 6)
 # ✗ Found 1 error in 12 files (0.0s)
 # ✗ DataFrame schema coverage 82.0% is below the required 90.0% (9/11 DataFrames had column info)
 ```
 
-`--fail-under=N` is the same idea as a test-coverage or mypy type-coverage gate, applied to how many DataFrames
+`--coverage-fail-under=N` is the same idea as a test-coverage or mypy type-coverage gate, applied to how many DataFrames
 the checker can resolve columns for — see [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
 Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete — see [Quick Start](#quick-start).
 
@@ -70,7 +70,7 @@ tracking and IDE autocomplete; they're a progressive enhancement, not a prerequi
 **What you get:**
 
 - ✅ **Works without schema annotations** - Column inference from `usecols=`, `dtype=`, and method chains catches errors on unannotated code
-- ✅ **CI gate via coverage threshold** - `--fail-under=N` fails the build when too much of your codebase is invisible to the checker, the same way you'd gate on test coverage or a type checker's type-coverage number
+- ✅ **CI gate via coverage threshold** - `--coverage-fail-under=N` fails the build when too much of your codebase is invisible to the checker, the same way you'd gate on test coverage or a type checker's type-coverage number
 - ✅ **Rust-fast** - Milliseconds, not seconds, even on hundreds of files; fast enough for pre-commit hooks and CI (see [benchmarks](#static-analysis-performance))
 - ✅ **Cross-file awareness** - Add `BaseSchema` and typed return annotations to follow schemas across module boundaries
 - ✅ **Refactor-safe access** - `df[Schema.column_group.s].mean()` (pandas) or `df.select(Schema.col.col)` (polars) instead of scattered string literals
@@ -401,7 +401,7 @@ typedframes check src/ --no-index
 typedframes check src/ --no-warnings
 
 # Enforce minimum DataFrame schema coverage (see below)
-typedframes check src/ --fail-under=90
+typedframes check src/ --coverage-fail-under=90
 
 # Show which DataFrames lack column info, per file
 typedframes check src/ --coverage-report=term-missing
@@ -471,11 +471,11 @@ fail_under = 90.0
 or as a one-off, without touching config:
 
 ```shell
-typedframes check src/ --fail-under=90
+typedframes check src/ --coverage-fail-under=90
 ```
 
 This is **entirely opt-in** — with no `[tool.typedframes.coverage]` table and no
-`--fail-under`, nothing changes: no threshold, no exit-code difference. Per-path
+`--coverage-fail-under`, nothing changes: no threshold, no exit-code difference. Per-path
 overrides (e.g. a lower bar for `legacy/**`), a `--coverage-report=term-missing` /
 `=json` breakdown of exactly which DataFrames cost you coverage, and the full config
 reference all live in the
@@ -719,7 +719,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | Column name checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Column type checking            | ✅ Yes                  | ⚠️ Limited  | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | Typo suggestions                | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
-| Coverage gate (`--fail-under`)  | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
+| Coverage gate (`--coverage-fail-under`)  | ✅ Yes                  | ❌ No        | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ❌ No     | ❌ No             | ❌ No             |
 | **Runtime Validation**          |
 | Data validation                 | ❌ No                   | ✅ Excellent | ✅ Excellent        | ✅ typeguard           | ❌ No         | ✅ Yes       | ✅ Yes              | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |
 | Value constraints               | ❌ No                   | ✅ Yes       | ✅ Excellent        | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ✅ Yes            | ❌ No     | ✅ Yes            | ✅ Yes            |

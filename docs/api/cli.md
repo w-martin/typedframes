@@ -10,36 +10,108 @@ typedframes check pipeline.py
 
 # Check an entire directory (builds a cross-file project index)
 typedframes check src/
-
-# Check without building the project index (each file checked independently)
-typedframes check src/ --no-index
-
-# Downgrade untracked-dataframe from a warning to a quiet info-level note for bare
-# DataFrame loads (warning by default)
-typedframes check src/ --lenient-ingest
-
-# Output formats
-typedframes check src/ --output-format text    # default — ty-style, auto-colored in terminal
-typedframes check src/ --output-format json    # machine-readable JSON
-typedframes check src/ --output-format github  # GitHub Actions annotations
-
-# Fail on any error — for CI (errors always exit non-zero standalone; --strict
-# additionally fails a run that only produced warnings)
-typedframes check src/ --strict
-
-# Suppress all warnings (untracked-dataframe, dropped-unknown-column)
-typedframes check src/ --no-warnings
-
-# Silence the informational summary line (a failed gate is still reported)
-typedframes check src/ --no-info
-
-# Enforce a minimum DataFrame schema coverage threshold — see
-# [DataFrame schema coverage thresholds](../usage.md#dataframe-schema-coverage-thresholds)
-typedframes check src/ --coverage-fail-under=90
-
-# Show which DataFrames lack column info, per file ("term-missing") or as JSON
-typedframes check src/ --coverage-report=term-missing
 ```
+
+Every other flag is documented below, grouped by what it controls, each with a runnable
+example. `typedframes check <path>` alone runs with every default: cross-file index on,
+warnings on, text output, no coverage gate.
+
+## Flags reference
+
+### Where to check
+
+- **`path`** (positional, required) — file or directory to check.
+- **`--no-index`** — skip building the cross-file project index; check each file in
+  isolation. Faster for a single file, but blind to imports across files (a schema
+  defined in `schemas.py` and used in `pipeline.py` won't be followed).
+
+  ```shell
+  typedframes check src/pipeline.py --no-index
+  ```
+
+### What to report
+
+- **`--no-warnings`** — suppress `untracked-dataframe` and `dropped-unknown-column`
+  diagnostics. They still count toward DataFrame schema coverage either way — this only
+  silences the printed warning, not the underlying "columns unknown" fact.
+
+  ```shell
+  typedframes check src/ --no-warnings
+  ```
+
+- **`--lenient-ingest`** — downgrade `untracked-dataframe` from a warning to an info-level
+  note, for EDA-style code that loads data before knowing its shape on purpose.
+
+  ```shell
+  typedframes check src/ --lenient-ingest
+  ```
+
+- **`--no-info`** — silence the informational one-line summary (files checked, elapsed
+  time, DataFrame schema coverage ratio). A failed `--coverage-fail-under` gate is still
+  reported regardless — this flag only silences the *informational* line, never a result.
+
+  ```shell
+  typedframes check src/ --no-info
+  ```
+
+- **`--strict`** — exit `1` if any errors were found. Without it, `check` still reports
+  errors but exits `0` unless something else (a failed coverage gate) demands non-zero.
+  Warnings alone never trigger `--strict`; it only judges errors.
+
+  ```shell
+  typedframes check src/ --strict
+  ```
+
+### How to shape the output
+
+These two flags are independent axes, not two ways to ask for the same thing:
+**`--output-format` picks the shape everything prints in; `--coverage-detail` picks how
+much coverage detail is in it.** Neither implies a value for the other.
+
+- **`--output-format {text,json,github}`** (default `text`) — the shape of every printed
+  result: diagnostics, the coverage summary line, coverage detail, gate failures.
+
+  ```shell
+  typedframes check src/ --output-format text    # default — ty/ruff-style, auto-colored on a TTY
+  typedframes check src/ --output-format json    # one JSON document to stdout
+  typedframes check src/ --output-format github  # GitHub Actions workflow annotations
+  ```
+
+- **`--coverage-detail {summary,term-missing}`** (default `summary`) — how much DataFrame
+  schema coverage detail to print, independent of `--output-format`. `summary` is the
+  existing one-line ratio (the default — an unconfigured project sees exactly what it
+  always saw). `term-missing` adds a breakdown of exactly which DataFrames lack column
+  info. There is deliberately no `json` value here: JSON-ness is `--output-format`'s job
+  alone. Ask for `term-missing` detail under whichever format you're already using, and
+  it renders in that shape — a text table under `text`, or the same data nested under a
+  `coverage` key under `json`:
+
+  ```shell
+  # As a text table
+  typedframes check src/ --coverage-detail term-missing
+
+  # The exact same detail, as structured JSON nested under a "coverage" key
+  typedframes check src/ --output-format json --coverage-detail term-missing
+  ```
+
+  See [DataFrame schema coverage thresholds](../usage.md#reporting-seeing-whats-missing)
+  for the full text-table and JSON payload shapes side by side.
+
+### Enforcing coverage
+
+- **`--coverage-fail-under=N`** — exit `1` if fewer than `N`% of DataFrames had
+  recognized column info. A total override: applies one threshold to every file and
+  ignores `[tool.typedframes.coverage]` entirely, per-path overrides included — handy for
+  a one-off CI run without touching project config.
+
+  ```shell
+  typedframes check src/ --coverage-fail-under=90
+  ```
+
+  For a threshold that persists across runs, or that needs a lower bar for legacy code,
+  configure `[tool.typedframes.coverage]` in `pyproject.toml` instead — see
+  [DataFrame schema coverage thresholds](../usage.md#dataframe-schema-coverage-thresholds)
+  for per-path overrides, which this flag doesn't support.
 
 ## Supported file formats
 

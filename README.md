@@ -404,7 +404,7 @@ typedframes check src/ --no-warnings
 typedframes check src/ --coverage-fail-under=90
 
 # Show which DataFrames lack column info, per file
-typedframes check src/ --coverage-report=term-missing
+typedframes check src/ --coverage-detail=term-missing
 ```
 
 To suppress warnings project-wide, add to `pyproject.toml`:
@@ -476,9 +476,10 @@ typedframes check src/ --coverage-fail-under=90
 
 This is **entirely opt-in** — with no `[tool.typedframes.coverage]` table and no
 `--coverage-fail-under`, nothing changes: no threshold, no exit-code difference. Per-path
-overrides (e.g. a lower bar for `legacy/**`), a `--coverage-report=term-missing` /
-`=json` breakdown of exactly which DataFrames cost you coverage, and the full config
-reference all live in the
+overrides (e.g. a lower bar for `legacy/**`), a `--coverage-detail=term-missing`
+breakdown of exactly which DataFrames cost you coverage (as text or, combined with
+`--output-format=json`, as structured JSON), and the full config reference all live in
+the
 [DataFrame schema coverage thresholds guide](docs/usage.md#dataframe-schema-coverage-thresholds).
 
 ## Static Analysis Performance

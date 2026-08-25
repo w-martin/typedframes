@@ -1797,7 +1797,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(shortfall, len(stats["untyped_sites"]))
 
     def test_should_print_term_missing_table_end_to_end(self) -> None:
-        """Test that --coverage-report=term-missing prints the per-file breakdown."""
+        """Test that --coverage-detail=term-missing prints the per-file breakdown."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
@@ -1806,31 +1806,21 @@ class TestCli(unittest.TestCase):
 
             # act
             with patch("sys.stdout", captured):
-                main(["check", tmpdir, "--no-warnings", "--coverage-report", "term-missing"])
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "term-missing"])
 
             # assert
             output = captured.getvalue()
             self.assertIn("Missing", output)
             self.assertIn("sales:2", output)
 
-    def test_should_print_standalone_json_coverage_report_in_text_mode(self) -> None:
-        """Test that --coverage-report=json emits a coverage document."""
-        # arrange
-        with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
-
-            captured = StringIO()
-
-            # act
-            with patch("sys.stdout", captured):
-                main(["check", tmpdir, "--no-warnings", "--no-info", "--coverage-report", "json"])
-
-            # assert
-            payload = json.loads(captured.getvalue().split("\n", 1)[1])
-            self.assertEqual("sales", payload["files"][0]["missing"][0]["var"])
+    def test_should_reject_json_as_a_coverage_detail_value(self) -> None:
+        """Test that json is not a --coverage-detail value -- --output-format owns format."""
+        # arrange / act / assert
+        with self.assertRaises(SystemExit):
+            main(["check", ".", "--coverage-detail", "json"])
 
     def test_should_nest_coverage_detail_inside_json_output_format(self) -> None:
-        """Test that json output stays one document when a coverage report is requested."""
+        """Test that --coverage-detail=term-missing nests as structured JSON under --output-format=json."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
@@ -1839,7 +1829,7 @@ class TestCli(unittest.TestCase):
 
             # act
             with patch("sys.stdout", captured):
-                main(["check", tmpdir, "--output-format", "json", "--coverage-report", "json"])
+                main(["check", tmpdir, "--output-format", "json", "--coverage-detail", "term-missing"])
 
             # assert
             payload = json.loads(captured.getvalue())
@@ -1862,55 +1852,55 @@ class TestCli(unittest.TestCase):
             payload = json.loads(captured.getvalue())
             self.assertEqual(["errors", "stats"], sorted(payload))
 
-    def test_should_read_report_mode_from_config(self) -> None:
-        """Test that the `report` key selects a report mode without a CLI flag."""
+    def test_should_read_detail_level_from_config(self) -> None:
+        """Test that the `detail` key selects a detail level without a CLI flag."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nreport = "term-missing"\n')
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\ndetail = "term-missing"\n')
 
             # act
             config = _load_coverage_config(Path(tmpdir))
 
             # assert
-            self.assertEqual("term-missing", config.report)
+            self.assertEqual("term-missing", config.detail)
 
-    def test_should_warn_and_fall_back_when_report_mode_is_unknown(self) -> None:
-        """Test that an unrecognized report mode is reported rather than silently accepted."""
+    def test_should_warn_and_fall_back_when_detail_level_is_unknown(self) -> None:
+        """Test that an unrecognized detail level is reported rather than silently accepted."""
         # arrange
         captured = StringIO()
         with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nreport = "html"\n')
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\ndetail = "html"\n')
 
             # act
             with patch("sys.stderr", captured):
                 config = _load_coverage_config(Path(tmpdir))
 
             # assert
-            self.assertEqual("summary", config.report)
-            self.assertIn("coverage.report", captured.getvalue())
+            self.assertEqual("summary", config.detail)
+            self.assertIn("coverage.detail", captured.getvalue())
 
-    def test_should_let_the_flag_override_the_configured_report_mode(self) -> None:
-        """Test that --coverage-report wins over the `report` config key."""
+    def test_should_let_the_flag_override_the_configured_detail_level(self) -> None:
+        """Test that --coverage-detail wins over the `detail` config key."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
-            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nreport = "term-missing"\n')
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\ndetail = "term-missing"\n')
 
             captured = StringIO()
 
             # act
             with patch("sys.stdout", captured):
-                main(["check", tmpdir, "--no-warnings", "--coverage-report", "summary"])
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "summary"])
 
             # assert
             self.assertNotIn("Missing", captured.getvalue())
 
     def test_should_report_detail_without_enabling_enforcement(self) -> None:
-        """Test that `report` is independent of `enabled`: detail without a gate."""
+        """Test that `detail` is independent of `enabled`: detail without a gate."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv")\n')
-            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nenabled = false\nreport = "term-missing"\n')
+            (Path(tmpdir) / "typedframes.toml").write_text('[coverage]\nenabled = false\ndetail = "term-missing"\n')
 
             captured = StringIO()
 

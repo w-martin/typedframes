@@ -339,7 +339,8 @@ Every `check` run ends with a DataFrame schema coverage line:
 **DataFrame schema coverage** is the fraction of DataFrames the checker could resolve
 column information for. It is this project's analogue of the "type coverage" reported by
 mypy, pyright, and pyre, and has nothing to do with test coverage — worth stating plainly,
-because the vocabulary below (`fail_under`, `term-missing`) is borrowed from coverage.py.
+because the vocabulary below (`fail_under`, `term-missing`) is borrowed from pytest-cov
+and coverage.py.
 
 It measures how much the checker could *see*, not how correct your code is: a low ratio
 means most DataFrames arrived without resolvable column information, so there was little
@@ -379,10 +380,14 @@ fail_under = 100.0
 # How much coverage detail to print after each check. One of:
 #   "summary"      one line (the default, unchanged from before this feature)
 #   "term-missing" per-file table plus the DataFrame sites lacking column info
-#   "json"         machine-readable document, for CI tooling
+# There's no "json" value here -- that's --output-format's job, not this key's.
+# Pair detail = "term-missing" with --output-format=json (or [tool.typedframes]
+# in general with an --output-format=json run) to get the exact same detail as
+# structured JSON, nested under a "coverage" key, instead of the text table. See
+# "Reporting: seeing what's missing" below for both forms side by side.
 # Independent of `enabled` — a detailed report is useful without a gate, and
-# vice versa. Overridden by `--coverage-report`.
-report = "summary"
+# vice versa. Overridden by `--coverage-detail`.
+detail = "summary"
 
 [tool.typedframes.coverage.overrides]
 # Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
@@ -404,7 +409,7 @@ The same settings work in a standalone `typedframes.toml` at the project root, w
 [coverage]
 enabled = false
 fail_under = 100.0
-report = "summary"
+detail = "summary"
 
 [coverage.overrides]
 # "legacy/**" = 50.0
@@ -444,11 +449,25 @@ silently improves the number the rest of your code is held to.
 ### Reporting: seeing what's missing
 
 The default one-line DataFrame schema coverage summary gives a ratio but nothing to act
-on. `term-missing` — named after `coverage report -m` — adds a per-file table and names
-the DataFrames that cost coverage:
+on. `--coverage-detail` controls how much more detail gets printed, and it takes exactly
+two values — `summary` (the default, one line, byte-for-byte what you already saw above)
+and `term-missing` (a per-file table naming the DataFrames that cost you coverage).
+
+There's no `json` value on `--coverage-detail`. That's deliberate: **`--coverage-detail`
+picks how much to show, `--output-format` picks the shape it's shown in** — they're two
+independent axes, not two competing "give me JSON" flags. Ask for `term-missing` detail
+under whichever `--output-format` you're already using, and the checker renders it in
+that same shape: a text table under the default `text` format, or nested, structured JSON
+under `--output-format=json`. The two examples below are the same underlying data in
+each of those two shapes — pick whichever your CI setup consumes.
+
+#### As a text table
+
+Named after `coverage report -m` — `term-missing` here is the same idea as `pytest-cov`'s
+`--cov-report=term-missing`:
 
 ```shell
-typedframes check src/ --coverage-report=term-missing
+typedframes check src/ --coverage-detail=term-missing
 ```
 
 ```
@@ -473,18 +492,15 @@ suppresses them entirely, while coverage is counted regardless.
 Files with no recognized DataFrames are omitted from the table — a `0/0` row says
 nothing about coverage and would only bury the rows that matter.
 
-For CI tooling, `json` emits the same data as a document:
+#### As structured JSON
+
+Add `--output-format=json` to the exact same `--coverage-detail=term-missing` flag, and
+you get the same information as a machine-readable document instead of a text table,
+nested under a `coverage` key so stdout stays a single valid JSON document (never two
+concatenated blobs):
 
 ```shell
-typedframes check src/ --coverage-report=json
-```
-
-Combine it with `--output-format=json` and the coverage report is nested under a
-`coverage` key rather than printed separately, so stdout stays a single valid JSON
-document:
-
-```shell
-typedframes check src/ --output-format=json --coverage-report=json
+typedframes check src/ --output-format=json --coverage-detail=term-missing
 ```
 
 Shape of the payload, with the `errors` list elided for brevity:
@@ -514,12 +530,13 @@ Percentages in the JSON report are left unrounded — a consumer deciding whethe
 passed needs the real ratio and can round for display itself. A file with no DataFrames
 reports `null` rather than a fabricated percentage.
 
-With no `--coverage-report` and no `report` key, the `coverage` key is absent and the
-JSON payload is exactly what it was before this feature existed.
+With `--coverage-detail=summary` (the default) and `--output-format=json`, the `coverage`
+key is absent entirely and the JSON payload is exactly what it was before this feature
+existed — asking for `term-missing` detail is what turns the key on, regardless of format.
 
-`report` is independent of `enabled`: you can get a detailed report with no threshold,
-or a threshold with only the one-line summary. The CLI flag wins over the config key, so
-a one-off `--coverage-report=term-missing` needs no config edit.
+`detail` is independent of `enabled`: you can get a detailed report with no threshold, or
+a threshold with only the one-line summary. The CLI flag wins over the config key, so a
+one-off `--coverage-detail=term-missing` needs no config edit.
 
 ### Behaviour notes
 

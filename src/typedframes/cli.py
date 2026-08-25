@@ -102,10 +102,13 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
 _COVERAGE_DEFAULT_FAIL_UNDER = 100.0
 _COVERAGE_PCT_MAX = 100.0
 
-# Report detail levels, named after `coverage report` / `coverage report -m`.
-# "summary" is the pre-existing one-line message and the default, so an unconfigured
-# project sees exactly what it saw before.
-_COVERAGE_REPORTS = ("summary", "term-missing", "json")
+# Coverage detail levels: how much DataFrame schema coverage detail to print, as text
+# (or nested as structured JSON under --output-format=json). Deliberately just two
+# verbosity levels, not a format -- "summary" is the pre-existing one-line message and
+# the default, so an unconfigured project sees exactly what it saw before; JSON-ness is
+# --output-format's job alone, not a third value here (see --coverage-detail's help).
+# "term-missing" is named after `coverage report -m`.
+_COVERAGE_DETAILS = ("summary", "term-missing")
 
 
 def _coverage_warn(message: str) -> None:
@@ -129,7 +132,7 @@ class CoverageConfig:
     fail_under: float = _COVERAGE_DEFAULT_FAIL_UNDER
     overrides: tuple[tuple[str, float], ...] = ()
 
-    report: str = "summary"
+    detail: str = "summary"
     """How much DataFrame schema coverage detail to print.
 
     Independent of `enabled`, which gates threshold *enforcement* only -- asking
@@ -186,10 +189,10 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
         if parsed is not None:
             fail_under = parsed
 
-    report = table.get("report", "summary")
-    if report not in _COVERAGE_REPORTS:
-        _coverage_warn(f"ignoring coverage.report: expected one of {', '.join(_COVERAGE_REPORTS)}")
-        report = "summary"
+    detail = table.get("detail", "summary")
+    if detail not in _COVERAGE_DETAILS:
+        _coverage_warn(f"ignoring coverage.detail: expected one of {', '.join(_COVERAGE_DETAILS)}")
+        detail = "summary"
 
     raw_overrides = table.get("overrides", {})
     overrides: list[tuple[str, float]] = []
@@ -208,7 +211,7 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
         enabled=enabled,
         fail_under=fail_under,
         overrides=tuple(overrides),
-        report=report,
+        detail=detail,
     )
 
 
@@ -401,7 +404,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
 
     Also returns ``untyped_sites``: every DataFrame origin the checker recognized
     but could not resolve columns for, with the file it came from attached. This
-    is the "missing" listing behind ``--coverage-report=term-missing``, the
+    is the "missing" listing behind ``--coverage-detail=term-missing``, the
     counterpart to `coverage report -m`'s missing line numbers.
     """
     try:
@@ -570,14 +573,17 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     check_parser.add_argument(
-        "--coverage-report",
-        choices=list(_COVERAGE_REPORTS),
+        "--coverage-detail",
+        choices=list(_COVERAGE_DETAILS),
         default=None,
-        dest="coverage_report",
+        dest="coverage_detail",
         help=(
-            "DataFrame schema coverage detail to print: summary (default, one line), term-missing "
-            "(per-file table plus the DataFrame sites lacking column info), or json. "
-            "Overrides the `report` key in [tool.typedframes.coverage]."
+            "How much DataFrame schema coverage detail to print: summary (default, one line) or "
+            "term-missing (per-file table plus the DataFrame sites lacking column info). Combine "
+            "with --output-format=json to get the same detail as structured JSON, nested under a "
+            "'coverage' key, instead of text -- there is no separate json value here, since picking "
+            "a format is --output-format's job alone. Overrides the `detail` key in "
+            "[tool.typedframes.coverage]."
         ),
     )
 
@@ -767,11 +773,12 @@ def _coverage_json_payload(
     untyped_sites: list[dict],
     root: Path,
 ) -> dict:
-    """Build the machine-readable DataFrame schema coverage document for `--coverage-report=json`.
+    """Build the machine-readable coverage document nested under `--output-format=json`'s `coverage` key.
 
-    Percentages are left unrounded here, unlike the human-facing table: a
-    consumer deciding whether a gate passed needs the real ratio, and can round
-    for display itself.
+    Reached when `--coverage-detail=term-missing` (or the `detail` config key) is
+    combined with `--output-format=json`. Percentages are left unrounded here,
+    unlike the human-facing table: a consumer deciding whether a gate passed
+    needs the real ratio, and can round for display itself.
     """
     sites_by_file: dict[str, list[dict]] = {}
     for site in untyped_sites:
@@ -807,26 +814,24 @@ def _coverage_json_payload(
     }
 
 
-def _print_coverage_report(stats: dict, root: Path, *, report: str) -> None:
-    """Emit the richer DataFrame schema coverage report requested by `--coverage-report`.
+def _print_coverage_report(stats: dict, root: Path, *, detail: str) -> None:
+    """Emit the richer DataFrame schema coverage report requested by `--coverage-detail`.
 
     `summary` is the default and prints nothing extra -- the existing one-line
     summary in `_print_results` already covers it, and keeping this a no-op is
     what makes the default path byte-for-byte unchanged.
 
-    Only reached for text/GitHub output. Under `--output-format=json` the
-    coverage document is nested into the single payload by `_print_json_results`
-    instead, so stdout stays one valid JSON document.
+    Only reached for text/GitHub output -- `--coverage-detail` has just the two
+    text-shaped values (`summary`, `term-missing`); under `--output-format=json`
+    the same detail is nested into the single JSON payload by `_print_json_results`
+    instead, so stdout stays one valid document. There's no `json` value here to
+    branch on: picking a format is `--output-format`'s job alone.
     """
-    if report == "summary":
+    if detail == "summary":
         return
 
     per_file = stats.get("per_file", {})
     untyped_sites = stats.get("untyped_sites", [])
-    if report == "json":
-        print(json.dumps(_coverage_json_payload(per_file, untyped_sites, root), indent=2))
-        return
-
     print()
     print(_format_term_missing(per_file, untyped_sites, root))
 
@@ -983,17 +988,17 @@ def _run_check(args: argparse.Namespace) -> None:
     all_errors = _apply_diagnostic_policy(all_errors, args)
 
     errors_only = [e for e in all_errors if e.get("severity") not in ("warning", "info")]
-    # The flag wins over the config key, so a one-off `--coverage-report` doesn't
+    # The flag wins over the config key, so a one-off `--coverage-detail` doesn't
     # require editing (or temporarily undoing) project config.
-    report = args.coverage_report or coverage_config.report
-    coverage_detail = (
+    detail = args.coverage_detail or coverage_config.detail
+    coverage_detail_payload = (
         _coverage_json_payload(coverage.get("per_file", {}), coverage.get("untyped_sites", []), path)
-        if report != "summary" and args.output_format == "json"
+        if detail != "summary" and args.output_format == "json"
         else None
     )
 
     if args.output_format == "json":
-        _print_json_results(all_errors, stats, coverage_detail)
+        _print_json_results(all_errors, stats, coverage_detail_payload)
     else:
         _print_results(
             files,
@@ -1002,7 +1007,7 @@ def _run_check(args: argparse.Namespace) -> None:
             output_format=args.output_format,
             show_info=not args.no_info,
         )
-        _print_coverage_report(coverage, path, report=report)
+        _print_coverage_report(coverage, path, detail=detail)
 
     # Coverage is a separate gate from --strict: --strict judges correctness (are
     # there errors?), the threshold judges annotation completeness (how much could

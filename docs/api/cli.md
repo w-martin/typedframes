@@ -162,15 +162,27 @@ Synapse, Fabric Warehouse) alongside standard `"double-quoted"` ones, regardless
 ### Tracing installed (non-project) packages
 
 Only files under the project itself are indexed by default — nothing inside `.venv` or
-any other installed-dependency location — *except* an installed package whose function
-your own first-party code calls in a way that looks like a DataFrame source: the
-result of an unrecognized call is later subscripted, or has a pandas/polars method
-called on it. That package's `Annotated[...]`/`BaseSchema` declarations and recognized
-transform patterns (rename, drop, case-fold, etc. — the same fixed set already applied
-to first-party code) are then indexed automatically, the same as any project-local
-helper. This is what makes a company-internal package (e.g. one that wraps a SQL
-connector) traceable with no configuration: your own code calling it in that shape is
-the signal.
+any other installed-dependency location — *except* an installed package that gets
+traced in on demand, by one of two independent routes:
+
+1. **Behavioral discovery** (works for any package, typed or not): your own first-party
+   code calls it in a way that looks like a DataFrame source, and the result is used
+   like a DataFrame afterward.
+2. **`py.typed` trust** (only for packages that declare it — see below): your own code
+   calls it through a tracked `self.<attr>` — no usage confirmation needed, since the
+   package's own declared return type is authoritative.
+
+Either route indexes that package's source the same way a project-local file is
+indexed: its `Annotated[...]`/`BaseSchema` declarations, recognized transform patterns
+(rename, drop, case-fold, etc.), and — see [Bare return
+types](#bare-pddataframepldataframe-return-types) below — plain `pd.DataFrame`/
+`pl.DataFrame` return annotations are all read from it directly.
+
+#### Behavioral discovery: a call whose result is used like a DataFrame
+
+The result of an unrecognized call — a bare function, `module.func(...)`, or
+`self.<attr>.<method>(...)` on an instance set up in `__init__` — is later subscripted
+or has a pandas/polars method called on it:
 
 ```python
 # your project's own code — no config needed for this to get traced
@@ -179,6 +191,71 @@ from internal_snowflake_pkg import load_orders
 orders = load_orders(query)  # unrecognized call...
 print(orders["order_id"])  # ...but subscripted like a DataFrame — traced automatically
 ```
+
+The same applies to a repository/wrapper-class pattern — a very common shape for
+internal packages that wrap a database connector — as long as the wrapper's result is
+used somewhere:
+
+```python
+# your project's own code
+from internal_snowflake_pkg import DataRepository
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()  # tracked: attr -> class, in __init__
+
+    def run(self):
+        df = self._data_repository.get_training(query)  # unrecognized call...
+        print(df["feature_a"])  # ...but subscripted like a DataFrame — traced automatically
+```
+
+This route works for **any** installed package, regardless of whether it ships type
+annotations — it's a fallback that asks "was this actually used like a DataFrame?"
+rather than trusting a declared type.
+
+#### `py.typed` trust: no usage confirmation needed
+
+A package that ships a [PEP 561](https://peps.python.org/pep-0561/) `py.typed` marker
+is declaring that its own type annotations are meant to be trusted by tooling. When a
+tracked `self.<attr>.<method>(...)` call's `<attr>` resolves to a class from a
+`py.typed` package, typedframes traces it **immediately** — the package's own return
+annotation is read directly, without needing to see the result used like a DataFrame
+anywhere first:
+
+```python
+# your project's own code — self._data_repository is never subscripted, printed, or
+# passed anywhere DataFrame-shaped in this file. Still traced, because
+# internal_repo_pkg/py.typed exists.
+from internal_repo_pkg import DataRepository
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get(query)
+        return df  # never used as a DataFrame here -- doesn't matter
+```
+
+Only `self.<attr>.<method>(...)` calls go through this route today (not bare or
+`module.func()` calls) — matching the shape most repository/wrapper packages actually
+use. A package without `py.typed` isn't penalized for it; it simply falls back to
+behavioral discovery, exactly as it always has.
+
+#### Bare `pd.DataFrame`/`pl.DataFrame` return types
+
+Most third-party packages have no reason to know about this project's `Schema`
+classes, so their return annotations — `py.typed`-declared or not — are almost always
+a bare `pd.DataFrame`/`pl.DataFrame`, never `Annotated[pd.DataFrame, YourSchema]`. A
+bare DataFrame return type is still registered as a resolved DataFrame origin, with an
+**open schema**: it counts toward [DataFrame schema
+coverage](../usage.md#dataframe-schema-coverage-thresholds) (this checker knows it's a
+DataFrame), but no specific column is ever flagged as unknown against it (this checker
+doesn't know *which* columns), the same treatment a Feast retrieval's unresolvable
+columns already get. If the package's real source is available and its function's body
+resolves a concrete column set (e.g. a `usecols=`-style load, or a SQL `SELECT` list),
+that's used instead — a bare return annotation is the lowest-priority fallback, never a
+ceiling on precision.
 
 Auto-discovery only ever considers packages your own code actually imports and calls
 this way — it never scans the whole `site-packages` tree, so pandas/polars/numpy/etc.
@@ -212,7 +289,14 @@ excluded_external_packages = ["some_huge_or_untrusted_pkg"] # opt out, even if a
   `pip install -e` (or `uv`'s equivalent) resolves through a `.pth`/`direct_url.json`
   redirect rather than living directly under `site-packages`, and isn't found by the
   current auto-detection. Install the package normally (a real, non-editable install)
-  for it to be traced.
+  for it to be traced. This applies to `py.typed` detection too: the marker file is
+  looked for at `<site-packages>/<package>/py.typed`, so an editable install's `py.typed`
+  isn't found any more than its source is.
+- A `py.typed` package is still subject to the same 20-package auto-discovery cap and
+  `excluded_external_packages` opt-out as any other auto-discovered candidate — the
+  only thing `py.typed` changes is that behavioral confirmation (a subscript or
+  pandas/polars method call on the result) isn't required first, for the
+  `self.<attr>.<method>(...)` shape specifically.
 - Indexing an external package means trusting its source enough to run static analysis
   over it. Auto-discovery only ever adds packages your own project's code demonstrably
   calls in a DataFrame-shaped way, never anything installed but unused this way — but

@@ -230,6 +230,17 @@ pub(crate) const SQL_FINALIZE_METHODS: &[&str] = &["to_dataframe", "toPandas", "
 // `duckdb.sql(sql)`/`duckdb.query(sql)`.
 pub(crate) const SQL_PRODUCING_METHODS: &[&str] = &["query", "sql"];
 
+// Sentinel value used in place of a real schema name wherever a function/method's
+// return type is recognized as a bare `pd.DataFrame`/`pl.DataFrame` -- no attached
+// Schema (see `ast_extract::extract_bare_dataframe_type`). These maps otherwise hold a
+// real name that indexes into `self.schemas`/`ProjectIndex.all_schemas`; this marker
+// is never inserted there, so a lookup with it MUST be special-cased by the caller to
+// synthesize an open/empty schema (mirroring `register_feast_dataframe`) rather than
+// treated as a schema name to resolve. Kept as a plain string rather than widening
+// every one of these `HashMap<String, String>` fields to an enum, matching this
+// checker's existing "empty string = none" sentinel convention for the same fields.
+pub(crate) const OPEN_FRAME_MARKER: &str = "__typedframes_open_frame__";
+
 pub(crate) const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "filter",
     "query",

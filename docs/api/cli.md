@@ -200,6 +200,7 @@ used somewhere:
 # your project's own code
 from internal_snowflake_pkg import DataRepository
 
+
 class Pipeline:
     def __init__(self):
         self._data_repository = DataRepository()  # tracked: attr -> class, in __init__
@@ -227,6 +228,7 @@ anywhere first:
 # passed anywhere DataFrame-shaped in this file. Still traced, because
 # internal_repo_pkg/py.typed exists.
 from internal_repo_pkg import DataRepository
+
 
 class Pipeline:
     def __init__(self):

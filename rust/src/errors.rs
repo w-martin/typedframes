@@ -59,7 +59,7 @@ pub struct FileStats {
 ///
 /// The exact counterpart of `dataframes_total - dataframes_typed`: every origin
 /// that bumps the denominator without bumping the numerator records a site here,
-/// so `--coverage-report=term-missing` can point at the specific assignments that
+/// so `--coverage-detail=term-missing` can point at the specific assignments that
 /// cost coverage rather than only reporting a ratio. Deliberately NOT derived from
 /// `untracked-dataframe` diagnostics, which don't reconcile: some are retracted
 /// once a call site resolves the columns cross-file (see the retraction logic in

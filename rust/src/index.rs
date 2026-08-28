@@ -83,6 +83,17 @@ pub(crate) struct IndexEntry {
     // attribute-style calls (`transforms.enrich(df)`) back to the module they came
     // from, the same way `imports` does for `from transforms import enrich`.
     pub(crate) module_aliases: HashMap<String, String>,
+    // Class name -> {method name -> return schema}, a direct copy of this file's own
+    // `Linter::class_methods` (see its doc comment for the value convention --
+    // OPEN_FRAME_MARKER for a bare pd.DataFrame/pl.DataFrame return). Lets
+    // `Linter::import_name` resolve `self.<attr>.<method>(...)` when `<attr>`'s class
+    // is imported from ANOTHER file -- first-party, or a `py.typed` external package
+    // once traced (see `package_declares_py_typed`) -- the same way `functions`
+    // already lets a plain imported function resolve. No project-wide union needed
+    // the way `all_schemas` has one: a class is looked up directly in the file it
+    // resolves to via `resolve_module_file`, not through a third file's indirection.
+    #[serde(default)]
+    pub(crate) class_methods: HashMap<String, HashMap<String, String>>,
 }
 
 // In-memory cross-file symbol index.
@@ -262,6 +273,24 @@ pub(crate) fn find_site_packages_dir_uncached(project_root: &Path) -> Option<Pat
     None
 }
 
+// Whether an external package declares PEP 561 `py.typed` -- a plain marker file at
+// the package's own root (`<site-packages>/<package>/py.typed`), meaning its author
+// intends its inline (or bundled `.pyi`) type annotations to be trusted by tooling.
+// Used to let a self.<attr>.<method>(...) call resolve immediately against that
+// package's actual return-type annotations (once traced -- see index_file's
+// `all_self_attr_origins` handling below), rather than needing
+// `dataframe_shaped_usage`'s "was the result actually used like a DataFrame"
+// confirmation first, the way plain auto-discovery still does for packages that don't
+// make this promise. Absence isn't a judgment on the package -- it just means this
+// checker has no first-party signal that its annotations (if any) are meant to be
+// consumed, so it falls back to behavioral discovery like everything else.
+pub(crate) fn package_declares_py_typed(project_root: &Path, package: &str) -> bool {
+    let Some(site_packages) = find_site_packages_dir(project_root) else {
+        return false;
+    };
+    site_packages.join(package).join("py.typed").is_file()
+}
+
 // Collect `.py` files for each named external package, resolved from the project's
 // own site-packages directory. `packages` is the already-merged, already-filtered set
 // -- see `resolve_traced_external_packages` for how `trace_external_packages`
@@ -426,25 +455,44 @@ pub(crate) fn index_file(
         }
     }
 
-    // Resolve each recorded unresolved-call name (an attribute-call receiver or a
+    // Resolve a recorded unresolved-call name (an attribute-call receiver or a
     // bare-call callee) to the module it was imported from, then take that module's
     // top-level package name -- matching the same dotted-import-binds-first-segment
     // convention as the `Stmt::Import` handling above. A name that isn't a plain
     // import at all (a local variable, a class instance, a closure) simply has no
     // entry in `imports`/`module_aliases` and is silently dropped here, same as any
     // other unresolvable name elsewhere in this module.
-    let external_package_candidates: Vec<String> = linter
+    let resolve_top_level_package = |name: &str, is_attribute_call: bool| -> Option<String> {
+        let module_name = if is_attribute_call {
+            module_aliases.get(name)
+        } else {
+            imports.get(name)
+        }?;
+        module_name.split('.').next().map(str::to_string)
+    };
+
+    let mut external_package_candidates: Vec<String> = linter
         .unresolved_dataframe_shaped_calls
         .iter()
-        .filter_map(|call| {
-            let module_name = if call.is_attribute_call {
-                module_aliases.get(&call.name)
-            } else {
-                imports.get(&call.name)
-            }?;
-            module_name.split('.').next().map(str::to_string)
-        })
+        .filter_map(|call| resolve_top_level_package(&call.name, call.is_attribute_call))
         .collect();
+
+    // self.<attr>.<method>(...) receivers whose class resolves to a py.typed-declared
+    // package -- traced immediately, without needing dataframe_shaped_usage's "was
+    // the result actually used like a DataFrame" confirmation the way the list above
+    // requires (see `package_declares_py_typed`'s doc comment for why a py.typed
+    // declaration alone is trust enough). Duplicates against the list above collapse
+    // naturally once both feed the same `discovered_candidates` HashSet in
+    // `build_index_internal`.
+    for origin in linter.all_self_attr_origins.values() {
+        if let Some(package) =
+            resolve_top_level_package(&origin.resolve_name, origin.is_attribute_call)
+        {
+            if package_declares_py_typed(project_root, &package) {
+                external_package_candidates.push(package);
+            }
+        }
+    }
 
     Some((
         IndexEntry {
@@ -454,6 +502,7 @@ pub(crate) fn index_file(
             exports,
             imports,
             module_aliases,
+            class_methods: linter.class_methods,
         },
         external_package_candidates,
     ))
@@ -1309,6 +1358,7 @@ mod tests {
                 exports: Vec::new(),
                 imports: HashMap::new(),
                 module_aliases: HashMap::new(),
+                class_methods: HashMap::new(),
             },
         );
         let candidates: std::collections::HashSet<String> =

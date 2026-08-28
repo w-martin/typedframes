@@ -259,6 +259,28 @@ pub(crate) fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
     }
 }
 
+// Recognize a BARE `pd.DataFrame` / `pl.DataFrame` (or a bare-imported `DataFrame`,
+// `from pandas import DataFrame`) return annotation -- no `Annotated[...]` wrapper, no
+// attached Schema, and (unlike `DataFrame[Schema]`) no subscript at all. Callers try
+// `extract_schema_from_annotation` first; this is the fallback for the shape that
+// leaves with no schema name to extract, which is what most third-party return
+// annotations look like (a `py.typed` package has no reason to know about this
+// project's `Schema` classes). The caller registers a match with an *open* schema
+// (empty column list, `open_schemas`) the same way `register_feast_dataframe` already
+// does -- "we know it's a DataFrame, we don't know its columns" is strictly better
+// than leaving the call untracked, and never manufactures a false unknown-column.
+//
+// Deliberately narrower than `extract_schema_from_annotation`: no quoted
+// (forward-referenced) form, since a bare `pd.DataFrame`/`pl.DataFrame` return never
+// needs forward-referencing the way a self-referencing project `Schema` class might.
+pub(crate) fn extract_bare_dataframe_type(expr: &Expr) -> bool {
+    match expr {
+        Expr::Attribute(attr) => is_frame_type(attr.attr.as_str()),
+        Expr::Name(name) => is_frame_type(name.id.as_str()),
+        _ => false,
+    }
+}
+
 // Extract a list of string literals from a `["a", "b", ...]` list expression.
 // Returns None if the expression is not a list or any element is not a string literal.
 pub(crate) fn extract_string_list(expr: &Expr) -> Option<Vec<String>> {
@@ -640,5 +662,53 @@ mod tests {
         } else {
             panic!("Expected AnnAssign");
         }
+    }
+
+    fn annotation_of(source: &str) -> ruff_python_ast::Expr {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::FunctionDef(func) = &parsed.into_syntax().body[0] else {
+            panic!("Expected FunctionDef");
+        };
+        (*func.returns.clone().expect("expected a return annotation")).clone()
+    }
+
+    #[test]
+    fn test_should_detect_bare_pandas_and_polars_dataframe_return_types() {
+        assert!(extract_bare_dataframe_type(&annotation_of(
+            "def f() -> pd.DataFrame: ..."
+        )));
+        assert!(extract_bare_dataframe_type(&annotation_of(
+            "def f() -> pl.DataFrame: ..."
+        )));
+        // Bare-imported form: `from pandas import DataFrame`, `-> DataFrame`.
+        assert!(extract_bare_dataframe_type(&annotation_of(
+            "def f() -> DataFrame: ..."
+        )));
+    }
+
+    #[test]
+    fn test_should_not_detect_a_schema_subscripted_dataframe_as_bare() {
+        // DataFrame[Schema] / Annotated[pd.DataFrame, Schema] have a real schema to
+        // extract via extract_schema_from_annotation -- callers try that FIRST, so
+        // extract_bare_dataframe_type only needs to reject them, not handle them.
+        assert!(!extract_bare_dataframe_type(&annotation_of(
+            "def f() -> DataFrame[MySchema]: ..."
+        )));
+        assert!(!extract_bare_dataframe_type(&annotation_of(
+            "def f() -> Annotated[pd.DataFrame, MySchema]: ..."
+        )));
+    }
+
+    #[test]
+    fn test_should_not_detect_an_unrelated_return_type_as_a_bare_dataframe() {
+        assert!(!extract_bare_dataframe_type(&annotation_of(
+            "def f() -> int: ..."
+        )));
+        assert!(!extract_bare_dataframe_type(&annotation_of(
+            "def f() -> pd.Series: ..."
+        )));
+        assert!(!extract_bare_dataframe_type(&annotation_of(
+            "def f() -> None: ..."
+        )));
     }
 }

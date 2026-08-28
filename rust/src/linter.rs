@@ -6,8 +6,8 @@
 
 use crate::config::LinterConfig;
 use crate::constants::{
-    CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS, LOAD_MODULES, RESERVED_METHODS,
-    ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
+    CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS, LOAD_MODULES, OPEN_FRAME_MARKER,
+    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
@@ -114,6 +114,28 @@ pub(crate) struct ParamGovernedAccess {
 #[derive(Debug, Clone)]
 pub(crate) struct UnresolvedDataframeShapedCall {
     pub(crate) name: String,
+    pub(crate) is_attribute_call: bool,
+}
+
+// What `self.<attr> = <value>(...)` in `__init__` resolved `<attr>` to -- see
+// `Linter::current_self_attrs`'s doc comment for why this exists at all.
+#[derive(Debug, Clone)]
+pub(crate) struct SelfAttrOrigin {
+    // Class name exactly as spelled at the assignment site (`ClassName` or
+    // `module.ClassName`'s trailing segment) -- looked up in `Linter::class_methods`
+    // (same-file) or the project index's cross-file `class_methods` (see index.rs) to
+    // resolve `self.<attr>.<method>(...)` to a schema.
+    pub(crate) class_name: String,
+    // `name`/`is_attribute_call` in exactly the shape
+    // `UnresolvedDataframeShapedCall` already uses, for feeding into that SAME
+    // `imports`/`module_aliases` resolution in index.rs when `class_name` isn't
+    // resolvable same-file (external package, or a first-party class not yet
+    // extended to cross-file `class_methods`): `resolve_name` is `class_name` itself
+    // (resolved via `imports`, i.e. `from module import ClassName`) when the
+    // assignment was `self.attr = ClassName(...)`, or the qualifying module name
+    // (resolved via `module_aliases`, i.e. `import module`) when it was
+    // `self.attr = module.ClassName(...)`.
+    pub(crate) resolve_name: String,
     pub(crate) is_attribute_call: bool,
 }
 
@@ -256,6 +278,48 @@ pub struct Linter {
     // literal list or f-string) as a valid call target for eval_feast_call, which
     // re-parses the target file itself rather than needing anything precomputed here.
     pub(crate) all_function_names: std::collections::BTreeSet<String>,
+    // Instance attribute name -> class name, for `self.<attr> = <ClassName>(...)` /
+    // `self.<attr> = <module>.<ClassName>(...)` assignments found in the CURRENTLY
+    // VISITED class's own `__init__`. Populated by a pre-scan in the `Stmt::ClassDef`
+    // arm, before `visit_body` descends into the rest of that class's methods, and
+    // saved/restored around that call so a nested class (rare, but not impossible)
+    // can't leak its own attrs into (or lose) an enclosing class's map. This is what
+    // makes `self._data_repository.get(...)` resolvable at all: without knowing what
+    // `_data_repository` IS, there's no receiver to look anything up against, the same
+    // way `self.functions`/class_methods below need a class name to key on. Single-
+    // assignment only, `__init__`-only -- an attribute reassigned to a different type
+    // later, or set up in some other method, is intentionally not tracked (matches
+    // this checker's existing single-binding conventions, e.g. `string_var_candidates`).
+    pub(crate) current_self_attrs: HashMap<String, SelfAttrOrigin>,
+    // Every self.<attr> origin ever seen anywhere in this file, across every class --
+    // unlike `current_self_attrs`, never reset per-class. Consulted only by
+    // `index.rs::index_file`, once this file's whole linter pass is done, to find
+    // `py.typed`-declared external packages worth tracing immediately (see
+    // `package_declares_py_typed`) -- a py.typed declaration is itself a strong enough
+    // trust signal that this doesn't need to wait for `dataframe_shaped_usage`'s
+    // "was the result actually used like a DataFrame" confirmation the way the plain
+    // `unresolved_dataframe_shaped_calls` discovery path does. A rare same-named attr
+    // on two different classes in one file can collide here (last one wins) -- harmless
+    // for this purpose, since it's only ever used to gather auto-discovery CANDIDATES,
+    // never to resolve an actual column set (that precision lives in
+    // `current_self_attrs`/`class_methods`, both unaffected by this field).
+    pub(crate) all_self_attr_origins: HashMap<String, SelfAttrOrigin>,
+    // Class name -> {method name -> return schema name}, for every class VISITED SO
+    // FAR in this file (top-to-bottom, like every other map this checker builds while
+    // walking a file -- a class defined textually AFTER its use isn't in here yet,
+    // same single-pass ordering limitation already documented for contract inference
+    // elsewhere in this file). The schema value follows the same convention as
+    // `self.functions`: a real name, or OPEN_FRAME_MARKER for a bare
+    // `pd.DataFrame`/`pl.DataFrame` return with no attached Schema (see its doc
+    // comment), registered with an open/empty schema the same way
+    // `register_feast_dataframe` already does for Feast. This is what lets
+    // `self.<attr>.<method>(...)` resolve to a schema once `<attr>`'s class (from
+    // `current_self_attrs`) is known, FOR A DIFFERENT CLASS than the one currently
+    // being visited -- unlike `current_self_attrs`, this is never reset: a class's
+    // methods, once seen, stay resolvable for the rest of the file, the same way
+    // `self.schemas`/`self.functions` accumulate. A class defined in another file
+    // needs the project index's own `class_methods` (see index.rs) instead.
+    pub(crate) class_methods: HashMap<String, HashMap<String, String>>,
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -300,6 +364,75 @@ fn find_returned_var(stmts: &[Stmt]) -> Option<String> {
         }
     }
     None
+}
+
+// Collect `self.<attr> = <ClassName>(...)` / `self.<attr> = <module>.<ClassName>(...)`
+// assignments from `__init__`'s body into `out` -- see `Linter::current_self_attrs`'s
+// doc comment for why this is what makes `self.<attr>.<method>(...)` resolvable at
+// all. Descends into `if`/`for`/`while`/`with` bodies, matching `find_returned_var`'s
+// recursion -- deliberately NOT into `try`/`except` or comprehensions, the same
+// conservative-not-exhaustive boundary already documented for contract inference
+// elsewhere in this file. Only the first assignment to a given attr name wins (a
+// later reassignment is silently ignored), matching this checker's existing
+// single-binding conventions (e.g. `string_var_candidates`).
+fn collect_self_attr_origins(stmts: &[Stmt], out: &mut HashMap<String, SelfAttrOrigin>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign(assign) if assign.targets.len() == 1 => {
+                let Expr::Attribute(target_attr) = &assign.targets[0] else {
+                    continue;
+                };
+                let Expr::Name(recv) = &*target_attr.value else {
+                    continue;
+                };
+                if recv.id.as_str() != "self" {
+                    continue;
+                }
+                let attr_name = target_attr.attr.to_string();
+                if out.contains_key(&attr_name) {
+                    continue;
+                }
+                let Expr::Call(call) = &*assign.value else {
+                    continue;
+                };
+                match &*call.func {
+                    Expr::Name(class_name) => {
+                        out.insert(
+                            attr_name,
+                            SelfAttrOrigin {
+                                class_name: class_name.id.to_string(),
+                                resolve_name: class_name.id.to_string(),
+                                is_attribute_call: false,
+                            },
+                        );
+                    }
+                    Expr::Attribute(class_attr) => {
+                        if let Expr::Name(module) = &*class_attr.value {
+                            out.insert(
+                                attr_name,
+                                SelfAttrOrigin {
+                                    class_name: class_attr.attr.to_string(),
+                                    resolve_name: module.id.to_string(),
+                                    is_attribute_call: true,
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Stmt::If(if_stmt) => {
+                collect_self_attr_origins(&if_stmt.body, out);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_self_attr_origins(&clause.body, out);
+                }
+            }
+            Stmt::For(for_stmt) => collect_self_attr_origins(&for_stmt.body, out),
+            Stmt::While(while_stmt) => collect_self_attr_origins(&while_stmt.body, out),
+            Stmt::With(with_stmt) => collect_self_attr_origins(&with_stmt.body, out),
+            _ => {}
+        }
+    }
 }
 
 // A candidate `string_var_candidates` entry: either resolved to a stable literal value,
@@ -544,6 +677,9 @@ impl Linter {
             cursor_sql: HashMap::new(),
             param_governed_templates: HashMap::new(),
             all_function_names: std::collections::BTreeSet::new(),
+            current_self_attrs: HashMap::new(),
+            all_self_attr_origins: HashMap::new(),
+            class_methods: HashMap::new(),
         }
     }
 
@@ -848,6 +984,41 @@ impl Linter {
         }
         if let Some(loc) = entry.schema_locations.get(name) {
             self.schema_locations.insert(name.to_string(), loc.clone());
+        }
+        // `name` may be a class (e.g. `from repository import DataRepository`) rather
+        // than a function -- entry.functions.get(name) below would be None for that
+        // and return early, so this has to run first. Never overwrites an entry this
+        // file's OWN class definitions already produced (see class_methods' doc
+        // comment): same-file always wins over cross-file, the same priority
+        // `current_self_attrs`/`class_methods` resolution already gives same-file
+        // information everywhere else.
+        if let Some(methods) = entry.class_methods.get(name) {
+            self.class_methods
+                .entry(name.to_string())
+                .or_insert_with(|| methods.clone());
+            // Pull in each named schema's actual column list from the project-wide
+            // `all_schemas` registry -- mirroring exactly what the `func.returns_schema`
+            // handling below does for a plain imported function, just for every one of
+            // this class's methods instead of a single function. Without this,
+            // `self.class_methods` would carry the right SCHEMA NAME across files, but
+            // `self.schemas[that name]` would stay empty here, since nothing else in
+            // this file ever imports the schema class by name directly. Schemas may
+            // live in a THIRD file (neither this one nor the class's own), same
+            // reasoning as `all_schemas` itself. OPEN_FRAME_MARKER entries need no
+            // handling here -- they're resolved into a real, freshly-synthesized open
+            // schema entirely at the call site, by `resolve_open_or_named_schema`.
+            for schema_name in methods.values() {
+                if schema_name == OPEN_FRAME_MARKER || self.schemas.contains_key(schema_name) {
+                    continue;
+                }
+                if let Some(cols) = all_schemas.get(schema_name) {
+                    self.schemas.insert(schema_name.clone(), cols.clone());
+                    if let Some(loc) = all_schema_locations.get(schema_name) {
+                        self.schema_locations
+                            .insert(schema_name.clone(), loc.clone());
+                    }
+                }
+            }
         }
         let Some(func) = entry.functions.get(name) else {
             return;
@@ -1461,6 +1632,29 @@ impl Linter {
                             name: base.id.to_string(),
                             is_attribute_call: true,
                         });
+                } else if let Expr::Attribute(recv_attr) = &*attr.value {
+                    // self.<attr>.<method>(...), where <attr>'s class (from
+                    // current_self_attrs) didn't resolve via class_methods -- not a
+                    // same-file first-party class with a known return type, so fall
+                    // back to the same external-package candidate discovery a plain
+                    // `module.func()` call already gets, using the receiver's
+                    // pre-resolved SelfAttrOrigin (see its doc comment for why
+                    // resolve_name/is_attribute_call is exactly what index.rs's
+                    // existing imports/module_aliases resolution needs).
+                    if let Expr::Name(recv_base) = &*recv_attr.value {
+                        if recv_base.id.as_str() == "self" {
+                            if let Some(origin) =
+                                self.current_self_attrs.get(recv_attr.attr.as_str())
+                            {
+                                self.unresolved_dataframe_shaped_calls.push(
+                                    UnresolvedDataframeShapedCall {
+                                        name: origin.resolve_name.clone(),
+                                        is_attribute_call: origin.is_attribute_call,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Expr::Name(func_name) => {
@@ -1745,6 +1939,30 @@ impl Linter {
         let name = format!("__inferred_{}_at_{}", var, line);
         self.schemas.insert(name.clone(), cols);
         name
+    }
+
+    // Resolve a `self.functions`/`class_methods`/cross-file `class_methods`
+    // entry to an actual schema name usable in `self.variables`. Most entries already
+    // ARE a real schema name and pass through unchanged; `OPEN_FRAME_MARKER` is the one
+    // exception (a bare `pd.DataFrame`/`pl.DataFrame` return with no attached Schema —
+    // see its doc comment), which this synthesizes into a fresh open/empty schema, the
+    // same way `register_feast_dataframe` already does for a resolved Feast retrieval.
+    // Centralized here because every call-resolution site that consults one of those
+    // maps (module-level bare calls, same-file `self.<attr>.<method>()`, and the
+    // upcoming cross-file case) needs the exact same marker-or-real-name branch.
+    fn resolve_open_or_named_schema(
+        &mut self,
+        marker_or_schema: &str,
+        var_hint: &str,
+        line: usize,
+    ) -> String {
+        if marker_or_schema == OPEN_FRAME_MARKER {
+            let name = self.make_inferred_schema(Vec::new(), var_hint, line);
+            self.open_schemas.insert(name.clone());
+            name
+        } else {
+            marker_or_schema.to_string()
+        }
     }
 
     // Column membership check used by every column-access validator (see
@@ -2145,6 +2363,23 @@ impl Linter {
                     );
                 }
 
+                // Pre-scan this class's own __init__ for self.<attr> origins (see
+                // current_self_attrs' doc comment) BEFORE visiting the body, so calls
+                // anywhere in the class -- including __init__ itself -- can resolve
+                // self.<attr>.<method>(...). Saved/restored around visit_body so a
+                // nested class definition (rare, but not impossible) can't leak its
+                // own attrs into, or clobber, an enclosing class's.
+                let mut self_attrs = HashMap::new();
+                for body_stmt in &class_def.body {
+                    if let Stmt::FunctionDef(func_def) = body_stmt {
+                        if func_def.name.as_str() == "__init__" {
+                            collect_self_attr_origins(&func_def.body, &mut self_attrs);
+                        }
+                    }
+                }
+                self.all_self_attr_origins.extend(self_attrs.clone());
+                let prev_self_attrs = std::mem::replace(&mut self.current_self_attrs, self_attrs);
+
                 // Visit the class body regardless of which branch above matched (or
                 // none did). A schema/ORM class's body is a declarative column list
                 // that the branches above already extracted -- re-visiting it as
@@ -2158,17 +2393,52 @@ impl Linter {
                 // checker, the same way it would be if the file were never linted at
                 // all.
                 self.visit_body(&class_def.body, errors);
+
+                self.current_self_attrs = prev_self_attrs;
+
+                // Record this class's own methods' return schemas into class_methods
+                // (see its doc comment) -- accumulated, never reset, so a DIFFERENT
+                // class visited later in the file can resolve a self.<attr> typed as
+                // THIS class. Done AFTER visit_body, by reading back self.functions --
+                // NOT by re-deriving from each method's annotation, so a method with
+                // no explicit return annotation at all still resolves here exactly the
+                // way a module-level function does (via find_returned_var's body
+                // inference, a few lines up), instead of needing that inference
+                // duplicated. Reading self.functions immediately after this class's own
+                // visit_body — before any later class's same-named method can
+                // overwrite the flat map — is what keeps this correct even though
+                // self.functions itself has no notion of "which class" a method
+                // belongs to.
+                let mut own_methods = HashMap::new();
+                for body_stmt in &class_def.body {
+                    if let Stmt::FunctionDef(func_def) = body_stmt {
+                        if let Some(schema_or_marker) = self.functions.get(func_def.name.as_str()) {
+                            own_methods.insert(func_def.name.to_string(), schema_or_marker.clone());
+                        }
+                    }
+                }
+                self.class_methods
+                    .insert(class_def.name.to_string(), own_methods);
             }
             Stmt::FunctionDef(func_def) => {
                 let (fn_def_line, _) = self.source_location(func_def.range().start());
                 self.all_function_names.insert(func_def.name.to_string());
 
-                // Track return type annotations like -> DataFrame[Schema]
+                // Track return type annotations like -> DataFrame[Schema]. A bare
+                // `-> pd.DataFrame` / `-> pl.DataFrame` (no attached Schema) is a
+                // LOWER-PRIORITY fallback -- see `is_bare_frame_return` below, checked
+                // once body-inference has had its chance, not here: an explicit named
+                // Schema always wins, but so does a body-inferred one (e.g. `load_orders`
+                // resolving real SQL-derived columns via `return df`) over a bare
+                // annotation that merely says "some DataFrame, columns unknown".
+                let mut is_bare_frame_return = false;
                 if let Some(returns) = &func_def.returns {
                     if let Some(schema_name) = ast_extract::extract_schema_from_annotation(returns)
                     {
                         self.functions
                             .insert(func_def.name.to_string(), schema_name.to_string());
+                    } else if ast_extract::extract_bare_dataframe_type(returns) {
+                        is_bare_frame_return = true;
                     }
                 }
 
@@ -2229,6 +2499,17 @@ impl Linter {
                             }
                         }
                     }
+                }
+                // Lowest-priority fallback: a bare `-> pd.DataFrame`/`-> pl.DataFrame`
+                // return annotation with nothing more specific found above (no named
+                // Schema, no body-inferred one either -- e.g. the function's real
+                // source, like a `py.typed` package's, isn't available to infer from).
+                // OPEN_FRAME_MARKER — see its doc comment — is what tells call-site
+                // resolution to register an open/empty schema rather than treat this
+                // as a real schema name.
+                if is_bare_frame_return && !self.functions.contains_key(func_def.name.as_str()) {
+                    self.functions
+                        .insert(func_def.name.to_string(), OPEN_FRAME_MARKER.to_string());
                 }
                 // Infer a column *contract* for the function's first parameter: every
                 // column subscripted directly off that parameter or a variable derived
@@ -2516,6 +2797,52 @@ impl Linter {
                     match &*call.func {
                         Expr::Attribute(attr) => {
                             let func_name = attr.attr.as_str();
+
+                            // Handle df = self.<attr>.<method>(...) where <attr>'s
+                            // class (known from __init__, see current_self_attrs) has
+                            // a <method> with a recognized return annotation (see
+                            // class_methods). None of the other receiver-shape checks
+                            // in this match arm (merge, chained SQL-producing calls,
+                            // etc.) apply to this shape -- the receiver here is
+                            // `self.<attr>`, never a tracked DataFrame variable or a
+                            // bare module/name -- so this is safe to check
+                            // unconditionally rather than needing an early return.
+                            if let Expr::Attribute(recv_attr) = &*attr.value {
+                                if let Expr::Name(recv_base) = &*recv_attr.value {
+                                    if recv_base.id.as_str() == "self" {
+                                        if let Some(origin) = self
+                                            .current_self_attrs
+                                            .get(recv_attr.attr.as_str())
+                                            .cloned()
+                                        {
+                                            if let Some(marker_or_schema) = self
+                                                .class_methods
+                                                .get(&origin.class_name)
+                                                .and_then(|methods| methods.get(func_name))
+                                                .cloned()
+                                            {
+                                                let schema_name = self
+                                                    .resolve_open_or_named_schema(
+                                                        &marker_or_schema,
+                                                        func_name,
+                                                        current_line,
+                                                    );
+                                                self.dataframes_total += 1;
+                                                self.dataframes_typed += 1;
+                                                for target in &assign.targets {
+                                                    if let Expr::Name(target_name) = target {
+                                                        self.variables.insert(
+                                                            target_name.id.to_string(),
+                                                            (schema_name.clone(), current_line),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if func_name == "merge" {
                                 if let Expr::Name(left_name) = &*attr.value {
                                     if let Some((left_schema, _)) =
@@ -3412,8 +3739,16 @@ impl Linter {
                         }
                     } else if let Expr::Name(func_name) = &*call.func {
                         // Handle df = load_users() where load_users() -> DataFrame[Schema]
-                        if let Some(schema_name) = self.functions.get(func_name.id.as_str()) {
-                            let schema_name = schema_name.clone();
+                        // (or a bare -> pd.DataFrame/pl.DataFrame, resolved to an open
+                        // schema by resolve_open_or_named_schema).
+                        if let Some(marker_or_schema) =
+                            self.functions.get(func_name.id.as_str()).cloned()
+                        {
+                            let schema_name = self.resolve_open_or_named_schema(
+                                &marker_or_schema,
+                                func_name.id.as_str(),
+                                current_line,
+                            );
                             self.dataframes_total += 1;
                             self.dataframes_typed += 1;
                             for target in &assign.targets {
@@ -4356,6 +4691,196 @@ class Loader:
         // as if it were at module level or inside a free function
         assert_eq!(linter.dataframes_total, 1);
         assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_resolve_self_attr_method_call_to_a_named_schema() {
+        // arrange: `self._data_repository.get(...)` -- a method call on an instance
+        // attribute assigned in __init__, not a bare name or module.func() call. This
+        // is the reported real-world shape (a repository/wrapper class) that was
+        // previously invisible to the checker entirely: the call's receiver
+        // (self._data_repository) is a nested Attribute, not a Name, so it never
+        // reached any recognized pattern.
+        let source = r#"
+from typing import Annotated
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+
+class TrainingSchema(BaseSchema):
+    feature_a = Column(type=float)
+    label = Column(type=int)
+
+
+class DataRepository:
+    def get_training(self) -> Annotated[pd.DataFrame, TrainingSchema]:
+        return pd.read_csv("training.csv")
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get_training()
+        print(df["feature_a"])
+        print(df["nonexistent"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("nonexistent"));
+        assert!(errors[0].message.contains("TrainingSchema"));
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_register_open_schema_for_bare_dataframe_return_via_self_attr() {
+        // arrange: DataRepository.get_raw returns a bare pd.DataFrame -- no attached
+        // Schema, the shape a py.typed third-party/internal package's own return
+        // annotations will actually have (they have no reason to know about this
+        // project's Schema classes). Must still count toward coverage (an OPEN
+        // schema, per register_feast_dataframe's existing precedent) rather than
+        // being silently invisible, and must never manufacture a false
+        // unknown-column on a column this checker simply doesn't know about.
+        let source = r#"
+import pandas as pd
+
+
+class DataRepository:
+    def get_raw(self) -> pd.DataFrame:
+        return pd.read_csv("raw.csv")
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        raw = self._data_repository.get_raw()
+        print(raw["anything_at_all"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_resolve_self_attr_method_with_no_return_annotation_via_body_inference() {
+        // arrange: the exact real-world shape reported -- a repository class method
+        // with NO return annotation at all, whose real schema is only inferable from
+        // its body (mirrors test_should_count_typed_dataframe_for_load_call_with_usecols'
+        // body-inference for module-level functions, applied through self.<attr>).
+        let source = r#"
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+    total = Column(type=float)
+
+
+class Warehouse:
+    def fetch_orders(self):
+        df = pd.read_csv("orders.csv", usecols=["order_id", "total"])
+        return df
+
+
+class Reporter:
+    def __init__(self):
+        self._warehouse = Warehouse()
+
+    def summarize(self):
+        orders = self._warehouse.fetch_orders()
+        print(orders["order_id"])
+        print(orders["not_a_real_column"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: 2 DataFrame origins, not 1 -- the inner pd.read_csv(usecols=...)
+        // inside fetch_orders' own body counts on its own (matching
+        // test_should_count_typed_dataframe_for_load_call_inside_class_method's
+        // existing precedent), independent of the outer self._warehouse.fetch_orders()
+        // assignment this test is actually about. Both resolve fully (usecols= for
+        // the inner one, body-inference for the outer one), so both are typed too.
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("not_a_real_column"));
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_not_confuse_same_named_methods_on_different_classes_via_self_attr() {
+        // arrange: guards against the exact false-positive shortcut that was
+        // deliberately ruled out (just checking a flat method-name map regardless of
+        // which class it belongs to). Two classes both define `get_training`, with
+        // DIFFERENT return schemas -- resolution must pick DataRepository's, not
+        // UnrelatedThing's, because current_self_attrs says _data_repository IS a
+        // DataRepository.
+        let source = r#"
+from typing import Annotated
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+
+class TrainingSchema(BaseSchema):
+    feature_a = Column(type=float)
+
+
+class DecoySchema(BaseSchema):
+    totally_different_col = Column(type=str)
+
+
+class DataRepository:
+    def get_training(self) -> Annotated[pd.DataFrame, TrainingSchema]:
+        return pd.read_csv("training.csv")
+
+
+class UnrelatedThing:
+    def get_training(self) -> Annotated[pd.DataFrame, DecoySchema]:
+        return pd.read_csv("decoy.csv")
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get_training()
+        print(df["feature_a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: feature_a is valid on TrainingSchema (the real receiver type) --
+        // if resolution had collided with UnrelatedThing.get_training's DecoySchema
+        // instead, this would incorrectly report feature_a as unknown.
+        assert!(errors.is_empty(), "errors: {errors:#?}");
     }
 
     #[test]
@@ -5697,6 +6222,196 @@ def process(query: str) -> None:
         assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
         assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
         assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_resolve_self_attr_method_call_to_a_first_party_class_in_another_file() {
+        // arrange: DataRepository (with its schema) lives entirely in repository.py;
+        // pipeline.py only imports the class and calls self._data_repository.get_
+        // training() -- neither the class definition NOR TrainingSchema's column
+        // list are visible without cross-file resolution (IndexEntry.class_methods,
+        // consulted via Linter::import_name).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("repository.py"),
+            r#"
+from typing import Annotated
+import pandas as pd
+from typedframes import BaseSchema, Column
+
+
+class TrainingSchema(BaseSchema):
+    feature_a = Column(type=float)
+    label = Column(type=int)
+
+
+class DataRepository:
+    def get_training(self) -> Annotated[pd.DataFrame, TrainingSchema]:
+        return pd.read_csv("training.csv")
+"#,
+        )
+        .unwrap();
+        let pipeline_source = r#"
+from repository import DataRepository
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get_training()
+        print(df["feature_a"])
+        print(df["nonexistent"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: the error message's schema location points back to repository.py,
+        // proving TrainingSchema's columns (not just its name) crossed the file
+        // boundary too, not only the resolved schema NAME.
+        assert_eq!(errors.len(), 1, "expected one error, got: {errors:?}");
+        assert!(errors[0].message.contains("nonexistent"));
+        assert!(errors[0].message.contains("TrainingSchema"));
+        assert!(
+            errors[0].message.contains("repository.py"),
+            "{}",
+            errors[0].message
+        );
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_trace_a_py_typed_external_package_via_self_attr_without_dataframe_shaped_usage()
+    {
+        // arrange: internal_repo_pkg declares py.typed, and its DataRepository.get is
+        // resolved through self._data_repository -- but its result is NEVER
+        // subscripted or otherwise used like a DataFrame anywhere in pipeline.py.
+        // Ordinary auto-discovery (dataframe_shaped_usage) would never trigger on
+        // this; py.typed alone must be enough.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_repo_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("py.typed"), "").unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+
+class DataRepository:
+    def get(self, query: str) -> pd.DataFrame:
+        return pd.read_sql(query, None)
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_repo_pkg import DataRepository
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get("SELECT * FROM training")
+        return df
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: resolved as an open schema (bare pd.DataFrame, no attached Schema)
+        // -- counts as typed even though nothing about USAGE ever hinted it was a
+        // DataFrame.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_not_trace_a_non_py_typed_external_package_via_self_attr_without_usage() {
+        // arrange: the exact same fixture as the py.typed test above, MINUS the
+        // py.typed marker, and with the result still not used like a DataFrame --
+        // must NOT be traced. This is the control proving py.typed is what made the
+        // difference above, not some other unrelated resolution path.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_repo_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+
+class DataRepository:
+    def get(self, query: str) -> pd.DataFrame:
+        return pd.read_sql(query, None)
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_repo_pkg import DataRepository
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get("SELECT * FROM training")
+        return df
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 0);
+        assert_eq!(linter.dataframes_typed, 0);
     }
 
     #[test]

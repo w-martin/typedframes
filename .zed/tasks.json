@@ -1,0 +1,14 @@
+[
+  {
+    "label": "Run all tests",
+    "command": "uv run inv test",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Run lint, format check and tests",
+    "command": "uv run inv all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  }
+]

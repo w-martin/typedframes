@@ -1,0 +1,82 @@
+name: typedframes
+description: Catch pandas/polars DataFrame column errors in CI, annotated inline on the pull request diff.
+author: William Martin
+
+branding:
+  icon: columns
+  color: blue
+
+inputs:
+  path:
+    description: File or directory to check. Passed straight to `typedframes check`.
+    required: false
+    default: "."
+  version:
+    description: >-
+      Version of typedframes to install from PyPI, e.g. "0.5.0". The default,
+      "latest", installs the newest release.
+    required: false
+    default: latest
+  strict:
+    description: >-
+      Fail the step when the checker reports errors. Set to "false" to get the
+      annotations without failing the build.
+    required: false
+    default: "true"
+  args:
+    description: >-
+      Extra arguments appended to `typedframes check`, e.g.
+      "--coverage-fail-under=90 --no-warnings". Split on whitespace.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Installed into a throwaway venv rather than the runner's Python: it leaves the
+    # caller's dependency set untouched and sidesteps PEP 668's externally-managed
+    # interpreters. typedframes publishes wheels for linux (x86_64/aarch64), macOS
+    # (x86_64/arm64) and windows (x86_64), so this is a download, not a Rust build.
+    - name: Install typedframes
+      shell: bash
+      env:
+        TYPEDFRAMES_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        py=python3
+        command -v python3 >/dev/null 2>&1 || py=python
+        venv="${RUNNER_TEMP}/typedframes-venv"
+        "$py" -m venv "$venv"
+        if [ -d "$venv/bin" ]; then
+          bindir="$venv/bin"
+        else
+          bindir="$venv/Scripts"
+        fi
+        if [ "$TYPEDFRAMES_VERSION" = "latest" ]; then
+          spec="typedframes"
+        else
+          spec="typedframes==${TYPEDFRAMES_VERSION}"
+        fi
+        "$bindir/python" -m pip install --disable-pip-version-check --quiet "$spec"
+        # An absolute path rather than a GITHUB_PATH entry, so no PATH string has to
+        # survive the runner's translation on Windows.
+        echo "TYPEDFRAMES_BIN=$bindir/typedframes" >> "$GITHUB_ENV"
+
+    # --output-format=github emits workflow-command annotations. The checker reports
+    # absolute paths; the runner rewrites any path under GITHUB_WORKSPACE to a
+    # repo-relative one, which is what puts the annotation on the diff.
+    - name: Run typedframes check
+      shell: bash
+      env:
+        TYPEDFRAMES_PATH: ${{ inputs.path }}
+        TYPEDFRAMES_STRICT: ${{ inputs.strict }}
+        TYPEDFRAMES_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        # $TYPEDFRAMES_ARGS is deliberately unquoted: it is a whitespace-separated
+        # argument list, not one argument.
+        if [ "$TYPEDFRAMES_STRICT" = "true" ]; then
+          "$TYPEDFRAMES_BIN" check "$TYPEDFRAMES_PATH" --output-format=github --strict $TYPEDFRAMES_ARGS
+        else
+          "$TYPEDFRAMES_BIN" check "$TYPEDFRAMES_PATH" --output-format=github $TYPEDFRAMES_ARGS
+        fi

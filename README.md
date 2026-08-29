@@ -452,6 +452,66 @@ See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method
 for the complete list of tracked, passthrough, and untracked operations, plus the error
 code reference.
 
+### Pre-commit Hook
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/w-martin/typedframes
+    rev: v0.5.1
+    hooks:
+      - id: typedframes
+```
+
+The hook defaults to `typedframes check . --strict` — one run per commit rather than one
+per staged file, so the cross-file index still sees the modules the commit didn't touch.
+`--strict` is what makes it block the commit; without it the checker reports errors and
+still exits 0. Override `args` to narrow the path or add flags:
+
+```yaml
+      - id: typedframes
+        args: [src/, --strict, --coverage-fail-under=90]
+```
+
+pre-commit builds that hook from this repository's source, which needs a Rust toolchain.
+To install the prebuilt PyPI wheel instead, declare it as a local hook:
+
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: typedframes
+        name: typedframes check
+        entry: typedframes check . --strict
+        language: python
+        additional_dependencies: ["typedframes==0.5.0"]
+        types_or: [python, jupyter]
+        pass_filenames: false
+```
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/typedframes.yml
+name: typedframes
+on: [push, pull_request]
+
+jobs:
+  typedframes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: w-martin/typedframes@v0.5.1
+        with:
+          path: src/
+          args: --coverage-fail-under=90
+```
+
+The action installs the PyPI wheel into a throwaway virtualenv and runs the checker with
+`--output-format=github`, so errors arrive as annotations on the pull request diff.
+Inputs: `path` (default `.`), `version` (the PyPI version to install, default `latest`),
+`strict` (default `true`), and `args` for any other flags.
+
 ---
 
 ## DataFrame Schema Coverage Thresholds (Opt-In)

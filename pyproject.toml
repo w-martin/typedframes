@@ -58,6 +58,7 @@ branch = true
 omit = [
     "benchmarks/*",
     "examples/*",
+    "scripts/*",
     "tests/*",
     "tasks.py",
 ]
@@ -135,7 +136,6 @@ dev = [
     "complexipy>=6.2.0",
     "coverage-threshold>=0.6.2",
     "invoke>=3.0.3",
-    "licensecheck>=2025.1.0",
     "maturin>=1.14.1",
     "pre-commit>=4.6.1",
     "pyrefly>=1.2.0",
@@ -151,6 +151,7 @@ dev = [
     "fastexcel>=0.20.2",
     "pandas-stubs>=3.0.5.260730",
     "mypy>=2.3.1",
+    "scancode-toolkit-mini>=32.5.0",
 ]
 
 [tool.bandit]
@@ -236,11 +237,6 @@ invalid-return-type = "ignore"
 [tool.typedframes]
 enabled = true
 warnings = true
-
-[tool.licensecheck]
-using = "PEP631"
-groups = ["dev"]
-ignore_packages = ["mypy-extensions", "typedframes", "pyrefly"]
 
 [tool.uv.workspace]
 exclude = ["examples/*/*"]

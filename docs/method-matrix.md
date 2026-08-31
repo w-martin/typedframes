@@ -5,6 +5,21 @@ Operations fall into three categories: **schema-modifying** (the checker updates
 internal column model), **row-passthrough** (the checker assumes the schema is unchanged),
 and **untracked** (the variable is dropped from tracking to avoid false positives).
 
+The tables below list every spelling the checker recognizes across the supported
+backends, so some rows are pandas-only (`query`, `nlargest`) and some are polars-only
+(`sort`, `select(pl.col(...))`, `with_columns`). A row applies to your code only if your
+backend actually provides that method.
+
+RAPIDS cuDF (experimental) uses pandas' string-subscript column access and pandas'
+signatures for `rename`, `drop`, `assign`, `pop`, `insert` and `merge`, so the
+pandas rows apply to it unchanged. cuDF implements no `filter`, `select`, `sort` or
+`with_columns`, and its reader surface is a subset of pandas': the checker recognizes
+`cudf.read_csv`, `read_parquet`, `read_json`, `read_orc`, `read_avro`, `read_feather`
+and `read_hdf`, and deliberately does not recognize `read_sql`, `read_excel` or
+polars' `scan_*` functions on a `cudf` receiver, because cuDF exports none of them.
+cuDF is eager on a single GPU — there is no `collect()`/`compute()` materialization step
+to track, unlike polars' `LazyFrame`.
+
 ---
 
 ## Schema-Modifying Operations

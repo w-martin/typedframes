@@ -6,8 +6,9 @@
 
 use crate::config::LinterConfig;
 use crate::constants::{
-    CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS, LOAD_MODULES, OPEN_FRAME_MARKER,
-    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
+    CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, FRAME_WRAP_FUNCTIONS, LOAD_FUNCTIONS,
+    LOAD_MODULES, OPEN_FRAME_MARKER, RESERVED_METHODS, ROW_PASSTHROUGH_METHODS,
+    SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
@@ -2889,8 +2890,18 @@ impl Linter {
                                 || LOAD_FUNCTIONS.contains(&func_name)
                             {
                                 // Schema.from_pandas(df) / Schema.from_polars(df).
-                                if let Expr::Name(class_name) = &*attr.value {
-                                    let class_str = class_name.id.as_str();
+                                //
+                                // The receiver is flattened to a dotted string rather
+                                // than destructured as a bare `Expr::Name`, so a
+                                // submodule namespace (`dask.dataframe.read_csv(...)`,
+                                // from a plain `import dask.dataframe`) reaches the
+                                // LOAD_MODULES check below alongside the conventional
+                                // `dd` alias. A bare name flattens to itself, leaving
+                                // every pd/pl/Schema path byte-for-byte unchanged.
+                                if let Some(class_str) =
+                                    ast_extract::dotted_module_path(&attr.value)
+                                {
+                                    let class_str = class_str.as_str();
                                     if self.schemas.contains_key(class_str) {
                                         // Schema.from_pandas(df) style
                                         self.dataframes_total += 1;
@@ -3075,6 +3086,80 @@ impl Linter {
                                                               `df: Annotated[pd.DataFrame, \
                                                               MySchema] = ...`"
                                                         .to_string(),
+                                                    severity: "warning".to_string(),
+                                                });
+                                            }
+                                        }
+                                    } else if LOAD_MODULES.contains(&class_str)
+                                        && FRAME_WRAP_FUNCTIONS.contains(&func_name)
+                                    {
+                                        // dd.from_pandas(pdf, npartitions=2) /
+                                        // pl.from_pandas(pdf): re-wraps an existing
+                                        // frame in another backend's container, columns
+                                        // unchanged, so the source variable's schema
+                                        // carries straight over.
+                                        //
+                                        // Counted as a DataFrame origin whether or not
+                                        // the source resolves — the same invariant every
+                                        // other LOAD_MODULES call upholds, and what keeps
+                                        // `dd`/`pl` from being swept into the
+                                        // unresolved-call external-package discovery that
+                                        // an unrecognized `<module>.<func>()` gets.
+                                        self.dataframes_total += 1;
+                                        let source_schema = call
+                                            .arguments
+                                            .args
+                                            .first()
+                                            .and_then(|arg| match arg {
+                                                Expr::Name(src) => {
+                                                    self.variables.get(src.id.as_str())
+                                                }
+                                                _ => None,
+                                            })
+                                            .map(|(schema, _)| schema.clone());
+                                        match source_schema {
+                                            Some(schema) => {
+                                                self.dataframes_typed += 1;
+                                                for target in &assign.targets {
+                                                    if let Expr::Name(target_name) = target {
+                                                        self.variables.insert(
+                                                            target_name.id.to_string(),
+                                                            (schema.clone(), current_line),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                let var_name = assign
+                                                    .targets
+                                                    .iter()
+                                                    .find_map(|t| {
+                                                        if let Expr::Name(n) = t {
+                                                            Some(n.id.to_string())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .unwrap_or_else(|| "df".to_string());
+                                                self.record_untyped_site(
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
+                                                );
+                                                errors.push(LintError {
+                                                    line: current_line,
+                                                    col: current_col,
+                                                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                                                    message: format!(
+                                                        "columns unknown at lint time; the \
+                                                         frame passed to `{class_str}.\
+                                                         {func_name}(...)` has no known \
+                                                         column set, so give that one \
+                                                         `usecols`/`columns`, or annotate \
+                                                         this variable's type, e.g. `df: \
+                                                         Annotated[{class_str}.DataFrame, \
+                                                         MySchema] = ...`"
+                                                    ),
                                                     severity: "warning".to_string(),
                                                 });
                                             }
@@ -7689,6 +7774,418 @@ print(df["missing"])
 
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].message.contains("missing"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // dask.dataframe (experimental third backend)
+    //
+    // Every column set asserted below was confirmed by executing the same call
+    // against dask 2026.8.0 and reading back `.columns` -- see the PR description
+    // for the probe script. dask.dataframe is a deliberate near-drop-in for pandas,
+    // so most of these pass through machinery that was already backend-agnostic
+    // (method-name-keyed structural ops, `Annotated[...]` parsing); the tests exist
+    // to pin that down rather than leave it to coincidence.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_should_infer_columns_from_a_dask_read_call_with_usecols() {
+        // arrange: dd.read_csv forwards **kwargs to pandas, so `usecols=` narrows the
+        // frame exactly as pd.read_csv does.
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_csv("orders.csv", usecols=["order_id", "amount"])
+print(df["amount"])
+print(df["revenue"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, "unknown-column");
+        assert!(errors[0].message.contains("revenue"));
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_infer_columns_from_a_dask_read_parquet_columns_kwarg() {
+        // arrange: dd.read_parquet takes `columns=` as a first-class named parameter,
+        // not just a forwarded kwarg.
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_parquet("orders.parquet", columns=["order_id", "amount"])
+print(df["order_id"])
+print(df["customer_id"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("customer_id"));
+    }
+
+    #[test]
+    fn test_should_recognize_a_dotted_dask_dataframe_module_load_call() {
+        // arrange: `import dask.dataframe` with no alias, so the call receiver is a
+        // nested attribute (`dask.dataframe`) rather than the bare `dd` name that
+        // every other LOAD_MODULES entry is written as.
+        let source = r#"
+import dask.dataframe
+
+df = dask.dataframe.read_csv("orders.csv", usecols=["order_id", "amount"])
+print(df["revenue"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("revenue"));
+    }
+
+    #[test]
+    fn test_should_propagate_a_dask_schema_through_row_passthrough_methods() {
+        // arrange: dask implements the pandas spellings (query/head/sort_values/
+        // dropna/fillna/...) but NOT polars' `filter`/`sort` -- only the ones it
+        // really has are exercised here.
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_csv("orders.csv", usecols=["order_id", "amount"])
+filtered = df.query("amount > 0")
+sorted_rows = filtered.sort_values("amount")
+clean = sorted_rows.dropna()
+print(clean["amount"])
+print(clean["revenue"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("revenue"));
+    }
+
+    #[test]
+    fn test_should_propagate_a_dask_schema_through_compute_persist_and_repartition() {
+        // arrange: dask.dataframe is lazy, so a pipeline's column set has to survive
+        // the materialization step or every post-.compute() access goes unchecked.
+        let source = r#"
+import dask.dataframe as dd
+
+lazy = dd.read_csv("orders.csv", usecols=["order_id", "amount"])
+cached = lazy.persist()
+rechunked = cached.repartition(npartitions=4)
+eager = rechunked.compute()
+print(eager["amount"])
+print(eager["revenue"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("revenue"));
+    }
+
+    #[test]
+    fn test_should_propagate_a_polars_lazyframe_schema_through_collect() {
+        // arrange: polars' lazy->eager finalizer, added alongside dask's `.compute()`
+        // because they are the same shape. Before this it had no handling at all, so
+        // a `pl.scan_csv(...)` column set was dropped the moment it was collected.
+        let source = r#"
+import polars as pl
+
+lazy = pl.scan_csv("orders.csv", schema={"order_id": pl.Int64, "amount": pl.Float64})
+eager = lazy.collect()
+print(eager["amount"])
+print(eager["revenue"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("revenue"));
+    }
+
+    #[test]
+    fn test_should_track_structural_operations_on_a_dask_frame() {
+        // arrange: drop / rename / assign / column-list subscript, all of which dask
+        // implements with pandas' signature and pandas' effect on the column set.
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_csv("orders.csv", usecols=["order_id", "customer_id", "amount"])
+trimmed = df.drop(columns=["customer_id"])
+print(trimmed["customer_id"])
+renamed = df.rename(columns={"amount": "total"})
+print(renamed["amount"])
+enriched = df.assign(tax=1)
+print(enriched["tax"])
+narrowed = df[["order_id", "amount"]]
+print(narrowed["customer_id"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: three unknown-column errors (the dropped, the renamed-away, and the
+        // sliced-away column); `enriched["tax"]` is the one access that stays valid.
+        assert_eq!(errors.len(), 3, "errors: {errors:?}");
+        assert!(errors[0].message.contains("customer_id"));
+        assert!(errors[1].message.contains("amount"));
+        assert!(errors[2].message.contains("customer_id"));
+    }
+
+    #[test]
+    fn test_should_track_in_place_mutation_on_a_dask_frame() {
+        // arrange: dask supports subscript assignment, `del`, and `pop` with pandas'
+        // in-place-on-the-column-set semantics (`insert` is the one member of this
+        // family dask does NOT have, so it is deliberately absent here).
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_csv("orders.csv", usecols=["order_id", "amount"])
+df["tax"] = df["amount"] * 0.2
+print(df["tax"])
+del df["amount"]
+print(df["amount"])
+df.pop("tax")
+print(df["tax"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: three errors, byte-for-byte what the identical pandas source
+        // produces. The first is the pre-existing mutation-tracking diagnostic for
+        // introducing a column an inferred set doesn't have; `tax` is added anyway,
+        // so the `df["tax"]` on the next line is clean. Then `del` and `pop` each
+        // remove a column and the following access to it fails.
+        assert_eq!(errors.len(), 3, "errors: {errors:?}");
+        assert!(errors[0].message.contains("(mutation tracking)"));
+        assert!(errors[1].message.contains("amount"));
+        assert!(errors[2].message.contains("tax"));
+    }
+
+    #[test]
+    fn test_should_combine_schemas_for_dask_merge_and_concat() {
+        // arrange: `left.merge(right, ...)` and `dd.concat([...])` both return the
+        // union of the two column sets in dask, same as pandas.
+        let source = r#"
+import dask.dataframe as dd
+
+left = dd.read_csv("orders.csv", usecols=["order_id", "amount"])
+right = dd.read_csv("notes.csv", usecols=["order_id", "note"])
+merged = left.merge(right, on="order_id")
+print(merged["note"])
+print(merged["revenue"])
+combined = dd.concat([left, right])
+print(combined["amount"])
+print(combined["shipped"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors[0].message.contains("revenue"));
+        assert!(errors[1].message.contains("shipped"));
+    }
+
+    #[test]
+    fn test_should_carry_the_source_schema_through_dd_from_pandas() {
+        // arrange: `dd.from_pandas(pdf, npartitions=n)` is dask's canonical entry
+        // point from an in-memory frame and keeps the source's columns verbatim.
+        let source = r#"
+import dask.dataframe as dd
+import pandas as pd
+
+pdf = pd.read_csv("orders.csv", usecols=["order_id", "amount"])
+ddf = dd.from_pandas(pdf, npartitions=2)
+print(ddf["amount"])
+print(ddf["revenue"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("revenue"));
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_warn_untracked_dataframe_for_dd_from_pandas_with_an_unknown_source() {
+        // arrange: the source frame's own columns are unknown, so the wrapped frame's
+        // are too -- reported as a DataFrame origin with no column info rather than
+        // silently untracked, matching a bare `pd.read_csv("x.csv")`.
+        let source = r#"
+import dask.dataframe as dd
+import pandas as pd
+
+ddf = dd.from_pandas(pd.DataFrame({"a": [1]}), npartitions=2)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, "untracked-dataframe");
+        assert!(errors[0].message.contains("dd.from_pandas(...)"));
+        assert!(errors[0]
+            .message
+            .contains("Annotated[dd.DataFrame, MySchema]"));
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    #[test]
+    fn test_should_warn_untracked_dataframe_for_a_bare_dask_read_call() {
+        // arrange: no usecols=/columns=, so there is nothing to infer -- the same
+        // nudge a bare pandas load gets.
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_csv("orders.csv")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, "untracked-dataframe");
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    #[test]
+    fn test_should_not_record_unresolved_call_for_recognized_dask_loads() {
+        // arrange: the dask counterpart of
+        // test_should_not_record_unresolved_call_for_recognized_pandas_and_polars_loads
+        // -- `dd`/`dask.dataframe` must never be swept into external-package
+        // candidate discovery, which relies on every LOAD_MODULES call bumping
+        // dataframes_total (including `from_pandas`, which resolves nothing here).
+        let source = r#"
+import dask.dataframe as dd
+
+df = dd.read_csv("orders.csv", usecols=["a", "b"])
+print(df["a"])
+wrapped = dd.from_pandas(something_unknown, npartitions=2)
+print(wrapped["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(linter.unresolved_dataframe_shaped_calls.is_empty());
+    }
+
+    #[test]
+    fn test_should_validate_a_dask_annotated_parameter_against_a_cross_file_schema() {
+        // arrange: `Annotated[dd.DataFrame, OrderSchema]` resolved across a file
+        // boundary, the dask spelling of the pandas/polars cross-file contract test
+        // above. The annotation parser keys on the `DataFrame` attribute name rather
+        // than the module it hangs off, so this works for any backend -- pinned here
+        // so a future narrowing of that check can't silently drop dask.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+    amount = Column(type=float)
+"#,
+        )
+        .unwrap();
+        let transforms_source = r#"
+from typing import Annotated
+
+import dask.dataframe as dd
+
+from schemas import OrderSchema
+
+def totals(orders: Annotated[dd.DataFrame, OrderSchema]):
+    print(orders["amount"])
+    print(orders["revenue"])
+    return orders
+"#;
+        fs::write(root.join("transforms.py"), transforms_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let transforms_path = root.join("transforms.py");
+        linter.load_cross_file_symbols(&index, transforms_source, &transforms_path, root);
+        let errors = linter
+            .check_file_internal(transforms_source, &transforms_path)
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, "unknown-column");
+        assert!(errors[0].message.contains("revenue"));
+        assert!(errors[0].message.contains("OrderSchema"));
     }
 
     #[test]

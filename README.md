@@ -75,7 +75,7 @@ tracking and IDE autocomplete; they're a progressive enhancement, not a prerequi
 - ✅ **Rust-fast** - Milliseconds, not seconds, even on hundreds of files; fast enough for pre-commit hooks and CI (see [benchmarks](#static-analysis-performance))
 - ✅ **Cross-file awareness** - Add `BaseSchema` and typed return annotations to follow schemas across module boundaries
 - ✅ **Refactor-safe access** - `df[Schema.column_group.s].mean()` (pandas) or `df.select(Schema.col.col)` (polars) instead of scattered string literals
-- ✅ **Works with pandas AND polars** - Same schema API, native backend types
+- ✅ **Works with pandas AND polars** - Same schema API, native backend types; `dask.dataframe` is supported experimentally ([details](#use-with-dask-experimental))
 - ✅ **Dynamic column matching** - Regex-based ColumnSets for time-series data
 - ✅ **Zero runtime overhead** - No validation, no slowdown
 - ✅ **Type-safe backends** - Type checker knows pandas vs polars methods
@@ -190,6 +190,40 @@ print(df.select(pl.col("profit")))  # ✗ unknown-column: Column 'profit' not in
 filtered = df.filter(SalesData.revenue.col > 1000)
 grouped = df.group_by("customer_id").agg(SalesData.revenue.col.sum())
 ```
+
+### Use With Dask (Experimental)
+
+`dask.dataframe` is recognized as a third backend. Because it is a deliberate near
+drop-in for pandas, the same inference and the same tracked operations apply —
+`usecols=`/`columns=` seed a column set, `drop`/`rename`/`assign`/`pop`/`del`/subscript
+assignment update it, and the lazy-to-eager `.compute()` step carries it through rather
+than losing it.
+
+```python
+from typing import Annotated
+import dask.dataframe as dd
+
+# Inference — no schema class needed, columns come from usecols=
+orders = dd.read_csv("orders.csv", usecols=["order_id", "customer_id", "amount"])
+
+# Tracking survives the lazy → eager boundary
+totals = orders.compute()
+print(totals["amount"])
+print(totals["revenue"])  # ✗ unknown-column: 'revenue' not in {order_id, customer_id, amount}
+
+# dd.from_pandas carries an in-memory frame's columns across
+ddf = dd.from_pandas(pd.read_csv("orders.csv", usecols=["order_id", "amount"]), npartitions=2)
+print(ddf["customer_id"])  # ✗ unknown-column: the pandas source never had it
+
+# Or annotate explicitly, same as pandas/polars
+df: Annotated[dd.DataFrame, SalesData] = dd.read_parquet("sales.parquet", columns=["revenue"])
+print(df["profit"])  # ✗ unknown-column: Column 'profit' not in SalesData
+```
+
+Dask needs to be installed only to *run* this code — the checker never imports it. The
+operations dask does not implement (`filter`, `sort`, `insert`, `select`) are simply
+never encountered; the ones it does implement behave exactly as the
+[Method Matrix](https://typedframes.readthedocs.io/en/latest/method-matrix/) describes.
 
 ---
 
@@ -446,8 +480,13 @@ mypy src/
 The checker tracks schema changes through `rename`, `drop`, `assign`, `select`, `pop`,
 `insert`, `del`, subscript assignment, `merge`, and `concat`. Row-passthrough operations
 like `filter`, `query`, `head`, `sort_values`, and `dropna` are validated without schema
-changes. Operations with runtime-dependent output (`join`, `pivot`, `melt`, `groupby`,
-`apply`, etc.) are left untracked to avoid false positives.
+changes, as are the lazy-to-eager finalizers (`collect` for polars, `compute` /
+`persist` / `repartition` for dask). Operations with runtime-dependent output (`join`,
+`pivot`, `melt`, `groupby`, `apply`, etc.) are left untracked to avoid false positives.
+
+Operations are matched by method name against a receiver the checker already tracks, so
+they apply to whichever backend implements them — that is what lets `dask.dataframe`,
+a near drop-in for pandas, reuse the whole table.
 
 See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method-matrix/)
 for the complete list of tracked, passthrough, and untracked operations, plus the error
@@ -793,6 +832,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | **Backend Support**             |
 | Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ⚠️ Limited        |
 | Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes            |
+| Dask                            | ⚠️ Experimental         | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Lazy   | ❌ No             | ❌ No             |
 | DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
 | **Project Status (Aug 2026)**   |
 | Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
@@ -934,6 +974,9 @@ Runnable versions of everything shown in [Quick Start](#quick-start) and
   `Annotated[pd.DataFrame, Schema]` with string and `.s` descriptor column access
 - [`annotated_polars_example.py`](examples/features/annotated_polars_example.py) —
   the same, with `pl.col()` and `.col` descriptor expressions
+- [`annotated_dask_example.py`](examples/features/annotated_dask_example.py) —
+  experimental `dask.dataframe` support: inference from `usecols=`, tracking through
+  `.compute()`, and `Annotated[dd.DataFrame, Schema]`
 - [`typedframes_example.py`](examples/features/typedframes_example.py) — pandas and
   polars side by side against one shared schema
 - [`schema_algebra_example.py`](examples/features/schema_algebra_example.py) —

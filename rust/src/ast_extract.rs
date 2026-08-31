@@ -208,6 +208,30 @@ pub(crate) fn is_relationship_annotation(annotation: &Expr) -> bool {
     }
 }
 
+// Flatten a call receiver that is a plain dotted module reference into a single string,
+// so it can be matched against `LOAD_MODULES` regardless of how the module was imported:
+// `import pandas as pd` gives a bare `Expr::Name` ("pd"), while `import dask.dataframe`
+// gives a nested `Expr::Attribute` ("dask.dataframe"). A bare name flattens to itself,
+// so callers that previously destructured `Expr::Name` keep the exact same string.
+//
+// Returns `None` as soon as any segment is not a name or attribute -- a call,
+// subscript, or literal -- so `loader.frames().read_csv(...)` never collapses into
+// something that could be mistaken for a module path. Note that `self.loader` DOES
+// flatten (to "self.loader"), which is harmless: it matches no entry in any of the
+// module tables it is compared against.
+pub(crate) fn dotted_module_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.id.to_string()),
+        Expr::Attribute(attr) => {
+            let mut path = dotted_module_path(&attr.value)?;
+            path.push('.');
+            path.push_str(attr.attr.as_str());
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
 // Check if a type name is a DataFrame/Frame type
 pub(crate) fn is_frame_type(name: &str) -> bool {
     name == "DataFrame"
@@ -697,6 +721,54 @@ mod tests {
         assert!(!extract_bare_dataframe_type(&annotation_of(
             "def f() -> Annotated[pd.DataFrame, MySchema]: ..."
         )));
+    }
+
+    fn call_receiver_of(source: &str) -> ruff_python_ast::Expr {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Expr(expr_stmt) = &parsed.into_syntax().body[0] else {
+            panic!("Expected an expression statement");
+        };
+        let Expr::Call(call) = expr_stmt.value.as_ref() else {
+            panic!("Expected a call");
+        };
+        let Expr::Attribute(attr) = call.func.as_ref() else {
+            panic!("Expected an attribute call");
+        };
+        (*attr.value).clone()
+    }
+
+    #[test]
+    fn test_should_flatten_a_bare_and_a_dotted_module_receiver() {
+        assert_eq!(
+            dotted_module_path(&call_receiver_of("pd.read_csv('a.csv')")).as_deref(),
+            Some("pd")
+        );
+        assert_eq!(
+            dotted_module_path(&call_receiver_of("dask.dataframe.read_csv('a.csv')")).as_deref(),
+            Some("dask.dataframe")
+        );
+        // Arbitrary depth, and no special-casing of `self`: it flattens like any
+        // other name, and simply matches nothing in the module tables it is
+        // compared against.
+        assert_eq!(
+            dotted_module_path(&call_receiver_of("self.loader.frames.read_csv('a.csv')"))
+                .as_deref(),
+            Some("self.loader.frames")
+        );
+    }
+
+    #[test]
+    fn test_should_refuse_to_flatten_a_receiver_containing_a_call_or_subscript() {
+        // A call or subscript anywhere in the chain means this is an expression, not
+        // a module path -- collapsing it to a string could let it be mistaken for one.
+        assert_eq!(
+            dotted_module_path(&call_receiver_of("loader.frames().read_csv('a.csv')")),
+            None
+        );
+        assert_eq!(
+            dotted_module_path(&call_receiver_of("registry['frames'].read_csv('a.csv')")),
+            None
+        );
     }
 
     #[test]

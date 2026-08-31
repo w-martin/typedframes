@@ -150,8 +150,8 @@ license genuinely cannot be determined from the installed artifact.
 > brew install libmagic
 > ```
 >
-> On Debian/Ubuntu the equivalent is `apt-get install libmagic1`. Note that CI does not
-> run this check, so this only affects local `uv run inv all` runs.
+> On Debian/Ubuntu the equivalent is `apt-get install libmagic1`. CI installs this
+> automatically (see `.github/workflows/publish.yml`) before running the check.
 
 ### Run All Checks
 

@@ -44,6 +44,7 @@ Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete —
 - [Quick Start](#quick-start)
 - [Column Inference](#column-inference)
 - [Static Analysis](#static-analysis)
+- [Editor Integration](#editor-integration)
 - [Jupyter Notebooks](#jupyter-notebooks)
 - [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in)
 - [Static Analysis Performance](#static-analysis-performance)
@@ -98,6 +99,13 @@ no required dependencies; add the extra for whichever backend(s) your code uses:
 ```shell
 pip install typedframes[pandas]   # includes pandas
 pip install typedframes[polars]   # includes polars
+```
+
+For inline diagnostics in an LSP-capable editor, add the language server (see
+[Editor Integration](#editor-integration)):
+
+```shell
+pip install typedframes[lsp]
 ```
 
 ---
@@ -452,6 +460,77 @@ changes. Operations with runtime-dependent output (`join`, `pivot`, `melt`, `gro
 See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method-matrix/)
 for the complete list of tracked, passthrough, and untracked operations, plus the error
 code reference.
+
+---
+
+## Editor Integration
+
+The mypy plugin above only reaches editors whose Python backend is mypy. Pyright/Pylance —
+the default in VS Code — has no plugin mechanism, so for inline squiggles anywhere else
+typedframes ships a small **language server**: it runs the same Rust checker and publishes
+its results over the Language Server Protocol.
+
+```shell
+pip install typedframes[lsp]
+```
+
+Start it as `typedframes-lsp`, or equivalently `python -m typedframes.lsp`. It speaks LSP
+over stdio and does exactly one thing — publish `unknown-column` and friends as
+diagnostics:
+
+- Diagnostics are published on `textDocument/didOpen` and re-published for every open
+  buffer on `textDocument/didSave`, so a schema edit in one file refreshes the files that
+  use it.
+- There is no `textDocument/didChange` handling. The checker reads from disk, so checking
+  a half-typed buffer would report positions from stale text; results refresh when you
+  save.
+- Nothing else is implemented — no hover, no completion, no code actions. It is meant to
+  run alongside your existing Python language server, not to replace it.
+- `[tool.typedframes]` in `pyproject.toml` (including `enabled = false`) applies exactly as
+  it does to `typedframes check`, resolved from the nearest `pyproject.toml` above the file.
+- Only `.py` files are checked. Notebooks go through the standalone checker
+  ([Jupyter Notebooks](#jupyter-notebooks)), which reads `.ipynb` directly.
+
+### Neovim
+
+Using the built-in LSP client (`vim.fs.root` needs Neovim 0.10+):
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "python",
+  callback = function(args)
+    vim.lsp.start({
+      name = "typedframes",
+      cmd = { "typedframes-lsp" },
+      root_dir = vim.fs.root(args.buf, { "pyproject.toml", ".git" }),
+    })
+  end,
+})
+```
+
+### Helix
+
+In `languages.toml`, alongside whichever Python server you already use:
+
+```toml
+[language-server.typedframes]
+command = "typedframes-lsp"
+
+[[language]]
+name = "python"
+language-servers = ["pyright", "typedframes"]
+```
+
+### Any other LSP client
+
+The full configuration is one command and one filetype: run `typedframes-lsp` with stdio
+transport for `python` files, rooted at the directory holding `pyproject.toml`. There are
+no initialization options and no workspace settings to pass.
+
+VS Code is the exception: it has no built-in generic LSP client, so pointing it at an
+arbitrary server binary needs a third-party extension. Use the
+[mypy plugin](#option-2-mypy-plugin-comprehensive) or `typedframes check` in a pre-commit
+hook there.
 
 ---
 

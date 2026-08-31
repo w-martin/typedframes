@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from invoke import Context, task
+from invoke import Context, Exit, task
 
 RUST_DIR = Path("rust")
 BINARY_PATH = RUST_DIR / "target" / "debug" / "typedframes_checker"
@@ -83,9 +83,18 @@ def docs(ctx: Context) -> None:
 
 
 @task
-def verify_licences(ctx: Context) -> None:
-    """Run licensecheck to verify dependency licenses."""
-    ctx.run("licensecheck")
+def verify_licences(_ctx: Context) -> None:
+    """Verify dependency licenses with scancode-toolkit's text-based detection."""
+    from scripts.check_licenses import check_licences, format_failure
+
+    print("Checking dependency licenses...")
+    failures, checked = check_licences()
+    if failures:
+        print(f"Disallowed or undetectable licenses in {len(failures)} of {checked} packages:")
+        for failure in failures:
+            print(format_failure(failure))
+        raise Exit(code=1)
+    print(f"All {checked} installed packages have an allowed license.")
 
 
 @task(name="all", pre=[build])

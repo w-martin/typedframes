@@ -45,6 +45,7 @@ Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete —
 - [Column Inference](#column-inference)
 - [Static Analysis](#static-analysis)
 - [Editor Integration](#editor-integration)
+- [Jupyter Notebooks](#jupyter-notebooks)
 - [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in)
 - [Static Analysis Performance](#static-analysis-performance)
 - [Type Safety With Multiple Backends](#type-safety-with-multiple-backends)
@@ -487,6 +488,8 @@ diagnostics:
   run alongside your existing Python language server, not to replace it.
 - `[tool.typedframes]` in `pyproject.toml` (including `enabled = false`) applies exactly as
   it does to `typedframes check`, resolved from the nearest `pyproject.toml` above the file.
+- Only `.py` files are checked. Notebooks go through the standalone checker
+  ([Jupyter Notebooks](#jupyter-notebooks)), which reads `.ipynb` directly.
 
 ### Neovim
 
@@ -528,6 +531,68 @@ VS Code is the exception: it has no built-in generic LSP client, so pointing it 
 arbitrary server binary needs a third-party extension. Use the
 [mypy plugin](#option-2-mypy-plugin-comprehensive) or `typedframes check` in a pre-commit
 hook there.
+
+---
+
+## Jupyter Notebooks
+
+The standalone checker reads `.ipynb` files directly — no `nbconvert`, no `jupytext`, no
+flag, no conversion step. Notebooks are parsed with
+[`ruff_notebook`](https://github.com/astral-sh/ruff/tree/main/crates/ruff_notebook), the
+same crate Ruff uses for its own notebook support:
+
+```shell
+# Check one notebook
+typedframes check analysis.ipynb
+
+# Check a directory — .py and .ipynb files are both picked up, no flag needed
+typedframes check notebooks/
+
+# Output — `cell N` is the notebook's Nth cell; line:col are relative to that cell:
+# analysis.ipynb:cell 6:2:1: warning[untracked-dataframe] columns unknown at lint time; specify
+#   `usecols`/`columns`, or annotate the variable's type
+# analysis.ipynb:cell 10:1:1: error[unknown-column] Column 'revenue' does not exist in Orders
+#   {amount, customer_id, order_id} (defined at analysis.ipynb cell 2:8)
+# ✗ Found 1 error, 2 warnings in 1 file (0.0s)
+```
+
+**Features:**
+- ✅ Auto-detected — every `.ipynb` under a checked path, alongside `.py` files
+- ✅ Diagnostics reported as `cell N:line:col`, mapped back to the cell that produced them
+  rather than a line number in the raw notebook JSON — including a same-notebook schema's
+  `(defined at ...)` cross-reference
+- ✅ Same error codes, severities, and flags as `.py` files: `--strict`,
+  `--output-format`, `--no-warnings`, `--lenient-ingest`, coverage thresholds
+- ✅ IPython magics and shell escapes parse natively (`%matplotlib inline`, `%%time`,
+  `!pip install ...`) — nothing has to be stripped first
+- ✅ `# typedframes: ignore` suppresses a diagnostic on a line inside a cell, same as in a
+  `.py` file
+- ✅ A schema imported from a project `.py` module resolves through the cross-file index,
+  so `orders = load_orders()` in a notebook is validated against the schema on
+  `load_orders`' return annotation
+- ✅ `.ipynb_checkpoints/` is pruned by default, so stale checkpoint copies aren't
+  re-reported
+
+**Caveats:**
+- ❌ The mypy plugin ([Option 2](#option-2-mypy-plugin-comprehensive)) is `.py`-only —
+  mypy reads Python source files, so notebook checking is standalone-checker-only
+- ❌ `cell N` counts *every* cell in the notebook, markdown and raw cells included — so
+  the number is a cell's position in the notebook, not "the Nth code cell"
+- ❌ A notebook is never a *source* of schemas for other files (Python can't import an
+  `.ipynb`); a schema defined in a notebook is visible only inside that notebook
+- ❌ A notebook that isn't valid notebook JSON, whose kernel isn't Python, or whose code
+  doesn't parse is skipped with a message on stderr and the run continues — a skip alone
+  never fails the run, `--strict` included
+- ❌ Under `--output-format=github`, the annotation's `line`/`col` stay cell-relative and
+  the cell number moves into the annotation title, since GitHub annotations address raw
+  file lines and an `.ipynb` is JSON rather than source text
+
+### See Also
+
+- [`examples/features/ipynb_example.ipynb`](examples/features/ipynb_example.ipynb) — a
+  runnable notebook with one schema, an IPython magic, and three intentional bugs
+  (`untracked-dataframe`, `dropped-unknown-column`, `unknown-column`), all caught by
+  `typedframes check ipynb_example.ipynb` without running a cell.
 
 ---
 
@@ -958,6 +1023,9 @@ Runnable versions of everything shown in [Quick Start](#quick-start) and
   [`multi_file_with_schema/`](examples/features/multi_file_with_schema/) — the same
   cross-file pipeline checked with and without schemas, see
   [`examples/features/README.md`](examples/features/README.md) for what each one catches
+- [`ipynb_example.ipynb`](examples/features/ipynb_example.ipynb) — the same checks in a
+  Jupyter notebook, with `cell N:line:col` locations (see [Jupyter
+  Notebooks](#jupyter-notebooks))
 
 ---
 

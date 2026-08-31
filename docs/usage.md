@@ -47,6 +47,10 @@ df = pd.read_parquet("orders.parquet", columns=["order_id", "amount"])
 pl_df = pl.read_parquet("orders.parquet", columns=["order_id", "amount"])
 ```
 
+**Jupyter notebooks are checked too.** `typedframes check src/` picks up `.ipynb` files
+alongside `.py` files with no flag and no conversion step, reporting each diagnostic as
+`analysis.ipynb:cell 10:1:1: ...` — see [Jupyter notebooks](api/cli.md#jupyter-notebooks).
+
 ## Step 2 — Add a schema class
 
 Define a `BaseSchema` class when you want cross-file awareness and IDE autocomplete:

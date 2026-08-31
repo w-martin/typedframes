@@ -453,6 +453,73 @@ See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method
 for the complete list of tracked, passthrough, and untracked operations, plus the error
 code reference.
 
+### Pre-commit Hook
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: local
+    hooks:
+      - id: typedframes
+        name: typedframes check
+        entry: typedframes check . --strict
+        language: python
+        additional_dependencies: ["typedframes==0.5.0"]
+        types_or: [python, jupyter]
+        pass_filenames: false
+```
+
+`pass_filenames: false` is deliberate: the checker takes a single path and builds its
+cross-file index from it, so one run per commit still sees the modules the commit didn't
+touch — a per-file invocation would lose that. `--strict` is what makes the hook block
+the commit: `typedframes check` exits 0 by default even when it finds real errors. Add
+the coverage gate to the same line:
+
+```yaml
+        # with coverage gating
+        entry: typedframes check . --strict --coverage-fail-under=90
+```
+
+This repository also ships a `.pre-commit-hooks.yaml`, so once a tagged release contains
+it you can point `repo:` straight at `https://github.com/w-martin/typedframes` with a
+`rev:` and drop the boilerplate above. That form needs a Rust toolchain wherever the hook
+runs — pre-commit's python installer builds the repository from source rather than
+fetching a wheel — so the local hook stays the quicker one to install either way.
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/typedframes.yml
+name: typedframes
+on: [push, pull_request]
+
+jobs:
+  typedframes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No tagged release contains action.yml yet. Repin this to that tag once one
+      # ships: an unpinned third-party action is a supply-chain risk, and @main is a
+      # stopgap rather than a recommendation.
+      - uses: w-martin/typedframes@main
+        with:
+          path: src/
+          coverage-fail-under: "90"
+```
+
+The action installs the PyPI wheel into a throwaway virtualenv and runs the checker with
+`--output-format=github`, so errors arrive as annotations on the pull request diff.
+
+| Input | Default | |
+|-------|---------|-|
+| `path` | `.` | File or directory to check |
+| `version` | `latest` | PyPI version to install, e.g. `"0.5.0"` |
+| `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
+| `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
+| `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown |
+| `no-warnings` | `false` | Suppress warning-level diagnostics |
+| `args` | *(empty)* | Escape hatch for `--no-index`, `--lenient-ingest`, `--no-info` |
+
 ---
 
 ## Jupyter Notebooks

@@ -204,10 +204,15 @@ def did_save(ls: TypedFramesLanguageServer, _params: types.DidSaveTextDocumentPa
     the file that changed may be the one *defining* a schema -- so the stale index is
     dropped and all open buffers are refreshed, not just the saved one. Which file
     was saved therefore does not narrow the work, and the params go unused.
+
+    Each document's own `uri` is republished, not the workspace's key for it: pygls
+    stores documents under a percent-decoded key, and a client matches published
+    diagnostics against the URI it sent. For a path with a space in it those two
+    differ, and diagnostics keyed on the decoded form would land on no buffer.
     """
     ls.clear_index_cache()
-    for uri in list(ls.workspace.text_documents):
-        ls.publish(uri)
+    for document in list(ls.workspace.text_documents.values()):
+        ls.publish(document.uri)
 
 
 def did_close(ls: TypedFramesLanguageServer, params: types.DidCloseTextDocumentParams) -> None:

@@ -216,6 +216,23 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
         # assert
         self.assertEqual(sorted(p.uri for p in server.published), sorted([self.uri, other]))
 
+    def test_should_republish_on_save_under_the_uri_the_client_sent(self) -> None:
+        """A percent-encoded path is republished as sent, not as pygls keys it internally."""
+        # arrange - pygls stores documents under a percent-decoded key, so a path with a
+        # space in it has a workspace key that no client would match diagnostics against
+        server = _RecordingServer(_checker([]))
+        uri = from_fs_path(str(Path("/my project/pipeline.py")))
+        server.workspace.put_text_document(_document_item(uri, self.source))
+
+        # act
+        did_save(
+            server,
+            types.DidSaveTextDocumentParams(text_document=types.TextDocumentIdentifier(uri=uri)),
+        )
+
+        # assert
+        self.assertEqual([p.uri for p in server.published], ["file:///my%20project/pipeline.py"])
+
     def test_should_clear_diagnostics_when_a_document_is_closed(self) -> None:
         """Closing a file removes its squiggles from the editor."""
         # arrange

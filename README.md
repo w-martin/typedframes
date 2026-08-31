@@ -457,35 +457,6 @@ code reference.
 ```yaml
 # .pre-commit-config.yaml
 repos:
-  - repo: https://github.com/w-martin/typedframes
-    rev: v0.5.1
-    hooks:
-      - id: typedframes
-```
-
-The hook defaults to `typedframes check . --strict` — one run per commit rather than one
-per staged file, so the cross-file index still sees the modules the commit didn't touch.
-`--strict` is what makes it block the commit: `typedframes check` exits 0 by default even
-when it finds real errors.
-
-`args` replaces that default list wholesale, so repeat the path and `--strict` when
-narrowing the path or turning on the coverage gate:
-
-```yaml
-# .pre-commit-config.yaml — with coverage gating
-repos:
-  - repo: https://github.com/w-martin/typedframes
-    rev: v0.5.1
-    hooks:
-      - id: typedframes
-        args: [src/, --strict, --coverage-fail-under=90]
-```
-
-pre-commit builds that hook from this repository's source, which needs a Rust toolchain.
-To install the prebuilt PyPI wheel instead, declare it as a local hook:
-
-```yaml
-repos:
   - repo: local
     hooks:
       - id: typedframes
@@ -496,6 +467,23 @@ repos:
         types_or: [python, jupyter]
         pass_filenames: false
 ```
+
+`pass_filenames: false` is deliberate: the checker takes a single path and builds its
+cross-file index from it, so one run per commit still sees the modules the commit didn't
+touch — a per-file invocation would lose that. `--strict` is what makes the hook block
+the commit: `typedframes check` exits 0 by default even when it finds real errors. Add
+the coverage gate to the same line:
+
+```yaml
+        # with coverage gating
+        entry: typedframes check . --strict --coverage-fail-under=90
+```
+
+This repository also ships a `.pre-commit-hooks.yaml`, so once a tagged release contains
+it you can point `repo:` straight at `https://github.com/w-martin/typedframes` with a
+`rev:` and drop the boilerplate above. That form needs a Rust toolchain wherever the hook
+runs — pre-commit's python installer builds the repository from source rather than
+fetching a wheel — so the local hook stays the quicker one to install either way.
 
 ### GitHub Actions
 
@@ -509,7 +497,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: w-martin/typedframes@v0.5.1
+      # No tagged release contains action.yml yet. Repin this to that tag once one
+      # ships: an unpinned third-party action is a supply-chain risk, and @main is a
+      # stopgap rather than a recommendation.
+      - uses: w-martin/typedframes@main
         with:
           path: src/
           coverage-fail-under: "90"

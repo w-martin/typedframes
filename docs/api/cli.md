@@ -1,6 +1,7 @@
 # CLI
 
-The `typedframes` command-line interface runs the Rust-based static checker on Python source files.
+The `typedframes` command-line interface runs the Rust-based static checker on Python
+source files and Jupyter notebooks.
 
 ## Basic usage
 
@@ -8,9 +9,16 @@ The `typedframes` command-line interface runs the Rust-based static checker on P
 # Check a single file
 typedframes check pipeline.py
 
+# Check a single Jupyter notebook
+typedframes check analysis.ipynb
+
 # Check an entire directory (builds a cross-file project index)
 typedframes check src/
 ```
+
+A directory is walked for both `.py` and `.ipynb` files — notebooks need no flag and no
+conversion step. Notebook diagnostics are located as `cell N:line:col` instead of
+`line:col`; see [Jupyter notebooks](#jupyter-notebooks) below.
 
 Every other flag is documented below, grouped by what it controls, each with a runnable
 example. `typedframes check <path>` alone runs with every default: cross-file index on,
@@ -194,6 +202,32 @@ src/pipeline.py:12:5: error[missing-column] 'customers' passed to contact_label 
 The format matches ty and ruff: `file:line:col: severity[code] message`. Most editors,
 CI systems, and LSP clients parse this automatically. Colors are applied when the output
 is a terminal (TTY); piping or redirecting strips them.
+
+## Jupyter notebooks
+
+`.ipynb` files are checked directly, with no flag and no conversion step, and a directory
+walk picks them up alongside `.py` files. Notebooks are parsed with
+[`ruff_notebook`](https://github.com/astral-sh/ruff/tree/main/crates/ruff_notebook), so
+IPython magics and shell escapes (`%matplotlib inline`, `%%time`, `!pip install ...`)
+parse natively.
+
+Every diagnostic — and any `(defined at ...)` reference to a schema defined in the same
+notebook — is located as `cell N:line:col`, where `line`/`col` are relative to that cell:
+
+```
+analysis.ipynb:cell 10:1:1: error[unknown-column] Column 'revenue' does not exist in Orders
+  {amount, customer_id, order_id} (defined at analysis.ipynb cell 2:8)
+```
+
+`cell N` counts every cell in the notebook, markdown and raw cells included, so it is a
+cell's position in the file rather than "the Nth code cell". Under `--output-format
+github`, `line`/`col` stay cell-relative and the cell number moves into the annotation
+title, since GitHub annotations address raw file lines and an `.ipynb` is JSON.
+
+A notebook that isn't valid notebook JSON, whose kernel isn't Python, or whose code
+doesn't parse is skipped with a message on stderr; the run continues, and a skip alone
+never fails it, `--strict` included. `.ipynb_checkpoints` is pruned by default (see
+[Excluding directories](#excluding-directories)).
 
 ## Error codes
 

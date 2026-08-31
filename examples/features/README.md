@@ -75,6 +75,25 @@ uv run ty check annotated_polars_example.py
 uv run typedframes check annotated_polars_example.py
 ```
 
+## annotated_cudf_example.py
+
+`Annotated[cudf.DataFrame, Schema]` on RAPIDS cuDF (experimental). cuDF uses
+pandas' string-subscript column access, so schema annotations, `columns=`/`usecols=`
+inference, row-preserving methods, `rename`/`drop`/`assign` and `merge` all behave as
+they do for pandas. Five intentional errors are caught, including one that only shows
+up after a `rename` and one that needs both sides of a merge.
+
+cuDF's reader surface is narrower than pandas': `cudf.read_sql` is deliberately left
+untracked because cuDF exports no SQL reader.
+
+Only the checker command is listed. `mypy`/`ty` would need cuDF genuinely importable,
+and cuDF requires an NVIDIA GPU with a CUDA runtime and ships Linux-only wheels — but
+`typedframes check` never imports the file, so it runs anywhere:
+
+```shell
+uv run typedframes check annotated_cudf_example.py
+```
+
 ## schema_algebra_example.py
 
 Schema composition via inheritance and the `+` operator.  Shows how to build

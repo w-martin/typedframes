@@ -6,8 +6,9 @@
 
 use crate::config::LinterConfig;
 use crate::constants::{
-    CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS, LOAD_MODULES, OPEN_FRAME_MARKER,
-    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
+    CONNECTORX_MODULES, CUDF_LOAD_FUNCTIONS, CUDF_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS,
+    LOAD_MODULES, OPEN_FRAME_MARKER, RESERVED_METHODS, ROW_PASSTHROUGH_METHODS,
+    SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
@@ -35,6 +36,19 @@ pub(crate) enum LoadKind {
     // A SQLAlchemy Core `select(...)` statement (or a `Name` bound to one) rather than
     // SQL text — see `extract_orm_select_columns`.
     Orm,
+}
+
+// Does `module.func(...)` name a load call that the module in question actually
+// provides? `LOAD_FUNCTIONS` is the union across every supported DataFrame library, so
+// on its own it would have `cudf.read_sql(...)` and `cudf.scan_csv(...)` resolving to
+// column sets even though cuDF exports neither. cuDF's reader surface is a strict
+// subset of pandas' (see `CUDF_LOAD_FUNCTIONS`), so it gets its own narrower list;
+// pandas and polars keep the union, which is how they have always been matched.
+fn is_load_call(module: &str, func_name: &str) -> bool {
+    if CUDF_MODULES.contains(&module) {
+        return CUDF_LOAD_FUNCTIONS.contains(&func_name);
+    }
+    LOAD_FUNCTIONS.contains(&func_name)
 }
 
 // A recognized case-fold of an *already-known* column set — e.g. a connector-specific
@@ -2904,9 +2918,10 @@ impl Linter {
                                             }
                                         }
                                     } else if LOAD_MODULES.contains(&class_str)
-                                        && LOAD_FUNCTIONS.contains(&func_name)
+                                        && is_load_call(class_str, func_name)
                                     {
-                                        // pd.read_csv() / pl.scan_parquet() / pd.read_sql() etc.
+                                        // pd.read_csv() / pl.scan_parquet() /
+                                        // pd.read_sql() / cudf.read_parquet() etc.
                                         self.dataframes_total += 1;
                                         let (extracted, load_kind) =
                                             self.extract_load_columns(func_name, call);
@@ -4607,6 +4622,331 @@ print(df["wrong_column"])
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("wrong_column"));
         assert!(errors[0].message.contains("UserSchema"));
+    }
+
+    // ---- RAPIDS cuDF (experimental) -------------------------------------------
+    //
+    // cuDF is a GPU library that cannot be installed or executed on most machines
+    // (Linux + NVIDIA CUDA only), and this checker never imports the libraries it
+    // analyses anyway. Every cuDF API shape asserted below was checked against
+    // cuDF's own published source -- `cudf/__init__.py`'s `__all__` for the module
+    // surface, and `cudf/core/{dataframe,indexed_frame,frame}.py` for the method
+    // signatures -- rather than inferred from cuDF's "drop-in pandas replacement"
+    // billing, which is true of the column-access idiom but NOT of the reader
+    // surface (see `CUDF_LOAD_FUNCTIONS`) or of `DataFrame.filter`, which cuDF does
+    // not implement at all.
+
+    #[test]
+    fn test_should_infer_columns_from_cudf_read_csv_usecols_and_dtype() {
+        // arrange: `usecols=` and `dtype=` are both real `cudf.read_csv` parameters
+        // (verified in cudf/io/csv.py), carrying the same meaning as in pandas.
+        let source = r#"
+import cudf
+
+by_usecols = cudf.read_csv("orders.csv", usecols=["order_id", "amount"])
+print(by_usecols["order_id"])
+print(by_usecols["missing_a"])
+
+by_dtype = cudf.read_csv("orders.csv", dtype={"order_id": "int64"})
+print(by_dtype["missing_b"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].message.contains("missing_a"));
+        assert!(errors[1].message.contains("missing_b"));
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_infer_columns_from_cudf_columnar_readers() {
+        // arrange: `columns=` on read_parquet/read_orc/read_avro and `dtype=` on
+        // read_json are all real cuDF parameters. read_feather/read_hdf forward
+        // `**kwargs` to pyarrow/pandas, which is where their `columns=` comes from.
+        let source = r#"
+import cudf
+
+pq = cudf.read_parquet("o.parquet", columns=["order_id", "amount"])
+print(pq["missing_pq"])
+
+orc = cudf.read_orc("o.orc", columns=["order_id"])
+print(orc["missing_orc"])
+
+avro = cudf.read_avro("o.avro", columns=["order_id"])
+print(avro["missing_avro"])
+
+js = cudf.read_json("o.json", dtype={"order_id": "int64"})
+print(js["missing_json"])
+
+ft = cudf.read_feather("o.feather", columns=["order_id"])
+print(ft["missing_feather"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 5);
+        assert!(errors[0].message.contains("missing_pq"));
+        assert!(errors[1].message.contains("missing_orc"));
+        assert!(errors[2].message.contains("missing_avro"));
+        assert!(errors[3].message.contains("missing_json"));
+        assert!(errors[4].message.contains("missing_feather"));
+        assert_eq!(linter.dataframes_typed, 5);
+    }
+
+    #[test]
+    fn test_should_not_recognize_load_functions_cudf_does_not_export() {
+        // arrange: `LOAD_FUNCTIONS` is the union across every supported library, so
+        // without `CUDF_LOAD_FUNCTIONS` narrowing it these would each resolve to a
+        // column set. None of them exists on cuDF: `read_sql`/`read_excel` are
+        // pandas-only, `scan_csv` is polars-only, and `read_text` returns a Series
+        // rather than a DataFrame. Nothing should be recognized, counted, or warned
+        // about -- a call that cannot exist is not an untracked DataFrame either.
+        let source = r#"
+import cudf
+
+a = cudf.read_sql("SELECT order_id FROM orders", conn)
+b = cudf.read_excel("orders.xlsx", usecols=["order_id"])
+c = cudf.scan_csv("orders.csv", columns=["order_id"])
+d = cudf.read_text("orders.txt", delimiter=",")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(errors.is_empty());
+        assert_eq!(linter.dataframes_total, 0);
+        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    #[test]
+    fn test_should_still_recognize_pandas_only_load_functions_after_cudf_narrowing() {
+        // arrange: the cuDF gate must narrow cuDF alone. pandas keeps the full
+        // union -- `pd.read_sql` in particular routes through SQL_LOAD_FUNCTIONS.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
+print(df["order_id"])
+print(df["missing"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_should_lint_annotated_cudf_pattern() {
+        // arrange: cuDF's column-access idiom is the pandas one (string subscript),
+        // so `Annotated[cudf.DataFrame, Schema]` needs no cuDF-specific expression
+        // recognition -- unlike polars, which addresses columns via `pl.col("x")`.
+        let source = r#"
+from typing import Annotated
+import cudf
+from typedframes import BaseSchema, Column
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+df: Annotated[cudf.DataFrame, UserSchema] = cudf.read_parquet("users.parquet")
+print(df["user_id"])
+print(df["wrong_column"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("wrong_column"));
+        assert!(errors[0].message.contains("UserSchema"));
+    }
+
+    #[test]
+    fn test_should_pass_cudf_row_passthrough_methods_through_unchanged() {
+        // arrange: every method here is a real cuDF DataFrame method, verified
+        // against cudf/core/{dataframe,indexed_frame,frame}.py. `filter` and `sort`
+        // are deliberately absent from this list: cuDF implements neither (they are
+        // pandas' and polars' spellings respectively), so exercising them here would
+        // assert on code cuDF users cannot write.
+        let source = r#"
+import cudf
+
+base = cudf.read_csv("orders.csv", usecols=["order_id", "amount"])
+print(base.head(10)["order_id"])
+print(base.sort_values("amount")["order_id"])
+print(base.dropna()["order_id"])
+print(base.query("amount > 0")["order_id"])
+print(base.reset_index()["order_id"])
+print(base.nlargest(3, "amount")["order_id"])
+print(base.nsmallest(3, "amount")["order_id"])
+print(base.fillna(0)["order_id"])
+print(base.ffill()["order_id"])
+print(base.bfill()["order_id"])
+print(base.sample(2)["order_id"])
+print(base.tail(2)["order_id"])
+
+narrowed = base.head(10)
+print(narrowed["missing_after_head"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the known column survives every passthrough, and the schema is
+        // still enforced on the far side of one.
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("missing_after_head"));
+    }
+
+    #[test]
+    fn test_should_track_cudf_structural_column_operations() {
+        // arrange: cuDF's `rename(mapper=None, index=None, columns=None, axis=0,
+        // ...)`, `drop(labels=None, axis=0, index=None, columns=None, ...)`,
+        // `assign(**kwargs)`, `pop(item)` and `insert(loc, column, value, ...)` all
+        // carry pandas' signatures and semantics (verified against cuDF's source),
+        // so the existing pandas handling applies unchanged.
+        let source = r#"
+import cudf
+
+base = cudf.read_csv("orders.csv", usecols=["order_id", "amount"])
+
+renamed = base.rename(columns={"amount": "total"})
+print(renamed["total"])
+print(renamed["amount"])
+
+dropped = base.drop(columns=["amount"])
+print(dropped["amount"])
+
+assigned = base.assign(tax=1.0)
+print(assigned["tax"])
+print(assigned["missing_assign"])
+
+mutated = cudf.read_csv("more.csv", usecols=["a", "b"])
+mutated.insert(1, "c", 0)
+print(mutated["c"])
+del mutated["a"]
+print(mutated["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 4);
+        assert!(errors[0].message.contains("amount"));
+        assert!(errors[1].message.contains("amount"));
+        assert!(errors[2].message.contains("missing_assign"));
+        assert!(errors[3].message.contains('a'));
+    }
+
+    #[test]
+    fn test_should_track_cudf_merge_and_concat() {
+        // arrange: `DataFrame.merge` is a cuDF method and `concat` is a top-level
+        // `cudf` export (both in `cudf.__all__`).
+        let source = r#"
+import cudf
+
+left = cudf.read_csv("l.csv", usecols=["k", "a"])
+right = cudf.read_csv("r.csv", usecols=["k", "b"])
+
+merged = left.merge(right, on="k")
+print(merged["a"])
+print(merged["b"])
+print(merged["missing_merge"])
+
+stacked = cudf.concat([left, right])
+print(stacked["missing_concat"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].message.contains("missing_merge"));
+        assert!(errors[1].message.contains("missing_concat"));
+    }
+
+    #[test]
+    fn test_should_enforce_cudf_function_contracts() {
+        // arrange: an `Annotated[cudf.DataFrame, Schema]` return type and parameter
+        // are both recognized, and a bare `-> cudf.DataFrame` registers an OPEN
+        // schema (columns unknown) rather than manufacturing a false positive.
+        let source = r#"
+from typing import Annotated
+import cudf
+from typedframes import BaseSchema, Column
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+    amount = Column(type=float)
+
+def load() -> Annotated[cudf.DataFrame, OrderSchema]:
+    return cudf.read_parquet("orders.parquet")
+
+def consume(df: Annotated[cudf.DataFrame, OrderSchema]) -> None:
+    print(df["order_id"])
+    print(df["missing_param"])
+
+def load_open() -> cudf.DataFrame:
+    return cudf.read_parquet("orders.parquet")
+
+got = load()
+print(got["order_id"])
+print(got["missing_return"])
+
+opened = load_open()
+print(opened["anything_at_all"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].message.contains("missing_param"));
+        assert!(errors[0].message.contains("OrderSchema"));
+        assert!(errors[1].message.contains("missing_return"));
+        assert!(errors[1].message.contains("OrderSchema"));
     }
 
     #[test]

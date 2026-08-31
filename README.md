@@ -191,6 +191,36 @@ filtered = df.filter(SalesData.revenue.col > 1000)
 grouped = df.group_by("customer_id").agg(SalesData.revenue.col.sum())
 ```
 
+### Use With cuDF (Experimental)
+
+RAPIDS [cuDF](https://docs.rapids.ai/api/cudf/stable/) uses pandas' string-subscript
+column access, so schema annotations, inference, row-passthrough methods and the
+tracked structural operations all work the same way they do for pandas.
+
+```python
+from typing import Annotated
+import cudf
+
+# Annotate your variable — checker validates all column access below
+df: Annotated[cudf.DataFrame, SalesData] = cudf.read_parquet("sales.parquet")
+
+print(df["revenue"].sum())
+print(df["profit"])  # ✗ unknown-column: Column 'profit' not in SalesData
+
+# Columns are inferred from `columns=`/`usecols=` with no schema class at all
+totals = cudf.read_csv("totals.csv", usecols=["order_id", "total"])
+print(totals["totl"])  # ✗ unknown-column: did you mean 'total'?
+```
+
+cuDF's reader surface is a subset of pandas': `read_csv`, `read_parquet`, `read_json`,
+`read_orc`, `read_avro`, `read_feather` and `read_hdf` are recognized. `read_sql`,
+`read_excel` and polars' `scan_*` functions are not, because cuDF exports none of them.
+
+The checker never imports the libraries it analyses, so cuDF code can be checked on any
+machine — no GPU, no CUDA runtime, and no cuDF installation required. Code written for
+cuDF's `cudf.pandas` accelerator mode still spells its imports `import pandas as pd` and
+is covered by the pandas support above.
+
 ---
 
 ## Column Inference
@@ -793,7 +823,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | **Backend Support**             |
 | Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ⚠️ Limited        |
 | Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes            |
-| DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
+| DuckDB, cuDF, etc.              | ⚠️ cuDF (experimental) | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
 | **Project Status (Aug 2026)**   |
 | Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
 
@@ -934,6 +964,9 @@ Runnable versions of everything shown in [Quick Start](#quick-start) and
   `Annotated[pd.DataFrame, Schema]` with string and `.s` descriptor column access
 - [`annotated_polars_example.py`](examples/features/annotated_polars_example.py) —
   the same, with `pl.col()` and `.col` descriptor expressions
+- [`annotated_cudf_example.py`](examples/features/annotated_cudf_example.py) —
+  `Annotated[cudf.DataFrame, Schema]` on RAPIDS cuDF (experimental), checked without a
+  GPU or a cuDF install
 - [`typedframes_example.py`](examples/features/typedframes_example.py) — pandas and
   polars side by side against one shared schema
 - [`schema_algebra_example.py`](examples/features/schema_algebra_example.py) —

@@ -5,6 +5,8 @@
 - Python 3.11 or higher
 - [uv](https://github.com/astral-sh/uv) - Python package manager
 - Rust toolchain (for building the linter extension)
+- `libmagic` (for the license check only — `brew install libmagic` on macOS,
+  `apt-get install libmagic1` on Debian/Ubuntu; see [Verify Licenses](#verify-licenses))
 
 > **macOS note:** If you installed Rust via `brew install rustup` and `rustc`/`cargo`
 > are not found even after `rustup toolchain install stable`, it's because Homebrew's
@@ -115,10 +117,41 @@ PYO3_PYTHON=/path/to/python3.11 cargo test
 ### Verify Licenses
 
 ```shell
-uv run licensecheck
+uv run inv verify-licences
 ```
 
-Runs licensecheck to verify all dependency licenses are compatible.
+Checks the license of every package installed in the development environment using
+[scancode-toolkit](https://github.com/aboutcode-org/scancode-toolkit). Unlike a
+metadata-only checker, scancode matches the actual license *text* a package ships
+against a database of ~2500 known licenses — the same approach GitHub's own license
+detector takes — so a package whose declared metadata is missing, stale, or vague is
+still identified from the LICENSE file it bundles.
+
+The policy lives in `scripts/check_licenses.py`. A package passes when at least one
+detected license falls into an allowed category: `Permissive`, `Public Domain` or
+`Copyleft Limited` (LGPL, MPL, EPL). Strong copyleft (GPL, AGPL), proprietary and
+undetectable licenses fail the build, which matches what this MIT-licensed project
+could actually depend on.
+
+The check requires at least one allowed license rather than the absence of a
+disallowed one, because packages routinely concatenate the license texts of their
+vendored dependencies into their own LICENSE file — pandas ships BSD-3-Clause
+alongside notices that include GPL text, and the grant pandas makes to us is
+BSD-3-Clause. A package offering only a disallowed license, or none at all, still
+fails. `IGNORED_PACKAGES` in that module is the escape hatch for a package whose
+license genuinely cannot be determined from the installed artifact.
+
+> **macOS/ARM note:** scancode depends on `libmagic`, and its bundled
+> `typecode-libmagic` plugin has no real arm64 build (the `macosx_11_0_arm64` wheel is
+> a 1 KB placeholder). On Apple Silicon, install libmagic yourself or the check fails
+> at import with `NoMagicLibError`:
+>
+> ```shell
+> brew install libmagic
+> ```
+>
+> On Debian/Ubuntu the equivalent is `apt-get install libmagic1`. CI installs this
+> automatically (see `.github/workflows/publish.yml`) before running the check.
 
 ### Run All Checks
 

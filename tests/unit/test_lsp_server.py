@@ -1,12 +1,13 @@
 """Unit tests for the typedframes language server."""
 
+import collections
 import json
 import tempfile
 import textwrap
 import unittest
 from collections.abc import Callable
 from pathlib import Path
-from typing import TextIO
+from typing import BinaryIO
 
 from lsprotocol import types
 from pygls.uris import from_fs_path
@@ -90,18 +91,19 @@ class _RecordingServer(TypedFramesLanguageServer):
     ) -> None:
         """Initialize the workspace the way a client's `initialize` request would."""
         super().__init__(check_file, build_index)
-        self.published: list[tuple[str, list, int | None, dict]] = []
-        self.lsp.lsp_initialize(types.InitializeParams(capabilities=types.ClientCapabilities()))
+        self.published: list[types.PublishDiagnosticsParams] = []
+        # pygls 2 implements its builtin handlers as generators, so that a
+        # user-registered handler for the same method can be run part-way through.
+        # Nothing here registers one, so the body runs straight to its return -- but
+        # only once the generator is driven, hence exhausting it rather than calling it.
+        collections.deque(
+            self.protocol.lsp_initialize(types.InitializeParams(capabilities=types.ClientCapabilities())),
+            maxlen=0,
+        )
 
-    def publish_diagnostics(
-        self,
-        uri: str,
-        diagnostics: list[types.Diagnostic] | None = None,
-        version: int | None = None,
-        **kwargs: object,
-    ) -> None:
-        """Record the whole call instead of notifying a client that isn't there."""
-        self.published.append((uri, diagnostics, version, kwargs))
+    def text_document_publish_diagnostics(self, params: types.PublishDiagnosticsParams) -> None:
+        """Record the params instead of notifying a client that isn't there."""
+        self.published.append(params)
 
 
 def _document_item(uri: str, source: str) -> types.TextDocumentItem:
@@ -129,8 +131,11 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
         did_open(server, types.DidOpenTextDocumentParams(text_document=item))
 
         # assert
-        uri, diagnostics, _, _ = server.published[-1]
-        self.assertEqual((uri, len(diagnostics), diagnostics[0].code), (self.uri, 1, "unknown-column"))
+        published = server.published[-1]
+        self.assertEqual(
+            (published.uri, len(published.diagnostics), published.diagnostics[0].code),
+            (self.uri, 1, "unknown-column"),
+        )
 
     def test_should_ignore_documents_that_are_not_python_files(self) -> None:
         """Notebooks and non-`file:` buffers are left alone."""
@@ -154,7 +159,7 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
         server.publish(self.uri)
 
         # assert
-        self.assertEqual(server.published, [(self.uri, [], None, {})])
+        self.assertEqual([(p.uri, p.diagnostics) for p in server.published], [(self.uri, [])])
 
     def test_should_check_without_an_index_when_the_extension_is_missing(self) -> None:
         """A missing Rust extension degrades the index to None instead of raising."""
@@ -209,7 +214,7 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
         )
 
         # assert
-        self.assertEqual(sorted(uri for uri, *_ in server.published), sorted([self.uri, other]))
+        self.assertEqual(sorted(p.uri for p in server.published), sorted([self.uri, other]))
 
     def test_should_clear_diagnostics_when_a_document_is_closed(self) -> None:
         """Closing a file removes its squiggles from the editor."""
@@ -223,7 +228,7 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
         )
 
         # assert
-        self.assertEqual(server.published, [(self.uri, [], None, {})])
+        self.assertEqual([(p.uri, p.diagnostics) for p in server.published], [(self.uri, [])])
 
     def test_should_register_the_three_document_handlers(self) -> None:
         """The server advertises open, save and close, and nothing else."""
@@ -232,7 +237,7 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
 
         # assert
         self.assertEqual(
-            sorted(server.lsp.fm.features),
+            sorted(server.protocol.fm.features),
             sorted(
                 [
                     types.TEXT_DOCUMENT_DID_OPEN,
@@ -250,7 +255,7 @@ class TestTypedFramesLanguageServer(unittest.TestCase):
         class _StdioRecordingServer(TypedFramesLanguageServer):
             """A server that records the transport it was started on."""
 
-            def start_io(self, stdin: TextIO | None = None, stdout: TextIO | None = None) -> None:
+            def start_io(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> None:
                 """Record the streams it was started on instead of blocking on stdin."""
                 started.append((stdin, stdout))
 

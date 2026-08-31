@@ -26,8 +26,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from lsprotocol import types
-from pygls.server import LanguageServer
+from pygls.lsp.server import LanguageServer
 from pygls.uris import to_fs_path
+from pygls.workspace import ServerTextPosition, ServerTextRange
 
 from typedframes import __version__
 
@@ -90,8 +91,9 @@ def diagnostic_range(error: dict, document: TextDocument) -> types.Range:
     """Convert one checker error's 1-indexed anchor into an LSP range.
 
     LSP positions are 0-indexed, and their `character` is counted in the encoding
-    the client negotiated, whereas the checker counts code points -- so the range is
-    handed to the document's position codec rather than emitted directly.
+    the client negotiated, whereas the checker counts code points -- so the anchor is
+    built as a `ServerTextRange` (pygls' name for a range in code points, indexable
+    into `document.lines`) and converted by the document rather than emitted directly.
     """
     line = max(error["line"] - 1, 0)
     start = max(error["col"] - 1, 0)
@@ -99,12 +101,11 @@ def diagnostic_range(error: dict, document: TextDocument) -> types.Range:
     text = lines[line] if line < len(lines) else ""
     match = _IDENTIFIER.match(text, start)
     end = match.end() if match else start + 1
-    return document.position_codec.range_to_client_units(
-        lines,
-        types.Range(
-            start=types.Position(line=line, character=start),
-            end=types.Position(line=line, character=end),
-        ),
+    return document.range_to_client_units(
+        ServerTextRange(
+            start=ServerTextPosition(line=line, character=start),
+            end=ServerTextPosition(line=line, character=end),
+        )
     )
 
 
@@ -179,13 +180,16 @@ class TypedFramesLanguageServer(LanguageServer):
 
         Anything that isn't a `.py` path is ignored, which covers both notebooks
         (`.ipynb` needs the separate `check_notebook` entry point the CLI uses) and
-        non-`file:` URIs such as an editor's unsaved `untitled:` buffers.
+        non-`file:` URIs such as an editor's unsaved `untitled:` buffers -- for which
+        `to_fs_path` returns `None`, since there is no file on disk to check.
         """
         path = to_fs_path(uri)
-        if not path.endswith(".py"):
+        if path is None or not path.endswith(".py"):
             return
         document = self.workspace.get_text_document(uri)
-        self.publish_diagnostics(uri, self.diagnostics(Path(path), document))
+        self.text_document_publish_diagnostics(
+            types.PublishDiagnosticsParams(uri=uri, diagnostics=self.diagnostics(Path(path), document))
+        )
 
 
 def did_open(ls: TypedFramesLanguageServer, params: types.DidOpenTextDocumentParams) -> None:
@@ -208,7 +212,7 @@ def did_save(ls: TypedFramesLanguageServer, _params: types.DidSaveTextDocumentPa
 
 def did_close(ls: TypedFramesLanguageServer, params: types.DidCloseTextDocumentParams) -> None:
     """Clear diagnostics for a closed document, so nothing lingers in the editor."""
-    ls.publish_diagnostics(params.text_document.uri, [])
+    ls.text_document_publish_diagnostics(types.PublishDiagnosticsParams(uri=params.text_document.uri, diagnostics=[]))
 
 
 def create_server() -> TypedFramesLanguageServer:

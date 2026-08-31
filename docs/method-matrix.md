@@ -5,6 +5,11 @@ Operations fall into three categories: **schema-modifying** (the checker updates
 internal column model), **row-passthrough** (the checker assumes the schema is unchanged),
 and **untracked** (the variable is dropped from tracking to avoid false positives).
 
+Operations are matched by method name against a receiver the checker already tracks, so
+the tables below apply to whichever backend implements that method. `dask.dataframe`
+(experimental) reuses the pandas spellings throughout — the dask-only entries are called
+out where they appear.
+
 ---
 
 ## Schema-Modifying Operations
@@ -25,8 +30,10 @@ are validated against the new schema.
 | `df.pop("col")` | Removes `"col"` from the schema | `df.pop("score")` |
 | `df.insert(pos, "col", val)` | Adds `"col"` to the schema | `df.insert(0, "rank", …)` |
 | `df[["c1", "c2"]]` | Narrows schema to selected columns | `subset = df[["id", "name"]]` |
-| `pd.merge(left, right, …)` | Merges both schemas | `merged = pd.merge(a, b, on="id")` |
+| `left.merge(right, …)` | Unions both schemas | `merged = a.merge(b, on="id")` |
 | `pd.concat([df1, df2], …)` | Unions both schemas | `combined = pd.concat([a, b])` |
+| `dd.from_pandas(pdf, …)` | Carries the source frame's schema over | `ddf = dd.from_pandas(pdf, npartitions=2)` |
+| `pl.from_pandas(pdf)` | Same | `df = pl.from_pandas(pdf)` |
 
 ---
 
@@ -50,6 +57,14 @@ the same column model as the input.
 | `df.fillna(…)` | Fill NaN values; columns unchanged |
 | `df.dropna(…)` | Drop NaN rows; columns unchanged |
 | `df.ffill()` / `df.bfill()` | Forward/back fill; columns unchanged |
+| `lf.collect()` | polars lazy → eager; columns unchanged |
+| `ddf.compute()` | dask lazy → eager (a real pandas DataFrame); columns unchanged |
+| `ddf.persist()` | dask; materializes into memory, columns unchanged |
+| `ddf.repartition(…)` | dask; changes partition layout only, columns unchanged |
+
+A chain is followed through named intermediates (`step = df.query(…)`, then
+`out = step.sort_values(…)`), not through several calls stacked into a single
+expression (`df.query(…).sort_values(…)`) — for every backend.
 
 ---
 
@@ -66,7 +81,9 @@ checker.
 | Operation | Why untracked |
 |-----------|--------------|
 | `df.join(other, …)` | Output schema depends on join keys and `how=` parameter |
-| `df.merge(other, …)` | (pandas instance method) Same as join |
+| `pd.merge(left, right, …)` | Module-level form; only the `left.merge(right, …)` instance form is tracked |
+| `dd.from_delayed(…)` / `dd.from_array(…)` | dask; columns exist only once the graph runs |
+| `dd.from_dict({…})` | dask; a literal rather than a tracked frame, like `pd.DataFrame({…})` |
 | `df.pivot(…)` | Output columns are derived from cell values at runtime |
 | `df.pivot_table(…)` | Same as pivot |
 | `df.melt(…)` | Converts columns to rows; output schema varies by `id_vars` |

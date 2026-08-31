@@ -151,6 +151,7 @@ dev = [
     "fastexcel>=0.20.2",
     "pandas-stubs>=3.0.5.260730",
     "mypy>=2.3.1",
+    "dask[dataframe]>=2024.1.0",
 ]
 
 [tool.bandit]

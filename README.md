@@ -465,10 +465,18 @@ repos:
 
 The hook defaults to `typedframes check . --strict` — one run per commit rather than one
 per staged file, so the cross-file index still sees the modules the commit didn't touch.
-`--strict` is what makes it block the commit; without it the checker reports errors and
-still exits 0. Override `args` to narrow the path or add flags:
+`--strict` is what makes it block the commit: `typedframes check` exits 0 by default even
+when it finds real errors.
+
+`args` replaces that default list wholesale, so repeat the path and `--strict` when
+narrowing the path or turning on the coverage gate:
 
 ```yaml
+# .pre-commit-config.yaml — with coverage gating
+repos:
+  - repo: https://github.com/w-martin/typedframes
+    rev: v0.5.1
+    hooks:
       - id: typedframes
         args: [src/, --strict, --coverage-fail-under=90]
 ```
@@ -504,13 +512,21 @@ jobs:
       - uses: w-martin/typedframes@v0.5.1
         with:
           path: src/
-          args: --coverage-fail-under=90
+          coverage-fail-under: "90"
 ```
 
 The action installs the PyPI wheel into a throwaway virtualenv and runs the checker with
 `--output-format=github`, so errors arrive as annotations on the pull request diff.
-Inputs: `path` (default `.`), `version` (the PyPI version to install, default `latest`),
-`strict` (default `true`), and `args` for any other flags.
+
+| Input | Default | |
+|-------|---------|-|
+| `path` | `.` | File or directory to check |
+| `version` | `latest` | PyPI version to install, e.g. `"0.5.0"` |
+| `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
+| `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
+| `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown |
+| `no-warnings` | `false` | Suppress warning-level diagnostics |
+| `args` | *(empty)* | Escape hatch for `--no-index`, `--lenient-ingest`, `--no-info` |
 
 ---
 

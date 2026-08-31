@@ -19,14 +19,39 @@ inputs:
     default: latest
   strict:
     description: >-
-      Fail the step when the checker reports errors. Set to "false" to get the
-      annotations without failing the build.
+      Fail the step when the checker reports errors. `typedframes check` exits 0
+      by default even when it finds real errors, so this is what makes the action
+      actually fail on them. Set to "false" to get the annotations without
+      failing the build.
     required: false
     default: "true"
+  coverage-fail-under:
+    description: >-
+      Minimum DataFrame schema coverage, as a percentage, e.g. "90". Empty (the
+      default) leaves the gate off, matching the CLI: coverage enforcement is
+      opt-in. When set it overrides `[tool.typedframes.coverage]` entirely,
+      per-path overrides included.
+    required: false
+    default: ""
+  coverage-detail:
+    description: >-
+      How much coverage detail to print - "summary" (the default, one line) or
+      "term-missing" (per-file table plus the DataFrame sites lacking column
+      info). Only meaningful alongside `coverage-fail-under`.
+    required: false
+    default: summary
+  no-warnings:
+    description: >-
+      Set to "true" to suppress warning-level diagnostics
+      (untracked-dataframe, dropped-unknown-column).
+    required: false
+    default: "false"
   args:
     description: >-
-      Extra arguments appended to `typedframes check`, e.g.
-      "--coverage-fail-under=90 --no-warnings". Split on whitespace.
+      Escape hatch for the rarer flags that have no input of their own -
+      `--no-index`, `--lenient-ingest`, `--no-info`. Split on whitespace and
+      appended last. Everything in common use has a named input above; reach for
+      this only when nothing up there fits.
     required: false
     default: ""
 
@@ -70,13 +95,29 @@ runs:
       env:
         TYPEDFRAMES_PATH: ${{ inputs.path }}
         TYPEDFRAMES_STRICT: ${{ inputs.strict }}
+        TYPEDFRAMES_COVERAGE_FAIL_UNDER: ${{ inputs['coverage-fail-under'] }}
+        TYPEDFRAMES_COVERAGE_DETAIL: ${{ inputs['coverage-detail'] }}
+        TYPEDFRAMES_NO_WARNINGS: ${{ inputs['no-warnings'] }}
         TYPEDFRAMES_ARGS: ${{ inputs.args }}
       run: |
         set -euo pipefail
+        cmd=("$TYPEDFRAMES_BIN" check "$TYPEDFRAMES_PATH" --output-format=github)
+        if [ "$TYPEDFRAMES_STRICT" = "true" ]; then
+          cmd+=(--strict)
+        fi
+        if [ -n "$TYPEDFRAMES_COVERAGE_FAIL_UNDER" ]; then
+          cmd+=("--coverage-fail-under=$TYPEDFRAMES_COVERAGE_FAIL_UNDER")
+        fi
+        # Passed only when it differs from the CLI's own default. --coverage-detail
+        # overrides the `detail` key in [tool.typedframes.coverage], so sending
+        # "summary" unconditionally would quietly clobber a project that configured
+        # term-missing for itself.
+        if [ "$TYPEDFRAMES_COVERAGE_DETAIL" != "summary" ]; then
+          cmd+=("--coverage-detail=$TYPEDFRAMES_COVERAGE_DETAIL")
+        fi
+        if [ "$TYPEDFRAMES_NO_WARNINGS" = "true" ]; then
+          cmd+=(--no-warnings)
+        fi
         # $TYPEDFRAMES_ARGS is deliberately unquoted: it is a whitespace-separated
         # argument list, not one argument.
-        if [ "$TYPEDFRAMES_STRICT" = "true" ]; then
-          "$TYPEDFRAMES_BIN" check "$TYPEDFRAMES_PATH" --output-format=github --strict $TYPEDFRAMES_ARGS
-        else
-          "$TYPEDFRAMES_BIN" check "$TYPEDFRAMES_PATH" --output-format=github $TYPEDFRAMES_ARGS
-        fi
+        "${cmd[@]}" $TYPEDFRAMES_ARGS

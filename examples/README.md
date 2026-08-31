@@ -1,6 +1,6 @@
 # Examples
 
-Three groups, each with its own README/SPEC:
+Four groups, each with its own README/SPEC:
 
 ## [`features/`](features/)
 
@@ -17,6 +17,13 @@ folding. One directory per connector (Snowflake, BigQuery, Athena, Redshift,
 Databricks, PySpark, DuckDB, connectorx, SQLAlchemy, Feast, Azure Synapse/Fabric),
 each a self-contained, runnable environment. See
 [`sql_connectors/README.md`](sql_connectors/README.md).
+
+## [`backends/`](backends/)
+
+Column tracking through a DataFrame library's own native API — its real method names
+and its own idiom for referring to a column, rather than a `SELECT` list or
+`usecols=`/`columns=`. Currently PySpark (`pyspark.sql.DataFrame`, experimental). See
+[`backends/README.md`](backends/README.md).
 
 ## [`comparisons/`](comparisons/)
 

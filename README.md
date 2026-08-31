@@ -449,6 +449,14 @@ like `filter`, `query`, `head`, `sort_values`, and `dropna` are validated withou
 changes. Operations with runtime-dependent output (`join`, `pivot`, `melt`, `groupby`,
 `apply`, etc.) are left untracked to avoid false positives.
 
+PySpark's equivalents are tracked under their own names (experimental):
+`withColumn`/`withColumns` for `assign`, `withColumnRenamed`/`withColumnsRenamed` for
+`rename`, `select` and `drop` in their varargs form, `toDF`, and
+`union`/`unionAll`/`unionByName`. `where`, `limit`, `orderBy`, `distinct` and
+`dropDuplicates` are row-passthrough. Spark's `join` stays untracked, as do UDFs
+(`pandas_udf`, `.rdd.map(...)`, a lambda inside `withColumn`) — see
+[Native PySpark DataFrames](#native-pyspark-dataframes-experimental).
+
 See the full [Method Matrix](https://typedframes.readthedocs.io/en/latest/method-matrix/)
 for the complete list of tracked, passthrough, and untracked operations, plus the error
 code reference.
@@ -610,6 +618,55 @@ df_polars: Annotated[pl.DataFrame, UserData] = pl.read_csv("data.csv")
 pandas_analyze(df_pandas)  # ✓ OK
 polars_analyze(df_polars)  # ✓ OK
 ```
+
+### Native PySpark DataFrames (Experimental)
+
+`pyspark.sql.DataFrame` is tracked as a native type, the same way `pd.DataFrame` and
+`pl.DataFrame` are — no conversion to pandas required. `F.col("...")` is validated
+exactly as `pl.col("...")` is, and Spark's structural operations are tracked under
+Spark's own names.
+
+```python
+from typing import Annotated
+import pyspark
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("orders").getOrCreate()
+
+# Declare the schema and the column set is known from there on
+orders = spark.read.schema("order_id INT, amount DOUBLE, region STRING").csv("orders.csv")
+
+print(orders["region"])  # ✓ OK
+print(orders.select(F.col("revenue")))  # ✗ unknown-column: 'revenue'
+
+taxed = orders.withColumn("tax", F.col("amount") * 0.2)
+print(taxed["tax"])  # ✓ OK
+
+renamed = orders.withColumnRenamed("amount", "total")
+print(renamed["amount"])  # ✗ unknown-column: renamed away
+
+# Or annotate, exactly as with pandas/polars
+typed: Annotated[pyspark.sql.DataFrame, UserData] = spark.read.csv("users.csv")
+```
+
+Spark decides a schema at runtime unless you tell it one, so there are three ways to
+make the column set knowable at lint time — an explicit schema (a DDL string, a
+`StructType`, or a list of names, inline or held in a variable), a `.select(...)`
+naming the columns, or a `SELECT` list. A bare `spark.read.csv(path)` is none of
+those and reports `untracked-dataframe`, the same as a bare `pd.read_csv()`.
+
+`join` is left untracked: its output depends on the join type (`left_semi` and
+`left_anti` return only the left side's columns), on whether `on` is a name list or a
+condition, and on how duplicate names across the two sides resolve. UDFs
+(`pandas_udf`, `.rdd.map(...)`, a lambda inside `withColumn`) are untracked for the
+same reason. `union` and `unionAll` resolve columns by position, so the result carries
+the left frame's names; `unionByName` does too, except with `allowMissingColumns=True`,
+where the result is the union of both sides.
+
+This coexists with the SQL-connector path: `spark.sql(sql).toPandas()` still infers
+from the `SELECT` list and produces a pandas frame, while `spark.sql(sql)` left as a
+Spark DataFrame is tracked natively. See
+[`examples/backends/pyspark/`](examples/backends/pyspark/).
 
 ---
 
@@ -793,11 +850,21 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | **Backend Support**             |
 | Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ⚠️ Limited        |
 | Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes            |
-| DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
+| DuckDB, cuDF, etc.              | ⚠️ Spark, SQL           | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
 | **Project Status (Aug 2026)**   |
 | Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
 
 **Legend:** ✅ Full support | ⚠️ Limited/Partial | ❌ Not supported
+
+**On typedframes' "DuckDB, cuDF, etc." cell.** Two different things sit behind that
+`⚠️`, and they cover different amounts of ground. Any backend reachable through a SQL
+query — DuckDB, BigQuery, Snowflake, Athena, Redshift, Spark SQL — is covered by
+inference from the query's `SELECT` list, which is why the cell isn't `❌`; that path
+ends in a pandas or polars DataFrame. PySpark additionally has **experimental** tracking
+of `pyspark.sql.DataFrame` as a native type, so a frame that never becomes a pandas one
+is still checked: `withColumn`, `withColumnRenamed`, `select`, `drop`, `union`, the
+row-preserving operations, and `F.col("...")` references. cuDF and the rest have neither
+a native backend nor anything beyond the SQL path.
 
 ### Tool Descriptions
 
@@ -947,6 +1014,14 @@ Runnable versions of everything shown in [Quick Start](#quick-start) and
 - [`ipynb_example.ipynb`](examples/features/ipynb_example.ipynb) — the same checks in a
   Jupyter notebook, with `cell N:line:col` locations (see [Jupyter
   Notebooks](#jupyter-notebooks))
+
+Native-backend tracking lives under [`examples/backends/`](examples/backends/):
+
+- [`pyspark/example.py`](examples/backends/pyspark/example.py) — native
+  `pyspark.sql.DataFrame` tracking (experimental): declared schemas, `withColumn`,
+  `withColumnRenamed`, varargs `select`/`drop`, `F.col()` validation, and how this
+  differs from the SQL path in
+  [`examples/sql_connectors/pyspark/`](examples/sql_connectors/pyspark/)
 
 ---
 

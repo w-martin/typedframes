@@ -38,6 +38,17 @@ pub(crate) struct NotebookUntypedSite {
     pub var: String,
 }
 
+/// The open-schema-DataFrame-site counterpart of [`NotebookLintError`]. See
+/// [`crate::errors::OpenSchemaSite`] for what these origins are and why they are
+/// reported apart from the untyped ones.
+#[derive(Debug, Serialize)]
+pub(crate) struct NotebookOpenSchemaSite {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+}
+
 /// The notebook counterpart of [`FileStats`], nested under `stats` in
 /// [`NotebookCheckResult`] -- matching [`crate::errors::CheckFileResult`]'s shape so
 /// the Python side can treat both JSON payloads the same way.
@@ -45,7 +56,9 @@ pub(crate) struct NotebookUntypedSite {
 pub(crate) struct NotebookFileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    pub dataframes_open_schema: usize,
     pub untyped_sites: Vec<NotebookUntypedSite>,
+    pub open_schema_sites: Vec<NotebookOpenSchemaSite>,
 }
 
 /// The JSON payload returned by the `check_notebook` entry point. Same shape as
@@ -134,12 +147,28 @@ pub(crate) fn translate_result(
         })
         .collect();
 
+    let open_schema_sites = stats
+        .open_schema_sites
+        .into_iter()
+        .map(|s| {
+            let (cell, line) = translate(index, s.line);
+            NotebookOpenSchemaSite {
+                cell,
+                line,
+                col: s.col,
+                var: s.var,
+            }
+        })
+        .collect();
+
     NotebookCheckResult {
         errors,
         stats: NotebookFileStats {
             dataframes_total: stats.dataframes_total,
             dataframes_typed: stats.dataframes_typed,
+            dataframes_open_schema: stats.dataframes_open_schema,
             untyped_sites,
+            open_schema_sites,
         },
     }
 }
@@ -147,7 +176,7 @@ pub(crate) fn translate_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::UntypedSite;
+    use crate::errors::{OpenSchemaSite, UntypedSite};
     use ruff_notebook::Notebook;
 
     // Four cells: markdown, code (2 lines), markdown, code (1 line). Cell numbers
@@ -242,12 +271,18 @@ mod tests {
             severity: "error".to_string(),
         }];
         let stats = FileStats {
-            dataframes_total: 2,
-            dataframes_typed: 1,
+            dataframes_total: 3,
+            dataframes_typed: 2,
+            dataframes_open_schema: 1,
             untyped_sites: vec![UntypedSite {
                 line: 1,
                 col: 1,
                 var: "df".to_string(),
+            }],
+            open_schema_sites: vec![OpenSchemaSite {
+                line: 3,
+                col: 2,
+                var: "feast_df".to_string(),
             }],
         };
 
@@ -260,11 +295,17 @@ mod tests {
         assert_eq!(result.errors[0].line, 1);
         assert_eq!(result.errors[0].col, 5);
         assert!(result.errors[0].message.contains("analysis.ipynb cell 2:1"));
-        assert_eq!(result.stats.dataframes_total, 2);
-        assert_eq!(result.stats.dataframes_typed, 1);
+        assert_eq!(result.stats.dataframes_total, 3);
+        assert_eq!(result.stats.dataframes_typed, 2);
+        assert_eq!(result.stats.dataframes_open_schema, 1);
         assert_eq!(result.stats.untyped_sites.len(), 1);
         assert_eq!(result.stats.untyped_sites[0].cell, 2);
         assert_eq!(result.stats.untyped_sites[0].line, 1);
         assert_eq!(result.stats.untyped_sites[0].var, "df");
+        assert_eq!(result.stats.open_schema_sites.len(), 1);
+        assert_eq!(result.stats.open_schema_sites[0].cell, 4);
+        assert_eq!(result.stats.open_schema_sites[0].line, 1);
+        assert_eq!(result.stats.open_schema_sites[0].col, 2);
+        assert_eq!(result.stats.open_schema_sites[0].var, "feast_df");
     }
 }

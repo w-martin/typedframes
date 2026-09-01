@@ -32,7 +32,8 @@ typedframes check src/ --coverage-fail-under=90
 ```
 
 `--coverage-fail-under=N` is the same idea as a test-coverage or mypy type-coverage gate, applied to how many DataFrames
-the checker can resolve columns for — see [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
+the checker can resolve columns for — with open schemas (resolved, but with no column list to check against) reported
+separately so the number means what it looks like. See [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
 Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete — see [Quick Start](#quick-start).
 
 ---
@@ -406,6 +407,9 @@ typedframes check src/ --coverage-fail-under=90
 
 # Show which DataFrames lack column info, per file
 typedframes check src/ --coverage-detail=term-missing
+
+# Grade that threshold on concrete column info only, excluding open schemas
+typedframes check src/ --coverage-fail-under=90 --coverage-exclude-open-schema
 ```
 
 To suppress warnings project-wide, add to `pyproject.toml`:
@@ -544,6 +548,21 @@ breakdown of exactly which DataFrames cost you coverage (as text or, combined wi
 `--output-format=json`, as structured JSON), and the full config reference all live in
 the
 [DataFrame schema coverage thresholds guide](docs/usage.md#dataframe-schema-coverage-thresholds).
+
+Some DataFrames resolve to an **open schema** — a Feast retrieval, or a bare
+`-> pd.DataFrame` return with no attached `Schema`. The checker knows they're DataFrames
+but has no column list for them, so no column-name error can ever be reported against
+one. They count as covered, and are reported separately so a "100%" that can't actually
+catch a typo is visible rather than implied:
+
+```
+ℹ 12/20 DataFrames had column info (60%), of which 4 open-schema (recognized as DataFrames, but column names are never checked)
+```
+
+They count toward the threshold by default, so upgrading never changes an existing gate's
+verdict; `--coverage-exclude-open-schema` (or `exclude_open_schema = true`) grades on
+concrete column information only. See
+[Open schemas](docs/usage.md#open-schemas-covered-but-not-column-checked).
 
 ## Static Analysis Performance
 

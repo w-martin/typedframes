@@ -12,11 +12,14 @@ from unittest.mock import patch
 from typedframes.cli import (
     CoverageBucket,
     CoverageConfig,
+    FileTally,
     RunStats,
     _check_files,
     _check_notebook_file,
     _collect_notebook_files,
     _collect_python_files,
+    _coverage_config_from_table,
+    _coverage_failure_message,
     _coverage_json_payload,
     _coverage_message,
     _evaluate_coverage,
@@ -30,6 +33,18 @@ from typedframes.cli import (
     _percentage,
     _relative_posix,
     main,
+)
+
+# A DataFrame origin the checker fully recognizes and resolves, but only to an OPEN
+# schema: a Feast retrieval's real output also carries entity_df's join keys and
+# timestamp column, so its column list is deliberately incomplete and no column name
+# is ever validated against it. One statement, no imports, no fixture packages --
+# the smallest honest "typed but column-unchecked" source available.
+_FEAST_OPEN_SCHEMA_SOURCE = (
+    "df = store.get_historical_features(\n"
+    "    entity_df=entity_df,\n"
+    '    features=["driver_stats:conv_rate"],\n'
+    ").to_df()\n"
 )
 
 
@@ -1222,7 +1237,7 @@ class TestCli(unittest.TestCase):
     def test_should_report_failing_bucket_when_below_global_threshold(self) -> None:
         """Test that coverage under the global fail_under produces a failing bucket."""
         # arrange
-        per_file = {"/proj/a.py": (4, 1)}
+        per_file = {"/proj/a.py": FileTally(4, 1, 0)}
         config = CoverageConfig(enabled=True, fail_under=90.0)
 
         # act
@@ -1236,7 +1251,7 @@ class TestCli(unittest.TestCase):
     def test_should_report_no_failures_when_threshold_is_met(self) -> None:
         """Test that coverage at or above the threshold passes."""
         # arrange
-        per_file = {"/proj/a.py": (4, 4)}
+        per_file = {"/proj/a.py": FileTally(4, 4, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0)
 
         # act
@@ -1248,7 +1263,7 @@ class TestCli(unittest.TestCase):
     def test_should_grade_override_bucket_separately_from_global_bucket(self) -> None:
         """Test that a per-path override is judged on its own files, not the whole project."""
         # arrange
-        per_file = {"/proj/legacy/old.py": (4, 0), "/proj/src/new.py": (2, 2)}
+        per_file = {"/proj/legacy/old.py": FileTally(4, 0, 0), "/proj/src/new.py": FileTally(2, 2, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
 
         # act
@@ -1260,7 +1275,7 @@ class TestCli(unittest.TestCase):
     def test_should_fail_only_the_override_bucket_that_misses_its_own_bar(self) -> None:
         """Test that a failing override is named in the report while the global bucket passes."""
         # arrange
-        per_file = {"/proj/legacy/old.py": (4, 1), "/proj/src/new.py": (2, 2)}
+        per_file = {"/proj/legacy/old.py": FileTally(4, 1, 0), "/proj/src/new.py": FileTally(2, 2, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 50.0),))
 
         # act
@@ -1273,7 +1288,7 @@ class TestCli(unittest.TestCase):
     def test_should_pass_vacuously_when_a_bucket_has_no_dataframes(self) -> None:
         """Test that 0/0 is treated as nothing to measure rather than a failure."""
         # arrange
-        per_file = {"/proj/a.py": (0, 0)}
+        per_file = {"/proj/a.py": FileTally(0, 0, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0)
 
         # act
@@ -1285,7 +1300,7 @@ class TestCli(unittest.TestCase):
     def test_should_ignore_path_overrides_when_fail_under_flag_is_given(self) -> None:
         """Test that --coverage-fail-under is a total override, not merged with config overrides."""
         # arrange
-        per_file = {"/proj/legacy/old.py": (4, 0)}
+        per_file = {"/proj/legacy/old.py": FileTally(4, 0, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
 
         # act
@@ -1662,7 +1677,7 @@ class TestCli(unittest.TestCase):
     def test_should_render_per_file_table_with_missing_sites(self) -> None:
         """Test that term-missing lists each file's tally and the sites lacking column info."""
         # arrange
-        per_file = {"/proj/src/new.py": (2, 1), "/proj/legacy/old.py": (2, 0)}
+        per_file = {"/proj/src/new.py": FileTally(2, 1, 0), "/proj/legacy/old.py": FileTally(2, 0, 0)}
         sites = [
             {"file": "/proj/legacy/old.py", "line": 2, "col": 1, "var": "old_one"},
             {"file": "/proj/src/new.py", "line": 3, "col": 1, "var": "bad"},
@@ -1680,7 +1695,7 @@ class TestCli(unittest.TestCase):
     def test_should_omit_files_with_no_dataframes_from_the_table(self) -> None:
         """Test that a 0/0 file is left out rather than padding the report."""
         # arrange
-        per_file = {"/proj/empty.py": (0, 0), "/proj/real.py": (1, 1)}
+        per_file = {"/proj/empty.py": FileTally(0, 0, 0), "/proj/real.py": FileTally(1, 1, 0)}
 
         # act
         table = _format_term_missing(per_file, [], Path("/proj"))
@@ -1692,7 +1707,7 @@ class TestCli(unittest.TestCase):
     def test_should_report_nothing_to_measure_when_no_file_has_dataframes(self) -> None:
         """Test that an entirely DataFrame-free run says so rather than printing an empty table."""
         # arrange
-        per_file = {"/proj/a.py": (0, 0)}
+        per_file = {"/proj/a.py": FileTally(0, 0, 0)}
 
         # act
         table = _format_term_missing(per_file, [], Path("/proj"))
@@ -1736,7 +1751,7 @@ class TestCli(unittest.TestCase):
     def test_should_build_json_coverage_payload_with_unrounded_percentages(self) -> None:
         """Test that the JSON report keeps the exact ratio for machine consumers."""
         # arrange
-        per_file = {"/proj/a.py": (3, 1)}
+        per_file = {"/proj/a.py": FileTally(3, 1, 0)}
         sites = [
             {"file": "/proj/a.py", "line": 5, "col": 1, "var": "x"},
             {"file": "/proj/a.py", "line": 4, "col": 1, "var": "y"},
@@ -1753,7 +1768,7 @@ class TestCli(unittest.TestCase):
     def test_should_use_null_percent_when_a_file_has_no_dataframes(self) -> None:
         """Test that the JSON report reports null rather than dividing by zero."""
         # arrange
-        per_file = {"/proj/a.py": (0, 0)}
+        per_file = {"/proj/a.py": FileTally(0, 0, 0)}
 
         # act
         payload = _coverage_json_payload(per_file, [], Path("/proj"))
@@ -1761,6 +1776,245 @@ class TestCli(unittest.TestCase):
         # assert
         self.assertIsNone(payload["percent"])
         self.assertIsNone(payload["files"][0]["percent"])
+
+    def test_should_report_both_coverage_readings_in_the_json_payload(self) -> None:
+        """Test that the JSON report carries the open-schema counts and both percentages.
+
+        A machine consumer gating on this payload has to be able to pick the strict
+        reading deliberately; `percent` alone cannot express the difference.
+        """
+        # arrange
+        per_file = {"/proj/a.py": FileTally(4, 4, 3)}
+        open_sites = [
+            {"file": "/proj/a.py", "line": 9, "col": 1, "var": "late"},
+            {"file": "/proj/a.py", "line": 2, "col": 1, "var": "early"},
+        ]
+
+        # act
+        payload = _coverage_json_payload(per_file, [], Path("/proj"), open_sites)
+
+        # assert
+        self.assertEqual(3, payload["dataframes_open_schema"])
+        self.assertEqual(100.0, payload["percent"])
+        self.assertEqual(25.0, payload["percent_concrete"])
+        self.assertEqual(["early", "late"], [s["var"] for s in payload["files"][0]["open_schema"]])
+
+    def test_should_report_null_concrete_percent_when_a_file_has_no_dataframes(self) -> None:
+        """Test that the strict percentage is null rather than fabricated for a 0/0 file."""
+        # arrange
+        per_file = {"/proj/a.py": FileTally(0, 0, 0)}
+
+        # act
+        payload = _coverage_json_payload(per_file, [], Path("/proj"))
+
+        # assert
+        self.assertIsNone(payload["percent_concrete"])
+        self.assertIsNone(payload["files"][0]["percent_concrete"])
+
+    def test_should_show_the_open_column_and_legend_in_the_term_missing_table(self) -> None:
+        """Test that open-schema origins are named in the table rather than hidden inside Typed."""
+        # arrange
+        per_file = {"/proj/src/new.py": FileTally(2, 2, 1)}
+        open_sites = [{"file": "/proj/src/new.py", "line": 4, "col": 1, "var": "feast_df"}]
+
+        # act
+        table = _format_term_missing(per_file, [], Path("/proj"), open_sites)
+
+        # assert
+        self.assertIn("Open", table)
+        self.assertIn("feast_df:4 (open)", table)
+        self.assertIn("no column name is ever checked against it", table)
+
+    def test_should_omit_the_open_schema_legend_when_nothing_is_open(self) -> None:
+        """Test that a project with no open schemas sees the table it always saw."""
+        # arrange
+        per_file = {"/proj/src/new.py": FileTally(2, 2, 0)}
+
+        # act
+        table = _format_term_missing(per_file, [], Path("/proj"))
+
+        # assert
+        self.assertNotIn("no column name is ever checked against it", table)
+
+    def test_should_append_the_open_schema_share_to_the_summary_line(self) -> None:
+        """Test that the top-line ratio says how much of it is column-unchecked."""
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=4, dataframes_typed=4, dataframes_open_schema=3)
+
+        # act
+        message = _coverage_message(stats)
+
+        # assert
+        self.assertIn("4/4 DataFrames had column info", message)
+        self.assertIn("of which 3 open-schema", message)
+
+    def test_should_omit_the_open_schema_note_when_every_frame_has_concrete_columns(self) -> None:
+        """Test that the summary line is unchanged for a project with no open schemas."""
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=4, dataframes_typed=4)
+
+        # act
+        message = _coverage_message(stats)
+
+        # assert
+        self.assertNotIn("open-schema", message)
+
+    def test_should_count_open_schema_frames_toward_the_gate_by_default(self) -> None:
+        """Test the backward-compatibility guarantee: an existing gate keeps its verdict.
+
+        An all-open-schema project passed `fail_under = 100` before this feature
+        existed, and must still pass it after, or upgrading silently breaks CI.
+        """
+        # arrange
+        per_file = {"/proj/a.py": FileTally(2, 2, 2)}
+        config = CoverageConfig(enabled=True, fail_under=100.0)
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual([], failing)
+
+    def test_should_grade_on_concrete_columns_only_when_open_schema_is_excluded(self) -> None:
+        """Test that the opt-in strict mode strikes open-schema frames from the numerator."""
+        # arrange
+        per_file = {"/proj/a.py": FileTally(4, 4, 3)}
+        config = CoverageConfig(enabled=True, fail_under=100.0)
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None, exclude_open_schema=True)
+
+        # assert
+        self.assertEqual(1, len(failing))
+        self.assertEqual(1, failing[0].counted)
+        self.assertEqual(25.0, failing[0].pct)
+
+    def test_should_name_the_excluded_open_schema_count_in_the_failure_message(self) -> None:
+        """Test that a strict-mode failure explains which numerator produced the percentage."""
+        # arrange
+        bucket = CoverageBucket(
+            label=None,
+            threshold=100.0,
+            total=4,
+            typed=4,
+            open_schema=3,
+            exclude_open_schema=True,
+        )
+
+        # act
+        message = _coverage_failure_message(bucket)
+
+        # assert
+        self.assertIn("1/4 DataFrames had concrete column info", message)
+        self.assertIn("3 open-schema excluded", message)
+
+    def test_should_warn_and_ignore_a_non_boolean_exclude_open_schema(self) -> None:
+        """Test that a mistyped config value falls back to the permissive default."""
+        # arrange
+        table = {"enabled": True, "exclude_open_schema": "yes"}
+
+        # act
+        with patch("sys.stderr", StringIO()) as captured:
+            config = _coverage_config_from_table(table)
+
+        # assert
+        self.assertFalse(config.exclude_open_schema)
+        self.assertIn("coverage.exclude_open_schema", captured.getvalue())
+
+    def test_should_read_exclude_open_schema_from_project_config(self) -> None:
+        """Test that the stricter grading can be turned on without a CLI flag."""
+        # arrange
+        table = {"enabled": True, "exclude_open_schema": True}
+
+        # act
+        config = _coverage_config_from_table(table)
+
+        # assert
+        self.assertTrue(config.exclude_open_schema)
+
+    def test_should_fail_the_gate_end_to_end_when_open_schema_is_excluded(self) -> None:
+        """Test that --coverage-exclude-open-schema turns an all-open-schema run into a failure."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "feast_load.py").write_text(_FEAST_OPEN_SCHEMA_SOURCE)
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit):
+                main(["check", tmpdir, "--coverage-fail-under", "100", "--coverage-exclude-open-schema"])
+
+            # assert
+            self.assertIn("0/1 DataFrames had concrete column info", captured.getvalue())
+
+    def test_should_pass_the_same_gate_end_to_end_without_the_exclude_flag(self) -> None:
+        """Test that the identical project passes the identical threshold by default."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "feast_load.py").write_text(_FEAST_OPEN_SCHEMA_SOURCE)
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--coverage-fail-under", "100"])
+
+            # assert
+            self.assertNotIn("below the required", captured.getvalue())
+
+    def test_should_surface_open_schema_origins_in_the_term_missing_run(self) -> None:
+        """Test that a real check run names its open-schema sites, not just a 100% row."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "feast_load.py").write_text(_FEAST_OPEN_SCHEMA_SOURCE)
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--coverage-detail", "term-missing"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("of which 1 open-schema", output)
+            self.assertIn("df:1 (open)", output)
+
+    def test_should_attach_open_schema_sites_to_their_source_file(self) -> None:
+        """Test that _check_files tags each open-schema site with the file it came from."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "feast_load.py"
+            py_file.write_text(_FEAST_OPEN_SCHEMA_SOURCE)
+
+            # act
+            _errors, stats = _check_files([py_file])
+
+            # assert
+            self.assertEqual(1, stats["dataframes_open_schema"])
+            self.assertEqual(1, len(stats["open_schema_sites"]))
+            self.assertEqual(str(py_file), stats["open_schema_sites"][0]["file"])
+            self.assertEqual("df", stats["open_schema_sites"][0]["var"])
+
+    def test_should_keep_open_schema_count_within_the_typed_count(self) -> None:
+        """Test the invariant the reporting relies on: open-schema is a subset of typed."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "mixed.py"
+            py_file.write_text(
+                "import pandas as pd\n"
+                'concrete = pd.read_csv("a.csv", usecols=["a"])\n'
+                'unresolved = pd.read_csv("b.csv")\n' + _FEAST_OPEN_SCHEMA_SOURCE
+            )
+
+            # act
+            _errors, stats = _check_files([py_file])
+
+            # assert
+            self.assertEqual(3, stats["dataframes_total"])
+            self.assertEqual(2, stats["dataframes_typed"])
+            self.assertEqual(1, stats["dataframes_open_schema"])
+            self.assertLessEqual(stats["dataframes_open_schema"], stats["dataframes_typed"])
+            self.assertEqual(len(stats["open_schema_sites"]), stats["dataframes_open_schema"])
 
     def test_should_attach_untyped_sites_to_their_source_file(self) -> None:
         """Test that _check_files tags each untyped site with the file it came from."""

@@ -44,15 +44,19 @@ pub(crate) fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
 }
 
 /// Coverage stats for a single checked file: how many DataFrame origins the
-/// linter recognized (`dataframes_total`) and how many of those resolved to a
-/// known column set (`dataframes_typed`). This is informational — a low ratio
+/// linter recognized (`dataframes_total`), how many of those resolved to a
+/// known column set (`dataframes_typed`), and how many of *those* resolved only
+/// to an open schema (`dataframes_open_schema` — a subset of `dataframes_typed`,
+/// never an independent bucket). This is informational — a low ratio
 /// means the check had little to validate, not that the file has fewer
 /// problems. See [`crate::linter::Linter`] for exactly what is counted.
 #[derive(Debug, Serialize, Default)]
 pub struct FileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    pub dataframes_open_schema: usize,
     pub untyped_sites: Vec<UntypedSite>,
+    pub open_schema_sites: Vec<OpenSchemaSite>,
 }
 
 /// One DataFrame origin the linter recognized but could not resolve columns for.
@@ -69,6 +73,32 @@ pub struct FileStats {
 /// Line and column are 1-indexed, matching [`LintError`].
 #[derive(Debug, Serialize)]
 pub struct UntypedSite {
+    pub line: usize,
+    pub col: usize,
+    /// The assigned variable name where one was available, else a generic stand-in.
+    pub var: String,
+}
+
+/// One DataFrame origin that WAS counted as typed, but only against an *open*
+/// schema (see `Linter::open_schemas`) — a Feast retrieval result, or a bare
+/// `-> pd.DataFrame`/`-> pl.DataFrame` return with no attached Schema.
+///
+/// The checker knows these are DataFrames; it does not know their columns, and
+/// `schema_has_column` answers `true` for every name asked of them. No
+/// `unknown-column` diagnostic can ever be raised against one, so counting them
+/// indistinguishably from a concrete column set would let a project report 100%
+/// coverage while a meaningful share of it is unvalidatable. Recorded alongside
+/// [`UntypedSite`] so `--coverage-detail=term-missing` can name them, and kept
+/// in step with `dataframes_open_schema` at each counting site rather than
+/// reconstructed later — the same discipline `UntypedSite` already follows.
+///
+/// Structurally identical to [`UntypedSite`], but deliberately a distinct type:
+/// these origins are on the *other* side of the typed/untyped split, and sharing
+/// one type would invite them being merged into one list.
+///
+/// Line and column are 1-indexed, matching [`LintError`].
+#[derive(Debug, Serialize)]
+pub struct OpenSchemaSite {
     pub line: usize,
     pub col: usize,
     /// The assigned variable name where one was available, else a generic stand-in.

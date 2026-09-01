@@ -13,6 +13,7 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 # ANSI escape sequences
 _RESET = "\033[0m"
@@ -140,6 +141,16 @@ class CoverageConfig:
     useful without the other.
     """
 
+    exclude_open_schema: bool = False
+    """Whether open-schema DataFrames are struck from the gate's numerator.
+
+    Off by default, so upgrading never silently flips a passing CI gate to
+    failing: what counted toward `fail_under` yesterday still counts today. Turn
+    it on to hold the project to *concrete* column information only -- see
+    `CoverageBucket.counted`, and `docs/usage.md` for why the two readings of
+    "covered" differ.
+    """
+
 
 def _parse_threshold(value: object, label: str) -> float | None:
     """Coerce a configured threshold to a percentage, or warn and return `None`."""
@@ -194,6 +205,11 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
         _coverage_warn(f"ignoring coverage.detail: expected one of {', '.join(_COVERAGE_DETAILS)}")
         detail = "summary"
 
+    exclude_open_schema = table.get("exclude_open_schema", False)
+    if not isinstance(exclude_open_schema, bool):
+        _coverage_warn("ignoring coverage.exclude_open_schema: expected true or false")
+        exclude_open_schema = False
+
     raw_overrides = table.get("overrides", {})
     overrides: list[tuple[str, float]] = []
     if isinstance(raw_overrides, dict):
@@ -212,6 +228,7 @@ def _coverage_config_from_table(table: dict) -> CoverageConfig:
         fail_under=fail_under,
         overrides=tuple(overrides),
         detail=detail,
+        exclude_open_schema=exclude_open_schema,
     )
 
 
@@ -334,9 +351,56 @@ def _collect_notebook_files(path: Path, configured_excludes: frozenset[str] | No
     return _collect_files_with_suffix(path, ".ipynb", configured_excludes)
 
 
-# One file's check outcome: (errors, dataframes_total, dataframes_typed, untyped_sites).
-_FileCheckResult = tuple[list[dict], int, int, list[dict]]
+class FileTally(NamedTuple):
+    """One file's DataFrame coverage counts.
+
+    `open_schema` is a *subset* of `typed`, not a third bucket: those origins were
+    recognized as DataFrames and resolved, but only to an open schema (a Feast
+    retrieval result, or a bare `-> pd.DataFrame` return with no attached Schema),
+    so the checker will never raise `unknown-column` against them. Carried
+    alongside the other two everywhere `total`/`typed` go, so a report can say how
+    much of "covered" is column information the checker can actually validate.
+    """
+
+    total: int
+    typed: int
+    open_schema: int
+
+
+class _FileCheckResult(NamedTuple):
+    """One file's check outcome, as returned by the per-file checker wrappers."""
+
+    errors: list[dict]
+    tally: FileTally
+    untyped_sites: list[dict]
+    open_schema_sites: list[dict]
+
+
 _CheckFileFn = Callable[[str, bytes | None], str]
+
+
+def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
+    """Unpack one Rust `check_file`/`check_notebook` payload, tagging every site with its file.
+
+    Shared by the `.py` and `.ipynb` wrappers: the two entry points differ in how
+    they get their source, not in the shape of what they return -- a notebook's
+    errors and sites simply carry an extra `cell` field, which passes through
+    untouched here.
+    """
+    errors = result["errors"]
+    for error in errors:
+        error["file"] = str(file_path)
+    stats = result["stats"]
+    return _FileCheckResult(
+        errors=errors,
+        tally=FileTally(
+            total=stats["dataframes_total"],
+            typed=stats["dataframes_typed"],
+            open_schema=stats.get("dataframes_open_schema", 0),
+        ),
+        untyped_sites=[{**site, "file": str(file_path)} for site in stats.get("untyped_sites", [])],
+        open_schema_sites=[{**site, "file": str(file_path)} for site in stats.get("open_schema_sites", [])],
+    )
 
 
 def _check_python_file(file_path: Path, check_file: _CheckFileFn, index_bytes: bytes | None) -> _FileCheckResult | None:
@@ -354,12 +418,7 @@ def _check_python_file(file_path: Path, check_file: _CheckFileFn, index_bytes: b
         print(f"{file_path}: skipped, {e}", file=sys.stderr)
         return None
 
-    result = json.loads(result_json)
-    errors = result["errors"]
-    for error in errors:
-        error["file"] = str(file_path)
-    sites = [{**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", [])]
-    return errors, result["stats"]["dataframes_total"], result["stats"]["dataframes_typed"], sites
+    return _file_check_result(json.loads(result_json), file_path)
 
 
 def _check_notebook_file(
@@ -385,27 +444,24 @@ def _check_notebook_file(
         print(f"{file_path}: skipped, {e}", file=sys.stderr)
         return None
 
-    result = json.loads(result_json)
-    errors = result["errors"]
-    for error in errors:
-        error["file"] = str(file_path)
-    sites = [{**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", [])]
-    return errors, result["stats"]["dataframes_total"], result["stats"]["dataframes_typed"], sites
+    return _file_check_result(json.loads(result_json), file_path)
 
 
 def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tuple[list[dict], dict]:
     """Run the Rust checker on each file, dispatching `.ipynb` notebooks through `_check_notebook_file`.
 
     Returns all errors with file paths attached, plus coverage stats
-    (``dataframes_total``/``dataframes_typed``) aggregated across every file checked,
-    and a ``per_file`` mapping of each file to its own ``(total, typed)`` tally --
-    needed to attribute coverage to per-path threshold overrides, which grade
-    subtrees separately rather than judging one project-wide ratio.
+    (``dataframes_total``/``dataframes_typed``/``dataframes_open_schema``) aggregated
+    across every file checked, and a ``per_file`` mapping of each file to its own
+    `FileTally` -- needed to attribute coverage to per-path threshold overrides, which
+    grade subtrees separately rather than judging one project-wide ratio.
 
-    Also returns ``untyped_sites``: every DataFrame origin the checker recognized
-    but could not resolve columns for, with the file it came from attached. This
-    is the "missing" listing behind ``--coverage-detail=term-missing``, the
-    counterpart to `coverage report -m`'s missing line numbers.
+    Also returns two site listings, both tagged with the file they came from:
+    ``untyped_sites``, every DataFrame origin the checker recognized but could not
+    resolve columns for, and ``open_schema_sites``, every origin it resolved only to
+    an open schema. Together they are the "missing" and "open" listings behind
+    ``--coverage-detail=term-missing``, the counterpart to `coverage report -m`'s
+    missing line numbers.
     """
     try:
         from typedframes._rust_checker import check_file, check_notebook
@@ -418,9 +474,10 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         sys.exit(1)
 
     all_errors: list[dict] = []
-    totals = {"dataframes_total": 0, "dataframes_typed": 0}
-    per_file: dict[str, tuple[int, int]] = {}
+    totals = {"dataframes_total": 0, "dataframes_typed": 0, "dataframes_open_schema": 0}
+    per_file: dict[str, FileTally] = {}
     untyped_sites: list[dict] = []
+    open_schema_sites: list[dict] = []
     for file_path in files:
         if file_path.suffix == ".ipynb":
             outcome = _check_notebook_file(file_path, check_notebook, index_bytes)
@@ -428,13 +485,19 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
             outcome = _check_python_file(file_path, check_file, index_bytes)
         if outcome is None:
             continue
-        errors, file_total, file_typed, sites = outcome
-        all_errors.extend(errors)
-        per_file[str(file_path)] = (file_total, file_typed)
-        totals["dataframes_total"] += file_total
-        totals["dataframes_typed"] += file_typed
-        untyped_sites.extend(sites)
-    return all_errors, {**totals, "per_file": per_file, "untyped_sites": untyped_sites}
+        all_errors.extend(outcome.errors)
+        per_file[str(file_path)] = outcome.tally
+        totals["dataframes_total"] += outcome.tally.total
+        totals["dataframes_typed"] += outcome.tally.typed
+        totals["dataframes_open_schema"] += outcome.tally.open_schema
+        untyped_sites.extend(outcome.untyped_sites)
+        open_schema_sites.extend(outcome.open_schema_sites)
+    return all_errors, {
+        **totals,
+        "per_file": per_file,
+        "untyped_sites": untyped_sites,
+        "open_schema_sites": open_schema_sites,
+    }
 
 
 def _error_location(error: dict) -> str:
@@ -586,6 +649,19 @@ def main(argv: list[str] | None = None) -> None:
             "[tool.typedframes.coverage]."
         ),
     )
+    check_parser.add_argument(
+        "--coverage-exclude-open-schema",
+        action="store_true",
+        dest="coverage_exclude_open_schema",
+        help=(
+            "Grade the coverage threshold on concrete column information only. Open-schema "
+            "DataFrames (a Feast retrieval, or a bare `-> pd.DataFrame` return with no attached "
+            "Schema) are recognized DataFrames, but no column name is ever checked against them; "
+            "by default they still count toward --coverage-fail-under. This strikes them from the "
+            "numerator. Opt-in only, so an existing gate never changes verdict on upgrade. Turns "
+            "on the `exclude_open_schema` key in [tool.typedframes.coverage]; it cannot turn it off."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -603,6 +679,8 @@ class RunStats:
     elapsed: float
     dataframes_total: int
     dataframes_typed: int
+    dataframes_open_schema: int = 0
+    """How many of `dataframes_typed` resolved only to an open schema. See `FileTally`."""
 
 
 def _coverage_message(stats: RunStats) -> str:
@@ -613,13 +691,24 @@ def _coverage_message(stats: RunStats) -> str:
     code is broken. Named in full ("DataFrame schema coverage") on the way out
     because the surrounding CLI vocabulary is borrowed from coverage.py, and a
     bare "coverage" here reads as test coverage to anyone skimming CI output.
+
+    The open-schema share is appended to this same line rather than left to the
+    detailed report, because the top-line ratio is the number a team reads in CI
+    and it overstates what the checker can validate by exactly that amount. It is
+    omitted entirely when there are none, so the common case is unchanged.
     """
     if stats.dataframes_total == 0:
         return "\u2139 No DataFrames with recognized loads/schemas found to check"
     pct = round(100 * stats.dataframes_typed / stats.dataframes_total)
+    open_note = ""
+    if stats.dataframes_open_schema:
+        open_note = (
+            f", of which {stats.dataframes_open_schema} open-schema "
+            f"(recognized as DataFrames, but column names are never checked)"
+        )
     return (
         f"\u2139 {stats.dataframes_typed}/{stats.dataframes_total} DataFrames had column info "
-        f"({pct}%) \u2014 DataFrame schema coverage, not a pass/fail result"
+        f"({pct}%){open_note} \u2014 DataFrame schema coverage, not a pass/fail result"
     )
 
 
@@ -633,13 +722,31 @@ class CoverageBucket:
     threshold: float
     total: int
     typed: int
+    open_schema: int = 0
+    """How many of `typed` resolved only to an open schema. See `FileTally`."""
+
+    exclude_open_schema: bool = False
+    """Whether `counted` strikes the open-schema frames from the numerator."""
+
+    @property
+    def counted(self) -> int:
+        """The numerator this bucket is graded on.
+
+        `typed` by default -- an open-schema frame IS a recognized, resolved
+        DataFrame, and dropping it from the numerator unasked would flip passing
+        CI gates to failing on upgrade. Under `exclude_open_schema` it falls back
+        to the concrete-column-list count, the stricter reading of "covered".
+        """
+        if self.exclude_open_schema:
+            return self.typed - self.open_schema
+        return self.typed
 
     @property
     def pct(self) -> float:
         """Coverage percentage, unrounded so a near miss isn't displayed as a pass."""
         if self.total == 0:
             return _COVERAGE_PCT_MAX
-        return _COVERAGE_PCT_MAX * self.typed / self.total
+        return _COVERAGE_PCT_MAX * self.counted / self.total
 
 
 def _relative_posix(file_str: str, root: Path) -> str:
@@ -661,10 +768,12 @@ def _override_for(rel_path: str, config: CoverageConfig) -> tuple[str, float] | 
 
 
 def _evaluate_coverage(
-    per_file: dict[str, tuple[int, int]],
+    per_file: dict[str, FileTally],
     config: CoverageConfig,
     root: Path,
     cli_fail_under: float | None,
+    *,
+    exclude_open_schema: bool = False,
 ) -> list[CoverageBucket]:
     """Group checked files by the threshold that governs them and return the failures.
 
@@ -680,22 +789,40 @@ def _evaluate_coverage(
     A bucket with no recognized DataFrames passes vacuously: 0/0 means the
     checker found nothing to measure there, not that the code failed, which is
     the same reading `_coverage_message` already gives an empty run.
+
+    `exclude_open_schema` picks which of the two readings of "covered" each bucket
+    is graded on -- see `CoverageBucket.counted`. It is off by default, so the
+    pass/fail outcome of an existing configuration is unchanged.
     """
-    tallies: dict[str | None, tuple[float, int, int]] = {}
-    for file_str, (total, typed) in sorted(per_file.items()):
+    tallies: dict[str | None, tuple[float, FileTally]] = {}
+    for file_str, tally in sorted(per_file.items()):
         if cli_fail_under is not None:
             label, threshold = None, cli_fail_under
         else:
             override = _override_for(_relative_posix(file_str, root), config)
             label, threshold = override if override is not None else (None, config.fail_under)
-        _, prev_total, prev_typed = tallies.get(label, (threshold, 0, 0))
-        tallies[label] = (threshold, prev_total + total, prev_typed + typed)
+        _, prev = tallies.get(label, (threshold, FileTally(0, 0, 0)))
+        tallies[label] = (
+            threshold,
+            FileTally(
+                total=prev.total + tally.total,
+                typed=prev.typed + tally.typed,
+                open_schema=prev.open_schema + tally.open_schema,
+            ),
+        )
 
     failing = []
-    for label, (threshold, total, typed) in tallies.items():
-        if total == 0:
+    for label, (threshold, tally) in tallies.items():
+        if tally.total == 0:
             continue
-        bucket = CoverageBucket(label=label, threshold=threshold, total=total, typed=typed)
+        bucket = CoverageBucket(
+            label=label,
+            threshold=threshold,
+            total=tally.total,
+            typed=tally.typed,
+            open_schema=tally.open_schema,
+            exclude_open_schema=exclude_open_schema,
+        )
         if bucket.pct < threshold:
             failing.append(bucket)
 
@@ -709,13 +836,27 @@ def _coverage_failure_message(bucket: CoverageBucket) -> str:
     The percentage is shown to one decimal rather than rounded to a whole number
     like the informational summary line: 99.6% against a `fail_under = 100` gate
     has to read as a failure, not as a baffling "100% is below the required 100%".
+
+    Under `exclude_open_schema` the tally has to say which numerator produced the
+    percentage, or a reader comparing it against the informational summary line
+    (which always reports the inclusive ratio) sees two different numbers for the
+    same run with nothing to explain the gap.
     """
     scope = f" for {bucket.label!r}" if bucket.label else ""
-    return (
-        f"✗ DataFrame schema coverage {bucket.pct:.1f}% is below the required "
-        f"{bucket.threshold:.1f}%{scope} "
-        f"({bucket.typed}/{bucket.total} DataFrames had column info)"
-    )
+    if bucket.exclude_open_schema:
+        tally = (
+            f"({bucket.counted}/{bucket.total} DataFrames had concrete column info; "
+            f"{bucket.open_schema} open-schema excluded)"
+        )
+    else:
+        tally = f"({bucket.typed}/{bucket.total} DataFrames had column info)"
+    return f"✗ DataFrame schema coverage {bucket.pct:.1f}% is below the required {bucket.threshold:.1f}%{scope} {tally}"
+
+
+_OPEN_SCHEMA_LEGEND = (
+    "Open = resolved to an open schema (Feast retrieval, or a bare `-> pd.DataFrame` return): "
+    "counted as typed, but no column name is ever checked against it."
+)
 
 
 def _missing_label(site: dict) -> str:
@@ -725,10 +866,24 @@ def _missing_label(site: dict) -> str:
     return f"{prefix}{site['var']}:{site['line']}"
 
 
+def _sites_by_file(sites: list[dict]) -> dict[str, list[dict]]:
+    """Group coverage sites by the file they came from, for per-row lookup."""
+    grouped: dict[str, list[dict]] = {}
+    for site in sites:
+        grouped.setdefault(site["file"], []).append(site)
+    return grouped
+
+
+def _site_labels(sites: list[dict], suffix: str = "") -> list[str]:
+    """Render one file's sites in line order, each optionally tagged with `suffix`."""
+    return [f"{_missing_label(site)}{suffix}" for site in sorted(sites, key=lambda s: s["line"])]
+
+
 def _format_term_missing(
-    per_file: dict[str, tuple[int, int]],
+    per_file: dict[str, FileTally],
     untyped_sites: list[dict],
     root: Path,
+    open_schema_sites: list[dict] | None = None,
 ) -> str:
     """Render the per-file DataFrame schema coverage table plus the sites that cost coverage.
 
@@ -737,41 +892,66 @@ def _format_term_missing(
     resolve -- the counterpart to coverage.py's missing line numbers, so the
     report is actionable rather than just a number.
 
+    The `Open` column, and the `(open)`-tagged entries beside the missing ones,
+    are the point of this report rather than a decoration: an open-schema origin
+    counts in `Typed` and so props up `Cover`, but no column name will ever be
+    validated against it, which is a materially different thing from a resolved
+    column list. A row can read `2  2  100%` and still catch nothing.
+
     Files with no recognized DataFrames are omitted: a row of `0/0` says nothing
     about coverage and would bury the files that do matter.
     """
-    rows = [(name, total, typed) for name, (total, typed) in sorted(per_file.items()) if total > 0]
+    rows = [(name, tally) for name, tally in sorted(per_file.items()) if tally.total > 0]
     if not rows:
         return "No DataFrames with recognized loads/schemas found to check"
 
-    sites_by_file: dict[str, list[dict]] = {}
-    for site in untyped_sites:
-        sites_by_file.setdefault(site["file"], []).append(site)
+    missing_by_file = _sites_by_file(untyped_sites)
+    open_by_file = _sites_by_file(open_schema_sites or [])
 
-    display = {name: _relative_posix(name, root) for name, _, _ in rows}
-    name_width = max(len("Name"), *(len(display[name]) for name, _, _ in rows))
-    header = f"{'Name'.ljust(name_width)}  Typed  Total   Cover   Missing"
+    display = {name: _relative_posix(name, root) for name, _ in rows}
+    name_width = max(len("Name"), *(len(display[name]) for name, _ in rows))
+    header = f"{'Name'.ljust(name_width)}  Typed   Open  Total   Cover   Missing"
     lines = [header, "-" * len(header)]
 
-    for name, total, typed in rows:
-        pct = round(_COVERAGE_PCT_MAX * typed / total)
-        missing = ", ".join(
-            _missing_label(site) for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
+    for name, tally in rows:
+        pct = round(_COVERAGE_PCT_MAX * tally.typed / tally.total)
+        labels = _site_labels(missing_by_file.get(name, [])) + _site_labels(open_by_file.get(name, []), " (open)")
+        row = (
+            f"{display[name].ljust(name_width)}  {tally.typed:>5}  {tally.open_schema:>5}  "
+            f"{tally.total:>5}  {pct:>5}%   {', '.join(labels)}"
         )
-        lines.append(f"{display[name].ljust(name_width)}  {typed:>5}  {total:>5}  {pct:>5}%   {missing}".rstrip())
+        lines.append(row.rstrip())
 
-    total_all = sum(total for _, total, _ in rows)
-    typed_all = sum(typed for _, _, typed in rows)
+    total_all = sum(tally.total for _, tally in rows)
+    typed_all = sum(tally.typed for _, tally in rows)
+    open_all = sum(tally.open_schema for _, tally in rows)
     pct_all = round(_COVERAGE_PCT_MAX * typed_all / total_all)
     lines.append("-" * len(header))
-    lines.append(f"{'TOTAL'.ljust(name_width)}  {typed_all:>5}  {total_all:>5}  {pct_all:>5}%")
+    lines.append(f"{'TOTAL'.ljust(name_width)}  {typed_all:>5}  {open_all:>5}  {total_all:>5}  {pct_all:>5}%")
+    if open_all:
+        lines.append("")
+        lines.append(_OPEN_SCHEMA_LEGEND)
     return "\n".join(lines)
 
 
+def _site_entries(sites: list[dict]) -> list[dict]:
+    """Render one file's sites as JSON objects, in line order."""
+    return [
+        {
+            "var": site["var"],
+            "line": site["line"],
+            "col": site["col"],
+            **({"cell": site["cell"]} if "cell" in site else {}),
+        }
+        for site in sorted(sites, key=lambda s: s["line"])
+    ]
+
+
 def _coverage_json_payload(
-    per_file: dict[str, tuple[int, int]],
+    per_file: dict[str, FileTally],
     untyped_sites: list[dict],
     root: Path,
+    open_schema_sites: list[dict] | None = None,
 ) -> dict:
     """Build the machine-readable coverage document nested under `--output-format=json`'s `coverage` key.
 
@@ -779,37 +959,41 @@ def _coverage_json_payload(
     combined with `--output-format=json`. Percentages are left unrounded here,
     unlike the human-facing table: a consumer deciding whether a gate passed
     needs the real ratio, and can round for display itself.
+
+    Both readings of "covered" are reported side by side -- `percent` over every
+    resolved DataFrame, `percent_concrete` over only those with a real column
+    list -- so a consumer gating on this payload picks a reading deliberately
+    rather than inheriting one. They are equal exactly when nothing resolved to an
+    open schema.
     """
-    sites_by_file: dict[str, list[dict]] = {}
-    for site in untyped_sites:
-        sites_by_file.setdefault(site["file"], []).append(site)
+    missing_by_file = _sites_by_file(untyped_sites)
+    open_by_file = _sites_by_file(open_schema_sites or [])
 
     files = []
-    for name, (total, typed) in sorted(per_file.items()):
+    for name, tally in sorted(per_file.items()):
+        concrete = tally.typed - tally.open_schema
         files.append(
             {
                 "file": _relative_posix(name, root),
-                "dataframes_total": total,
-                "dataframes_typed": typed,
-                "percent": (_COVERAGE_PCT_MAX * typed / total) if total else None,
-                "missing": [
-                    {
-                        "var": site["var"],
-                        "line": site["line"],
-                        "col": site["col"],
-                        **({"cell": site["cell"]} if "cell" in site else {}),
-                    }
-                    for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
-                ],
+                "dataframes_total": tally.total,
+                "dataframes_typed": tally.typed,
+                "dataframes_open_schema": tally.open_schema,
+                "percent": (_COVERAGE_PCT_MAX * tally.typed / tally.total) if tally.total else None,
+                "percent_concrete": (_COVERAGE_PCT_MAX * concrete / tally.total) if tally.total else None,
+                "missing": _site_entries(missing_by_file.get(name, [])),
+                "open_schema": _site_entries(open_by_file.get(name, [])),
             }
         )
 
-    total_all = sum(total for total, _ in per_file.values())
-    typed_all = sum(typed for _, typed in per_file.values())
+    total_all = sum(tally.total for tally in per_file.values())
+    typed_all = sum(tally.typed for tally in per_file.values())
+    open_all = sum(tally.open_schema for tally in per_file.values())
     return {
         "dataframes_total": total_all,
         "dataframes_typed": typed_all,
+        "dataframes_open_schema": open_all,
         "percent": (_COVERAGE_PCT_MAX * typed_all / total_all) if total_all else None,
+        "percent_concrete": (_COVERAGE_PCT_MAX * (typed_all - open_all) / total_all) if total_all else None,
         "files": files,
     }
 
@@ -832,8 +1016,9 @@ def _print_coverage_report(stats: dict, root: Path, *, detail: str) -> None:
 
     per_file = stats.get("per_file", {})
     untyped_sites = stats.get("untyped_sites", [])
+    open_schema_sites = stats.get("open_schema_sites", [])
     print()
-    print(_format_term_missing(per_file, untyped_sites, root))
+    print(_format_term_missing(per_file, untyped_sites, root, open_schema_sites))
 
 
 def _print_coverage_failures(buckets: list[CoverageBucket], *, output_format: str) -> None:
@@ -863,7 +1048,11 @@ def _print_json_results(all_errors: list[dict], stats: RunStats, coverage_detail
     report requested -- leaves the payload byte-for-byte as it was before
     coverage reporting existed.
     """
-    stats_dict = {"dataframes_total": stats.dataframes_total, "dataframes_typed": stats.dataframes_typed}
+    stats_dict = {
+        "dataframes_total": stats.dataframes_total,
+        "dataframes_typed": stats.dataframes_typed,
+        "dataframes_open_schema": stats.dataframes_open_schema,
+    }
     payload: dict = {"errors": all_errors, "stats": stats_dict}
     if coverage_detail is not None:
         payload["coverage"] = coverage_detail
@@ -983,6 +1172,7 @@ def _run_check(args: argparse.Namespace) -> None:
         elapsed=elapsed,
         dataframes_total=coverage["dataframes_total"],
         dataframes_typed=coverage["dataframes_typed"],
+        dataframes_open_schema=coverage.get("dataframes_open_schema", 0),
     )
 
     all_errors = _apply_diagnostic_policy(all_errors, args)
@@ -991,8 +1181,18 @@ def _run_check(args: argparse.Namespace) -> None:
     # The flag wins over the config key, so a one-off `--coverage-detail` doesn't
     # require editing (or temporarily undoing) project config.
     detail = args.coverage_detail or coverage_config.detail
+    # A store_true flag can only say "on", never "off", so this is an OR rather than
+    # the flag-wins precedence `detail` uses: `--coverage-exclude-open-schema` turns
+    # the stricter grading on for one run, and its absence leaves whatever the
+    # project configured alone rather than silently loosening it.
+    exclude_open_schema = args.coverage_exclude_open_schema or coverage_config.exclude_open_schema
     coverage_detail_payload = (
-        _coverage_json_payload(coverage.get("per_file", {}), coverage.get("untyped_sites", []), path)
+        _coverage_json_payload(
+            coverage.get("per_file", {}),
+            coverage.get("untyped_sites", []),
+            path,
+            coverage.get("open_schema_sites", []),
+        )
         if detail != "summary" and args.output_format == "json"
         else None
     )
@@ -1020,6 +1220,7 @@ def _run_check(args: argparse.Namespace) -> None:
             coverage_config,
             path,
             args.fail_under,
+            exclude_open_schema=exclude_open_schema,
         )
         if failing_buckets:
             _print_coverage_failures(failing_buckets, output_format=args.output_format)

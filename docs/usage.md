@@ -355,6 +355,36 @@ turn on a threshold. Enforcement is **entirely opt-in**: with no
 `[tool.typedframes.coverage]` table and no `--coverage-fail-under`, no threshold is evaluated
 and the exit code is exactly what it was before.
 
+### Open schemas: covered, but not column-checked
+
+Not every resolved DataFrame carries a column list the checker can validate against.
+Two kinds of origin resolve to an **open schema** — the checker knows it is a DataFrame,
+and knows its column list is deliberately incomplete:
+
+- a **Feast retrieval** (`store.get_historical_features(...).to_df()`), whose real output
+  also carries `entity_df`'s join keys and timestamp column, which aren't resolvable in
+  general;
+- a **bare `-> pd.DataFrame` / `-> pl.DataFrame` return** with no attached `Schema` — the
+  usual shape of an internal `py.typed` client library, reached through a plain call or
+  through `self._client.get_data(...)`.
+
+Column membership is answered `true` for anything asked of an open schema, on purpose:
+treating a knowingly-incomplete list as exhaustive would manufacture `unknown-column`
+errors on real columns. The consequence is that **no column-name error can ever be
+reported against an open-schema DataFrame**. It is covered in the sense that the checker
+recognized and resolved it, and not covered in the sense that a typo in it will never be
+caught.
+
+Both counts are reported, so the two readings are never conflated:
+
+```
+ℹ 12/20 DataFrames had column info (60%), of which 4 open-schema (recognized as DataFrames, but column names are never checked) — DataFrame schema coverage, not a pass/fail result
+```
+
+The open-schema note is omitted entirely when there are none. Open-schema DataFrames
+**do** count toward `--coverage-fail-under` by default — see
+[Grading on concrete columns only](#grading-on-concrete-columns-only) to change that.
+
 ### One-off enforcement
 
 ```shell
@@ -393,6 +423,12 @@ fail_under = 100.0
 # vice versa. Overridden by `--coverage-detail`.
 detail = "summary"
 
+# Grade the threshold on concrete column information only, striking open-schema
+# DataFrames from the numerator. Off by default, so an existing gate keeps the
+# verdict it had before this key existed. `--coverage-exclude-open-schema` turns
+# this on for one run; there is no flag that turns it back off.
+exclude_open_schema = false
+
 [tool.typedframes.coverage.overrides]
 # Per-path glob overrides of `fail_under`, for holding legacy code to a lower bar
 # than new code. Each glob is graded on its own files as a separate group, so a
@@ -414,6 +450,7 @@ The same settings work in a standalone `typedframes.toml` at the project root, w
 enabled = false
 fail_under = 100.0
 detail = "summary"
+exclude_open_schema = false
 
 [coverage.overrides]
 # "legacy/**" = 50.0
@@ -475,18 +512,29 @@ typedframes check src/ --coverage-detail=term-missing
 ```
 
 ```
-Name           Typed  Total   Cover   Missing
----------------------------------------------
-legacy/old.py      0      2      0%   old_one:2, old_two:3
-src/new.py         1      2     50%   bad:3
----------------------------------------------
-TOTAL              1      4     25%
+Name           Typed   Open  Total   Cover   Missing
+----------------------------------------------------
+legacy/old.py      0      0      2      0%   old_one:2, old_two:3
+src/new.py         1      0      2     50%   bad:3
+src/feast.py       1      1      1    100%   df:4 (open)
+----------------------------------------------------
+TOTAL              2      1      5     40%
+
+Open = resolved to an open schema (Feast retrieval, or a bare `-> pd.DataFrame` return): counted as typed, but no column name is ever checked against it.
 ```
 
 Each `Missing` entry is `variable:line`: the assignment where the checker recognized a
 DataFrame origin but couldn't resolve its columns. These are exactly the origins counted
 in the denominator but not the numerator, so the listing always reconciles with the
-table — the count of missing entries equals `Total - Typed` for every row.
+table — the count of untagged missing entries equals `Total - Typed` for every row.
+
+The `Open` column and the `(open)`-tagged entries beside them are the other half of the
+picture: those origins *are* counted in `Typed`, and so prop up `Cover`, but no column
+name is ever checked against them (see
+[Open schemas](#open-schemas-covered-but-not-column-checked)). The `src/feast.py` row
+above reads `100%` and would still not catch `df["typo_column"]`. Reading the `Open`
+column alongside `Cover` is how you tell a genuinely-validated 100% from one that only
+looks like it. The legend line is printed only when a run has at least one open schema.
 
 That reconciliation is why the sites are tracked by the checker itself rather than
 derived from `untracked-dataframe` warnings, which would not add up: some warnings are
@@ -512,23 +560,39 @@ Shape of the payload, with the `errors` list elided for brevity:
 ```json
 {
   "errors": [],
-  "stats": { "dataframes_total": 2, "dataframes_typed": 1 },
+  "stats": {
+    "dataframes_total": 3,
+    "dataframes_typed": 2,
+    "dataframes_open_schema": 1
+  },
   "coverage": {
-    "dataframes_total": 2,
-    "dataframes_typed": 1,
-    "percent": 50.0,
+    "dataframes_total": 3,
+    "dataframes_typed": 2,
+    "dataframes_open_schema": 1,
+    "percent": 66.66666666666667,
+    "percent_concrete": 33.333333333333336,
     "files": [
       {
         "file": "load.py",
-        "dataframes_total": 2,
-        "dataframes_typed": 1,
-        "percent": 50.0,
-        "missing": [{ "var": "sales", "line": 3, "col": 1 }]
+        "dataframes_total": 3,
+        "dataframes_typed": 2,
+        "dataframes_open_schema": 1,
+        "percent": 66.66666666666667,
+        "percent_concrete": 33.333333333333336,
+        "missing": [{ "var": "sales", "line": 3, "col": 1 }],
+        "open_schema": [{ "var": "features", "line": 5, "col": 1 }]
       }
     ]
   }
 }
 ```
+
+`percent` is coverage over every resolved DataFrame — the number the gate uses by
+default, and the one the summary line prints. `percent_concrete` is the same ratio with
+open-schema DataFrames struck from the numerator: coverage over DataFrames whose columns
+can actually be checked. The two are equal exactly when `dataframes_open_schema` is `0`.
+Both are reported so a consumer gating on this payload picks a reading deliberately
+rather than inheriting one.
 
 Percentages in the JSON report are left unrounded — a consumer deciding whether a gate
 passed needs the real ratio and can round for display itself. A file with no DataFrames
@@ -542,6 +606,47 @@ existed — asking for `term-missing` detail is what turns the key on, regardles
 a threshold with only the one-line summary. The CLI flag wins over the config key, so a
 one-off `--coverage-detail=term-missing` needs no config edit.
 
+### Grading on concrete columns only
+
+By default the threshold is graded on every resolved DataFrame, open schemas included.
+That is the permissive reading of "covered", and it is the default deliberately: an
+open-schema DataFrame *is* a DataFrame the checker recognized and resolved, and changing
+what the numerator means would flip passing CI gates to failing on upgrade, with nothing
+in the codebase having changed.
+
+If you want the stricter reading — gate on column information the checker can actually
+validate — opt in:
+
+```shell
+typedframes check src/ --coverage-fail-under=90 --coverage-exclude-open-schema
+```
+
+```toml
+[tool.typedframes.coverage]
+enabled = true
+fail_under = 90.0
+exclude_open_schema = true
+```
+
+Open-schema DataFrames are then struck from the numerator but stay in the denominator,
+so a project whose only resolved frames are open schemas grades as `0%` rather than
+`100%`. A failure says which numerator produced the percentage, so it can't be confused
+with the inclusive ratio on the summary line:
+
+```
+✗ DataFrame schema coverage 0.0% is below the required 100.0% (0/2 DataFrames had concrete column info; 2 open-schema excluded)
+```
+
+The flag can only turn this on, never off — its absence leaves whatever the project
+configured alone rather than silently loosening a gate for one run. Only the gate is
+affected: the summary line, the `term-missing` table, and `percent` in the JSON payload
+all keep reporting the inclusive ratio either way, with the open-schema count beside it.
+
+Reaching a high `exclude_open_schema` number means giving those origins real column
+information — annotating the variable (`df: Annotated[pd.DataFrame, MySchema] = ...`),
+or giving the library function a `-> Annotated[pd.DataFrame, MySchema]` return type in
+place of the bare `-> pd.DataFrame`.
+
 ### Behaviour notes
 
 - **Separate from `--strict`.** `--strict` fails on errors (correctness); a coverage
@@ -551,6 +656,10 @@ one-off `--coverage-detail=term-missing` needs no config edit.
   (`2` stays reserved for usage errors, including an out-of-range `--coverage-fail-under`.)
 - **Empty groups pass.** A group with no recognized DataFrames is 0/0 — nothing to
   measure, not a failure — matching how the summary line already reports an empty run.
+- **Open schemas count toward the gate by default.** They are reported separately
+  everywhere, but the pass/fail verdict is unchanged unless you opt into
+  `exclude_open_schema` — visibility first, so a team sees the gap and decides for
+  itself rather than having its CI verdict changed for it.
 - **`--no-info` doesn't hide failures.** That flag silences the informational coverage
   line; a failed gate is a result, so it is still reported.
 - **Machine-readable output stays clean.** With `--output-format=json` the failure

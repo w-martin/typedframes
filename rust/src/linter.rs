@@ -13,7 +13,7 @@ use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
     CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME,
 };
-use crate::errors::{LintError, UntypedSite};
+use crate::errors::{LintError, OpenSchemaSite, UntypedSite};
 use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
 use crate::typo::find_best_match;
 use crate::{ast_extract, contract, sql};
@@ -195,10 +195,28 @@ pub struct Linter {
     // with unrelated calls.
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    // How many of `dataframes_typed` resolved only to an OPEN schema (see
+    // `open_schemas`) rather than a concrete column list -- a subset of
+    // `dataframes_typed`, never an independent bucket. Both kinds of origin mean
+    // "the checker knows this is a DataFrame", but only a concrete column list can
+    // ever produce an `unknown-column` diagnostic: `schema_has_column` returns
+    // `true` for every name asked of an open schema, by design. Without this
+    // counter a project can report 100% DataFrame schema coverage while an
+    // arbitrary share of that 100% is incapable of catching a single column-name
+    // typo -- exactly the false reassurance a `--coverage-fail-under` gate is
+    // supposed to protect against. Counted via `count_typed_dataframe`, which every
+    // `dataframes_typed` bump goes through so the two can never drift apart.
+    pub dataframes_open_schema: usize,
     // Every origin counted in `dataframes_total` that did NOT resolve to a column
     // set, recorded so the CLI can report which assignments cost coverage. Kept in
     // step with the counters at each counting site rather than reconstructed later.
     pub untyped_sites: Vec<UntypedSite>,
+    // The `dataframes_open_schema` counterpart of `untyped_sites`: one entry per
+    // origin that counted as typed but only against an open schema, so
+    // `--coverage-detail=term-missing` can point at the specific assignments whose
+    // columns will never be checked. `open_schema_sites.len()` always equals
+    // `dataframes_open_schema`.
+    pub open_schema_sites: Vec<OpenSchemaSite>,
     // Every bare-Name variable subscripted (`x["col"]`) or method-called with a
     // RESERVED_METHODS name (`x.groupby(...)`) anywhere in the module. Populated by a
     // whole-module pre-pass (see DataFrameShapedUsageCollector), same timing as
@@ -320,6 +338,24 @@ pub struct Linter {
     // `self.schemas`/`self.functions` accumulate. A class defined in another file
     // needs the project index's own `class_methods` (see index.rs) instead.
     pub(crate) class_methods: HashMap<String, HashMap<String, String>>,
+}
+
+// The first plain-name assignment target, used to label a coverage site with the
+// variable a reader of the report would actually recognize. Falls back to `fallback`
+// for a target with no single name of its own (tuple unpacking, `obj.attr = ...`,
+// `d["k"] = ...`), matching what the existing untyped-site call sites already do.
+fn assign_var_hint(assign: &ast::StmtAssign, fallback: &str) -> String {
+    assign
+        .targets
+        .iter()
+        .find_map(|t| {
+            if let Expr::Name(n) = t {
+                Some(n.id.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -665,7 +701,9 @@ impl Linter {
             file_display: String::new(),
             dataframes_total: 0,
             dataframes_typed: 0,
+            dataframes_open_schema: 0,
             untyped_sites: Vec::new(),
+            open_schema_sites: Vec::new(),
             dataframe_shaped_usage: std::collections::HashSet::new(),
             unresolved_dataframe_shaped_calls: Vec::new(),
             sql_dialect: sql::SqlDialect::Generic,
@@ -1597,6 +1635,37 @@ impl Linter {
         });
     }
 
+    // Count one DataFrame origin whose columns the linter DID resolve, splitting out
+    // the open-schema case. Every `dataframes_typed` bump in this file goes through
+    // here (the caller still owns its own `dataframes_total += 1`, since several
+    // sites bump the denominator before they know whether the columns will resolve),
+    // so `dataframes_open_schema` can never drift out of step with the numerator it
+    // is a subset of.
+    //
+    // `schema_name` being in `self.open_schemas` is the whole distinction: such an
+    // origin is a real, recognized DataFrame -- it belongs in the numerator, and
+    // dropping it there would be a silent regression for every Feast user -- but
+    // `schema_has_column` answers `true` for anything asked of it, so no
+    // `unknown-column` diagnostic can ever come from it. Callers must therefore
+    // insert into `open_schemas` BEFORE calling this, not after.
+    fn count_typed_dataframe(
+        &mut self,
+        schema_name: &str,
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+    ) {
+        self.dataframes_typed += 1;
+        if self.open_schemas.contains(schema_name) {
+            self.dataframes_open_schema += 1;
+            self.open_schema_sites.push(OpenSchemaSite {
+                line: current_line,
+                col: current_col,
+                var: var_hint.to_string(),
+            });
+        }
+    }
+
     // Called at the end of the `x = call(...)` origin dispatch in the Assign handler,
     // after every recognized pattern (pd.read_csv/read_sql, connectorx, Feast,
     // SQL_PRODUCING_METHODS+SQL_FINALIZE_METHODS, Schema.from_pandas, a same-repo
@@ -1684,9 +1753,9 @@ impl Linter {
         self.dataframes_total += 1;
         match cols {
             Some(cols) => {
-                self.dataframes_typed += 1;
                 let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
                 self.open_schemas.insert(schema_name.clone());
+                self.count_typed_dataframe(&schema_name, var_hint, current_line, current_col);
                 for name in target_names {
                     self.variables
                         .insert(name.clone(), (schema_name.clone(), current_line));
@@ -1732,8 +1801,8 @@ impl Linter {
         );
         match cols {
             Some(cols) => {
-                self.dataframes_typed += 1;
                 let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
+                self.count_typed_dataframe(&schema_name, var_hint, current_line, current_col);
                 for name in target_names {
                     self.variables
                         .insert(name.clone(), (schema_name.clone(), current_line));
@@ -2828,7 +2897,18 @@ impl Linter {
                                                         current_line,
                                                     );
                                                 self.dataframes_total += 1;
-                                                self.dataframes_typed += 1;
+                                                // A bare `-> pd.DataFrame` return (the
+                                                // common shape for a py.typed internal
+                                                // library) lands here as an OPEN schema:
+                                                // typed, but with no column list to check
+                                                // anything against.
+                                                let var_hint = assign_var_hint(assign, func_name);
+                                                self.count_typed_dataframe(
+                                                    &schema_name,
+                                                    &var_hint,
+                                                    current_line,
+                                                    current_col,
+                                                );
                                                 for target in &assign.targets {
                                                     if let Expr::Name(target_name) = target {
                                                         self.variables.insert(
@@ -2894,7 +2974,13 @@ impl Linter {
                                     if self.schemas.contains_key(class_str) {
                                         // Schema.from_pandas(df) style
                                         self.dataframes_total += 1;
-                                        self.dataframes_typed += 1;
+                                        let var_hint = assign_var_hint(assign, class_str);
+                                        self.count_typed_dataframe(
+                                            class_str,
+                                            &var_hint,
+                                            current_line,
+                                            current_col,
+                                        );
                                         for target in &assign.targets {
                                             if let Expr::Name(target_name) = target {
                                                 self.variables.insert(
@@ -2912,7 +2998,6 @@ impl Linter {
                                             self.extract_load_columns(func_name, call);
                                         match extracted {
                                             Some(cols) => {
-                                                self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
                                                     .targets
                                                     .iter()
@@ -2926,12 +3011,18 @@ impl Linter {
                                                     .collect();
                                                 let var_name = target_names
                                                     .first()
-                                                    .map(|s| s.as_str())
-                                                    .unwrap_or("df");
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "df".to_string());
                                                 let schema_name = self.make_inferred_schema(
                                                     cols,
-                                                    var_name,
+                                                    &var_name,
                                                     current_line,
+                                                );
+                                                self.count_typed_dataframe(
+                                                    &schema_name,
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
                                                 );
                                                 for name in &target_names {
                                                     self.variables.insert(
@@ -3019,7 +3110,6 @@ impl Linter {
                                             });
                                         match cols {
                                             Some(cols) => {
-                                                self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
                                                     .targets
                                                     .iter()
@@ -3033,12 +3123,18 @@ impl Linter {
                                                     .collect();
                                                 let var_name = target_names
                                                     .first()
-                                                    .map(|s| s.as_str())
-                                                    .unwrap_or("df");
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "df".to_string());
                                                 let schema_name = self.make_inferred_schema(
                                                     cols,
-                                                    var_name,
+                                                    &var_name,
                                                     current_line,
+                                                );
+                                                self.count_typed_dataframe(
+                                                    &schema_name,
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
                                                 );
                                                 for name in &target_names {
                                                     self.variables.insert(
@@ -3636,11 +3732,13 @@ impl Linter {
 
                     if is_merge_or_concat {
                         if let Some((s1, s2)) = merge_schema {
-                            // The merged/concatenated result has a fully known schema by
-                            // construction -- both inputs were already tracked DataFrames --
-                            // so it's a new, fully-typed DataFrame origin in its own right.
+                            // The merged/concatenated result is a new DataFrame origin in
+                            // its own right -- both inputs were already tracked frames --
+                            // so it always counts as typed. Whether its column list is
+                            // CONCRETE depends on the inputs: an open input keeps the
+                            // result open (see below), which is why the numerator bump
+                            // waits until `open_schemas` has been updated.
                             self.dataframes_total += 1;
-                            self.dataframes_typed += 1;
 
                             // Union semantics: the result of merge/concat contains every
                             // column from both inputs.  Sort + dedup gives a stable,
@@ -3666,6 +3764,13 @@ impl Linter {
                             }
                             self.schemas
                                 .insert(combined_schema_name.clone(), combined_cols);
+                            let var_hint = assign_var_hint(assign, "df");
+                            self.count_typed_dataframe(
+                                &combined_schema_name,
+                                &var_hint,
+                                current_line,
+                                current_col,
+                            );
                             for target in &assign.targets {
                                 if let Expr::Name(target_name) = target {
                                     self.variables.insert(
@@ -3684,9 +3789,15 @@ impl Linter {
                             if type_name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     // The constructor names the schema directly -- always
-                                    // fully typed.
+                                    // fully typed, with a concrete column list.
                                     self.dataframes_total += 1;
-                                    self.dataframes_typed += 1;
+                                    let var_hint = assign_var_hint(assign, "df");
+                                    self.count_typed_dataframe(
+                                        schema_name.id.as_str(),
+                                        &var_hint,
+                                        current_line,
+                                        current_col,
+                                    );
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3707,7 +3818,13 @@ impl Linter {
                                     // Constructed from a known schema class -- always fully
                                     // typed, regardless of which method was chained onto it.
                                     self.dataframes_total += 1;
-                                    self.dataframes_typed += 1;
+                                    let var_hint = assign_var_hint(assign, "df");
+                                    self.count_typed_dataframe(
+                                        schema_name.id.as_str(),
+                                        &var_hint,
+                                        current_line,
+                                        current_col,
+                                    );
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3750,7 +3867,13 @@ impl Linter {
                                 current_line,
                             );
                             self.dataframes_total += 1;
-                            self.dataframes_typed += 1;
+                            let var_hint = assign_var_hint(assign, func_name.id.as_str());
+                            self.count_typed_dataframe(
+                                &schema_name,
+                                &var_hint,
+                                current_line,
+                                current_col,
+                            );
                             for target in &assign.targets {
                                 if let Expr::Name(target_name) = target {
                                     self.variables.insert(
@@ -3783,7 +3906,7 @@ impl Linter {
                 self.visit_expr(&assign.value, errors);
             }
             Stmt::AnnAssign(ann_assign) => {
-                let (current_line, _) = self.source_location(ann_assign.range().start());
+                let (current_line, current_col) = self.source_location(ann_assign.range().start());
                 // An annotated assignment's schema is always fully known once resolved --
                 // there's no "partially typed" case here, unlike a load call whose columns
                 // might not parse. Both the value-side and annotation-side checks below can
@@ -3900,7 +4023,22 @@ impl Linter {
 
                 if schema_resolved {
                     self.dataframes_total += 1;
-                    self.dataframes_typed += 1;
+                    // Every branch above resolves by writing the target's schema into
+                    // `self.variables`, so read it back rather than threading a name out
+                    // of five separate arms. An annotation always names a real schema
+                    // class, so this is never an open schema today -- routing it through
+                    // the same helper as every other counting site is what keeps the
+                    // open-schema tally correct by construction if that ever changes.
+                    let var_hint = match &*ann_assign.target {
+                        Expr::Name(target_name) => target_name.id.to_string(),
+                        _ => "df".to_string(),
+                    };
+                    let schema_name = self
+                        .variables
+                        .get(var_hint.as_str())
+                        .map(|(schema, _)| schema.clone())
+                        .unwrap_or_default();
+                    self.count_typed_dataframe(&schema_name, &var_hint, current_line, current_col);
                 }
 
                 self.visit_expr(&ann_assign.target, errors);
@@ -6351,9 +6489,83 @@ class Pipeline:
 
         // assert: resolved as an open schema (bare pd.DataFrame, no attached Schema)
         // -- counts as typed even though nothing about USAGE ever hinted it was a
-        // DataFrame.
+        // DataFrame, and is ALSO counted as open-schema, since no column name will
+        // ever be validated against it.
         assert_eq!(linter.dataframes_total, 1);
         assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_open_schema, 1);
+        assert_eq!(linter.open_schema_sites.len(), 1);
+        assert_eq!(linter.open_schema_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_report_an_external_bare_dataframe_return_as_open_schema_coverage() {
+        // arrange: the reduced form of the reported bug -- a py.typed internal library
+        // whose method is annotated `-> pd.DataFrame` with no attached Schema, called
+        // through self.<attr> and then subscripted with a typo. The checker resolves
+        // it (so it counts as typed) but has no column list, so the typo is NOT caught
+        // -- which is exactly why this must not be indistinguishable from a concrete
+        // column set in the coverage counters.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_dir = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("internal_client_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("py.typed"), "").unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+
+class Client:
+    def get_data(self, query: str) -> pd.DataFrame:
+        return pd.read_sql(query, None)
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_client_pkg import Client
+
+
+class Pipeline:
+    def __init__(self):
+        self._client = Client()
+
+    def run(self):
+        df = self._client.get_data("SELECT * FROM orders")
+        print(df["typo_column"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: the typo really is unreported -- that is the premise -- and the
+        // counters now say so, instead of claiming 1/1 fully-covered.
+        assert!(
+            !errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN),
+            "expected no unknown-column diagnostic, got: {errors:?}"
+        );
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_open_schema, 1);
+        assert_eq!(linter.open_schema_sites.len(), 1);
+        assert_eq!(linter.open_schema_sites[0].var, "df");
+        assert_eq!(linter.open_schema_sites[0].line, 10);
     }
 
     #[test]
@@ -7343,6 +7555,156 @@ print(df["driver_id"])
         assert_eq!(errors.len(), 0, "errors: {errors:?}");
         let schema_name = &linter.variables.get("df").unwrap().0;
         assert!(linter.open_schemas.contains(schema_name));
+    }
+
+    #[test]
+    fn test_should_count_a_feast_retrieval_as_open_schema_coverage() {
+        // arrange: a Feast retrieval resolves its feature columns, so it counts as
+        // typed -- but the schema is deliberately open (the real frame also carries
+        // entity_df's join keys), so no unknown-column can ever come from it.
+        let source = r#"
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+).to_df()
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_open_schema, 1);
+        assert_eq!(linter.open_schema_sites.len(), 1);
+        assert_eq!(linter.open_schema_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_not_count_a_resolved_column_list_as_open_schema_coverage() {
+        // arrange: the control for the open-schema counter -- a load with a real,
+        // exhaustive column list is typed AND concrete, and must stay out of the
+        // open-schema tally entirely.
+        let source = r#"
+import pandas as pd
+df = pd.read_csv("a.csv", usecols=["order_id", "amount"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_open_schema, 0);
+        assert!(linter.open_schema_sites.is_empty());
+    }
+
+    #[test]
+    fn test_should_count_a_bare_dataframe_returning_function_call_as_open_schema() {
+        // arrange: the same-file counterpart of the external-package case -- a bare
+        // `-> pd.DataFrame` return with no attached Schema resolves through
+        // OPEN_FRAME_MARKER, so the call site is typed but column-unchecked.
+        let source = r#"
+import pandas as pd
+
+
+def load_users() -> pd.DataFrame:
+    ...
+
+
+df = load_users()
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_open_schema, 1);
+        assert_eq!(linter.open_schema_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_keep_a_merge_with_an_open_input_counted_as_open_schema() {
+        // arrange: merging an open frame with a concrete one cannot recover the
+        // missing columns, so the result stays open -- and the coverage counters have
+        // to agree with `open_schemas`, which already propagates that.
+        let source = r#"
+import pandas as pd
+feast_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+).to_df()
+orders = pd.read_csv("orders.csv", usecols=["order_id"])
+joined = feast_df.merge(orders)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: three origins, all typed; the Feast frame and the merge result are
+        // open, the plain read_csv is not.
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 3);
+        assert_eq!(linter.dataframes_open_schema, 2);
+        let open_vars: Vec<&str> = linter
+            .open_schema_sites
+            .iter()
+            .map(|s| s.var.as_str())
+            .collect();
+        assert_eq!(open_vars, vec!["feast_df", "joined"]);
+    }
+
+    #[test]
+    fn test_should_keep_open_schema_sites_in_step_with_the_open_schema_count() {
+        // arrange: the invariant the term-missing report relies on, the open-schema
+        // counterpart of `untyped_sites.len() == total - typed`. A mix of every
+        // outcome in one file: concrete, open, and unresolved.
+        let source = r#"
+import pandas as pd
+
+
+def load_users() -> pd.DataFrame:
+    ...
+
+
+concrete = pd.read_csv("a.csv", usecols=["a"])
+open_frame = load_users()
+unresolved = pd.read_csv("b.csv")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 2);
+        assert_eq!(linter.dataframes_open_schema, 1);
+        assert_eq!(
+            linter.untyped_sites.len(),
+            linter.dataframes_total - linter.dataframes_typed
+        );
+        assert_eq!(
+            linter.open_schema_sites.len(),
+            linter.dataframes_open_schema
+        );
+        assert!(linter.dataframes_open_schema <= linter.dataframes_typed);
     }
 
     #[test]

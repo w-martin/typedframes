@@ -29,9 +29,23 @@ warnings on, text output, no coverage gate.
 ### Where to check
 
 - **`path`** (positional, required) — file or directory to check.
-- **`--no-index`** — skip building the cross-file project index; check each file in
-  isolation. Faster for a single file, but blind to imports across files (a schema
-  defined in `schemas.py` and used in `pipeline.py` won't be followed).
+
+  A **directory** is treated as the project root: every `.py` file under it is indexed,
+  so a schema defined anywhere in the project resolves anywhere else in it.
+
+  A **single file** is checked against a narrower index built from that file's own
+  references: the file, the project-local modules its `import` statements reach
+  (followed transitively, up to three hops), and any installed package that closure
+  calls in a DataFrame-shaped way. The project root is found by walking up from the file
+  to the nearest `pyproject.toml`; with no `pyproject.toml` anywhere above it, there is
+  nothing to resolve against and the file is checked in isolation. Unrelated project
+  files are never opened, which is what keeps a single-file check proportional to the
+  file rather than to the project.
+
+- **`--no-index`** — build no index at all; check each file in complete isolation,
+  following no imports of any kind. The fastest mode, and the blindest: a schema defined
+  in `schemas.py` and used in `pipeline.py` is not followed even when `pipeline.py`
+  imports it directly.
 
   ```shell
   typedframes check src/pipeline.py --no-index

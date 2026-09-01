@@ -395,7 +395,10 @@ typedframes check src/ --strict
 # JSON output
 typedframes check src/ --output-format=json
 
-# Skip cross-file index (single-file mode, faster for quick checks)
+# Check a single file (follows that file's own imports, not the whole project)
+typedframes check src/pipeline.py
+
+# Skip the cross-file index entirely (every file in isolation, fastest)
 typedframes check src/ --no-index
 
 # Suppress all warnings (untracked-dataframe, dropped-unknown-column)
@@ -566,9 +569,11 @@ Fast feedback reduces development time. The typedframes Rust binary provides nea
 
 The typedframes binary resolves column names within a file and, when a project index is present, across files too.
 Run `typedframes check src/` to build the index automatically and catch errors like `df = load_users(); df["typo"]`
-even when `load_users` is defined in another module. Pass `--no-index` to skip the index and check each file in
-isolation. Full type checkers (mypy, pyright, ty) analyze all Python types across your entire codebase. Use both: the
-binary for fast iteration, mypy for comprehensive checking.
+even when `load_users` is defined in another module. Checking a single file
+(`typedframes check src/pipeline.py`) builds a smaller index from that file's own imports instead of walking the whole
+project, so it still resolves `load_users` without paying for files it never references. Pass `--no-index` to skip the
+index entirely and check each file in isolation. Full type checkers (mypy, pyright, ty) analyze all Python types across
+your entire codebase. Use both: the binary for fast iteration, mypy for comprehensive checking.
 
 The standalone checker is built with [`ruff_python_parser`](https://github.com/astral-sh/ruff) for Python AST
 parsing.

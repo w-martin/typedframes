@@ -9,6 +9,9 @@
 //!    (`ProjectIndex`) containing schema definitions and annotated function return types.
 //!    The index is serialised to MessagePack bytes (via `rmp_serde`) and passed back to
 //!    the Python caller in memory — no files are written to disk.
+//!    Checking a single file instead uses `build_single_file_index`, which produces the
+//!    same `ProjectIndex` from a much narrower file set: just the checked file plus the
+//!    project-local modules and external packages its own imports actually reach.
 //!
 //! 2. **Check phase** (`check_file`) — parses a single file, optionally deserialises the
 //!    project index, resolves cross-file imports, and runs the [`Linter`] AST visitor.
@@ -53,5 +56,6 @@ fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pyapi::check_file, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::check_notebook, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::build_project_index, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::build_single_file_index, m)?)?;
     Ok(())
 }

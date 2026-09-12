@@ -99,21 +99,37 @@ pub fn is_enabled(project_root: &Path) -> bool {
 
 /// Walk up the directory tree from `start_path` until a `pyproject.toml` is found.
 ///
-/// Returns the directory containing `pyproject.toml`, or `start_path` itself if no
-/// `pyproject.toml` exists anywhere in the ancestor chain (e.g. standalone scripts).
-pub fn find_project_root(start_path: &Path) -> PathBuf {
+/// Returns `None` when no `pyproject.toml` exists anywhere in the ancestor chain --
+/// i.e. there is no project root to speak of (a standalone script in a scratch
+/// directory, a file under `/tmp`, ...). Callers that need a best-effort directory
+/// regardless should use [`find_project_root`], which substitutes `start_path`.
+///
+/// `pyproject.toml` is the ONE project-root marker this checker recognises, and it is
+/// deliberately the same marker used everywhere else: `load_linter_config` reads
+/// `[tool.typedframes]` out of it, and `find_site_packages_dir` looks for `.venv`
+/// beside it. Single-file and directory checks must agree on where the root is, or the
+/// same file would resolve its imports differently depending on how it was checked.
+pub fn find_project_root_opt(start_path: &Path) -> Option<PathBuf> {
     let mut current = start_path.to_path_buf();
     if current.is_file() {
         current.pop();
     }
     loop {
         if current.join("pyproject.toml").exists() {
-            return current;
+            return Some(current);
         }
         if !current.pop() {
-            return start_path.to_path_buf();
+            return None;
         }
     }
+}
+
+/// Walk up the directory tree from `start_path` until a `pyproject.toml` is found.
+///
+/// Returns the directory containing `pyproject.toml`, or `start_path` itself if no
+/// `pyproject.toml` exists anywhere in the ancestor chain (e.g. standalone scripts).
+pub fn find_project_root(start_path: &Path) -> PathBuf {
+    find_project_root_opt(start_path).unwrap_or_else(|| start_path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -130,6 +146,30 @@ mod tests {
 
         assert_eq!(find_project_root(&sub), root);
         assert_eq!(find_project_root(root), root);
+    }
+
+    #[test]
+    fn test_find_project_root_opt_reports_when_there_is_no_root_at_all() {
+        // arrange: a directory tree with no pyproject.toml anywhere above it. The
+        // best-effort `find_project_root` still has to return *something*, which is
+        // exactly why the Option-returning variant exists -- a caller that needs to
+        // skip gracefully (single-file indexing) can't tell "root found" from "gave
+        // up and handed back the start path" through the infallible one.
+        let temp = tempfile::tempdir().unwrap();
+        let sub = temp.path().join("a/b/c");
+        fs::create_dir_all(&sub).unwrap();
+
+        // act / assert -- no pyproject.toml exists in the tempdir, but a real one may
+        // well exist further up (e.g. checked-out under a repo), so only assert the
+        // agreement between the two functions rather than an absolute None.
+        match find_project_root_opt(&sub) {
+            Some(found) => assert_eq!(find_project_root(&sub), found),
+            None => assert_eq!(find_project_root(&sub), sub),
+        }
+
+        // A root that genuinely exists is reported as Some(that root).
+        fs::write(temp.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(find_project_root_opt(&sub), Some(temp.path().to_path_buf()));
     }
 
     #[test]

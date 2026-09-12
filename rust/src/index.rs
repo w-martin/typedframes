@@ -6,7 +6,7 @@
 //! individual files, and the linter calls back here to resolve cross-file symbols.
 
 use crate::ast_extract;
-use crate::config::{load_linter_config, LinterConfig};
+use crate::config::{find_project_root_opt, load_linter_config, LinterConfig};
 use crate::constants::DEFAULT_EXCLUDED_DIRS;
 use crate::errors::{LintError, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME};
 use crate::linter::{Linter, ParamGovernedTemplate};
@@ -572,16 +572,7 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
     // a mismatch here would make a SQL-derived schema's columns differ depending on
     // whether they were read from the cached project index or inferred fresh.
     let config = load_linter_config(project_root);
-    // A configured `exclude` REPLACES DEFAULT_EXCLUDED_DIRS entirely -- it does not
-    // add to it (see collect_py_files's doc comment).
-    let resolved_excludes: std::collections::HashSet<String> = match &config.exclude {
-        Some(list) => list.iter().cloned().collect(),
-        None => DEFAULT_EXCLUDED_DIRS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    };
-    let py_files = collect_py_files(project_root, &resolved_excludes);
+    let py_files = collect_py_files(project_root, &resolve_excluded_dirs(&config));
 
     let mut files = HashMap::new();
     let mut discovered_candidates: std::collections::HashSet<String> =
@@ -595,16 +586,53 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
         }
     }
 
+    index_traced_external_packages(project_root, &config, discovered_candidates, &mut files);
+    finalise_index(project_root, files)
+}
+
+// A configured `exclude` REPLACES DEFAULT_EXCLUDED_DIRS entirely -- it does not add to
+// it (see collect_py_files's doc comment).
+pub(crate) fn resolve_excluded_dirs(config: &LinterConfig) -> std::collections::HashSet<String> {
+    match &config.exclude {
+        Some(list) => list.iter().cloned().collect(),
+        None => DEFAULT_EXCLUDED_DIRS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+// Second indexing phase, shared by the whole-project and single-file entry points:
+// resolve which external installed packages are worth tracing (see
+// `resolve_traced_external_packages` -- pure decision logic over an already-collected
+// candidate set, so it works identically whether those candidates came from every file
+// in the project or from just one file's own import/call graph), then index their files
+// into the same map.
+pub(crate) fn index_traced_external_packages(
+    project_root: &Path,
+    config: &LinterConfig,
+    discovered_candidates: std::collections::HashSet<String>,
+    files: &mut HashMap<String, IndexEntry>,
+) {
     let traced_packages =
-        resolve_traced_external_packages(&config, discovered_candidates, project_root, &files);
+        resolve_traced_external_packages(config, discovered_candidates, project_root, files);
     for file_path in collect_external_package_files(project_root, &traced_packages) {
-        if let Some((entry, _candidates)) = index_file(&file_path, project_root, &config) {
+        if let Some((entry, _candidates)) = index_file(&file_path, project_root, config) {
             if let Some(path_str) = file_path.to_str() {
                 files.insert(path_str.to_string(), entry);
             }
         }
     }
+}
 
+// Final resolution pass, shared by the whole-project and single-file entry points.
+// Every step here is a fold over the `files` map that was handed in — it never goes
+// looking for more files — so it costs whatever that map contains and nothing more,
+// which is exactly what lets single-file mode reuse it unchanged.
+pub(crate) fn finalise_index(
+    project_root: &Path,
+    mut files: HashMap<String, IndexEntry>,
+) -> ProjectIndex {
     let all_schemas = compute_all_schemas(&files);
     let all_schema_locations = compute_all_schema_locations(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
@@ -618,6 +646,139 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
         call_site_errors: governed.call_site_errors,
         resolved_governed: governed.resolved_governed,
     }
+}
+
+// How many import hops past the checked file `build_single_file_index_internal` will
+// follow. Depth 1 is the file's own direct imports; depth 2 is what those files
+// themselves import, and so on.
+//
+// Three is the smallest bound that covers the shapes this checker actually needs, with
+// one hop of slack:
+//   - depth 1: `pipeline.py` imports a schema straight from `schemas.py`.
+//   - depth 2: `pipeline.py` imports `load_users` from `loaders.py`, whose return
+//     annotation names a schema that lives in a THIRD file, `schemas.py` — the case
+//     `all_schemas` exists for (see `compute_all_schemas`), and by far the most common
+//     real layout.
+//   - depth 3: one more hop for a delegate chain (`resolve_transitive_requires`), where
+//     the imported function forwards its DataFrame on to a function in a further file
+//     that is the one actually accessing columns.
+// Past that, the marginal chance of the extra file mattering to THIS file's diagnostics
+// drops off sharply while the fan-out keeps multiplying, so the bound is a deliberate
+// "conservative, no surprising slowness" cut-off rather than a technical limit — the
+// whole point of single-file mode is staying proportional to what the checked file
+// actually references. A project that wants unbounded resolution already has it:
+// checking the directory.
+pub(crate) const MAX_SINGLE_FILE_IMPORT_DEPTH: usize = 3;
+
+// Hard ceiling on how many first-party files the single-file import walk will index,
+// regardless of depth. Bounds the pathological case the depth limit alone doesn't: a
+// file importing a wide module which itself imports another wide module, where each
+// hop multiplies rather than adds. 200 is comfortably above any realistic import
+// closure at depth 3 (the shapes above reach 2-5 files) while still being a small
+// fraction of a large project's file count, so hitting it means the walk had already
+// stopped resembling "this file's own references" — the same spirit as
+// MAX_AUTO_TRACED_PACKAGES here and MAX_SQL_FILE_READS_PER_FILE in linter.rs.
+pub(crate) const MAX_SINGLE_FILE_INDEXED_FILES: usize = 200;
+
+// Resolve a dotted module name to a first-party file ON DISK, without needing an
+// already-populated index the way `resolve_module_file` does. Used only by the
+// single-file import walk, which is discovering the files to index in the first place
+// and so has nothing to look them up in yet.
+//
+// Deliberately tries exactly the same two roots `resolve_module_file` does — the
+// project root and a `src/` layout — so that every file this walk decides to index is
+// also a file check-time resolution (`Linter::load_cross_file_symbols`) can actually
+// find again. A package `__init__.py` is NOT a candidate for the same reason: check
+// time wouldn't resolve `from pkg import X` to it either (in whole-project mode just
+// as much as here), so indexing it would add cost for a symbol nothing would ever look
+// up. A resolved path under an excluded directory is dropped, matching what
+// `collect_py_files` would have pruned in whole-project mode.
+pub(crate) fn resolve_first_party_module_path(
+    module_name: &str,
+    project_root: &Path,
+    excluded_dirs: &std::collections::HashSet<String>,
+) -> Option<PathBuf> {
+    let mod_path = module_name.replace('.', "/");
+    let candidate = [
+        project_root.join(format!("{mod_path}.py")),
+        project_root.join("src").join(format!("{mod_path}.py")),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())?;
+    let under_excluded_dir = candidate
+        .strip_prefix(project_root)
+        .ok()?
+        .components()
+        .any(|c| excluded_dirs.contains(c.as_os_str().to_string_lossy().as_ref()));
+    (!under_excluded_dir).then_some(candidate)
+}
+
+// Build a ProjectIndex scoped to ONE file: the file itself, the project-local modules
+// its own `import` / `from ... import ...` statements reach (transitively, bounded by
+// MAX_SINGLE_FILE_IMPORT_DEPTH and MAX_SINGLE_FILE_INDEXED_FILES), and any external
+// installed package that closure calls in a DataFrame-shaped way.
+//
+// This is the single-file counterpart to `build_index_internal`, and the difference is
+// entirely in how the file set is chosen: whole-project mode walks every `.py` file
+// under the root (`collect_py_files`) because it has to produce an index valid for
+// every file it will then check; here there is exactly one file to check, so the walk
+// follows that file's own import graph instead and never lists a directory it wasn't
+// pointed at. Both phases after that — external-package tracing and
+// `finalise_index`'s cross-file resolution — are shared verbatim, since both are folds
+// over whatever file set they're handed.
+//
+// Returns `None` when there is no project root at all (no `pyproject.toml` anywhere
+// above the file). That is not an error: without a root there is no place to resolve a
+// project-local import against and no `.venv` to find installed packages in, so the
+// caller falls back to the same no-index behaviour it had before, having genuinely
+// tried first.
+pub(crate) fn build_single_file_index_internal(file_path: &Path) -> Option<ProjectIndex> {
+    let project_root = find_project_root_opt(file_path)?;
+    let config = load_linter_config(&project_root);
+    let excluded_dirs = resolve_excluded_dirs(&config);
+
+    let mut files: HashMap<String, IndexEntry> = HashMap::new();
+    let mut discovered_candidates: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Breadth-first, so the closest (and most likely relevant) files are the ones that
+    // get indexed if MAX_SINGLE_FILE_INDEXED_FILES cuts the walk short.
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        std::collections::VecDeque::from([(file_path.to_path_buf(), 0)]);
+    let mut seen: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::from([file_path.to_path_buf()]);
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if files.len() >= MAX_SINGLE_FILE_INDEXED_FILES {
+            break;
+        }
+        let Some((entry, candidates)) = index_file(&current, &project_root, &config) else {
+            continue;
+        };
+        discovered_candidates.extend(candidates);
+        // Only absolute imports are followed. A relative import (`from .schemas import
+        // UserSchema`) is skipped by `index_file` itself and, more to the point, by
+        // `load_cross_file_symbols` at check time — so its target could never be looked
+        // up even if it were indexed here.
+        if depth < MAX_SINGLE_FILE_IMPORT_DEPTH {
+            let imported_modules = entry.imports.values().chain(entry.module_aliases.values());
+            for module_name in imported_modules {
+                let Some(target) =
+                    resolve_first_party_module_path(module_name, &project_root, &excluded_dirs)
+                else {
+                    continue;
+                };
+                if seen.insert(target.clone()) {
+                    queue.push_back((target, depth + 1));
+                }
+            }
+        }
+        if let Some(path_str) = current.to_str() {
+            files.insert(path_str.to_string(), entry);
+        }
+    }
+
+    index_traced_external_packages(&project_root, &config, discovered_candidates, &mut files);
+    Some(finalise_index(&project_root, files))
 }
 
 // Resolve each function's `param_schema_name` (the schema its first parameter is
@@ -1779,6 +1940,372 @@ def transform(df):
         assert_eq!(func.requires, vec!["c".to_string()]);
     }
 
+    // pipeline.py -> loaders.py -> schemas.py: the schema the checked file's diagnostics
+    // depend on is TWO import hops away, in a file pipeline.py never names itself. Shared
+    // by the single-file tests below, which differ only in what they then assert.
+    fn write_two_hop_project(root: &Path) -> PathBuf {
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        fs::write(
+            root.join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    name = Column(type=str)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("loaders.py"),
+            r#"
+from typing import Annotated
+
+import pandas as pd
+
+from schemas import UserSchema
+
+
+def load_users(path: str) -> Annotated[pd.DataFrame, UserSchema]:
+    return pd.read_csv(path)
+"#,
+        )
+        .unwrap();
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(
+            &pipeline_path,
+            r#"
+from loaders import load_users
+
+
+def run(path: str) -> None:
+    df = load_users(path)
+    print(df["name"])
+"#,
+        )
+        .unwrap();
+        pipeline_path
+    }
+
+    #[test]
+    fn test_should_resolve_a_schema_two_import_hops_away_from_a_single_checked_file() {
+        // arrange: pipeline.py imports load_users from loaders.py, whose return
+        // annotation names UserSchema -- defined in a THIRD file pipeline.py never
+        // mentions. Following only direct imports would miss it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pipeline_path = write_two_hop_project(root);
+
+        // act
+        let index = build_single_file_index_internal(&pipeline_path).expect("project root found");
+
+        // assert: the two-hop schema resolved, with the location that makes the
+        // "(defined at ...)" part of a diagnostic possible.
+        assert_eq!(
+            index.all_schemas.get("UserSchema"),
+            Some(&vec!["name".to_string(), "user_id".to_string()])
+        );
+        assert!(index.all_schema_locations.contains_key("UserSchema"));
+    }
+
+    #[test]
+    fn test_should_not_index_project_files_the_checked_file_never_references() {
+        // The whole point of single-file mode: cost proportional to what the checked
+        // file references, not to what the project contains. An unrelated file sitting
+        // right next to pipeline.py must never be opened.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pipeline_path = write_two_hop_project(root);
+        fs::write(
+            root.join("unrelated.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+
+class UnrelatedSchema(BaseSchema):
+    other = Column(type=int)
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&pipeline_path).expect("project root found");
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert_eq!(indexed.len(), 3, "{indexed:#?}");
+        assert!(
+            !indexed.iter().any(|p| p.ends_with("unrelated.py")),
+            "unrelated.py is not referenced by pipeline.py and must not be indexed: {indexed:#?}"
+        );
+        assert!(!index.all_schemas.contains_key("UnrelatedSchema"));
+        // ... and for contrast, the whole-project index DOES pick it up -- the two
+        // modes differ in file set, which is exactly the intended trade-off.
+        assert!(build_index_internal(root)
+            .all_schemas
+            .contains_key("UnrelatedSchema"));
+    }
+
+    #[test]
+    fn test_should_stop_following_a_single_file_import_chain_past_the_depth_bound() {
+        // arrange: a straight chain hop0 (the checked file) -> hop1 -> ... -> hop5.
+        // MAX_SINGLE_FILE_IMPORT_DEPTH hops past the checked file get indexed; the
+        // next one does not.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        let chain_len = MAX_SINGLE_FILE_IMPORT_DEPTH + 3;
+        for i in 0..chain_len {
+            fs::write(
+                root.join(format!("hop{i}.py")),
+                format!("from hop{} import thing_{}\n", i + 1, i + 1),
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join(format!("hop{chain_len}.py")),
+            format!("thing_{chain_len} = 1\n"),
+        )
+        .unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&root.join("hop0.py")).expect("root found");
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert_eq!(
+            indexed.len(),
+            MAX_SINGLE_FILE_IMPORT_DEPTH + 1,
+            "{indexed:#?}"
+        );
+        let last_followed = format!("hop{MAX_SINGLE_FILE_IMPORT_DEPTH}.py");
+        let first_dropped = format!("hop{}.py", MAX_SINGLE_FILE_IMPORT_DEPTH + 1);
+        assert!(indexed.iter().any(|p| p.ends_with(&last_followed)));
+        assert!(!indexed.iter().any(|p| p.ends_with(&first_dropped)));
+    }
+
+    #[test]
+    fn test_should_cap_the_number_of_files_a_single_file_import_walk_indexes() {
+        // arrange: one file importing far more modules than the cap allows, so the
+        // depth bound alone never fires -- only MAX_SINGLE_FILE_INDEXED_FILES stops it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        let fan_out = MAX_SINGLE_FILE_INDEXED_FILES + 50;
+        let mut imports = String::new();
+        for i in 0..fan_out {
+            fs::write(
+                root.join(format!("wide_{i}.py")),
+                format!("value_{i} = 1\n"),
+            )
+            .unwrap();
+            imports.push_str(&format!("from wide_{i} import value_{i}\n"));
+        }
+        let hub_path = root.join("hub.py");
+        fs::write(&hub_path, imports).unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&hub_path).expect("root found");
+
+        // assert
+        assert_eq!(index.files.len(), MAX_SINGLE_FILE_INDEXED_FILES);
+    }
+
+    #[test]
+    fn test_should_follow_a_single_file_import_into_a_src_layout() {
+        // A `src/` layout is the second root resolve_module_file tries at check time,
+        // so single-file discovery has to try it too or the file it finds and the file
+        // check time looks for would disagree.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(
+            root.join("src").join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+
+class SrcSchema(BaseSchema):
+    amount = Column(type=int)
+"#,
+        )
+        .unwrap();
+        let pipeline_path = root.join("src").join("pipeline.py");
+        fs::write(&pipeline_path, "from schemas import SrcSchema\n").unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&pipeline_path).expect("root found");
+
+        // assert
+        assert!(index.all_schemas.contains_key("SrcSchema"));
+    }
+
+    #[test]
+    fn test_should_not_follow_a_single_file_import_into_an_excluded_directory() {
+        // A configured `exclude` prunes the same directories here as it does for the
+        // whole-project walk -- an import that happens to resolve into one is dropped
+        // rather than quietly reintroducing what the user asked to ignore.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\"vendor\"]\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("vendor")).unwrap();
+        fs::write(
+            root.join("vendor").join("schemas.py"),
+            r#"
+from typedframes import BaseSchema, Column
+
+
+class VendoredSchema(BaseSchema):
+    x = Column(type=int)
+"#,
+        )
+        .unwrap();
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(
+            &pipeline_path,
+            "from vendor.schemas import VendoredSchema\n",
+        )
+        .unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&pipeline_path).expect("root found");
+
+        // assert
+        assert_eq!(index.files.len(), 1, "only pipeline.py itself");
+        assert!(!index.all_schemas.contains_key("VendoredSchema"));
+    }
+
+    #[test]
+    fn test_should_auto_discover_an_external_package_from_a_single_checked_file() {
+        // arrange: the same shape as linter.rs's py.typed auto-discovery coverage, but
+        // reached from ONE file rather than a whole-project walk -- the import sits
+        // right there in the checked file, so it must still be followed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        let site_packages = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let pkg_dir = site_packages.join("internal_repo_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("py.typed"), "").unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+
+class DataRepository:
+    def get(self, query: str) -> pd.DataFrame:
+        return pd.read_sql(query, None)
+"#,
+        )
+        .unwrap();
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(
+            &pipeline_path,
+            r#"
+from internal_repo_pkg import DataRepository
+
+
+class Pipeline:
+    def __init__(self):
+        self._data_repository = DataRepository()
+
+    def run(self):
+        df = self._data_repository.get("SELECT * FROM training")
+        return df
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&pipeline_path).expect("root found");
+
+        // assert: the installed package's own file was indexed alongside the checked
+        // one, which is what makes DataRepository.get's return type resolvable.
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed
+                .iter()
+                .any(|p| p.contains("internal_repo_pkg") && p.ends_with("__init__.py")),
+            "{indexed:#?}"
+        );
+        let pkg_entry = index
+            .files
+            .get(pkg_dir.join("__init__.py").to_str().unwrap())
+            .expect("package indexed");
+        assert!(pkg_entry.class_methods.contains_key("DataRepository"));
+    }
+
+    #[test]
+    fn test_should_skip_single_file_indexing_when_there_is_no_project_root() {
+        // A lone script with no pyproject.toml anywhere above it has no root to
+        // resolve imports against and no .venv to find packages in. Skipping is the
+        // documented graceful outcome (the caller falls back to no index at all), not
+        // an error.
+        let dir = tempfile::tempdir().unwrap();
+        let lone = dir.path().join("lone_script.py");
+        fs::write(&lone, "from schemas import UserSchema\n").unwrap();
+
+        // act / assert
+        assert!(build_single_file_index_internal(&lone).is_none());
+    }
+
+    #[test]
+    fn test_should_resolve_a_param_governed_call_site_in_single_file_mode() {
+        // The call-site pass (resolve_param_governed_call_sites) is a fold over the
+        // file map it's handed, so it works unchanged on a single file's import
+        // closure -- here the governed callee lives one hop away in helpers.py.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        fs::write(
+            root.join("helpers.py"),
+            r#"
+from feast import FeatureStore
+import pandas as pd
+
+
+def load_conv_rate(store: FeatureStore, entity_df: pd.DataFrame, feature_names: list) -> None:
+    df = store.get_historical_features(entity_df=entity_df, features=feature_names).to_df()
+    print(df["conv_rate"])
+"#,
+        )
+        .unwrap();
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(
+            &pipeline_path,
+            r#"
+from helpers import load_conv_rate
+
+load_conv_rate(store, entity_df, ["driver_stats:acc_rate"])
+"#,
+        )
+        .unwrap();
+
+        // act
+        let index = build_single_file_index_internal(&pipeline_path).expect("root found");
+
+        // assert
+        let errors = index
+            .call_site_errors
+            .get(pipeline_path.to_str().unwrap())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("conv_rate"));
+    }
+
     fn write_import_heavy_project(root: &Path, num_files: usize) {
         fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
         for hub in 0..5 {
@@ -1907,6 +2434,75 @@ def load_orders(query: str) -> pd.DataFrame:
         let elapsed = start.elapsed();
         eprintln!(
             "build_index_internal, 300 files, .venv + allowlisted package: {:?} ({} files indexed)",
+            elapsed,
+            index.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_single_file_vs_whole_project_index() {
+        // The trade-off single-file mode exists to make: the same project, indexed
+        // whole vs. indexed from one file's own import closure. mod_0.py imports
+        // exactly one hub module, so its closure is 2 files out of 305.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_import_heavy_project(root, 300);
+
+        let start = std::time::Instant::now();
+        let whole = build_index_internal(root);
+        let whole_elapsed = start.elapsed();
+
+        let target = root.join("mod_0.py");
+        let start = std::time::Instant::now();
+        let single = build_single_file_index_internal(&target).expect("root found");
+        let single_elapsed = start.elapsed();
+
+        eprintln!(
+            "305-file project: whole-project index {:?} ({} files) vs single-file index \
+             {:?} ({} files)",
+            whole_elapsed,
+            whole.files.len(),
+            single_elapsed,
+            single.files.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_single_file_index_worst_case_fan_out() {
+        // The honest worst case for single-file mode: a file that imports enough
+        // distinct modules, each importing more, to hit MAX_SINGLE_FILE_INDEXED_FILES.
+        // Bounded by construction, but this is what "bounded" actually costs.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+        let fan_out = MAX_SINGLE_FILE_INDEXED_FILES + 50;
+        let mut imports = String::new();
+        for i in 0..fan_out {
+            fs::write(
+                root.join(format!("wide_{i}.py")),
+                format!(
+                    r#"
+import pandas as pd
+
+def load_{i}(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, usecols=["a", "b", "c"])
+"#
+                ),
+            )
+            .unwrap();
+            imports.push_str(&format!("from wide_{i} import load_{i}\n"));
+        }
+        let hub_path = root.join("hub.py");
+        fs::write(&hub_path, imports).unwrap();
+
+        let start = std::time::Instant::now();
+        let index = build_single_file_index_internal(&hub_path).expect("root found");
+        let elapsed = start.elapsed();
+        eprintln!(
+            "single-file index, worst-case fan-out (capped): {:?} ({} files indexed of \
+             {fan_out} importable)",
             elapsed,
             index.files.len()
         );

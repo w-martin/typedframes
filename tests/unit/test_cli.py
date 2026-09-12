@@ -574,6 +574,135 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("\u2713 Checked 1 file", output)
 
+    @staticmethod
+    def _write_two_hop_project(root: Path) -> Path:
+        """Write pipeline.py -> loaders.py -> schemas.py and return pipeline.py's path.
+
+        The schema pipeline.py's diagnostics depend on is two import hops away, in a
+        file pipeline.py never names -- so resolving it proves the single-file index
+        follows imports transitively, not just one level.
+        """
+        (root / "pyproject.toml").write_text("[tool.typedframes]\n")
+        (root / "schemas.py").write_text(
+            "from typedframes import BaseSchema, Column\n"
+            "\n"
+            "\n"
+            "class UserSchema(BaseSchema):\n"
+            "    user_id = Column(type=int)\n"
+            "    name = Column(type=str)\n"
+        )
+        (root / "loaders.py").write_text(
+            "from typing import Annotated\n"
+            "\n"
+            "import pandas as pd\n"
+            "\n"
+            "from schemas import UserSchema\n"
+            "\n"
+            "\n"
+            "def load_users(path: str) -> Annotated[pd.DataFrame, UserSchema]:\n"
+            "    return pd.read_csv(path)\n"
+        )
+        pipeline = root / "pipeline.py"
+        pipeline.write_text(
+            "from loaders import load_users\n"
+            "\n"
+            "\n"
+            "def run(path: str) -> None:\n"
+            "    df = load_users(path)\n"
+            '    print(df["nmae"])\n'
+        )
+        return pipeline
+
+    def test_should_resolve_a_project_local_schema_import_when_checking_a_single_file(self) -> None:
+        """Test that checking one file follows its own imports to a schema two files away."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = self._write_two_hop_project(Path(tmpdir))
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit) as ctx:
+                main(["check", str(pipeline), "--strict"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("unknown-column", output)
+            self.assertIn("UserSchema", output)
+
+    def test_should_not_resolve_a_project_local_schema_import_with_no_index(self) -> None:
+        """Test that --no-index still means fully isolated, following no imports at all."""
+        # arrange -- the identical fixture, so the only difference is the flag
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = self._write_two_hop_project(Path(tmpdir))
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(pipeline), "--no-index", "--strict"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertNotIn("unknown-column", output)
+            self.assertIn("✓ Checked 1 file", output)
+
+    def test_should_auto_discover_an_external_package_when_checking_a_single_file(self) -> None:
+        """Test that a single file's own import of a py.typed installed package is followed."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("[tool.typedframes]\n")
+            pkg = root / ".venv" / "lib" / "python3.12" / "site-packages" / "internal_repo_pkg"
+            pkg.mkdir(parents=True)
+            (pkg / "py.typed").write_text("")
+            (pkg / "__init__.py").write_text(
+                "import pandas as pd\n"
+                "\n"
+                "\n"
+                "class DataRepository:\n"
+                "    def get(self, query: str) -> pd.DataFrame:\n"
+                "        return pd.read_sql(query, None)\n"
+            )
+            pipeline = root / "pipeline.py"
+            pipeline.write_text(
+                "from internal_repo_pkg import DataRepository\n"
+                "\n"
+                "\n"
+                "class Pipeline:\n"
+                "    def __init__(self):\n"
+                "        self._data_repository = DataRepository()\n"
+                "\n"
+                "    def run(self):\n"
+                '        df = self._data_repository.get("SELECT * FROM training")\n'
+                "        return df\n"
+            )
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(pipeline)])
+
+            # assert -- the DataFrame is recognised because the installed package's own
+            # return annotation was indexed; without following the import it would not
+            # have been seen at all.
+            self.assertIn("1/1 DataFrames had column info", captured.getvalue())
+
+    def test_should_check_a_single_file_gracefully_when_there_is_no_project_root(self) -> None:
+        """Test that a lone file with no pyproject.toml above it is checked, not errored on."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lone = Path(tmpdir) / "lone_script.py"
+            lone.write_text("from schemas import UserSchema\n\nx = 1\n")
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(lone)])
+
+            # assert -- no root to resolve the import against, so nothing is resolved,
+            # exactly as before; the run itself still succeeds.
+            self.assertIn("✓ Checked 1 file", captured.getvalue())
+
     def test_should_suppress_warnings_with_no_warnings_flag(self) -> None:
         """Test that --no-warnings suppresses untracked-dataframe/dropped-unknown-column warnings from output."""
         # arrange

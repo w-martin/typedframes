@@ -423,10 +423,11 @@ If both files exist, `typedframes.toml` wins **entirely**. The two are never mer
 exactly one file always explains the whole configuration.
 
 Config is read from the directory you point `check` at, and only that directory — there
-is no walking up the ancestor chain, matching how `exclude` and the cross-file index
-already treat that path as the project root. Checking a single file
-(`typedframes check src/pipeline.py`) therefore picks up no config file; use
-`--coverage-fail-under` there.
+is no walking up the ancestor chain, matching how `exclude` treats that path as the
+project root. Checking a single file (`typedframes check src/pipeline.py`) therefore
+picks up no coverage config file; use `--coverage-fail-under` there. (Single-file
+*indexing* is separate and does walk up to the nearest `pyproject.toml`, since it needs
+a root to resolve the file's imports against.)
 
 ### A worked example
 

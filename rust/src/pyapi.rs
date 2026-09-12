@@ -5,7 +5,7 @@
 
 use crate::config::{find_project_root, load_linter_config};
 use crate::errors::{CheckFileResult, FileStats, LintError, CODE_UNTRACKED_DATAFRAME};
-use crate::index::{build_index_internal, ProjectIndex};
+use crate::index::{build_index_internal, build_single_file_index_internal, ProjectIndex};
 use crate::notebook::{self, NotebookCheckResult, NotebookFileStats};
 use crate::Linter;
 use pyo3::prelude::*;
@@ -247,5 +247,29 @@ pub(crate) fn build_project_index(project_root: String) -> PyResult<Vec<u8>> {
     let root = Path::new(&project_root);
     let index = build_index_internal(root);
     rmp_serde::to_vec(&index)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+}
+
+/// Build a cross-file symbol index scoped to a SINGLE file's own references.
+///
+/// The counterpart to [`build_project_index`] for `typedframes check some_file.py`.
+/// Rather than walking the whole project, it locates the project root by walking up
+/// from `file_path` to the nearest `pyproject.toml` and indexes only that file, the
+/// project-local modules its own imports reach (bounded — see
+/// `MAX_SINGLE_FILE_IMPORT_DEPTH`), and any external installed package that closure
+/// calls in a DataFrame-shaped way. Same MessagePack-serialised [`ProjectIndex`] shape,
+/// so [`check_file`] consumes it identically.
+///
+/// Returns `None` when no `pyproject.toml` exists anywhere above the file — there is
+/// then no root to resolve imports against, so the caller checks the file in isolation
+/// exactly as it did before.
+#[pyfunction]
+pub(crate) fn build_single_file_index(file_path: String) -> PyResult<Option<Vec<u8>>> {
+    let path = Path::new(&file_path);
+    let Some(index) = build_single_file_index_internal(path) else {
+        return Ok(None);
+    };
+    rmp_serde::to_vec(&index)
+        .map(Some)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
 }

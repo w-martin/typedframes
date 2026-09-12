@@ -74,8 +74,10 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
     Mirrors the Rust checker's own `[tool.typedframes] exclude` key (see
     `load_linter_config` in rust/src/lib.rs) so a single config value controls both
     collectors, regardless of which one runs for a given invocation. Only looks at
-    `path` itself (no walking up the ancestor chain) -- matches `_build_index_bytes`,
-    which already treats `path` as the project root when it's a directory.
+    `path` itself (no walking up the ancestor chain) -- matches `_build_index_bytes`'s
+    directory case, which treats `path` as the project root. Nothing to resolve when
+    `path` is a single file: it is its own complete file list, so there is no descent
+    to prune.
     """
     if not path.is_dir():
         return None
@@ -226,10 +228,12 @@ def _load_coverage_config(path: Path) -> CoverageConfig:
     `[coverage]` rather than `[tool.typedframes.coverage]`.
 
     Only looks at `path`, and only when it is a directory -- no walking up the
-    ancestor chain -- matching `_load_configured_excludes` and
-    `_build_index_bytes`, which already treat `path` as the project root.
-    Checking a single file therefore never picks up a config file; `--coverage-fail-under`
-    covers that case.
+    ancestor chain -- matching `_load_configured_excludes` and `_build_index_bytes`'s
+    directory case, which treat `path` as the project root. Checking a single file
+    therefore never picks up a coverage config file; `--coverage-fail-under` covers
+    that case. (Single-file *indexing* does walk up to find a project root, since it
+    has to resolve the file's imports against something -- coverage thresholds are a
+    deliberate opt-in and are left alone.)
 
     Returns the disabled default whenever nothing is configured or the config is
     unusable, which is what keeps the opt-in guarantee: no table, no threshold.
@@ -535,7 +539,11 @@ def main(argv: list[str] | None = None) -> None:
         const="json",
         help=argparse.SUPPRESS,
     )
-    check_parser.add_argument("--no-index", action="store_true", help="Disable cross-file index.")
+    check_parser.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Disable the cross-file index entirely; check every file in isolation, following no imports.",
+    )
     check_parser.add_argument(
         "--no-warnings",
         action="store_true",
@@ -943,15 +951,33 @@ def _apply_diagnostic_policy(all_errors: list[dict], args: argparse.Namespace) -
 
 
 def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
-    """Build the cross-file project index, unless disabled or the path isn't a directory."""
-    if not path.is_dir() or args.no_index:
+    """Build the cross-file index for this run, unless `--no-index` disabled it.
+
+    Two shapes, picked by what `path` is:
+
+    - a directory -- the whole-project index, treating `path` itself as the project
+      root: every `.py` file underneath it, plus any external package the project
+      calls in a DataFrame-shaped way.
+    - a single file -- an index scoped to that file's own references: the file, the
+      project-local modules its imports reach (transitively, bounded), and the
+      external packages that closure calls. The project root is found by walking up
+      from the file to the nearest `pyproject.toml`, so this deliberately does NOT
+      treat the file's own directory as the root the way the directory case does.
+      `None` comes back when there is no `pyproject.toml` anywhere above the file --
+      nothing to resolve against, so the file is checked in isolation.
+
+    `--no-index` remains the explicit opt-out from both: truly no index, every file
+    checked in isolation, no import following of any kind.
+    """
+    if args.no_index:
         return None
     try:
-        from typedframes._rust_checker import build_project_index
-
-        return build_project_index(str(path))
+        from typedframes._rust_checker import build_project_index, build_single_file_index
     except ImportError:
         return None
+    if path.is_dir():
+        return build_project_index(str(path))
+    return build_single_file_index(str(path))
 
 
 def _run_check(args: argparse.Namespace) -> None:

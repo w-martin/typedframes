@@ -28,6 +28,33 @@ are validated against the new schema.
 | `pd.merge(left, right, …)` | Merges both schemas | `merged = pd.merge(a, b, on="id")` |
 | `pd.concat([df1, df2], …)` | Unions both schemas | `combined = pd.concat([a, b])` |
 
+### PySpark (Experimental)
+
+Spark spells most of these differently, so it gets its own names rather than reusing the
+pandas/polars ones. See
+[Native PySpark DataFrames](https://github.com/w-martin/typedframes#native-pyspark-dataframes-experimental).
+
+| Operation | Effect on schema | Example |
+|-----------|-----------------|---------|
+| `df.withColumn("c", expr)` | Adds `"c"` (or replaces it) — Spark's `assign` | `df.withColumn("tax", F.col("amount") * 0.2)` |
+| `df.withColumns({…})` | Adds/replaces each key | `df.withColumns({"tax": F.col("amount")})` |
+| `df.withColumnRenamed(old, new)` | Renames `old` to `new`; the two names are separate positional arguments | `df.withColumnRenamed("amount", "total")` |
+| `df.withColumnsRenamed({…})` | Renames by mapping | `df.withColumnsRenamed({"amount": "total"})` |
+| `df.select(*cols)` | Narrows to the named columns; `.alias("x")` sets the output name | `df.select("id", F.col("amount").alias("total"))` |
+| `df.drop(*cols)` | Removes listed columns — bare varargs, no `columns=` | `df.drop("region", "amount")` |
+| `df.toDF(*names)` | Renames every column positionally | `df.toDF("a", "b")` |
+| `df.union(other)` / `df.unionAll(other)` | Takes the LEFT schema — Spark resolves these by position | `left.union(right)` |
+| `df.unionByName(other)` | Takes the left schema | `left.unionByName(right)` |
+| `df.unionByName(other, allowMissingColumns=True)` | Unions both schemas | `left.unionByName(right, allowMissingColumns=True)` |
+| `spark.read.schema(…).csv(path)` | Schema from a DDL string, `StructType`, or list of names (inline or in a variable) | `spark.read.schema("id INT").csv("f.csv")` |
+| `spark.read.csv(path).select(…)` | Schema from the chained `select` | `spark.read.csv("f.csv").select("id")` |
+| `spark.createDataFrame(data, schema)` | Schema from the second argument | `spark.createDataFrame(rows, ["id", "name"])` |
+| `spark.sql(sql)` | Schema from the `SELECT` list, kept as a Spark DataFrame | `spark.sql("SELECT id FROM t")` |
+
+A `spark.read` with no declared schema and no chained `select` reports
+`untracked-dataframe`: Spark resolves that schema at runtime, so it is genuinely unknown
+at lint time — the same situation as a bare `pd.read_csv()`.
+
 ---
 
 ## Row-Passthrough Operations
@@ -50,6 +77,25 @@ the same column model as the input.
 | `df.fillna(…)` | Fill NaN values; columns unchanged |
 | `df.dropna(…)` | Drop NaN rows; columns unchanged |
 | `df.ffill()` / `df.bfill()` | Forward/back fill; columns unchanged |
+
+### PySpark (Experimental)
+
+| Operation | Notes |
+|-----------|-------|
+| `df.where(…)` | Alias of `filter`; columns unchanged |
+| `df.limit(n)` / `df.offset(n)` | Row slice; columns unchanged |
+| `df.orderBy(…)` / `df.sortWithinPartitions(…)` | Row sort; columns unchanged |
+| `df.distinct()` | Row dedup; columns unchanged |
+| `df.dropDuplicates(…)` / `df.dropDuplicatesWithinWatermark(…)` | Row dedup; columns unchanged |
+| `df.repartition(…)` / `df.repartitionByRange(…)` / `df.coalesce(n)` | Partitioning only; columns unchanged |
+| `df.cache()` / `df.persist()` / `df.unpersist()` | Caching only; columns unchanged |
+| `df.checkpoint()` / `df.localCheckpoint()` | Checkpointing only; columns unchanged |
+| `df.alias(name)` / `df.hint(…)` | Naming/planner hint; columns unchanged |
+
+Spark's `head`, `tail` and `first` are **not** listed: they return `Row`/`list[Row]`
+rather than a DataFrame. They are nonetheless treated as row-passthrough, because
+`head`/`tail` are pandas methods that do return a frame and the checker tracks a
+variable's column set rather than which library produced it.
 
 ---
 
@@ -79,6 +125,11 @@ checker.
 | `df.transform(fn, …)` | Output depends on `fn` |
 | `df.groupby(…).agg(…)` | Output columns are determined by aggregation spec |
 | `df.with_columns(…)` | polars column addition/mutation; schema not narrowed statically |
+| `df.join(other, …)` (PySpark) | `left_semi`/`left_anti` return only the left columns; `on=` as a name list collapses the join keys while a condition keeps both; duplicate names across the sides resolve at runtime |
+| `df.selectExpr(…)` | Output names come from SQL expression strings, not parsed |
+| `df.withColumn("c", udf(…))` | A UDF's output is opaque; the column is still added, but only when its name is a literal |
+| `df.rdd.map(…)` / `df.mapInPandas(…)` / `df.mapInArrow(…)` | Output schema is decided by the function |
+| `df.groupBy(…).agg(…)` (PySpark) | Output columns are determined by the aggregation spec |
 
 ---
 

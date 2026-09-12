@@ -7,7 +7,8 @@
 use crate::config::LinterConfig;
 use crate::constants::{
     CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS, LOAD_MODULES, OPEN_FRAME_MARKER,
-    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
+    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SPARK_READ_METHODS, SPARK_RESERVED_ATTRIBUTES,
+    SPARK_ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
@@ -267,6 +268,24 @@ pub struct Linter {
     // removes) the previous entry — matching real PEP 249 semantics, where a cursor
     // holds exactly one most-recently-executed query at a time.
     pub(crate) cursor_sql: HashMap<String, String>,
+    // Variable names bound to a PySpark `SparkSession` — from a
+    // `SparkSession.builder…getOrCreate()` chain, or a `SparkSession`-annotated
+    // function parameter. Used to gate NATIVE `session.sql(...)` tracking (where the
+    // result stays a Spark DataFrame) on the receiver really being a session.
+    //
+    // The gate matters because `sql` is also in `SQL_PRODUCING_METHODS`, shared with
+    // DuckDB, where `duckdb.sql(q)` returns a `DuckDBPyRelation` rather than a
+    // DataFrame — registering one of those in `self.variables` would make ordinary
+    // relation methods (`rel.fetchall()`, …) look like unknown column accesses.
+    // `spark.sql(sql).toPandas()` is unaffected either way: that chain's outermost
+    // call is the finalize method, so it is claimed by the pre-existing SQL-connector
+    // path before this one is ever consulted.
+    pub(crate) spark_sessions: std::collections::HashSet<String>,
+    // Variable name -> the column names of a PySpark schema bound to it, e.g.
+    // `schema = StructType([...])`. Declaring the schema in a variable and passing it
+    // to `spark.read.schema(schema)` is the idiomatic Spark spelling, so resolving
+    // only the inlined form would miss most real code.
+    pub(crate) spark_schema_vars: HashMap<String, Vec<String>>,
     // func_name -> a recognized "parameter feeds a Feast features= call, whose result is
     // subscripted in the same body" shape, found while indexing this file's functions.
     // Consumed once, project-wide, by resolve_param_governed_call_sites -- see
@@ -675,6 +694,8 @@ impl Linter {
             retrieval_jobs: HashMap::new(),
             open_schemas: std::collections::HashSet::new(),
             cursor_sql: HashMap::new(),
+            spark_sessions: std::collections::HashSet::new(),
+            spark_schema_vars: HashMap::new(),
             param_governed_templates: HashMap::new(),
             all_function_names: std::collections::BTreeSet::new(),
             current_self_attrs: HashMap::new(),
@@ -1941,6 +1962,204 @@ impl Linter {
         name
     }
 
+    // Bind every assignment target to a freshly inferred schema over `cols`.
+    fn track_columns(&mut self, cols: Vec<String>, targets: &[String], line: usize) {
+        let var_hint = targets.first().map(|s| s.as_str()).unwrap_or("unknown");
+        let schema_name = self.make_inferred_schema(cols, var_hint, line);
+        for name in targets {
+            self.variables
+                .insert(name.clone(), (schema_name.clone(), line));
+        }
+    }
+
+    // Forget any schema bound to these targets.
+    //
+    // Needed wherever an operation is known to CHANGE the column set but the change
+    // itself couldn't be resolved — `df = df.withColumn(name_from_a_variable, ...)`
+    // being the standard case. Simply declining to insert would leave the target's
+    // previous binding in place, and for the extremely common `df = df.<op>(...)`
+    // rebinding shape that stale schema is exactly the one the operation just
+    // invalidated, so every access to the new column would be reported as unknown.
+    // Dropping the binding downgrades those to unchecked, which is this checker's
+    // preferred failure direction.
+    fn untrack_targets(&mut self, targets: &[String]) {
+        for name in targets {
+            self.variables.remove(name);
+        }
+    }
+
+    // Report every column in `referenced` that isn't in `base_cols`, phrased against
+    // the receiver's schema. Shared by the PySpark structural ops, which all validate
+    // their column arguments the same way.
+    #[allow(clippy::too_many_arguments)]
+    fn check_columns_exist(
+        &self,
+        referenced: &[String],
+        base_cols: &[String],
+        schema_name: &str,
+        defined_line: usize,
+        line: usize,
+        col: usize,
+        code: &str,
+        severity: &str,
+        context: &str,
+        errors: &mut Vec<LintError>,
+    ) {
+        for name in referenced {
+            if base_cols.iter().any(|c| c == name) {
+                continue;
+            }
+            let schema_display = self.schema_display(schema_name, defined_line);
+            let mut message = format!("Column '{}' does not exist in {}", name, schema_display);
+            if !context.is_empty() {
+                message.push_str(&format!(" ({})", context));
+            }
+            if let Some(suggestion) = find_best_match(name, base_cols) {
+                message.push_str(&format!(" (did you mean '{}'?)", suggestion));
+            }
+            errors.push(LintError {
+                line,
+                col,
+                code: code.to_string(),
+                message,
+                severity: severity.to_string(),
+            });
+        }
+    }
+
+    // PySpark's concat-equivalents. All three are more determinate than pandas'
+    // `concat`, and are tracked more narrowly than it as a result:
+    //
+    // * `union`/`unionAll` resolve columns BY POSITION -- "following the standard
+    //   behavior in SQL", per PySpark's own docs -- so the result carries the LEFT
+    //   frame's column names whatever the right frame calls its columns. Spark
+    //   rejects a mismatched column count outright, so for any program that runs at
+    //   all, left's schema is exactly the result's.
+    // * `unionByName` resolves by name and likewise yields left's columns, EXCEPT
+    //   with `allowMissingColumns=True`, the one case where the result really is the
+    //   union of both sides. That case is tracked only when the right side is itself
+    //   a tracked frame; otherwise the extra columns are unknowable and the binding
+    //   is dropped rather than guessed at.
+    //
+    // Deliberately NOT extended to `join`, which stays untracked: a Spark join's
+    // output columns depend on the join type (`left_semi`/`left_anti` return only the
+    // left side's), on whether `on` is a name list (which collapses the join keys
+    // into one column) or a condition (which keeps both), and on how duplicate names
+    // across the two sides resolve. That is the runtime-dependent bucket this checker
+    // leaves alone by design.
+    fn track_spark_union(
+        &mut self,
+        func_name: &str,
+        call: &ast::ExprCall,
+        recv: &Expr,
+        target_names: &[String],
+        line: usize,
+    ) {
+        let Some((_, left_cols, _)) = self.tracked_receiver(recv) else {
+            return;
+        };
+        let allow_missing_expr = call
+            .arguments
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("allowMissingColumns"))
+            .map(|k| &k.value)
+            .or_else(|| call.arguments.args.get(1));
+        let allow_missing = func_name == "unionByName"
+            && matches!(allow_missing_expr, Some(Expr::BooleanLiteral(b)) if b.value);
+        if !allow_missing {
+            self.track_columns(left_cols, target_names, line);
+            return;
+        }
+        match call
+            .arguments
+            .args
+            .first()
+            .and_then(|a| self.tracked_receiver(a))
+        {
+            Some((_, right_cols, _)) => {
+                let mut cols = left_cols;
+                for c in right_cols {
+                    if !cols.contains(&c) {
+                        cols.push(c);
+                    }
+                }
+                self.track_columns(cols, target_names, line);
+            }
+            None => self.untrack_targets(target_names),
+        }
+    }
+
+    // A PySpark schema expression resolved to its column names — inlined at the call
+    // site (`StructType([...])`, a DDL string, a list of names) or, failing that,
+    // referred to by a variable recorded in `spark_schema_vars`.
+    fn resolve_spark_schema(&self, expr: &Expr) -> Option<Vec<String>> {
+        ast_extract::extract_spark_schema_columns(expr).or_else(|| match expr {
+            Expr::Name(n) => self.spark_schema_vars.get(n.id.as_str()).cloned(),
+            _ => None,
+        })
+    }
+
+    // Register a native PySpark DataFrame origin: a `spark.read…` call, a
+    // `spark.createDataFrame(...)`, or a `.select(...)` chained straight onto a read.
+    //
+    // `cols` is `None` when the column set genuinely isn't knowable at lint time —
+    // Spark decides it at runtime from the data (schema inference) or from the
+    // catalog. That is the same situation a bare `pd.read_csv()` is in, so it gets
+    // the same `untracked-dataframe` warning and the same coverage accounting, with
+    // a hint naming Spark's own ways of making it knowable.
+    fn register_spark_dataframe(
+        &mut self,
+        cols: Option<Vec<String>>,
+        target_names: &[String],
+        line: usize,
+        col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        self.dataframes_total += 1;
+        match cols {
+            Some(cols) => {
+                self.dataframes_typed += 1;
+                self.track_columns(cols, target_names, line);
+            }
+            None => {
+                let var_hint = target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                self.untrack_targets(target_names);
+                self.record_untyped_site(var_hint, line, col);
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNTRACKED_DATAFRAME.to_string(),
+                    message: "columns unknown at lint time; Spark resolves this schema at \
+                              runtime -- declare it instead, e.g. \
+                              `.schema(\"id INT, name STRING\")` or \
+                              `.schema(StructType([...]))`, chain a `.select(...)` naming \
+                              the columns, or annotate the variable's type, e.g. \
+                              `df: Annotated[pyspark.sql.DataFrame, MySchema] = ...`"
+                        .to_string(),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
+    }
+
+    // The receiver of a `<name>.<method>(...)` call, resolved to its tracked schema
+    // name, that schema's columns, and the line it was defined on. `None` whenever
+    // the receiver isn't a plain tracked variable, or its schema is *open* (columns
+    // deliberately incomplete — see `open_schemas`), where deriving an exact new
+    // column set from an incomplete one would manufacture false unknown-columns.
+    fn tracked_receiver(&self, recv: &Expr) -> Option<(String, Vec<String>, usize)> {
+        let Expr::Name(name) = recv else {
+            return None;
+        };
+        let (schema_name, defined_line) = self.variables.get(name.id.as_str())?;
+        if self.open_schemas.contains(schema_name) {
+            return None;
+        }
+        let cols = self.schemas.get(schema_name)?.clone();
+        Some((schema_name.clone(), cols, *defined_line))
+    }
+
     // Resolve a `self.functions`/`class_methods`/cross-file `class_methods`
     // entry to an actual schema name usable in `self.variables`. Most entries already
     // ARE a real schema name and pass through unchanged; `OPEN_FRAME_MARKER` is the one
@@ -2464,6 +2683,12 @@ impl Linter {
                                 (schema_name.to_string(), fn_def_line),
                             );
                         }
+                        // `def load(spark: SparkSession)` — the other way a name gets
+                        // into `spark_sessions` besides a `getOrCreate()` chain, and the
+                        // usual one in code that takes its session as an argument.
+                        if ast_extract::is_spark_session_annotation(annotation) {
+                            self.spark_sessions.insert(p.parameter.name.id.to_string());
+                        }
                     }
                 }
 
@@ -2685,6 +2910,29 @@ impl Linter {
                                 self.variables
                                     .insert(target_recv.id.to_string(), (new_schema, current_line));
                             }
+                        }
+                    }
+                }
+
+                // `schema = StructType([...])` / `= "id INT, name STRING"` /
+                // `= ["id", "name"]` — a PySpark schema bound to a name, which is how
+                // real Spark code usually declares one rather than inlining it into the
+                // read call. Recorded here so `spark.read.schema(schema)` and
+                // `spark.createDataFrame(rows, schema)` can resolve it.
+                //
+                // Registering the looser forms (a bare list, a bare string) is safe
+                // because this map is ONLY consulted where a Spark schema is already
+                // expected; an unrelated `cols = ["a", "b"]` simply never gets looked
+                // up. Reassignment overwrites, so this stays correct in top-to-bottom
+                // order like every other binding this checker tracks.
+                if let [Expr::Name(target_name)] = assign.targets.as_slice() {
+                    match ast_extract::extract_spark_schema_columns(&assign.value) {
+                        Some(cols) => {
+                            self.spark_schema_vars
+                                .insert(target_name.id.to_string(), cols);
+                        }
+                        None => {
+                            self.spark_schema_vars.remove(target_name.id.as_str());
                         }
                     }
                 }
@@ -3081,8 +3329,21 @@ impl Linter {
                                         }
                                     }
                                 }
-                            } else if ROW_PASSTHROUGH_METHODS.contains(&func_name) {
-                                // Row-preserving ops: propagate base schema unchanged
+                            } else if ROW_PASSTHROUGH_METHODS.contains(&func_name)
+                                || SPARK_ROW_PASSTHROUGH_METHODS.contains(&func_name)
+                            {
+                                // Row-preserving ops: propagate base schema unchanged.
+                                //
+                                // Note that neither list is gated on which library the
+                                // receiver came from — the linter tracks a variable's
+                                // column set, not its backend. That is why PySpark's
+                                // `head`/`tail`/`first` are NOT in
+                                // `SPARK_ROW_PASSTHROUGH_METHODS`: they return
+                                // `Row`/`list[Row]` rather than a DataFrame, but
+                                // `head`/`tail` are already in the shared
+                                // `ROW_PASSTHROUGH_METHODS` for pandas, where they do
+                                // return a frame, and there is no per-variable backend
+                                // to tell the two apart.
                                 if let Expr::Name(recv) = &*attr.value {
                                     if let Some((base_schema, _)) =
                                         self.variables.get(recv.id.as_str())
@@ -3098,7 +3359,12 @@ impl Linter {
                                         }
                                     }
                                 }
-                            } else if func_name == "select" {
+                            } else if func_name == "select" && matches!(&*attr.value, Expr::Name(_))
+                            {
+                                // The receiver check is hoisted into the branch guard so
+                                // that a `select` on a NON-variable receiver falls
+                                // through to the Spark `read(...).select(...)` branch
+                                // below instead of being swallowed here.
                                 if let Expr::Name(recv) = &*attr.value {
                                     let recv_str = recv.id.as_str();
                                     let base_info =
@@ -3106,15 +3372,44 @@ impl Linter {
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
+                                    // Two readings, in order: the pandas/polars
+                                    // `select(["a", "b"])` literal list, then PySpark's
+                                    // `select(*cols)` varargs (which also covers polars'
+                                    // `select(pl.col("a"), ...)` expression form, since
+                                    // both idioms spell a column reference the same way
+                                    // — see `extract_spark_select_items`).
+                                    //
+                                    // The result is a pair: the OUTPUT column names, and
+                                    // the subset of them that names a source column on
+                                    // the receiver and so can be checked for existence.
+                                    // Those differ exactly when an item is renamed —
+                                    // `F.col("id").alias("user_id")` outputs `user_id`,
+                                    // which is deliberately not a receiver column.
                                     let selected_cols = call
                                         .arguments
                                         .args
                                         .first()
-                                        .and_then(ast_extract::extract_string_list);
+                                        .and_then(ast_extract::extract_string_list)
+                                        .map(|cols| (cols.clone(), cols))
+                                        .or_else(|| {
+                                            ast_extract::extract_spark_select_items(call, recv_str)
+                                                .map(|items| {
+                                                    (
+                                                        items
+                                                            .iter()
+                                                            .map(|i| i.output.clone())
+                                                            .collect::<Vec<_>>(),
+                                                        items
+                                                            .iter()
+                                                            .filter_map(|i| i.source.clone())
+                                                            .collect::<Vec<_>>(),
+                                                    )
+                                                })
+                                        });
                                     match selected_cols {
-                                        Some(cols) => {
+                                        Some((cols, sources)) => {
                                             if let Some(ref bc) = base_cols {
-                                                for col in &cols {
+                                                for col in &sources {
                                                     if !bc.contains(col) {
                                                         let schema_display = base_info
                                                             .as_ref()
@@ -3538,6 +3833,272 @@ impl Linter {
                                             name.clone(),
                                             (schema_name.clone(), current_line),
                                         );
+                                    }
+                                }
+                            } else if SPARK_READ_METHODS.contains(&func_name)
+                                && ast_extract::spark_reader_schema(&attr.value).is_some()
+                            {
+                                // PySpark: `spark.read.csv(path)` / `.parquet(...)` /
+                                // `.load(...)` / `.table(...)`. Unlike pandas there is no
+                                // read-time column subset to read off — the column set
+                                // comes from an explicit schema, given either as
+                                // `.schema(...)` earlier in the reader chain or as this
+                                // call's own `schema=` (which `csv`/`json` also accept
+                                // positionally, as does `load` in third position).
+                                let chain_schema =
+                                    ast_extract::spark_reader_schema(&attr.value).flatten();
+                                let kwarg_schema = call
+                                    .arguments
+                                    .keywords
+                                    .iter()
+                                    .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("schema"))
+                                    .map(|k| &k.value);
+                                let positional_schema = match func_name {
+                                    "csv" | "json" => call.arguments.args.get(1),
+                                    "load" => call.arguments.args.get(2),
+                                    _ => None,
+                                };
+                                let cols = chain_schema
+                                    .or(kwarg_schema)
+                                    .or(positional_schema)
+                                    .and_then(|e| self.resolve_spark_schema(e));
+                                let target_names = assign_target_names(assign);
+                                self.register_spark_dataframe(
+                                    cols,
+                                    &target_names,
+                                    current_line,
+                                    current_col,
+                                    errors,
+                                );
+                            } else if func_name == "select"
+                                && ast_extract::is_spark_read_call(&attr.value)
+                            {
+                                // `spark.read.csv(path).select("id", "amount")` — a
+                                // select chained straight onto a read. The read's own
+                                // schema is unknown, but a select whose every item
+                                // resolves to a name states the output columns outright,
+                                // so the chain as a whole IS knowable. This is the second
+                                // of the two ways a Spark read becomes trackable, and the
+                                // one the `untracked-dataframe` hint points at.
+                                //
+                                // There is no receiver schema to validate against here
+                                // (the read is untyped by construction), so the resolved
+                                // items are taken as the column set without a membership
+                                // check — there is nothing to check them against.
+                                let cols = ast_extract::extract_spark_select_items(call, "").map(
+                                    |items| items.into_iter().map(|i| i.output).collect::<Vec<_>>(),
+                                );
+                                let target_names = assign_target_names(assign);
+                                self.register_spark_dataframe(
+                                    cols,
+                                    &target_names,
+                                    current_line,
+                                    current_col,
+                                    errors,
+                                );
+                            } else if func_name == "createDataFrame" {
+                                // `spark.createDataFrame(rows, schema)` — the schema is
+                                // the second positional argument or the `schema=` keyword,
+                                // in any of the forms `extract_spark_schema_columns`
+                                // knows. Not gated on the receiver being a recognized
+                                // session: `createDataFrame` is a distinctive enough name
+                                // to dispatch on alone, the same reasoning
+                                // `fetch_pandas_all` already uses.
+                                let schema_expr = call
+                                    .arguments
+                                    .keywords
+                                    .iter()
+                                    .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("schema"))
+                                    .map(|k| &k.value)
+                                    .or_else(|| call.arguments.args.get(1));
+                                let cols = schema_expr.and_then(|e| self.resolve_spark_schema(e));
+                                let target_names = assign_target_names(assign);
+                                self.register_spark_dataframe(
+                                    cols,
+                                    &target_names,
+                                    current_line,
+                                    current_col,
+                                    errors,
+                                );
+                            } else if func_name == "sql"
+                                && matches!(&*attr.value, Expr::Name(n)
+                                    if self.spark_sessions.contains(n.id.as_str()))
+                            {
+                                // `df = spark.sql("SELECT ...")` kept as a NATIVE Spark
+                                // DataFrame — the columns come from the SELECT list, the
+                                // same inference `spark.sql(...).toPandas()` already uses,
+                                // reached through the same `register_sql_dataframe`. The
+                                // two paths can't collide: that one matches on the outer
+                                // `.toPandas()` call, this one only when the `.sql(...)`
+                                // call is itself the assigned value.
+                                //
+                                // Gated on `spark_sessions` because `sql` is shared with
+                                // DuckDB, whose `duckdb.sql(q)` returns a relation rather
+                                // than a DataFrame -- see the field's doc comment.
+                                let sql = self.extract_sql_literal(call);
+                                let target_names = assign_target_names(assign);
+                                let var_hint =
+                                    target_names.first().map(|s| s.as_str()).unwrap_or("df");
+                                self.register_sql_dataframe(
+                                    sql.as_deref(),
+                                    &target_names,
+                                    var_hint,
+                                    current_line,
+                                    current_col,
+                                    errors,
+                                );
+                            } else if func_name == "withColumn" || func_name == "withColumns" {
+                                // PySpark's assign-equivalent. `withColumn(name, expr)`
+                                // adds or REPLACES one column; `withColumns({name: expr})`
+                                // does the same for several at once. Either way the output
+                                // is the receiver's columns plus any name not already
+                                // there — exactly pandas' `assign(**kwargs)` semantics,
+                                // with the names in an argument rather than in keywords.
+                                let added = if func_name == "withColumn" {
+                                    call.arguments
+                                        .args
+                                        .first()
+                                        .and_then(|a| ast_extract::extract_string_literal(a))
+                                        .map(|s| vec![s.to_string()])
+                                } else {
+                                    match call.arguments.args.first() {
+                                        Some(Expr::Dict(dict)) => {
+                                            ast_extract::extract_dict_string_keys(dict)
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                let target_names = assign_target_names(assign);
+                                match (self.tracked_receiver(&attr.value), added) {
+                                    (Some((_, base_cols, _)), Some(added)) => {
+                                        let mut new_cols = base_cols;
+                                        for name in added {
+                                            if !new_cols.contains(&name) {
+                                                new_cols.push(name);
+                                            }
+                                        }
+                                        self.track_columns(new_cols, &target_names, current_line);
+                                    }
+                                    (Some(_), None) => {
+                                        // The new column's name is computed at runtime, so
+                                        // the output schema is unknown. Dropping the
+                                        // binding is what keeps `df = df.withColumn(name,
+                                        // ...)` from later reporting the added column as
+                                        // unknown -- see `untrack_targets`.
+                                        self.untrack_targets(&target_names);
+                                    }
+                                    (None, _) => {}
+                                }
+                            } else if func_name == "withColumnRenamed"
+                                || func_name == "withColumnsRenamed"
+                            {
+                                // PySpark's rename-equivalent:
+                                // `withColumnRenamed(existing, new)` takes the two names
+                                // as separate positional arguments (not a mapping the way
+                                // pandas' `rename(columns=...)` does), while
+                                // `withColumnsRenamed({old: new})` does take a mapping.
+                                //
+                                // Both are documented as a NO-OP when the source column is
+                                // absent, so a rename of a column that isn't there is a
+                                // silent bug at runtime -- worth reporting, and reported
+                                // with the same code and severity the pandas/polars
+                                // `rename` path already uses for the same mistake.
+                                let mapping =
+                                    if func_name == "withColumnRenamed" {
+                                        match (
+                                            call.arguments.args.first().and_then(|a| {
+                                                ast_extract::extract_string_literal(a)
+                                            }),
+                                            call.arguments.args.get(1).and_then(|a| {
+                                                ast_extract::extract_string_literal(a)
+                                            }),
+                                        ) {
+                                            (Some(old), Some(new)) => Some(HashMap::from([(
+                                                old.to_string(),
+                                                new.to_string(),
+                                            )])),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        match call.arguments.args.first() {
+                                            Some(Expr::Dict(dict)) => {
+                                                ast_extract::extract_string_dict(dict)
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                let target_names = assign_target_names(assign);
+                                match (self.tracked_receiver(&attr.value), mapping) {
+                                    (Some((schema_name, base_cols, def_line)), Some(mapping)) => {
+                                        let mut renamed: Vec<String> =
+                                            mapping.keys().cloned().collect();
+                                        renamed.sort();
+                                        self.check_columns_exist(
+                                            &renamed,
+                                            &base_cols,
+                                            &schema_name,
+                                            def_line,
+                                            current_line,
+                                            current_col,
+                                            CODE_UNKNOWN_COLUMN,
+                                            "error",
+                                            "rename",
+                                            errors,
+                                        );
+                                        let new_cols: Vec<String> = base_cols
+                                            .iter()
+                                            .map(|c| {
+                                                mapping.get(c).cloned().unwrap_or_else(|| c.clone())
+                                            })
+                                            .collect();
+                                        self.track_columns(new_cols, &target_names, current_line);
+                                    }
+                                    (Some(_), None) => self.untrack_targets(&target_names),
+                                    (None, _) => {}
+                                }
+                            } else if func_name == "union"
+                                || func_name == "unionAll"
+                                || func_name == "unionByName"
+                            {
+                                self.track_spark_union(
+                                    func_name,
+                                    call,
+                                    &attr.value,
+                                    &assign_target_names(assign),
+                                    current_line,
+                                );
+                            } else if func_name == "toDF" {
+                                // `df.toDF("a", "b")` renames every column positionally,
+                                // so the argument list IS the output schema. A bare
+                                // `toDF()` (the RDD-to-DataFrame form) names nothing and
+                                // leaves the columns unknown.
+                                let target_names = assign_target_names(assign);
+                                let renamed: Option<Vec<String>> = call
+                                    .arguments
+                                    .args
+                                    .iter()
+                                    .map(|a| {
+                                        ast_extract::extract_string_literal(a)
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect();
+                                match renamed {
+                                    Some(cols)
+                                        if !cols.is_empty()
+                                            && self.tracked_receiver(&attr.value).is_some() =>
+                                    {
+                                        self.track_columns(cols, &target_names, current_line);
+                                    }
+                                    _ => self.untrack_targets(&target_names),
+                                }
+                            } else if func_name == "getOrCreate" {
+                                // `spark = SparkSession.builder.appName(...).getOrCreate()`
+                                // — not a DataFrame, but the binding that later lets
+                                // `spark.sql(...)` be recognized as Spark's rather than
+                                // some other library's. See `spark_sessions`.
+                                if ast_extract::is_spark_session_builder(&assign.value) {
+                                    for name in assign_target_names(assign) {
+                                        self.spark_sessions.insert(name);
                                     }
                                 }
                             } else if func_name == "pop" {
@@ -4155,6 +4716,7 @@ impl Linter {
                             let attr_name = attr.attr.as_str();
                             if !self.schema_has_column(schema_name, attr_name)
                                 && !RESERVED_METHODS.contains(&attr_name)
+                                && !SPARK_RESERVED_ATTRIBUTES.contains(&attr_name)
                             {
                                 let (line, col) = self.source_location(attr.range().start());
                                 let schema_display =
@@ -4272,6 +4834,20 @@ impl Linter {
             _ => {}
         }
     }
+}
+
+// Every plain-name target of an assignment (`a = b = <value>` binds two). Non-name
+// targets — subscripts, attributes, tuple unpacking — are handled elsewhere and are
+// skipped here.
+fn assign_target_names(assign: &ast::StmtAssign) -> Vec<String> {
+    assign
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            Expr::Name(n) => Some(n.id.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -8126,5 +8702,636 @@ def process(path: str) -> None:
         assert_eq!(errors[0].code, "missing-column");
         assert!(errors[0].message.contains("missing column(s) {c}"));
         assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PySpark native DataFrame tracking (experimental)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // Every PySpark test below builds on the same declared-schema read, which is the
+    // only way a Spark read has a knowable column set without an annotation.
+    fn spark_source(body: &str) -> String {
+        format!(
+            r#"
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("t").getOrCreate()
+df = spark.read.schema("order_id INT, amount DOUBLE, region STRING").csv("o.csv")
+{body}
+"#
+        )
+    }
+
+    fn check(source: &str) -> Vec<LintError> {
+        let mut linter = Linter::new();
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap()
+    }
+
+    fn check_spark(body: &str) -> Vec<LintError> {
+        check(&spark_source(body))
+    }
+
+    #[test]
+    fn test_should_infer_spark_read_schema_from_a_ddl_string() {
+        // arrange/act
+        let errors = check_spark("print(df[\"region\"])\nprint(df[\"regoin\"])");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("regoin"));
+        assert!(errors[0].message.contains("did you mean 'region'?"));
+    }
+
+    #[test]
+    fn test_should_infer_spark_read_schema_from_a_struct_type() {
+        // arrange
+        let source = r#"
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType
+
+spark = SparkSession.builder.getOrCreate()
+schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+df = spark.read.schema(StructType([StructField("id", IntegerType()), StructField("name", StringType())])).parquet("p")
+print(df["name"])
+print(df["nope"])
+"#;
+
+        // act
+        let errors = check(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn test_should_infer_spark_read_schema_from_keyword_and_positional_arguments() {
+        // `csv`/`json` take the schema as their second positional argument as well as
+        // by keyword, so both spellings have to resolve.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+positional = spark.read.csv("x.csv", "m INT, n INT")
+keyword = spark.read.json("x.json", schema="p INT, q INT")
+print(positional["m"])
+print(keyword["p"])
+print(positional["nope"])
+print(keyword["nope"])
+"#;
+
+        // act
+        let errors = check(source);
+
+        // assert
+        assert_eq!(errors.len(), 2, "errors: {errors:#?}");
+        assert!(errors.iter().all(|e| e.message.contains("nope")));
+    }
+
+    #[test]
+    fn test_should_warn_that_an_undeclared_spark_read_has_unknown_columns() {
+        // Spark infers this schema at runtime from the data -- the same situation a
+        // bare `pd.read_csv()` is in, and it gets the same warning. Crucially the
+        // variable is then left UNTRACKED, so no column access on it is reported.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.read.csv("o.csv")
+print(df["anything_at_all"])
+"#;
+
+        // act
+        let errors = check(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(errors[0].severity, "warning");
+        assert!(errors[0]
+            .message
+            .contains("Spark resolves this schema at runtime"));
+    }
+
+    #[test]
+    fn test_should_infer_spark_columns_from_a_select_chained_onto_an_undeclared_read() {
+        // The second of the two ways a Spark read becomes knowable, and the one the
+        // untracked-dataframe hint points at.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.read.csv("o.csv").select("order_id", "amount")
+print(df["amount"])
+print(df["region"])
+"#;
+
+        // act
+        let errors = check(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("region"));
+    }
+
+    #[test]
+    fn test_should_infer_spark_createdataframe_columns_from_its_schema_argument() {
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.createDataFrame([], ["id", "label"])
+print(df["label"])
+print(df["missing"])
+"#;
+
+        // act
+        let errors = check(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_should_track_spark_withcolumn_as_the_assign_equivalent() {
+        // arrange/act
+        let errors = check_spark(
+            "out = df.withColumn(\"tax\", F.col(\"amount\") * 0.2)\n\
+             print(out[\"tax\"])\n\
+             print(out[\"amount\"])\n\
+             print(out[\"nope\"])",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn test_should_validate_spark_f_col_references_against_the_receiver() {
+        // `F.col("...")` is Spark's `pl.col("...")`, and is checked the same way.
+        let errors = check_spark("out = df.withColumn(\"tax\", F.col(\"nonexistent\") * 2)");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_should_track_spark_withcolumns_dict_form() {
+        let errors = check_spark(
+            "out = df.withColumns({\"tax\": F.col(\"amount\"), \"flag\": F.lit(1)})\n\
+             print(out[\"tax\"])\n\
+             print(out[\"flag\"])\n\
+             print(out[\"nope\"])",
+        );
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn test_should_untrack_a_spark_withcolumn_whose_name_is_computed_at_runtime() {
+        // The output schema is genuinely unknown, so the binding is dropped rather
+        // than left stale -- otherwise `df = df.withColumn(name, ...)` would report
+        // the added column as unknown on every later access.
+        let errors = check_spark(
+            "name = \"computed\"\n\
+             df = df.withColumn(name, F.lit(1))\n\
+             print(df[\"computed\"])\n\
+             print(df[\"anything\"])",
+        );
+
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_should_track_spark_withcolumnrenamed_as_the_rename_equivalent() {
+        // Spark takes the two names as separate positional arguments, not a mapping.
+        let errors = check_spark(
+            "out = df.withColumnRenamed(\"amount\", \"total\")\n\
+             print(out[\"total\"])\n\
+             print(out[\"amount\"])",
+        );
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("amount"));
+    }
+
+    #[test]
+    fn test_should_report_a_spark_rename_of_a_column_that_does_not_exist() {
+        // PySpark documents withColumnRenamed as a NO-OP when the column is absent,
+        // so this is a silent bug at runtime and worth reporting.
+        let errors = check_spark("out = df.withColumnRenamed(\"missing\", \"x\")");
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("missing"));
+        assert!(errors[0].message.contains("rename"));
+    }
+
+    #[test]
+    fn test_should_track_spark_withcolumnsrenamed_mapping_form() {
+        let errors = check_spark(
+            "out = df.withColumnsRenamed({\"amount\": \"total\"})\n\
+             print(out[\"total\"])\n\
+             print(out[\"amount\"])",
+        );
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("amount"));
+    }
+
+    #[test]
+    fn test_should_track_spark_drop_varargs() {
+        // Spark's `drop(*cols)` takes bare column-name varargs, unlike pandas'
+        // `columns=[...]` keyword.
+        let errors = check_spark(
+            "out = df.drop(\"region\", \"amount\")\n\
+             print(out[\"order_id\"])\n\
+             print(out[\"amount\"])",
+        );
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("amount"));
+    }
+
+    #[test]
+    fn test_should_track_spark_select_varargs_and_aliases() {
+        // The alias is the OUTPUT name; the aliased source column is validated
+        // separately, so an alias never manufactures an unknown-column of its own.
+        let errors = check_spark(
+            "out = df.select(F.col(\"order_id\"), F.col(\"amount\").alias(\"total\"))\n\
+             print(out[\"total\"])\n\
+             print(out[\"order_id\"])\n\
+             print(out[\"region\"])",
+        );
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("region"));
+    }
+
+    #[test]
+    fn test_should_report_a_spark_select_of_a_column_that_does_not_exist_exactly_once() {
+        // Guards against double-reporting: the select branch and
+        // validate_pl_col_args_on_receiver both see this expression.
+        let errors = check_spark("out = df.select(F.col(\"bogus\"))");
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("bogus"));
+
+        // The bare-string form is the one only the select branch sees.
+        let string_form = check_spark("out = df.select(\"order_id\", \"bogus\")");
+        assert_eq!(string_form.len(), 1, "errors: {string_form:#?}");
+        assert!(string_form[0].message.contains("bogus"));
+    }
+
+    #[test]
+    fn test_should_carry_the_schema_through_a_spark_select_star() {
+        // `select("*")` is unresolvable as a column list, so the receiver's schema is
+        // carried forward unchanged rather than replaced by a wrong one.
+        let errors =
+            check_spark("out = df.select(\"*\")\nprint(out[\"region\"])\nprint(out[\"nope\"])");
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn test_should_carry_the_schema_through_spark_row_passthrough_methods() {
+        for method in [
+            "where(F.col(\"amount\") > 1)",
+            "limit(5)",
+            "orderBy(\"amount\")",
+            "distinct()",
+            "dropDuplicates()",
+            "repartition(4)",
+            "cache()",
+            "alias(\"t\")",
+        ] {
+            let errors = check_spark(&format!(
+                "out = df.{method}\nprint(out[\"region\"])\nprint(out[\"nope\"])"
+            ));
+            assert_eq!(errors.len(), 1, "method {method}, errors: {errors:#?}");
+            assert!(errors[0].message.contains("nope"), "method {method}");
+        }
+    }
+
+    #[test]
+    fn test_should_take_the_left_schema_for_a_spark_union() {
+        // union/unionAll resolve columns BY POSITION, so the result carries the left
+        // frame's names whatever the right frame calls its columns.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+left = spark.read.schema("a INT, b STRING").csv("x.csv")
+right = spark.read.schema("b STRING, c DOUBLE").csv("y.csv")
+u = left.union(right)
+print(u["a"])
+print(u["c"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("'c'"));
+    }
+
+    #[test]
+    fn test_should_union_both_schemas_for_spark_unionbyname_allowing_missing_columns() {
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+left = spark.read.schema("a INT, b STRING").csv("x.csv")
+right = spark.read.schema("b STRING, c DOUBLE").csv("y.csv")
+u = left.unionByName(right, allowMissingColumns=True)
+print(u["a"])
+print(u["c"])
+print(u["zz"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("zz"));
+    }
+
+    #[test]
+    fn test_should_untrack_a_spark_unionbyname_whose_right_side_is_unknown() {
+        // With allowMissingColumns=True the result really is the union of both sides,
+        // so an untracked right side makes the whole output unknowable.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+left = spark.read.schema("a INT, b STRING").csv("x.csv")
+right = spark.read.csv("y.csv")
+u = left.unionByName(right, allowMissingColumns=True)
+print(u["anything"])
+"#;
+
+        let errors = check(source);
+
+        // Only the untracked-dataframe warning for `right` itself.
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+    }
+
+    #[test]
+    fn test_should_leave_a_spark_join_untracked() {
+        // A Spark join's output depends on the join type, on whether `on` is a name
+        // list or a condition, and on duplicate names across the two sides -- the
+        // runtime-dependent bucket this checker leaves alone.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+left = spark.read.schema("a INT, b STRING").csv("x.csv")
+right = spark.read.schema("b STRING, c DOUBLE").csv("y.csv")
+j = left.join(right, "b")
+print(j["anything_at_all"])
+"#;
+
+        let errors = check(source);
+
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_should_track_spark_todf_positional_rename() {
+        let errors = check_spark(
+            "out = df.toDF(\"p\", \"q\", \"r\")\nprint(out[\"p\"])\nprint(out[\"order_id\"])",
+        );
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("order_id"));
+    }
+
+    #[test]
+    fn test_should_track_a_native_spark_sql_call_from_a_session_variable() {
+        // `df = spark.sql(...)` kept as a NATIVE Spark DataFrame -- distinct from the
+        // pre-existing `spark.sql(...).toPandas()` connector path.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.sql("SELECT order_id, amount FROM orders")
+print(df["amount"])
+print(df["region"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("region"));
+    }
+
+    #[test]
+    fn test_should_track_a_native_spark_sql_call_from_an_annotated_parameter() {
+        let source = r#"
+from pyspark.sql import SparkSession
+
+def load(session: SparkSession) -> None:
+    df = session.sql("SELECT id, total FROM t")
+    print(df["total"])
+    print(df["nope"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn test_should_not_track_a_sql_call_on_a_receiver_that_is_not_a_spark_session() {
+        // `sql` is shared with DuckDB, where the result is a relation rather than a
+        // DataFrame. Registering one would make ordinary relation methods look like
+        // unknown column accesses, so an unrecognized receiver is left alone.
+        let source = r#"
+import duckdb
+
+rel = duckdb.sql("SELECT id FROM t")
+print(rel["whatever"])
+print(rel.fetchall())
+"#;
+
+        let errors = check(source);
+
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_should_leave_the_spark_sql_to_pandas_connector_path_untouched() {
+        // The pre-existing SQL-connector path matches on the outer `.toPandas()`
+        // call, so it still claims this chain -- the native `.sql()` branch only
+        // fires when the `.sql(...)` call is itself the assigned value.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.sql("SELECT customer_id, amount FROM orders").toPandas()
+print(df["amount"])
+print(df["region"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("region"));
+    }
+
+    #[test]
+    fn test_should_track_an_annotated_pyspark_dataframe() {
+        let source = r#"
+from typing import Annotated
+import pyspark
+from pyspark.sql import DataFrame, SparkSession
+from typedframes import BaseSchema, Column
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+    amount = Column(type=float)
+
+spark = SparkSession.builder.getOrCreate()
+qualified: Annotated[pyspark.sql.DataFrame, OrderSchema] = spark.read.csv("o.csv")
+bare: Annotated[DataFrame, OrderSchema] = spark.read.csv("o.csv")
+print(qualified["amount"])
+print(bare["amount"])
+print(qualified["region"])
+print(bare["region"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 2, "errors: {errors:#?}");
+        assert!(errors.iter().all(|e| e.message.contains("region")));
+        assert!(errors.iter().all(|e| e.message.contains("OrderSchema")));
+    }
+
+    #[test]
+    fn test_should_recognize_a_pyspark_dataframe_return_annotation() {
+        let source = r#"
+from typing import Annotated
+import pyspark
+from typedframes import BaseSchema, Column
+
+class OrderSchema(BaseSchema):
+    order_id = Column(type=int)
+    amount = Column(type=float)
+
+def load() -> Annotated[pyspark.sql.DataFrame, OrderSchema]: ...
+
+df = load()
+print(df["amount"])
+print(df["region"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(errors[0].message.contains("region"));
+    }
+
+    #[test]
+    fn test_should_not_report_spark_dataframe_methods_as_unknown_columns() {
+        // A tracked Spark frame has a large non-column attribute surface that
+        // RESERVED_METHODS (pandas/polars only) doesn't cover.
+        let errors = check_spark(
+            "df.printSchema()\n\
+             df.show()\n\
+             df.createOrReplaceTempView(\"t\")\n\
+             df.write.mode(\"overwrite\").saveAsTable(\"t\")\n\
+             print(df.na)\n\
+             print(df.rdd)\n\
+             print(df.isStreaming)",
+        );
+
+        assert!(errors.is_empty(), "errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_should_count_a_declared_spark_read_as_a_typed_dataframe() {
+        // Coverage accounting: a declared read counts as resolved, an undeclared one
+        // counts as an origin that failed to resolve, and records the site.
+        let mut linter = Linter::new();
+        let source = spark_source("");
+        linter
+            .check_file_internal(&source, Path::new("test.py"))
+            .unwrap();
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+
+        let mut undeclared = Linter::new();
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.read.csv("o.csv")
+"#;
+        undeclared
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+        assert_eq!(undeclared.dataframes_total, 1);
+        assert_eq!(undeclared.dataframes_typed, 0);
+        assert_eq!(undeclared.untyped_sites.len(), 1);
+        assert_eq!(undeclared.untyped_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_resolve_a_spark_schema_held_in_a_variable() {
+        // Declaring the schema in a variable and passing it to `.schema(...)` is the
+        // idiomatic Spark spelling; resolving only the inlined form would miss it.
+        let source = r#"
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType
+
+spark = SparkSession.builder.getOrCreate()
+schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+names = ["a", "b"]
+ddl = "p INT, q STRING"
+
+from_struct = spark.read.schema(schema).parquet("x")
+from_ddl = spark.read.schema(ddl).csv("y")
+from_names = spark.createDataFrame([], names)
+
+print(from_struct["nope"])
+print(from_ddl["nope"])
+print(from_names["nope"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 3, "errors: {errors:#?}");
+        assert!(errors.iter().all(|e| e.code == CODE_UNKNOWN_COLUMN));
+    }
+
+    #[test]
+    fn test_should_forget_a_spark_schema_variable_that_is_reassigned_to_something_unresolvable() {
+        // Top-to-bottom order has to stay correct: once the name no longer holds a
+        // readable schema, the read that uses it is unknown again, not stale.
+        let source = r#"
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+schema = "p INT, q STRING"
+schema = build_schema()
+df = spark.read.schema(schema).csv("y")
+print(df["anything"])
+"#;
+
+        let errors = check(source);
+
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
     }
 }

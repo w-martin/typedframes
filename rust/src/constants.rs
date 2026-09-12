@@ -257,3 +257,167 @@ pub(crate) const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "ffill",
     "bfill",
 ];
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PySpark (`pyspark.sql.DataFrame`) — experimental native tracking
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// This is the NATIVE Spark DataFrame path: `spark.read.csv(...)` /
+// `spark.createDataFrame(...)` / `spark.sql(...)` kept as a Spark DataFrame and
+// chained through `.select()`/`.withColumn()`/… . It is deliberately distinct from
+// the pre-existing SQL-connector path (`SQL_PRODUCING_METHODS` /
+// `SQL_FINALIZE_METHODS`), which only fires for `spark.sql(sql).toPandas()` — a
+// chain that ends in a *pandas* DataFrame. The two never see the same AST node:
+// the SQL path matches on the outer `.toPandas()` call, this one on a `.sql()`
+// call that is itself the assigned value.
+
+// Module aliases conventionally used for `pyspark.sql.functions`, whose `col("x")`
+// is Spark's counterpart to polars' `pl.col("x")`. `F` is the near-universal
+// convention (`from pyspark.sql import functions as F`); `sf` and the unaliased
+// `functions` are the other two forms seen in the wild. The bare-imported form
+// (`from pyspark.sql.functions import col`, then `col("x")`) needs nothing here —
+// it is already covered by `ast_extract::extract_pl_col_name`'s backend-agnostic
+// bare-`col` branch.
+pub(crate) const SPARK_FUNCTIONS_MODULES: &[&str] = &["F", "sf", "functions"];
+
+// `DataFrameReader` methods that terminate a `spark.read…` chain by returning an
+// actual DataFrame. Unlike pandas' `read_csv(usecols=[...])` there is no
+// column-subset argument here: Spark's column set comes from an explicit
+// `.schema(...)`/`schema=` (a `StructType`, a DDL string, or a list of names), and
+// is otherwise decided at runtime by Spark's own schema inference — genuinely
+// unknowable at lint time, and reported with the same `untracked-dataframe`
+// warning a bare `pd.read_csv()` gets.
+//
+// `text` is deliberately absent: its schema is documented as `value` *plus any
+// partition columns*, so neither "unknown" nor a fixed `["value"]` is accurate,
+// and it is rare enough not to be worth an open-schema special case.
+pub(crate) const SPARK_READ_METHODS: &[&str] = &["csv", "parquet", "json", "orc", "load", "table"];
+
+// `DataFrameReader` methods that return the reader itself, so a `spark.read…`
+// chain can be walked through them looking for `.schema(...)`.
+pub(crate) const SPARK_READER_CHAIN_METHODS: &[&str] = &["option", "options", "format"];
+
+// Spark DataFrame methods that return a DataFrame with an identical column set:
+// row filters, orderings, partitioning/caching hints, and aliasing. Each was
+// checked against its PySpark signature and docstring for whether it really is
+// column-preserving (which is why `head`/`tail`/`first` are absent — in Spark they
+// return `Row`/`list[Row]`, not a DataFrame; see the note in the linter's
+// row-passthrough branch).
+//
+// Kept separate from `ROW_PASSTHROUGH_METHODS` rather than merged into it so the
+// Spark additions stay reviewable as a set; both lists are consulted at the same
+// call site, and neither is gated on the receiver's backend (the linter tracks a
+// variable's column set, not which library produced it).
+// PySpark `DataFrame` attributes and methods that are NOT column names, consulted
+// only where `df.<name>` attribute access is validated as a column reference (see
+// `Linter::visit_expr`). Without this, every `df.write…`, `df.printSchema()` or
+// `df.createOrReplaceTempView(...)` on a tracked Spark frame would be reported as an
+// unknown column — `RESERVED_METHODS` covers the pandas/polars surface only, and
+// Spark's is camelCase and largely disjoint from it.
+//
+// Deliberately NOT merged into `RESERVED_METHODS`, which is also used for the
+// `reserved-name` diagnostic: a pandas user whose schema has a column called `write`
+// or `observe` should not start being told it shadows a method that only exists in a
+// library they aren't using. The trade-off within Spark is the same one
+// `RESERVED_METHODS` already makes — a Spark column genuinely named `where` goes
+// unvalidated on attribute access — which is this checker's preferred direction.
+pub(crate) const SPARK_RESERVED_ATTRIBUTES: &[&str] = &[
+    "write",
+    "writeStream",
+    "writeTo",
+    "na",
+    "stat",
+    "rdd",
+    "sparkSession",
+    "isStreaming",
+    "isLocal",
+    "isEmpty",
+    "storageLevel",
+    "printSchema",
+    "show",
+    "take",
+    "toDF",
+    "toPandas",
+    "toArrow",
+    "toJSON",
+    "toLocalIterator",
+    "createTempView",
+    "createOrReplaceTempView",
+    "createGlobalTempView",
+    "createOrReplaceGlobalTempView",
+    "registerTempTable",
+    "selectExpr",
+    "withColumn",
+    "withColumns",
+    "withColumnRenamed",
+    "withColumnsRenamed",
+    "withWatermark",
+    "where",
+    "orderBy",
+    "sortWithinPartitions",
+    "distinct",
+    "dropDuplicates",
+    "drop_duplicates",
+    "dropDuplicatesWithinWatermark",
+    "union",
+    "unionAll",
+    "unionByName",
+    "intersect",
+    "intersectAll",
+    "exceptAll",
+    "subtract",
+    "crossJoin",
+    "groupBy",
+    "rollup",
+    "cube",
+    "unpivot",
+    "colRegex",
+    "repartition",
+    "repartitionByRange",
+    "repartitionById",
+    "coalesce",
+    "cache",
+    "persist",
+    "unpersist",
+    "checkpoint",
+    "localCheckpoint",
+    "hint",
+    "offset",
+    "explain",
+    "observe",
+    "summary",
+    "freqItems",
+    "approxQuantile",
+    "sampleBy",
+    "replace",
+    "inputFiles",
+    "foreach",
+    "foreachPartition",
+    "mapInPandas",
+    "mapInArrow",
+    "toPandasOnSpark",
+    "sameSemantics",
+    "semanticHash",
+];
+
+pub(crate) const SPARK_ROW_PASSTHROUGH_METHODS: &[&str] = &[
+    "where",
+    "limit",
+    "offset",
+    "orderBy",
+    "distinct",
+    "dropDuplicates",
+    "drop_duplicates",
+    "dropDuplicatesWithinWatermark",
+    "sortWithinPartitions",
+    "repartition",
+    "repartitionByRange",
+    "coalesce",
+    "cache",
+    "persist",
+    "unpersist",
+    "checkpoint",
+    "localCheckpoint",
+    "alias",
+    "hint",
+];

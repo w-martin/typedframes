@@ -11,7 +11,7 @@ use crate::constants::{
 };
 use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
-    CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME,
+    CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
 };
 use crate::errors::{LintError, UntypedSite};
 use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
@@ -194,10 +194,14 @@ pub struct Linter {
     // returns a DataFrame at all; counting it would inflate the denominator
     // with unrelated calls.
     pub dataframes_total: usize,
+    // An origin in `unresolved_schemas` does NOT bump this counter -- no
+    // `unknown-column` verdict is possible without a concrete column list, so
+    // every access on it raises `unverifiable-column` instead. Falls into
+    // `untyped_sites` like any other unresolved DataFrame (e.g. unparseable SQL).
     pub dataframes_typed: usize,
-    // Every origin counted in `dataframes_total` that did NOT resolve to a column
-    // set, recorded so the CLI can report which assignments cost coverage. Kept in
-    // step with the counters at each counting site rather than reconstructed later.
+    // Every origin counted in `dataframes_total` that did NOT resolve to a concrete
+    // column set. Kept in step with the counters at each counting site rather than
+    // reconstructed later.
     pub untyped_sites: Vec<UntypedSite>,
     // Every bare-Name variable subscripted (`x["col"]`) or method-called with a
     // RESERVED_METHODS name (`x.groupby(...)`) anywhere in the module. Populated by a
@@ -245,21 +249,21 @@ pub struct Linter {
     // A later reassignment simply overwrites the entry, consistent with how
     // `self.variables` already behaves elsewhere in this checker.
     pub(crate) stmt_var_candidates: HashMap<String, Vec<String>>,
-    // Names bound to a Feast `store.get_historical_features(...)`/
-    // `get_online_features(...)` result's resolved feature-name columns, BEFORE
-    // `.to_df()` is called on it (the split form: `job = store.get_...(...)`, then
-    // `df = job.to_df()`). Kept separate from `self.variables`/`self.schemas` — a
+    // Names bound to a Feast retrieval's resolved feature columns, plus entity_df's
+    // own columns when those resolved too (see `resolve_feast_entity_columns`) --
+    // BEFORE `.to_df()` (the split form: `job = store.get_...(...)`, then
+    // `df = job.to_df()`). Kept separate from `self.variables`/`self.schemas`: a
     // RetrievalJob/OnlineResponse isn't a DataFrame, so `job["x"]` shouldn't be
-    // validated as a column access the way it would be if `job` were registered there.
-    // See `register_feast_dataframe` for where this becomes an actual tracked frame.
-    pub(crate) retrieval_jobs: HashMap<String, Vec<String>>,
-    // Schema names (from `self.schemas`) whose known column list is deliberately
-    // incomplete — currently only Feast retrieval results (see
-    // `register_feast_dataframe`), whose real output also includes entity_df's join
-    // keys and timestamp column, not resolvable in general. `schema_has_column` treats
-    // membership against these as always `true`, so `unknown-column` can never
-    // false-positive on a real column this checker just doesn't know about.
-    pub(crate) open_schemas: std::collections::HashSet<String>,
+    // validated as a column access. See `register_feast_dataframe`.
+    pub(crate) retrieval_jobs: HashMap<String, (Vec<String>, Option<Vec<String>>)>,
+    // Schema names for a recognized DataFrame origin with no resolvable column
+    // list: a Feast retrieval whose entity_df isn't concretely typed (see
+    // `register_feast_dataframe` -- a typed entity_df gets unioned into a real
+    // schema instead and never lands here), or a bare `-> pd.DataFrame`/
+    // `-> pl.DataFrame` return with no attached Schema. Every access against one
+    // of these raises `unverifiable-column` (see `schema_has_column`'s call sites)
+    // rather than passing or false-positiving on a column this checker can't see.
+    pub(crate) unresolved_schemas: std::collections::HashSet<String>,
     // Cursor variable name -> the SQL text most recently passed to `cursor.execute(sql)`
     // (the PEP 249 pattern used by Snowflake, Redshift, and similar connectors), until
     // a later `cursor.fetch_pandas_all()` materializes it into a DataFrame. A second
@@ -320,6 +324,24 @@ pub struct Linter {
     // `self.schemas`/`self.functions` accumulate. A class defined in another file
     // needs the project index's own `class_methods` (see index.rs) instead.
     pub(crate) class_methods: HashMap<String, HashMap<String, String>>,
+}
+
+// The first plain-name assignment target, used to label a coverage site with the
+// variable a reader of the report would actually recognize. Falls back to `fallback`
+// for a target with no single name of its own (tuple unpacking, `obj.attr = ...`,
+// `d["k"] = ...`), matching what the existing untyped-site call sites already do.
+fn assign_var_hint(assign: &ast::StmtAssign, fallback: &str) -> String {
+    assign
+        .targets
+        .iter()
+        .find_map(|t| {
+            if let Expr::Name(n) = t {
+                Some(n.id.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -648,6 +670,10 @@ impl Default for Linter {
     }
 }
 
+// (feature_cols, entity_cols) resolved for a Feast retrieval -- see
+// Linter::register_feast_dataframe.
+type FeastColumns = (Option<Vec<String>>, Option<Vec<String>>);
+
 impl Linter {
     pub fn new() -> Self {
         Self {
@@ -673,7 +699,7 @@ impl Linter {
             string_var_candidates: HashMap::new(),
             stmt_var_candidates: HashMap::new(),
             retrieval_jobs: HashMap::new(),
-            open_schemas: std::collections::HashSet::new(),
+            unresolved_schemas: std::collections::HashSet::new(),
             cursor_sql: HashMap::new(),
             param_governed_templates: HashMap::new(),
             all_function_names: std::collections::BTreeSet::new(),
@@ -1306,11 +1332,8 @@ impl Linter {
     // `extract_select_args`: a silently-dropped element would understate the real
     // projection.
     //
-    // Note this can NEVER be the complete output column set regardless — Feast's real
-    // output also includes entity_df's join keys and timestamp column, which aren't
-    // resolvable in general. That's handled at the call site by registering the result
-    // as an *open* schema (`register_feast_dataframe`), not by trying to enumerate
-    // those columns here.
+    // Not the complete output on its own — Feast's real output also includes
+    // entity_df's own columns; see `resolve_feast_entity_columns`.
     fn extract_feast_feature_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
         let features_list = call
             .arguments
@@ -1333,6 +1356,27 @@ impl Linter {
         };
 
         ast_extract::feast_columns_from_list_expr(features_list, full_feature_names)
+    }
+
+    // Feast's output is entity_df's columns unioned with the requested features
+    // (Feast docs: retrieval keeps the entity rows and adds the joined feature
+    // values). Resolves entity_df to a concrete schema if we can; `None` if it
+    // isn't a plain `Name`, or is itself unresolved -- no partial credit.
+    fn resolve_feast_entity_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        let entity_expr = call
+            .arguments
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("entity_df"))
+            .map(|k| &k.value)?;
+        let Expr::Name(entity_name) = entity_expr else {
+            return None;
+        };
+        let (schema_name, _) = self.variables.get(entity_name.id.as_str())?;
+        if self.unresolved_schemas.contains(schema_name) {
+            return None;
+        }
+        self.schemas.get(schema_name).cloned()
     }
 
     // Shared by `extract_feast_feature_columns` above (the `features=` keyword found
@@ -1597,6 +1641,23 @@ impl Linter {
         });
     }
 
+    // Bumps `dataframes_typed` for a concrete schema, or records an `untyped_sites`
+    // entry for an unresolved one (caller owns `dataframes_total += 1` separately).
+    // Callers must insert into `unresolved_schemas` before calling this.
+    fn count_typed_dataframe(
+        &mut self,
+        schema_name: &str,
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+    ) {
+        if self.unresolved_schemas.contains(schema_name) {
+            self.record_untyped_site(var_hint, current_line, current_col);
+        } else {
+            self.dataframes_typed += 1;
+        }
+    }
+
     // Called at the end of the `x = call(...)` origin dispatch in the Assign handler,
     // after every recognized pattern (pd.read_csv/read_sql, connectorx, Feast,
     // SQL_PRODUCING_METHODS+SQL_FINALIZE_METHODS, Schema.from_pandas, a same-repo
@@ -1668,13 +1729,13 @@ impl Linter {
         }
     }
 
-    // Register `target_names` as a DataFrame materialized from a Feast retrieval
-    // (`.to_df()` on a `get_historical_features`/`get_online_features` result), with an
-    // *open* schema over `cols` when resolved. See `open_schemas`'s docs for why exact
-    // matching would be wrong here regardless of how well `features=` parsed.
+    // Register `target_names` as a DataFrame materialized from a Feast retrieval.
+    // `entity_cols`, when resolved, is unioned with the feature columns into one
+    // concrete schema; `None` registers the result as unresolved instead, with no
+    // partial credit for the feature columns alone.
     fn register_feast_dataframe(
         &mut self,
-        cols: Option<Vec<String>>,
+        (cols, entity_cols): FeastColumns,
         target_names: &[String],
         var_hint: &str,
         current_line: usize,
@@ -1683,10 +1744,24 @@ impl Linter {
     ) {
         self.dataframes_total += 1;
         match cols {
-            Some(cols) => {
-                self.dataframes_typed += 1;
-                let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
-                self.open_schemas.insert(schema_name.clone());
+            Some(feature_cols) => {
+                let full_cols = match &entity_cols {
+                    Some(entity_cols) => {
+                        let mut merged = entity_cols.clone();
+                        for c in &feature_cols {
+                            if !merged.contains(c) {
+                                merged.push(c.clone());
+                            }
+                        }
+                        merged
+                    }
+                    None => feature_cols,
+                };
+                let schema_name = self.make_inferred_schema(full_cols, var_hint, current_line);
+                if entity_cols.is_none() {
+                    self.unresolved_schemas.insert(schema_name.clone());
+                }
+                self.count_typed_dataframe(&schema_name, var_hint, current_line, current_col);
                 for name in target_names {
                     self.variables
                         .insert(name.clone(), (schema_name.clone(), current_line));
@@ -1732,8 +1807,8 @@ impl Linter {
         );
         match cols {
             Some(cols) => {
-                self.dataframes_typed += 1;
                 let schema_name = self.make_inferred_schema(cols, var_hint, current_line);
+                self.count_typed_dataframe(&schema_name, var_hint, current_line, current_col);
                 for name in target_names {
                     self.variables
                         .insert(name.clone(), (schema_name.clone(), current_line));
@@ -1945,11 +2020,12 @@ impl Linter {
     // entry to an actual schema name usable in `self.variables`. Most entries already
     // ARE a real schema name and pass through unchanged; `OPEN_FRAME_MARKER` is the one
     // exception (a bare `pd.DataFrame`/`pl.DataFrame` return with no attached Schema —
-    // see its doc comment), which this synthesizes into a fresh open/empty schema, the
-    // same way `register_feast_dataframe` already does for a resolved Feast retrieval.
-    // Centralized here because every call-resolution site that consults one of those
-    // maps (module-level bare calls, same-file `self.<attr>.<method>()`, and the
-    // upcoming cross-file case) needs the exact same marker-or-real-name branch.
+    // see its doc comment), which this synthesizes into a fresh, unresolved, empty
+    // schema, the same way `register_feast_dataframe` does for a Feast retrieval whose
+    // entity_df didn't resolve. Centralized here because every call-resolution site
+    // that consults one of those maps (module-level bare calls, same-file
+    // `self.<attr>.<method>()`, and the upcoming cross-file case) needs the exact same
+    // marker-or-real-name branch.
     fn resolve_open_or_named_schema(
         &mut self,
         marker_or_schema: &str,
@@ -1958,32 +2034,30 @@ impl Linter {
     ) -> String {
         if marker_or_schema == OPEN_FRAME_MARKER {
             let name = self.make_inferred_schema(Vec::new(), var_hint, line);
-            self.open_schemas.insert(name.clone());
+            self.unresolved_schemas.insert(name.clone());
             name
         } else {
             marker_or_schema.to_string()
         }
     }
 
-    // Column membership check used by every column-access validator (see
-    // `schema_has_column`'s call sites). Exact match: SQL-derived schemas already have
-    // `self.sql_dialect`'s case-folding baked into their column names by
-    // `sql::columns_from_select` at inference time, so e.g. a Snowflake query genuinely
-    // produces `ORDER_ID`, and `df["order_id"]` is a real bug worth reporting, not a
-    // false positive to suppress. Kept as a named helper (rather than inlining
-    // `cols.iter().any(|c| c == col)` at each call site) so every validator agrees by
-    // construction if this ever needs to change again.
-    //
-    // The one exception is an *open* schema (`self.open_schemas`, e.g. a Feast
-    // retrieval result — see `register_feast_dataframe`): membership is unconditionally
-    // `true` there, because the known column list is deliberately incomplete (Feast's
-    // real output also includes entity_df's join keys and timestamp column, which
-    // aren't resolvable in general) and treating it as exhaustive would manufacture
-    // false unknown-column errors on real columns this checker just doesn't know about.
+    // Whether `schema_name` is a recognized DataFrame origin with no concrete column
+    // list (see `unresolved_schemas`'s docs) — checked by every column-access
+    // validator BEFORE consulting `schema_has_column`, since an unresolved schema
+    // means "unverifiable", a third outcome distinct from both "found" and "missing".
+    fn schema_is_unresolved(&self, schema_name: &str) -> bool {
+        self.unresolved_schemas.contains(schema_name)
+    }
+
+    // Column membership check used by every column-access validator (see its call
+    // sites, all of which check `schema_is_unresolved` first). Exact match:
+    // SQL-derived schemas already have `self.sql_dialect`'s case-folding baked into
+    // their column names by `sql::columns_from_select` at inference time, so e.g. a
+    // Snowflake query genuinely produces `ORDER_ID`, and `df["order_id"]` is a real
+    // bug worth reporting, not a false positive to suppress. Kept as a named helper
+    // (rather than inlining `cols.iter().any(|c| c == col)` at each call site) so
+    // every validator agrees by construction if this ever needs to change again.
     fn schema_has_column(&self, schema_name: &str, col: &str) -> bool {
-        if self.open_schemas.contains(schema_name) {
-            return true;
-        }
         self.schemas
             .get(schema_name)
             .is_some_and(|cols| cols.iter().any(|c| c == col))
@@ -2624,25 +2698,40 @@ impl Linter {
                                 {
                                     let schema_name = schema_name.clone();
                                     let defined_line = *defined_line;
-                                    let already_has_col =
-                                        self.schema_has_column(&schema_name, col_name);
-                                    if !already_has_col {
+                                    if self.schema_is_unresolved(&schema_name) {
                                         let schema_display =
                                             self.schema_display(&schema_name, defined_line);
                                         errors.push(LintError {
                                             line: current_line,
                                             col: current_col,
-                                            code: CODE_UNKNOWN_COLUMN.to_string(),
+                                            code: CODE_UNVERIFIABLE_COLUMN.to_string(),
                                             message: format!(
-                                                "Column '{}' does not exist in {} (mutation tracking)",
+                                                "Column '{}' cannot be verified (mutation tracking): {} has no concrete column list",
                                                 col_name, schema_display
                                             ),
                                             severity: "error".to_string(),
                                         });
-                                    }
-                                    if let Some(columns) = self.schemas.get_mut(&schema_name) {
+                                    } else {
+                                        let already_has_col =
+                                            self.schema_has_column(&schema_name, col_name);
                                         if !already_has_col {
-                                            columns.push(col_name.to_string());
+                                            let schema_display =
+                                                self.schema_display(&schema_name, defined_line);
+                                            errors.push(LintError {
+                                                line: current_line,
+                                                col: current_col,
+                                                code: CODE_UNKNOWN_COLUMN.to_string(),
+                                                message: format!(
+                                                    "Column '{}' does not exist in {} (mutation tracking)",
+                                                    col_name, schema_display
+                                                ),
+                                                severity: "error".to_string(),
+                                            });
+                                        }
+                                        if let Some(columns) = self.schemas.get_mut(&schema_name) {
+                                            if !already_has_col {
+                                                columns.push(col_name.to_string());
+                                            }
                                         }
                                     }
                                 }
@@ -2828,7 +2917,18 @@ impl Linter {
                                                         current_line,
                                                     );
                                                 self.dataframes_total += 1;
-                                                self.dataframes_typed += 1;
+                                                // A bare `-> pd.DataFrame` return (the
+                                                // common shape for a py.typed internal
+                                                // library) lands here as an OPEN schema:
+                                                // typed, but with no column list to check
+                                                // anything against.
+                                                let var_hint = assign_var_hint(assign, func_name);
+                                                self.count_typed_dataframe(
+                                                    &schema_name,
+                                                    &var_hint,
+                                                    current_line,
+                                                    current_col,
+                                                );
                                                 for target in &assign.targets {
                                                     if let Expr::Name(target_name) = target {
                                                         self.variables.insert(
@@ -2894,7 +2994,13 @@ impl Linter {
                                     if self.schemas.contains_key(class_str) {
                                         // Schema.from_pandas(df) style
                                         self.dataframes_total += 1;
-                                        self.dataframes_typed += 1;
+                                        let var_hint = assign_var_hint(assign, class_str);
+                                        self.count_typed_dataframe(
+                                            class_str,
+                                            &var_hint,
+                                            current_line,
+                                            current_col,
+                                        );
                                         for target in &assign.targets {
                                             if let Expr::Name(target_name) = target {
                                                 self.variables.insert(
@@ -2912,7 +3018,6 @@ impl Linter {
                                             self.extract_load_columns(func_name, call);
                                         match extracted {
                                             Some(cols) => {
-                                                self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
                                                     .targets
                                                     .iter()
@@ -2926,12 +3031,18 @@ impl Linter {
                                                     .collect();
                                                 let var_name = target_names
                                                     .first()
-                                                    .map(|s| s.as_str())
-                                                    .unwrap_or("df");
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "df".to_string());
                                                 let schema_name = self.make_inferred_schema(
                                                     cols,
-                                                    var_name,
+                                                    &var_name,
                                                     current_line,
+                                                );
+                                                self.count_typed_dataframe(
+                                                    &schema_name,
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
                                                 );
                                                 for name in &target_names {
                                                     self.variables.insert(
@@ -3019,7 +3130,6 @@ impl Linter {
                                             });
                                         match cols {
                                             Some(cols) => {
-                                                self.dataframes_typed += 1;
                                                 let target_names: Vec<String> = assign
                                                     .targets
                                                     .iter()
@@ -3033,12 +3143,18 @@ impl Linter {
                                                     .collect();
                                                 let var_name = target_names
                                                     .first()
-                                                    .map(|s| s.as_str())
-                                                    .unwrap_or("df");
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "df".to_string());
                                                 let schema_name = self.make_inferred_schema(
                                                     cols,
-                                                    var_name,
+                                                    &var_name,
                                                     current_line,
+                                                );
+                                                self.count_typed_dataframe(
+                                                    &schema_name,
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
                                                 );
                                                 for name in &target_names {
                                                     self.variables.insert(
@@ -3188,9 +3304,12 @@ impl Linter {
                                 // access. See `register_feast_dataframe` for where this
                                 // actually becomes a tracked DataFrame.
                                 if let Some(cols) = self.extract_feast_feature_columns(call) {
+                                    let entity_cols = self.resolve_feast_entity_columns(call);
                                     if let [Expr::Name(target_name)] = assign.targets.as_slice() {
-                                        self.retrieval_jobs
-                                            .insert(target_name.id.to_string(), cols);
+                                        self.retrieval_jobs.insert(
+                                            target_name.id.to_string(),
+                                            (cols, entity_cols),
+                                        );
                                     }
                                 }
                             } else if func_name == "to_df" {
@@ -3203,22 +3322,27 @@ impl Linter {
                                 // (unrelated to Feast) is deliberately left alone —
                                 // matched only once one of these two specific shapes is
                                 // confirmed, not on the method name alone.
-                                let feast_cols = match &*attr.value {
-                                    Expr::Name(recv) => {
-                                        self.retrieval_jobs.get(recv.id.as_str()).cloned().map(Some)
-                                    }
+                                let feast_cols: Option<FeastColumns> = match &*attr.value {
+                                    Expr::Name(recv) => self
+                                        .retrieval_jobs
+                                        .get(recv.id.as_str())
+                                        .cloned()
+                                        .map(|(cols, entity_cols)| (Some(cols), entity_cols)),
                                     Expr::Call(inner_call) => match &*inner_call.func {
                                         Expr::Attribute(inner_attr)
                                             if FEAST_RETRIEVAL_METHODS
                                                 .contains(&inner_attr.attr.as_str()) =>
                                         {
-                                            Some(self.extract_feast_feature_columns(inner_call))
+                                            Some((
+                                                self.extract_feast_feature_columns(inner_call),
+                                                self.resolve_feast_entity_columns(inner_call),
+                                            ))
                                         }
                                         _ => None,
                                     },
                                     _ => None,
                                 };
-                                if let Some(cols) = feast_cols {
+                                if let Some((cols, entity_cols)) = feast_cols {
                                     let target_names: Vec<String> = assign
                                         .targets
                                         .iter()
@@ -3233,7 +3357,7 @@ impl Linter {
                                     let var_name =
                                         target_names.first().map(|s| s.as_str()).unwrap_or("df");
                                     self.register_feast_dataframe(
-                                        cols,
+                                        (cols, entity_cols),
                                         &target_names,
                                         var_name,
                                         current_line,
@@ -3636,11 +3760,14 @@ impl Linter {
 
                     if is_merge_or_concat {
                         if let Some((s1, s2)) = merge_schema {
-                            // The merged/concatenated result has a fully known schema by
-                            // construction -- both inputs were already tracked DataFrames --
-                            // so it's a new, fully-typed DataFrame origin in its own right.
+                            // The merged/concatenated result is a new DataFrame origin in
+                            // its own right -- both inputs were already tracked frames --
+                            // so it's always recognized (dataframes_total). Whether it
+                            // counts as TYPED depends on the inputs: an unresolved input
+                            // keeps the result unresolved (see below), which is why the
+                            // count_typed_dataframe call waits until `unresolved_schemas`
+                            // has been updated.
                             self.dataframes_total += 1;
-                            self.dataframes_typed += 1;
 
                             // Union semantics: the result of merge/concat contains every
                             // column from both inputs.  Sort + dedup gives a stable,
@@ -3657,15 +3784,23 @@ impl Linter {
                             combined_cols.dedup();
 
                             let combined_schema_name = format!("{}_{}", s1, s2);
-                            // An open schema (see `register_feast_dataframe`) stays open
-                            // after a merge/concat: its column list was already known to
-                            // be incomplete before the join, and combining it with
-                            // another frame's columns doesn't make it any more complete.
-                            if self.open_schemas.contains(&s1) || self.open_schemas.contains(&s2) {
-                                self.open_schemas.insert(combined_schema_name.clone());
+                            // An unresolved schema (see `register_feast_dataframe`,
+                            // `resolve_open_or_named_schema`) stays unresolved after a
+                            // merge/concat: its column list was already known to be
+                            // incomplete before the join, and combining it with another
+                            // frame's columns doesn't make it any more complete.
+                            if self.schema_is_unresolved(&s1) || self.schema_is_unresolved(&s2) {
+                                self.unresolved_schemas.insert(combined_schema_name.clone());
                             }
                             self.schemas
                                 .insert(combined_schema_name.clone(), combined_cols);
+                            let var_hint = assign_var_hint(assign, "df");
+                            self.count_typed_dataframe(
+                                &combined_schema_name,
+                                &var_hint,
+                                current_line,
+                                current_col,
+                            );
                             for target in &assign.targets {
                                 if let Expr::Name(target_name) = target {
                                     self.variables.insert(
@@ -3684,9 +3819,15 @@ impl Linter {
                             if type_name == "DataFrame" {
                                 if let Expr::Name(schema_name) = &*subscript.slice {
                                     // The constructor names the schema directly -- always
-                                    // fully typed.
+                                    // fully typed, with a concrete column list.
                                     self.dataframes_total += 1;
-                                    self.dataframes_typed += 1;
+                                    let var_hint = assign_var_hint(assign, "df");
+                                    self.count_typed_dataframe(
+                                        schema_name.id.as_str(),
+                                        &var_hint,
+                                        current_line,
+                                        current_col,
+                                    );
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3707,7 +3848,13 @@ impl Linter {
                                     // Constructed from a known schema class -- always fully
                                     // typed, regardless of which method was chained onto it.
                                     self.dataframes_total += 1;
-                                    self.dataframes_typed += 1;
+                                    let var_hint = assign_var_hint(assign, "df");
+                                    self.count_typed_dataframe(
+                                        schema_name.id.as_str(),
+                                        &var_hint,
+                                        current_line,
+                                        current_col,
+                                    );
                                     for target in &assign.targets {
                                         if let Expr::Name(target_name) = target {
                                             self.variables.insert(
@@ -3750,7 +3897,13 @@ impl Linter {
                                 current_line,
                             );
                             self.dataframes_total += 1;
-                            self.dataframes_typed += 1;
+                            let var_hint = assign_var_hint(assign, func_name.id.as_str());
+                            self.count_typed_dataframe(
+                                &schema_name,
+                                &var_hint,
+                                current_line,
+                                current_col,
+                            );
                             for target in &assign.targets {
                                 if let Expr::Name(target_name) = target {
                                     self.variables.insert(
@@ -3778,12 +3931,23 @@ impl Linter {
                     );
                 }
                 for target in &assign.targets {
-                    self.visit_expr(target, errors);
+                    // `name["literal"] = ...` was already handled by the mutation-tracking
+                    // check above; revisiting it here would double-report an unresolved
+                    // schema (no backstop like the concrete case's `self.schemas` append).
+                    let already_handled_as_mutation = matches!(
+                        target,
+                        Expr::Subscript(s)
+                            if matches!(&*s.value, Expr::Name(_))
+                                && ast_extract::extract_string_literal(&s.slice).is_some()
+                    );
+                    if !already_handled_as_mutation {
+                        self.visit_expr(target, errors);
+                    }
                 }
                 self.visit_expr(&assign.value, errors);
             }
             Stmt::AnnAssign(ann_assign) => {
-                let (current_line, _) = self.source_location(ann_assign.range().start());
+                let (current_line, current_col) = self.source_location(ann_assign.range().start());
                 // An annotated assignment's schema is always fully known once resolved --
                 // there's no "partially typed" case here, unlike a load call whose columns
                 // might not parse. Both the value-side and annotation-side checks below can
@@ -3900,7 +4064,22 @@ impl Linter {
 
                 if schema_resolved {
                     self.dataframes_total += 1;
-                    self.dataframes_typed += 1;
+                    // Every branch above resolves by writing the target's schema into
+                    // `self.variables`, so read it back rather than threading a name out
+                    // of five separate arms. An annotation always names a real schema
+                    // class, so this is never an open schema today -- routing it through
+                    // the same helper as every other counting site is what keeps the
+                    // open-schema tally correct by construction if that ever changes.
+                    let var_hint = match &*ann_assign.target {
+                        Expr::Name(target_name) => target_name.id.to_string(),
+                        _ => "df".to_string(),
+                    };
+                    let schema_name = self
+                        .variables
+                        .get(var_hint.as_str())
+                        .map(|(schema, _)| schema.clone())
+                        .unwrap_or_default();
+                    self.count_typed_dataframe(&schema_name, &var_hint, current_line, current_col);
                 }
 
                 self.visit_expr(&ann_assign.target, errors);
@@ -4151,28 +4330,45 @@ impl Linter {
                 if let Expr::Name(name) = &*attr.value {
                     if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str())
                     {
-                        if let Some(columns) = self.schemas.get(schema_name) {
-                            let attr_name = attr.attr.as_str();
-                            if !self.schema_has_column(schema_name, attr_name)
-                                && !RESERVED_METHODS.contains(&attr_name)
-                            {
+                        let attr_name = attr.attr.as_str();
+                        if !RESERVED_METHODS.contains(&attr_name) {
+                            if self.schema_is_unresolved(schema_name) {
                                 let (line, col) = self.source_location(attr.range().start());
                                 let schema_display =
                                     self.schema_display(schema_name, *defined_line);
-                                let mut message = format!(
-                                    "Column '{}' does not exist in {}",
-                                    attr_name, schema_display
-                                );
-                                if let Some(suggestion) = find_best_match(attr_name, columns) {
-                                    message.push_str(&format!(" (did you mean '{}'?)", suggestion));
-                                }
                                 errors.push(LintError {
                                     line,
                                     col,
-                                    code: CODE_UNKNOWN_COLUMN.to_string(),
-                                    message,
+                                    code: CODE_UNVERIFIABLE_COLUMN.to_string(),
+                                    message: format!(
+                                        "Column '{}' cannot be verified: {} has no concrete column list",
+                                        attr_name, schema_display
+                                    ),
                                     severity: "error".to_string(),
                                 });
+                            } else if let Some(columns) = self.schemas.get(schema_name) {
+                                if !self.schema_has_column(schema_name, attr_name) {
+                                    let (line, col) = self.source_location(attr.range().start());
+                                    let schema_display =
+                                        self.schema_display(schema_name, *defined_line);
+                                    let mut message = format!(
+                                        "Column '{}' does not exist in {}",
+                                        attr_name, schema_display
+                                    );
+                                    if let Some(suggestion) = find_best_match(attr_name, columns) {
+                                        message.push_str(&format!(
+                                            " (did you mean '{}'?)",
+                                            suggestion
+                                        ));
+                                    }
+                                    errors.push(LintError {
+                                        line,
+                                        col,
+                                        code: CODE_UNKNOWN_COLUMN.to_string(),
+                                        message,
+                                        severity: "error".to_string(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -4183,10 +4379,24 @@ impl Linter {
                 if let Expr::Name(name) = &*subscript.value {
                     if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str())
                     {
-                        if let Some(columns) = self.schemas.get(schema_name) {
-                            if let Some(col_name) =
-                                ast_extract::extract_string_literal(&subscript.slice)
-                            {
+                        if let Some(col_name) =
+                            ast_extract::extract_string_literal(&subscript.slice)
+                        {
+                            if self.schema_is_unresolved(schema_name) {
+                                let (line, col) = self.source_location(subscript.range().start());
+                                let schema_display =
+                                    self.schema_display(schema_name, *defined_line);
+                                errors.push(LintError {
+                                    line,
+                                    col,
+                                    code: CODE_UNVERIFIABLE_COLUMN.to_string(),
+                                    message: format!(
+                                        "Column '{}' cannot be verified: {} has no concrete column list",
+                                        col_name, schema_display
+                                    ),
+                                    severity: "error".to_string(),
+                                });
+                            } else if let Some(columns) = self.schemas.get(schema_name) {
                                 if !self.schema_has_column(schema_name, col_name) {
                                     let (line, col) =
                                         self.source_location(subscript.range().start());
@@ -4742,14 +4952,9 @@ class Pipeline:
     }
 
     #[test]
-    fn test_should_register_open_schema_for_bare_dataframe_return_via_self_attr() {
-        // arrange: DataRepository.get_raw returns a bare pd.DataFrame -- no attached
-        // Schema, the shape a py.typed third-party/internal package's own return
-        // annotations will actually have (they have no reason to know about this
-        // project's Schema classes). Must still count toward coverage (an OPEN
-        // schema, per register_feast_dataframe's existing precedent) rather than
-        // being silently invisible, and must never manufacture a false
-        // unknown-column on a column this checker simply doesn't know about.
+    fn test_should_report_unverifiable_for_bare_dataframe_return_via_self_attr() {
+        // arrange: DataRepository.get_raw returns a bare pd.DataFrame, no Schema --
+        // recognized (dataframes_total) but not typed, and column access unverifiable.
         let source = r#"
 import pandas as pd
 
@@ -4775,9 +4980,10 @@ class Pipeline:
             .unwrap();
 
         // assert
-        assert!(errors.is_empty(), "errors: {errors:#?}");
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
         assert_eq!(linter.dataframes_total, 1);
-        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_typed, 0);
     }
 
     #[test]
@@ -6349,11 +6555,83 @@ class Pipeline:
             .check_file_internal(pipeline_source, &pipeline_path)
             .unwrap();
 
-        // assert: resolved as an open schema (bare pd.DataFrame, no attached Schema)
-        // -- counts as typed even though nothing about USAGE ever hinted it was a
-        // DataFrame.
+        // assert: recognized as a DataFrame (bare pd.DataFrame, no attached Schema),
+        // but NOT counted as typed -- no column name could ever be validated against
+        // it, so it lands in untyped_sites like any other unresolved origin.
         assert_eq!(linter.dataframes_total, 1);
-        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert_eq!(linter.untyped_sites.len(), 1);
+        assert_eq!(linter.untyped_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_report_an_external_bare_dataframe_return_as_unverifiable() {
+        // arrange: a py.typed internal library method annotated `-> pd.DataFrame` with
+        // no Schema, called through self.<attr> and subscripted with a typo.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_dir = root
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("internal_client_pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("py.typed"), "").unwrap();
+        fs::write(
+            pkg_dir.join("__init__.py"),
+            r#"
+import pandas as pd
+
+
+class Client:
+    def get_data(self, query: str) -> pd.DataFrame:
+        return pd.read_sql(query, None)
+"#,
+        )
+        .unwrap();
+
+        let pipeline_source = r#"
+from internal_client_pkg import Client
+
+
+class Pipeline:
+    def __init__(self):
+        self._client = Client()
+
+    def run(self):
+        df = self._client.get_data("SELECT * FROM orders")
+        print(df["typo_column"])
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+        fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.with_context(root.to_path_buf(), &LinterConfig::EMPTY);
+        let pipeline_path = root.join("pipeline.py");
+        linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        let errors = linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: the access raises unverifiable-column (not unknown-column -- this
+        // checker has no basis to claim the column definitely doesn't exist), and
+        // the origin does NOT count as typed.
+        assert!(
+            !errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN),
+            "expected no unknown-column diagnostic, got: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNVERIFIABLE_COLUMN),
+            "expected an unverifiable-column diagnostic, got: {errors:?}"
+        );
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert_eq!(linter.untyped_sites.len(), 1);
+        assert_eq!(linter.untyped_sites[0].var, "df");
+        assert_eq!(linter.untyped_sites[0].line, 10);
     }
 
     #[test]
@@ -7322,11 +7600,9 @@ df = pd.read_sql(select(Order), engine)
     }
 
     #[test]
-    fn test_feast_chained_form_registers_open_schema_over_feature_columns() {
-        // The critical case: df["driver_id"] is an entity join key, NOT one of the
-        // features= names, and is the first line of the canonical Feast tutorial. If
-        // this were an exact-match schema it would be a false unknown-column — the
-        // whole reason register_feast_dataframe marks it open instead.
+    fn test_feast_chained_form_with_unresolved_entity_df_is_unverifiable() {
+        // entity_df is an undefined name here, so it never resolves -- both the known
+        // feature name and the join key raise unverifiable-column, no partial credit.
         let source = r#"
 df = store.get_historical_features(
     entity_df=entity_df,
@@ -7340,13 +7616,188 @@ print(df["driver_id"])
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.code == CODE_UNVERIFIABLE_COLUMN));
         let schema_name = &linter.variables.get("df").unwrap().0;
-        assert!(linter.open_schemas.contains(schema_name));
+        assert!(linter.unresolved_schemas.contains(schema_name));
+    }
+
+    #[test]
+    fn test_feast_with_concrete_entity_df_is_fully_typed() {
+        // arrange: entity_df resolves to a concrete schema at the call site, so Feast's
+        // real output (entity_df's own columns UNION the requested features) is fully
+        // derivable -- no unresolved gap at all. A typo in the feature name IS caught.
+        let source = r#"
+import pandas as pd
+entity_df = pd.read_csv("entities.csv", usecols=["driver_id", "event_timestamp"])
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+).to_df()
+print(df["driver_id"])
+print(df["conv_rate"])
+print(df["cnv_rate"])
+"#;
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("cnv_rate"));
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+        let schema_name = &linter.variables.get("df").unwrap().0;
+        assert!(!linter.unresolved_schemas.contains(schema_name));
+    }
+
+    #[test]
+    fn test_should_not_count_a_feast_retrieval_with_unresolved_entity_df_as_typed() {
+        // arrange: entity_df is never resolved, so the retrieval's real output can't be
+        // fully derived -- it must NOT count as typed, even though the feature columns
+        // alone did resolve.
+        let source = r#"
+df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+).to_df()
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert_eq!(linter.untyped_sites.len(), 1);
+        assert_eq!(linter.untyped_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_count_a_resolved_column_list_as_typed() {
+        // arrange: a load with a real, exhaustive column list is typed AND concrete.
+        let source = r#"
+import pandas as pd
+df = pd.read_csv("a.csv", usecols=["order_id", "amount"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert!(linter.untyped_sites.is_empty());
+    }
+
+    #[test]
+    fn test_should_not_count_a_bare_dataframe_returning_function_call_as_typed() {
+        // arrange: the same-file counterpart of the external-package case -- a bare
+        // `-> pd.DataFrame` return with no attached Schema resolves through
+        // OPEN_FRAME_MARKER into an unresolved schema, so the call site is recognized
+        // but does NOT count as typed.
+        let source = r#"
+import pandas as pd
+
+
+def load_users() -> pd.DataFrame:
+    ...
+
+
+df = load_users()
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert_eq!(linter.untyped_sites.len(), 1);
+        assert_eq!(linter.untyped_sites[0].var, "df");
+    }
+
+    #[test]
+    fn test_should_keep_a_merge_with_an_unresolved_input_from_counting_as_typed() {
+        // arrange: merging an unresolved frame with a concrete one cannot recover the
+        // missing columns, so the result stays unresolved too -- and does NOT count as
+        // typed, even though it's still a recognized DataFrame origin.
+        let source = r#"
+import pandas as pd
+feast_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:conv_rate"],
+).to_df()
+orders = pd.read_csv("orders.csv", usecols=["order_id"])
+joined = feast_df.merge(orders)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: three origins recognized; only the plain read_csv is typed -- the
+        // Feast frame and the merge result are both unresolved.
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 1);
+        let untyped_vars: Vec<&str> = linter
+            .untyped_sites
+            .iter()
+            .map(|s| s.var.as_str())
+            .collect();
+        assert_eq!(untyped_vars, vec!["feast_df", "joined"]);
+    }
+
+    #[test]
+    fn test_should_keep_untyped_sites_in_step_with_the_typed_count() {
+        // arrange: the invariant the term-missing report relies on --
+        // `untyped_sites.len() == total - typed`. A mix of every outcome in one file:
+        // concrete, unresolved-via-bare-return, and unresolved-via-unparseable-load.
+        let source = r#"
+import pandas as pd
+
+
+def load_users() -> pd.DataFrame:
+    ...
+
+
+concrete = pd.read_csv("a.csv", usecols=["a"])
+open_frame = load_users()
+unresolved = pd.read_csv("b.csv")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(
+            linter.untyped_sites.len(),
+            linter.dataframes_total - linter.dataframes_typed
+        );
     }
 
     #[test]
     fn test_feast_split_form_job_not_treated_as_dataframe_before_to_df() {
+        // entity_df is unresolved here (an undefined name), so both accesses below
+        // raise unverifiable-column once `df` is materialized -- the point of this
+        // test is the `job` assertion, which holds regardless.
         let source = r#"
 job = store.get_historical_features(
     entity_df=entity_df,
@@ -7361,7 +7812,8 @@ print(df["driver_id"])
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.code == CODE_UNVERIFIABLE_COLUMN));
         assert!(
             !linter.variables.contains_key("job"),
             "job (a RetrievalJob, not a DataFrame) should not be tracked in self.variables"
@@ -7370,20 +7822,28 @@ print(df["driver_id"])
 
     #[test]
     fn test_feast_full_feature_names_uses_double_underscore() {
+        // entity_df resolves concretely here, so the retrieval is fully typed and the
+        // double-underscore feature name formatting is actually exercised by a real
+        // unknown-column check, not just an absence of errors.
         let source = r#"
+import pandas as pd
+entity_df = pd.read_csv("entities.csv", usecols=["driver_id"])
 df = store.get_historical_features(
     entity_df=entity_df,
     features=["driver_stats:conv_rate"],
     full_feature_names=True,
 ).to_df()
 print(df["driver_stats__conv_rate"])
+print(df["driver_stats__cnv_rate"])
 "#;
         let mut linter = Linter::new();
         let errors = linter
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        assert_eq!(errors.len(), 0, "errors: {errors:?}");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("driver_stats__cnv_rate"));
     }
 
     #[test]

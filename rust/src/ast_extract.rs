@@ -265,10 +265,9 @@ pub(crate) fn extract_schema_from_annotation(expr: &Expr) -> Option<&str> {
 // `extract_schema_from_annotation` first; this is the fallback for the shape that
 // leaves with no schema name to extract, which is what most third-party return
 // annotations look like (a `py.typed` package has no reason to know about this
-// project's `Schema` classes). The caller registers a match with an *open* schema
-// (empty column list, `open_schemas`) the same way `register_feast_dataframe` already
-// does -- "we know it's a DataFrame, we don't know its columns" is strictly better
-// than leaving the call untracked, and never manufactures a false unknown-column.
+// project's `Schema` classes). The caller registers this as an unresolved schema
+// (empty column list, `unresolved_schemas`) -- recognized as a DataFrame rather
+// than untracked, with every column access raising `unverifiable-column`.
 //
 // Deliberately narrower than `extract_schema_from_annotation`: no quoted
 // (forward-referenced) form, since a bare `pd.DataFrame`/`pl.DataFrame` return never

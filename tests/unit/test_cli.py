@@ -12,11 +12,13 @@ from unittest.mock import patch
 from typedframes.cli import (
     CoverageBucket,
     CoverageConfig,
+    FileTally,
     RunStats,
     _check_files,
     _check_notebook_file,
     _collect_notebook_files,
     _collect_python_files,
+    _coverage_failure_message,
     _coverage_json_payload,
     _coverage_message,
     _evaluate_coverage,
@@ -30,6 +32,15 @@ from typedframes.cli import (
     _percentage,
     _relative_posix,
     main,
+)
+
+# A Feast retrieval whose entity_df is an undefined name -- recognized but
+# unresolved, so it doesn't count as typed.
+_FEAST_UNRESOLVED_SOURCE = (
+    "df = store.get_historical_features(\n"
+    "    entity_df=entity_df,\n"
+    '    features=["driver_stats:conv_rate"],\n'
+    ").to_df()\n"
 )
 
 
@@ -684,8 +695,9 @@ class TestCli(unittest.TestCase):
 
             # assert -- the DataFrame is recognised because the installed package's own
             # return annotation was indexed; without following the import it would not
-            # have been seen at all.
-            self.assertIn("1/1 DataFrames had column info", captured.getvalue())
+            # have been seen at all. It's still unresolved (a bare `-> pd.DataFrame`, no
+            # Schema), so it doesn't count as typed -- only that it was counted at all.
+            self.assertIn("/1 DataFrames had column info", captured.getvalue())
 
     def test_should_check_a_single_file_gracefully_when_there_is_no_project_root(self) -> None:
         """Test that a lone file with no pyproject.toml above it is checked, not errored on."""
@@ -1351,7 +1363,7 @@ class TestCli(unittest.TestCase):
     def test_should_report_failing_bucket_when_below_global_threshold(self) -> None:
         """Test that coverage under the global fail_under produces a failing bucket."""
         # arrange
-        per_file = {"/proj/a.py": (4, 1)}
+        per_file = {"/proj/a.py": FileTally(4, 1)}
         config = CoverageConfig(enabled=True, fail_under=90.0)
 
         # act
@@ -1365,7 +1377,7 @@ class TestCli(unittest.TestCase):
     def test_should_report_no_failures_when_threshold_is_met(self) -> None:
         """Test that coverage at or above the threshold passes."""
         # arrange
-        per_file = {"/proj/a.py": (4, 4)}
+        per_file = {"/proj/a.py": FileTally(4, 4)}
         config = CoverageConfig(enabled=True, fail_under=100.0)
 
         # act
@@ -1377,7 +1389,7 @@ class TestCli(unittest.TestCase):
     def test_should_grade_override_bucket_separately_from_global_bucket(self) -> None:
         """Test that a per-path override is judged on its own files, not the whole project."""
         # arrange
-        per_file = {"/proj/legacy/old.py": (4, 0), "/proj/src/new.py": (2, 2)}
+        per_file = {"/proj/legacy/old.py": FileTally(4, 0), "/proj/src/new.py": FileTally(2, 2)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
 
         # act
@@ -1389,7 +1401,7 @@ class TestCli(unittest.TestCase):
     def test_should_fail_only_the_override_bucket_that_misses_its_own_bar(self) -> None:
         """Test that a failing override is named in the report while the global bucket passes."""
         # arrange
-        per_file = {"/proj/legacy/old.py": (4, 1), "/proj/src/new.py": (2, 2)}
+        per_file = {"/proj/legacy/old.py": FileTally(4, 1), "/proj/src/new.py": FileTally(2, 2)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 50.0),))
 
         # act
@@ -1402,7 +1414,7 @@ class TestCli(unittest.TestCase):
     def test_should_pass_vacuously_when_a_bucket_has_no_dataframes(self) -> None:
         """Test that 0/0 is treated as nothing to measure rather than a failure."""
         # arrange
-        per_file = {"/proj/a.py": (0, 0)}
+        per_file = {"/proj/a.py": FileTally(0, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0)
 
         # act
@@ -1414,7 +1426,7 @@ class TestCli(unittest.TestCase):
     def test_should_ignore_path_overrides_when_fail_under_flag_is_given(self) -> None:
         """Test that --coverage-fail-under is a total override, not merged with config overrides."""
         # arrange
-        per_file = {"/proj/legacy/old.py": (4, 0)}
+        per_file = {"/proj/legacy/old.py": FileTally(4, 0)}
         config = CoverageConfig(enabled=True, fail_under=100.0, overrides=(("legacy/**", 0.0),))
 
         # act
@@ -1791,7 +1803,7 @@ class TestCli(unittest.TestCase):
     def test_should_render_per_file_table_with_missing_sites(self) -> None:
         """Test that term-missing lists each file's tally and the sites lacking column info."""
         # arrange
-        per_file = {"/proj/src/new.py": (2, 1), "/proj/legacy/old.py": (2, 0)}
+        per_file = {"/proj/src/new.py": FileTally(2, 1), "/proj/legacy/old.py": FileTally(2, 0)}
         sites = [
             {"file": "/proj/legacy/old.py", "line": 2, "col": 1, "var": "old_one"},
             {"file": "/proj/src/new.py", "line": 3, "col": 1, "var": "bad"},
@@ -1809,7 +1821,7 @@ class TestCli(unittest.TestCase):
     def test_should_omit_files_with_no_dataframes_from_the_table(self) -> None:
         """Test that a 0/0 file is left out rather than padding the report."""
         # arrange
-        per_file = {"/proj/empty.py": (0, 0), "/proj/real.py": (1, 1)}
+        per_file = {"/proj/empty.py": FileTally(0, 0), "/proj/real.py": FileTally(1, 1)}
 
         # act
         table = _format_term_missing(per_file, [], Path("/proj"))
@@ -1821,7 +1833,7 @@ class TestCli(unittest.TestCase):
     def test_should_report_nothing_to_measure_when_no_file_has_dataframes(self) -> None:
         """Test that an entirely DataFrame-free run says so rather than printing an empty table."""
         # arrange
-        per_file = {"/proj/a.py": (0, 0)}
+        per_file = {"/proj/a.py": FileTally(0, 0)}
 
         # act
         table = _format_term_missing(per_file, [], Path("/proj"))
@@ -1865,7 +1877,7 @@ class TestCli(unittest.TestCase):
     def test_should_build_json_coverage_payload_with_unrounded_percentages(self) -> None:
         """Test that the JSON report keeps the exact ratio for machine consumers."""
         # arrange
-        per_file = {"/proj/a.py": (3, 1)}
+        per_file = {"/proj/a.py": FileTally(3, 1)}
         sites = [
             {"file": "/proj/a.py", "line": 5, "col": 1, "var": "x"},
             {"file": "/proj/a.py", "line": 4, "col": 1, "var": "y"},
@@ -1882,7 +1894,7 @@ class TestCli(unittest.TestCase):
     def test_should_use_null_percent_when_a_file_has_no_dataframes(self) -> None:
         """Test that the JSON report reports null rather than dividing by zero."""
         # arrange
-        per_file = {"/proj/a.py": (0, 0)}
+        per_file = {"/proj/a.py": FileTally(0, 0)}
 
         # act
         payload = _coverage_json_payload(per_file, [], Path("/proj"))
@@ -1890,6 +1902,102 @@ class TestCli(unittest.TestCase):
         # assert
         self.assertIsNone(payload["percent"])
         self.assertIsNone(payload["files"][0]["percent"])
+
+    def test_should_fail_the_gate_for_an_unresolved_schema_by_default(self) -> None:
+        """Test that a DataFrame recognized but never resolved to concrete columns fails the gate.
+
+        This is the core fix: an unresolved schema (a Feast retrieval whose
+        entity_df isn't itself concrete, a bare `-> pd.DataFrame` return) must not
+        be able to pass a `--coverage-fail-under=100` gate just because it was
+        recognized as a DataFrame -- only a concrete column list counts.
+        """
+        # arrange
+        per_file = {"/proj/a.py": FileTally(2, 0)}
+        config = CoverageConfig(enabled=True, fail_under=100.0)
+
+        # act
+        failing = _evaluate_coverage(per_file, config, Path("/proj"), None)
+
+        # assert
+        self.assertEqual(1, len(failing))
+        self.assertEqual(0.0, failing[0].pct)
+
+    def test_should_name_the_typed_count_in_the_failure_message(self) -> None:
+        """Test that a gate failure explains what was measured."""
+        # arrange
+        bucket = CoverageBucket(label=None, threshold=100.0, total=4, typed=1)
+
+        # act
+        message = _coverage_failure_message(bucket)
+
+        # assert
+        self.assertIn("1/4 DataFrames had column info", message)
+
+    def test_should_fail_the_gate_end_to_end_for_an_unresolved_feast_retrieval(self) -> None:
+        """Test that a real check run fails a 100% gate when Feast's entity_df is unresolved."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "feast_load.py").write_text(_FEAST_UNRESOLVED_SOURCE)
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured), self.assertRaises(SystemExit):
+                main(["check", tmpdir, "--coverage-fail-under", "100"])
+
+            # assert
+            self.assertIn("0/1 DataFrames had column info", captured.getvalue())
+
+    def test_should_surface_the_unresolved_feast_site_in_the_term_missing_run(self) -> None:
+        """Test that a real check run names the unresolved Feast site, not just a 0% row."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "feast_load.py").write_text(_FEAST_UNRESOLVED_SOURCE)
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--coverage-detail", "term-missing"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("df:1", output)
+
+    def test_should_attach_the_unresolved_feast_site_to_untyped_sites(self) -> None:
+        """Test that _check_files reports an unresolved Feast retrieval as an untyped site."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "feast_load.py"
+            py_file.write_text(_FEAST_UNRESOLVED_SOURCE)
+
+            # act
+            _errors, stats = _check_files([py_file])
+
+            # assert
+            self.assertEqual(0, stats["dataframes_typed"])
+            self.assertEqual(1, len(stats["untyped_sites"]))
+            self.assertEqual(str(py_file), stats["untyped_sites"][0]["file"])
+            self.assertEqual("df", stats["untyped_sites"][0]["var"])
+
+    def test_should_keep_untyped_count_matching_the_total_minus_typed(self) -> None:
+        """Test the invariant term-missing relies on, across a mix of concrete/unresolved origins."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "mixed.py"
+            py_file.write_text(
+                "import pandas as pd\n"
+                'concrete = pd.read_csv("a.csv", usecols=["a"])\n'
+                'unresolved = pd.read_csv("b.csv")\n' + _FEAST_UNRESOLVED_SOURCE
+            )
+
+            # act
+            _errors, stats = _check_files([py_file])
+
+            # assert
+            self.assertEqual(3, stats["dataframes_total"])
+            self.assertEqual(1, stats["dataframes_typed"])
+            self.assertEqual(2, len(stats["untyped_sites"]))
 
     def test_should_attach_untyped_sites_to_their_source_file(self) -> None:
         """Test that _check_files tags each untyped site with the file it came from."""

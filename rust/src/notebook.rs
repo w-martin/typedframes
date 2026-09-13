@@ -242,8 +242,8 @@ mod tests {
             severity: "error".to_string(),
         }];
         let stats = FileStats {
-            dataframes_total: 2,
-            dataframes_typed: 1,
+            dataframes_total: 3,
+            dataframes_typed: 2,
             untyped_sites: vec![UntypedSite {
                 line: 1,
                 col: 1,
@@ -260,8 +260,8 @@ mod tests {
         assert_eq!(result.errors[0].line, 1);
         assert_eq!(result.errors[0].col, 5);
         assert!(result.errors[0].message.contains("analysis.ipynb cell 2:1"));
-        assert_eq!(result.stats.dataframes_total, 2);
-        assert_eq!(result.stats.dataframes_typed, 1);
+        assert_eq!(result.stats.dataframes_total, 3);
+        assert_eq!(result.stats.dataframes_typed, 2);
         assert_eq!(result.stats.untyped_sites.len(), 1);
         assert_eq!(result.stats.untyped_sites[0].cell, 2);
         assert_eq!(result.stats.untyped_sites[0].line, 1);

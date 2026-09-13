@@ -355,6 +355,35 @@ turn on a threshold. Enforcement is **entirely opt-in**: with no
 `[tool.typedframes.coverage]` table and no `--coverage-fail-under`, no threshold is evaluated
 and the exit code is exactly what it was before.
 
+### Unresolved schemas: recognized, but not column-checked
+
+Not every recognized DataFrame carries a column list the checker can validate against.
+Two kinds of origin are recognized but never resolve to a concrete column list:
+
+- a **Feast retrieval** (`store.get_historical_features(...).to_df()`) whose `entity_df`
+  argument isn't itself resolved to a concrete schema. Feast's real output is `entity_df`'s
+  own columns plus the requested feature columns — when `entity_df` IS a concretely typed
+  DataFrame at the call site, both halves are derivable and the result is fully typed and
+  checked normally, no exception. It's only unresolved when `entity_df` itself can't be
+  pinned down (an untyped parameter, an unresolved upstream call, ...);
+- a **bare `-> pd.DataFrame` / `-> pl.DataFrame` return** with no attached `Schema` — the
+  usual shape of an internal `py.typed` client library, reached through a plain call or
+  through `self._client.get_data(...)`. There's nothing to derive here at all.
+
+These do **not** count as covered, and every column accessed on one — at the origin or at
+any point downstream (a return, a reassignment, a `merge`/`concat`) — is flagged
+`unverifiable-column` rather than passed through silently. The checker genuinely doesn't
+know whether the column exists, so it says exactly that instead of guessing either way:
+
+```
+src/pipeline.py:8:7: error[unverifiable-column] Column 'conv_rate' cannot be verified: inferred column set {} (defined at line 5) has no concrete column list
+```
+
+Recovering coverage means giving the origin real column information: annotating the
+variable (`df: Annotated[pd.DataFrame, MySchema] = ...`), giving the library function a
+`-> Annotated[pd.DataFrame, MySchema]` return type in place of the bare `-> pd.DataFrame`,
+or — for Feast — making sure `entity_df` itself resolves to a concrete schema.
+
 ### One-off enforcement
 
 ```shell
@@ -477,17 +506,21 @@ typedframes check src/ --coverage-detail=term-missing
 
 ```
 Name           Typed  Total   Cover   Missing
----------------------------------------------
+-----------------------------------------------
 legacy/old.py      0      2      0%   old_one:2, old_two:3
 src/new.py         1      2     50%   bad:3
----------------------------------------------
-TOTAL              1      4     25%
+src/feast.py       0      1      0%   df:4
+-----------------------------------------------
+TOTAL              1      5     20%
 ```
 
 Each `Missing` entry is `variable:line`: the assignment where the checker recognized a
-DataFrame origin but couldn't resolve its columns. These are exactly the origins counted
-in the denominator but not the numerator, so the listing always reconciles with the
-table — the count of missing entries equals `Total - Typed` for every row.
+DataFrame origin but couldn't resolve its columns to a concrete list — including one
+resolved only to an unresolved schema (see
+[Unresolved schemas](#unresolved-schemas-recognized-but-not-column-checked)), like
+`src/feast.py`'s `df` above. These are exactly the origins counted in the denominator but
+not the numerator, so the listing always reconciles with the table — the count of missing
+entries equals `Total - Typed` for every row.
 
 That reconciliation is why the sites are tracked by the checker itself rather than
 derived from `untracked-dataframe` warnings, which would not add up: some warnings are
@@ -513,23 +546,29 @@ Shape of the payload, with the `errors` list elided for brevity:
 ```json
 {
   "errors": [],
-  "stats": { "dataframes_total": 2, "dataframes_typed": 1 },
+  "stats": {
+    "dataframes_total": 3,
+    "dataframes_typed": 2
+  },
   "coverage": {
-    "dataframes_total": 2,
-    "dataframes_typed": 1,
-    "percent": 50.0,
+    "dataframes_total": 3,
+    "dataframes_typed": 2,
+    "percent": 66.66666666666667,
     "files": [
       {
         "file": "load.py",
-        "dataframes_total": 2,
-        "dataframes_typed": 1,
-        "percent": 50.0,
+        "dataframes_total": 3,
+        "dataframes_typed": 2,
+        "percent": 66.66666666666667,
         "missing": [{ "var": "sales", "line": 3, "col": 1 }]
       }
     ]
   }
 }
 ```
+
+`percent` is coverage over every DataFrame resolved to a concrete column list — the
+number the gate uses, and the one the summary line prints.
 
 Percentages in the JSON report are left unrounded — a consumer deciding whether a gate
 passed needs the real ratio and can round for display itself. A file with no DataFrames
@@ -552,6 +591,10 @@ one-off `--coverage-detail=term-missing` needs no config edit.
   (`2` stays reserved for usage errors, including an out-of-range `--coverage-fail-under`.)
 - **Empty groups pass.** A group with no recognized DataFrames is 0/0 — nothing to
   measure, not a failure — matching how the summary line already reports an empty run.
+- **Unresolved schemas never count toward the gate.** A DataFrame the checker recognizes
+  but can't resolve to a concrete column list (see
+  [Unresolved schemas](#unresolved-schemas-recognized-but-not-column-checked)) is treated
+  the same as any other unresolved origin — there is no separate, more lenient reading.
 - **`--no-info` doesn't hide failures.** That flag silences the informational coverage
   line; a failed gate is a result, so it is still reported.
 - **Machine-readable output stays clean.** With `--output-format=json` the failure

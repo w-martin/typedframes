@@ -13,6 +13,7 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 # ANSI escape sequences
 _RESET = "\033[0m"
@@ -338,9 +339,44 @@ def _collect_notebook_files(path: Path, configured_excludes: frozenset[str] | No
     return _collect_files_with_suffix(path, ".ipynb", configured_excludes)
 
 
-# One file's check outcome: (errors, dataframes_total, dataframes_typed, untyped_sites).
-_FileCheckResult = tuple[list[dict], int, int, list[dict]]
+class FileTally(NamedTuple):
+    """One file's DataFrame coverage counts."""
+
+    total: int
+    typed: int
+
+
+class _FileCheckResult(NamedTuple):
+    """One file's check outcome, as returned by the per-file checker wrappers."""
+
+    errors: list[dict]
+    tally: FileTally
+    untyped_sites: list[dict]
+
+
 _CheckFileFn = Callable[[str, bytes | None], str]
+
+
+def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
+    """Unpack one Rust `check_file`/`check_notebook` payload, tagging every site with its file.
+
+    Shared by the `.py` and `.ipynb` wrappers: the two entry points differ in how
+    they get their source, not in the shape of what they return -- a notebook's
+    errors and sites simply carry an extra `cell` field, which passes through
+    untouched here.
+    """
+    errors = result["errors"]
+    for error in errors:
+        error["file"] = str(file_path)
+    stats = result["stats"]
+    return _FileCheckResult(
+        errors=errors,
+        tally=FileTally(
+            total=stats["dataframes_total"],
+            typed=stats["dataframes_typed"],
+        ),
+        untyped_sites=[{**site, "file": str(file_path)} for site in stats.get("untyped_sites", [])],
+    )
 
 
 def _check_python_file(file_path: Path, check_file: _CheckFileFn, index_bytes: bytes | None) -> _FileCheckResult | None:
@@ -358,12 +394,7 @@ def _check_python_file(file_path: Path, check_file: _CheckFileFn, index_bytes: b
         print(f"{file_path}: skipped, {e}", file=sys.stderr)
         return None
 
-    result = json.loads(result_json)
-    errors = result["errors"]
-    for error in errors:
-        error["file"] = str(file_path)
-    sites = [{**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", [])]
-    return errors, result["stats"]["dataframes_total"], result["stats"]["dataframes_typed"], sites
+    return _file_check_result(json.loads(result_json), file_path)
 
 
 def _check_notebook_file(
@@ -389,27 +420,25 @@ def _check_notebook_file(
         print(f"{file_path}: skipped, {e}", file=sys.stderr)
         return None
 
-    result = json.loads(result_json)
-    errors = result["errors"]
-    for error in errors:
-        error["file"] = str(file_path)
-    sites = [{**site, "file": str(file_path)} for site in result["stats"].get("untyped_sites", [])]
-    return errors, result["stats"]["dataframes_total"], result["stats"]["dataframes_typed"], sites
+    return _file_check_result(json.loads(result_json), file_path)
 
 
 def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tuple[list[dict], dict]:
     """Run the Rust checker on each file, dispatching `.ipynb` notebooks through `_check_notebook_file`.
 
     Returns all errors with file paths attached, plus coverage stats
-    (``dataframes_total``/``dataframes_typed``) aggregated across every file checked,
-    and a ``per_file`` mapping of each file to its own ``(total, typed)`` tally --
+    (``dataframes_total``/``dataframes_typed``) aggregated across every file
+    checked, and a ``per_file`` mapping of each file to its own `FileTally` --
     needed to attribute coverage to per-path threshold overrides, which grade
     subtrees separately rather than judging one project-wide ratio.
 
-    Also returns ``untyped_sites``: every DataFrame origin the checker recognized
-    but could not resolve columns for, with the file it came from attached. This
-    is the "missing" listing behind ``--coverage-detail=term-missing``, the
-    counterpart to `coverage report -m`'s missing line numbers.
+    Also returns ``untyped_sites``, tagged with the file each came from: every
+    DataFrame origin the checker recognized but could not resolve columns for
+    (including one resolved only to an unresolved schema -- a Feast retrieval
+    whose entity_df isn't itself concrete, or a bare `-> pd.DataFrame` return with
+    no attached Schema). This is the "missing" listing behind
+    ``--coverage-detail=term-missing``, the counterpart to `coverage report -m`'s
+    missing line numbers.
     """
     try:
         from typedframes._rust_checker import check_file, check_notebook
@@ -423,7 +452,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
 
     all_errors: list[dict] = []
     totals = {"dataframes_total": 0, "dataframes_typed": 0}
-    per_file: dict[str, tuple[int, int]] = {}
+    per_file: dict[str, FileTally] = {}
     untyped_sites: list[dict] = []
     for file_path in files:
         if file_path.suffix == ".ipynb":
@@ -432,13 +461,16 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
             outcome = _check_python_file(file_path, check_file, index_bytes)
         if outcome is None:
             continue
-        errors, file_total, file_typed, sites = outcome
-        all_errors.extend(errors)
-        per_file[str(file_path)] = (file_total, file_typed)
-        totals["dataframes_total"] += file_total
-        totals["dataframes_typed"] += file_typed
-        untyped_sites.extend(sites)
-    return all_errors, {**totals, "per_file": per_file, "untyped_sites": untyped_sites}
+        all_errors.extend(outcome.errors)
+        per_file[str(file_path)] = outcome.tally
+        totals["dataframes_total"] += outcome.tally.total
+        totals["dataframes_typed"] += outcome.tally.typed
+        untyped_sites.extend(outcome.untyped_sites)
+    return all_errors, {
+        **totals,
+        "per_file": per_file,
+        "untyped_sites": untyped_sites,
+    }
 
 
 def _error_location(error: dict) -> str:
@@ -594,7 +626,6 @@ def main(argv: list[str] | None = None) -> None:
             "[tool.typedframes.coverage]."
         ),
     )
-
     args = parser.parse_args(argv)
 
     if args.command != "check":
@@ -669,7 +700,7 @@ def _override_for(rel_path: str, config: CoverageConfig) -> tuple[str, float] | 
 
 
 def _evaluate_coverage(
-    per_file: dict[str, tuple[int, int]],
+    per_file: dict[str, FileTally],
     config: CoverageConfig,
     root: Path,
     cli_fail_under: float | None,
@@ -689,21 +720,27 @@ def _evaluate_coverage(
     checker found nothing to measure there, not that the code failed, which is
     the same reading `_coverage_message` already gives an empty run.
     """
-    tallies: dict[str | None, tuple[float, int, int]] = {}
-    for file_str, (total, typed) in sorted(per_file.items()):
+    tallies: dict[str | None, tuple[float, FileTally]] = {}
+    for file_str, tally in sorted(per_file.items()):
         if cli_fail_under is not None:
             label, threshold = None, cli_fail_under
         else:
             override = _override_for(_relative_posix(file_str, root), config)
             label, threshold = override if override is not None else (None, config.fail_under)
-        _, prev_total, prev_typed = tallies.get(label, (threshold, 0, 0))
-        tallies[label] = (threshold, prev_total + total, prev_typed + typed)
+        _, prev = tallies.get(label, (threshold, FileTally(0, 0)))
+        tallies[label] = (
+            threshold,
+            FileTally(
+                total=prev.total + tally.total,
+                typed=prev.typed + tally.typed,
+            ),
+        )
 
     failing = []
-    for label, (threshold, total, typed) in tallies.items():
-        if total == 0:
+    for label, (threshold, tally) in tallies.items():
+        if tally.total == 0:
             continue
-        bucket = CoverageBucket(label=label, threshold=threshold, total=total, typed=typed)
+        bucket = CoverageBucket(label=label, threshold=threshold, total=tally.total, typed=tally.typed)
         if bucket.pct < threshold:
             failing.append(bucket)
 
@@ -719,11 +756,8 @@ def _coverage_failure_message(bucket: CoverageBucket) -> str:
     has to read as a failure, not as a baffling "100% is below the required 100%".
     """
     scope = f" for {bucket.label!r}" if bucket.label else ""
-    return (
-        f"✗ DataFrame schema coverage {bucket.pct:.1f}% is below the required "
-        f"{bucket.threshold:.1f}%{scope} "
-        f"({bucket.typed}/{bucket.total} DataFrames had column info)"
-    )
+    tally = f"({bucket.typed}/{bucket.total} DataFrames had column info)"
+    return f"✗ DataFrame schema coverage {bucket.pct:.1f}% is below the required {bucket.threshold:.1f}%{scope} {tally}"
 
 
 def _missing_label(site: dict) -> str:
@@ -733,8 +767,21 @@ def _missing_label(site: dict) -> str:
     return f"{prefix}{site['var']}:{site['line']}"
 
 
+def _sites_by_file(sites: list[dict]) -> dict[str, list[dict]]:
+    """Group coverage sites by the file they came from, for per-row lookup."""
+    grouped: dict[str, list[dict]] = {}
+    for site in sites:
+        grouped.setdefault(site["file"], []).append(site)
+    return grouped
+
+
+def _site_labels(sites: list[dict], suffix: str = "") -> list[str]:
+    """Render one file's sites in line order, each optionally tagged with `suffix`."""
+    return [f"{_missing_label(site)}{suffix}" for site in sorted(sites, key=lambda s: s["line"])]
+
+
 def _format_term_missing(
-    per_file: dict[str, tuple[int, int]],
+    per_file: dict[str, FileTally],
     untyped_sites: list[dict],
     root: Path,
 ) -> str:
@@ -748,36 +795,46 @@ def _format_term_missing(
     Files with no recognized DataFrames are omitted: a row of `0/0` says nothing
     about coverage and would bury the files that do matter.
     """
-    rows = [(name, total, typed) for name, (total, typed) in sorted(per_file.items()) if total > 0]
+    rows = [(name, tally) for name, tally in sorted(per_file.items()) if tally.total > 0]
     if not rows:
         return "No DataFrames with recognized loads/schemas found to check"
 
-    sites_by_file: dict[str, list[dict]] = {}
-    for site in untyped_sites:
-        sites_by_file.setdefault(site["file"], []).append(site)
+    missing_by_file = _sites_by_file(untyped_sites)
 
-    display = {name: _relative_posix(name, root) for name, _, _ in rows}
-    name_width = max(len("Name"), *(len(display[name]) for name, _, _ in rows))
+    display = {name: _relative_posix(name, root) for name, _ in rows}
+    name_width = max(len("Name"), *(len(display[name]) for name, _ in rows))
     header = f"{'Name'.ljust(name_width)}  Typed  Total   Cover   Missing"
     lines = [header, "-" * len(header)]
 
-    for name, total, typed in rows:
-        pct = round(_COVERAGE_PCT_MAX * typed / total)
-        missing = ", ".join(
-            _missing_label(site) for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
-        )
-        lines.append(f"{display[name].ljust(name_width)}  {typed:>5}  {total:>5}  {pct:>5}%   {missing}".rstrip())
+    for name, tally in rows:
+        pct = round(_COVERAGE_PCT_MAX * tally.typed / tally.total)
+        labels = _site_labels(missing_by_file.get(name, []))
+        row = f"{display[name].ljust(name_width)}  {tally.typed:>5}  {tally.total:>5}  {pct:>5}%   {', '.join(labels)}"
+        lines.append(row.rstrip())
 
-    total_all = sum(total for _, total, _ in rows)
-    typed_all = sum(typed for _, _, typed in rows)
+    total_all = sum(tally.total for _, tally in rows)
+    typed_all = sum(tally.typed for _, tally in rows)
     pct_all = round(_COVERAGE_PCT_MAX * typed_all / total_all)
     lines.append("-" * len(header))
     lines.append(f"{'TOTAL'.ljust(name_width)}  {typed_all:>5}  {total_all:>5}  {pct_all:>5}%")
     return "\n".join(lines)
 
 
+def _site_entries(sites: list[dict]) -> list[dict]:
+    """Render one file's sites as JSON objects, in line order."""
+    return [
+        {
+            "var": site["var"],
+            "line": site["line"],
+            "col": site["col"],
+            **({"cell": site["cell"]} if "cell" in site else {}),
+        }
+        for site in sorted(sites, key=lambda s: s["line"])
+    ]
+
+
 def _coverage_json_payload(
-    per_file: dict[str, tuple[int, int]],
+    per_file: dict[str, FileTally],
     untyped_sites: list[dict],
     root: Path,
 ) -> dict:
@@ -788,32 +845,22 @@ def _coverage_json_payload(
     unlike the human-facing table: a consumer deciding whether a gate passed
     needs the real ratio, and can round for display itself.
     """
-    sites_by_file: dict[str, list[dict]] = {}
-    for site in untyped_sites:
-        sites_by_file.setdefault(site["file"], []).append(site)
+    missing_by_file = _sites_by_file(untyped_sites)
 
     files = []
-    for name, (total, typed) in sorted(per_file.items()):
+    for name, tally in sorted(per_file.items()):
         files.append(
             {
                 "file": _relative_posix(name, root),
-                "dataframes_total": total,
-                "dataframes_typed": typed,
-                "percent": (_COVERAGE_PCT_MAX * typed / total) if total else None,
-                "missing": [
-                    {
-                        "var": site["var"],
-                        "line": site["line"],
-                        "col": site["col"],
-                        **({"cell": site["cell"]} if "cell" in site else {}),
-                    }
-                    for site in sorted(sites_by_file.get(name, []), key=lambda s: s["line"])
-                ],
+                "dataframes_total": tally.total,
+                "dataframes_typed": tally.typed,
+                "percent": (_COVERAGE_PCT_MAX * tally.typed / tally.total) if tally.total else None,
+                "missing": _site_entries(missing_by_file.get(name, [])),
             }
         )
 
-    total_all = sum(total for total, _ in per_file.values())
-    typed_all = sum(typed for _, typed in per_file.values())
+    total_all = sum(tally.total for tally in per_file.values())
+    typed_all = sum(tally.typed for tally in per_file.values())
     return {
         "dataframes_total": total_all,
         "dataframes_typed": typed_all,
@@ -871,7 +918,10 @@ def _print_json_results(all_errors: list[dict], stats: RunStats, coverage_detail
     report requested -- leaves the payload byte-for-byte as it was before
     coverage reporting existed.
     """
-    stats_dict = {"dataframes_total": stats.dataframes_total, "dataframes_typed": stats.dataframes_typed}
+    stats_dict = {
+        "dataframes_total": stats.dataframes_total,
+        "dataframes_typed": stats.dataframes_typed,
+    }
     payload: dict = {"errors": all_errors, "stats": stats_dict}
     if coverage_detail is not None:
         payload["coverage"] = coverage_detail
@@ -1018,7 +1068,11 @@ def _run_check(args: argparse.Namespace) -> None:
     # require editing (or temporarily undoing) project config.
     detail = args.coverage_detail or coverage_config.detail
     coverage_detail_payload = (
-        _coverage_json_payload(coverage.get("per_file", {}), coverage.get("untyped_sites", []), path)
+        _coverage_json_payload(
+            coverage.get("per_file", {}),
+            coverage.get("untyped_sites", []),
+            path,
+        )
         if detail != "summary" and args.output_format == "json"
         else None
     )

@@ -32,7 +32,10 @@ typedframes check src/ --coverage-fail-under=90
 ```
 
 `--coverage-fail-under=N` is the same idea as a test-coverage or mypy type-coverage gate, applied to how many DataFrames
-the checker can resolve columns for — see [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
+the checker can resolve to a concrete column list — a DataFrame it merely recognizes but can't resolve columns for
+(a Feast retrieval whose entity_df isn't itself concrete, a bare `-> pd.DataFrame` return with no attached Schema)
+does not count, and any column accessed on it is flagged `unverifiable-column` rather than passed through silently.
+See [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
 Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete — see [Quick Start](#quick-start).
 
 ---
@@ -547,6 +550,16 @@ breakdown of exactly which DataFrames cost you coverage (as text or, combined wi
 `--output-format=json`, as structured JSON), and the full config reference all live in
 the
 [DataFrame schema coverage thresholds guide](docs/usage.md#dataframe-schema-coverage-thresholds).
+
+Some DataFrames are recognized but never resolve to a concrete column list — a Feast
+retrieval whose `entity_df` isn't itself concretely typed, or a bare `-> pd.DataFrame`
+return with no attached `Schema`. These do **not** count as covered, and accessing any
+column on one is flagged `unverifiable-column` rather than passed through silently —
+the checker genuinely doesn't know whether the column exists, so it says so instead of
+guessing either way. A Feast retrieval whose `entity_df` argument IS a concretely typed
+DataFrame is fully resolved instead: Feast's real output is `entity_df`'s own columns
+plus the requested features, so both halves get checked normally. See
+[Unresolved schemas](docs/usage.md#unresolved-schemas-recognized-but-not-column-checked).
 
 ## Static Analysis Performance
 

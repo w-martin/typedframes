@@ -16,6 +16,12 @@ pub(crate) const CODE_RESERVED_NAME: &str = "reserved-name";
 pub(crate) const CODE_UNTRACKED_DATAFRAME: &str = "untracked-dataframe";
 pub(crate) const CODE_DROPPED_UNKNOWN_COLUMN: &str = "dropped-unknown-column";
 pub(crate) const CODE_MISSING_COLUMN: &str = "missing-column";
+// A recognized DataFrame with no resolvable column list (unresolved entity_df in
+// a Feast retrieval, a bare `-> pd.DataFrame` return with no attached Schema).
+// Unlike CODE_UNKNOWN_COLUMN, there's no schema to check against, so access is
+// unverifiable rather than definitely wrong. Raised at every access site, since
+// the unresolved state propagates through returns, reassignment, and merge/concat.
+pub(crate) const CODE_UNVERIFIABLE_COLUMN: &str = "unverifiable-column";
 
 // Return true if the source line at `line` (1-indexed) carries a
 // `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
@@ -48,6 +54,10 @@ pub(crate) fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
 /// known column set (`dataframes_typed`). This is informational — a low ratio
 /// means the check had little to validate, not that the file has fewer
 /// problems. See [`crate::linter::Linter`] for exactly what is counted.
+///
+/// An origin with no resolvable column list (see `CODE_UNVERIFIABLE_COLUMN`) does
+/// NOT count toward `dataframes_typed` — it falls into `untyped_sites` like any
+/// other unresolved DataFrame.
 #[derive(Debug, Serialize, Default)]
 pub struct FileStats {
     pub dataframes_total: usize,

@@ -192,6 +192,39 @@ df.filter(EventSchema.user_id.col > 100)
 df.select(EventSchema.event_id.col, EventSchema.user_id.col)
 ```
 
+## Step 4a — Use with dask (experimental)
+
+`dask.dataframe` is recognized as a third backend. It is a deliberate near drop-in for
+pandas, so the same inference and the same tracked operations apply, plus the
+lazy-to-eager step:
+
+```python
+from typing import Annotated
+import dask.dataframe as dd
+from typedframes import BaseSchema, Column
+
+
+class EventSchema(BaseSchema):
+    event_id = Column(type=int)
+    user_id = Column(type=int)
+
+
+# Inference from usecols=, no schema class required
+events = dd.read_csv("events.csv", usecols=["event_id", "user_id"])
+
+# `.compute()` materializes to a real pandas DataFrame; the column set carries over
+frame = events.compute()
+print(frame["event_id"])  # ✓ OK
+print(frame["typo"])  # ✗ unknown-column
+
+# Or annotate explicitly
+df: Annotated[dd.DataFrame, EventSchema] = dd.read_parquet("events.parquet", columns=["event_id"])
+print(df["timestamp"])  # ✗ unknown-column
+```
+
+The checker never imports dask — it is a pure AST pass, so dask only needs to be
+installed to run the code, not to check it.
+
 ## Step 5 — Schema composition
 
 Build merged schemas for joins using inheritance or the `+` operator:

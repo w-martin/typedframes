@@ -5,8 +5,9 @@ Three groups, each with its own README/SPEC:
 ## [`features/`](features/)
 
 Core typedframes usage: inference from `usecols=`/`columns=`, multi-file schema
-propagation, `Annotated` schemas for pandas/polars, schema algebra, Jupyter notebook
-(`.ipynb`) checking, and the Pandera bridge. Start here if you're new to typedframes. See
+propagation, `Annotated` schemas for pandas/polars (and, experimentally,
+`dask.dataframe`), schema algebra, Jupyter notebook (`.ipynb`) checking, and the Pandera
+bridge. Start here if you're new to typedframes. See
 [`features/README.md`](features/README.md).
 
 ## [`sql_connectors/`](sql_connectors/)

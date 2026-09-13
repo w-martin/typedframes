@@ -75,6 +75,26 @@ uv run ty check annotated_polars_example.py
 uv run typedframes check annotated_polars_example.py
 ```
 
+## annotated_dask_example.py
+
+**Experimental.** `dask.dataframe` as a third backend: inference from
+`dd.read_csv(usecols=...)`, structural operations (drop / assign) on a dask frame,
+column tracking surviving the lazy-to-eager `.compute()` step,
+`dd.from_pandas(...)` carrying an in-memory frame's columns across, and
+`Annotated[dd.DataFrame, Schema]` for the annotated form. Four intentional
+unknown-column errors and one `untracked-dataframe` warning.
+
+Run without `--strict`, unlike the pandas/polars examples above: dask ships a
+`py.typed` marker but its annotations are incomplete (`dd.read_csv` returns `Any`,
+`dd.from_pandas` is untyped), so `--strict` reports `no-any-return` /
+`no-untyped-call` against dask's own API rather than anything in this file.
+
+```shell
+uv run mypy --config-file mypy_empty.ini annotated_dask_example.py
+uv run ty check annotated_dask_example.py
+uv run typedframes check annotated_dask_example.py
+```
+
 ## schema_algebra_example.py
 
 Schema composition via inheritance and the `+` operator.  Shows how to build

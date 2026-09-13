@@ -184,7 +184,33 @@ pub(crate) const LOAD_FUNCTIONS: &[&str] = &[
     "read_gbq",
 ];
 
-pub(crate) const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars"];
+// DataFrame-library namespaces whose `LOAD_FUNCTIONS` calls seed a column set. Matched
+// against the call receiver flattened by `ast_extract::dotted_module_path`, which is why
+// the dotted `dask.dataframe` spelling can sit in the same list as the bare aliases: a
+// plain `Expr::Name` receiver flattens to itself, so `pd`/`pl` behave exactly as before.
+//
+// `dd`/`dask.dataframe` is EXPERIMENTAL. dask.dataframe is a deliberate near-drop-in for
+// pandas, so every load function it implements (`read_csv`, `read_parquet`, `read_json`,
+// `read_sql`/`read_sql_query`/`read_sql_table`, `read_hdf`, `read_orc`) already appears
+// in `LOAD_FUNCTIONS` under its pandas spelling, with the same `usecols=`/`columns=`
+// kwargs -- verified by executing them against dask 2026.8.0, not just read from docs.
+// The functions dask does NOT have (`read_excel`, `read_html`, `read_feather`,
+// `read_clipboard`, polars' `scan_*`/`read_database*`) simply never match a real `dd.`
+// call, so no per-module gating is needed.
+pub(crate) const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars", "dd", "dask.dataframe"];
+
+// Module-level constructors that re-wrap an ALREADY-TRACKED frame in another backend's
+// container without touching its column set, with the source frame as the first
+// positional argument: `dd.from_pandas(pdf, npartitions=2)` -- dask's canonical entry
+// point from an in-memory frame -- and `pl.from_pandas(pdf)`. Both verified to return
+// the source's columns unchanged by running them, against dask 2026.8.0 and polars
+// 1.43.2.
+//
+// Deliberately excludes dask's other `from_*` constructors: `from_dict` takes a literal
+// rather than a tracked frame (the same shape as `pd.DataFrame({...})`, which this
+// checker also leaves untracked), and `from_delayed`/`from_array`/`from_map` produce
+// columns that only exist at runtime.
+pub(crate) const FRAME_WRAP_FUNCTIONS: &[&str] = &["from_pandas"];
 
 // Load functions whose column set lives in a SQL SELECT list rather than a
 // usecols/columns/dtype/schema kwarg. `read_sql_table` is deliberately excluded: its
@@ -256,4 +282,15 @@ pub(crate) const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "dropna",
     "ffill",
     "bfill",
+    // Materialization and partition-layout changes, which preserve the column set
+    // exactly. `compute`/`persist`/`repartition` are dask.dataframe's (all three
+    // verified to return the receiver's columns unchanged against dask 2026.8.0);
+    // `collect` is polars' LazyFrame finalizer, which had no handling before, so a
+    // `pl.scan_csv(...)` schema used to be lost the moment it was collected. Each only
+    // fires when the receiver is already a tracked frame, so an unrelated `.collect()`
+    // on some other object is still ignored.
+    "compute",
+    "persist",
+    "repartition",
+    "collect",
 ];

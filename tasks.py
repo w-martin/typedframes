@@ -1,27 +1,44 @@
 """Invoke tasks for typedframes development."""
 
+import importlib.machinery
 from pathlib import Path
 
 from invoke import Context, task
 
 RUST_DIR = Path("rust")
-BINARY_PATH = RUST_DIR / "target" / "debug" / "typedframes_checker"
+EXTENSION_DIR = Path("src") / "typedframes"
+
+
+def _compiled_extension() -> Path | None:
+    """Find the compiled Python extension module actually loaded by `import typedframes`."""
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        matches = list(EXTENSION_DIR.glob(f"_rust_checker{suffix}"))
+        if matches:
+            return matches[0]
+    return None
 
 
 def _needs_build() -> bool:
-    """Check if rust binary needs rebuilding."""
-    if not BINARY_PATH.exists():
+    """Check if the compiled Python extension needs rebuilding.
+
+    Must check the extension `maturin develop` installs into `src/typedframes/`, not
+    `rust/target/debug/typedframes_checker` (the standalone CLI binary `cargo build`/`cargo
+    test` produces) -- the two are built independently, so a bare `cargo test` can leave this
+    check thinking the extension is fresh when it's actually stale.
+    """
+    extension = _compiled_extension()
+    if extension is None:
         return True
 
-    binary_mtime = BINARY_PATH.stat().st_mtime
+    extension_mtime = extension.stat().st_mtime
     src_dir = RUST_DIR / "src"
 
     for src_file in src_dir.rglob("*.rs"):
-        if src_file.stat().st_mtime > binary_mtime:
+        if src_file.stat().st_mtime > extension_mtime:
             return True
 
     cargo_toml = RUST_DIR / "Cargo.toml"
-    return cargo_toml.exists() and cargo_toml.stat().st_mtime > binary_mtime
+    return cargo_toml.exists() and cargo_toml.stat().st_mtime > extension_mtime
 
 
 @task

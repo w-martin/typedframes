@@ -115,10 +115,21 @@ PYO3_PYTHON=/path/to/python3.11 cargo test
 ### Verify Licenses
 
 ```shell
-uv run licensecheck
+uv run inv verify-licences
 ```
 
-Runs licensecheck to verify all dependency licenses are compatible.
+Checks the license of every package installed in the development environment using
+[trustedlicenses](https://github.com/w-martin/trustedlicenses). It checks a
+package's declared metadata first, falling back to text-matching its bundled
+license file when metadata is missing, stale, or too vague to act on.
+
+The policy lives in `[tool.trustedlicenses]` in `pyproject.toml`. A package passes
+when at least one detected license falls into an allowed category: `Permissive`,
+`Public Domain` or `Copyleft Limited` (LGPL, MPL, EPL). Strong copyleft (GPL, AGPL),
+proprietary and undetectable licenses fail the build, which matches what this
+MIT-licensed project could actually depend on. `ignored-packages` in the same table
+is the escape hatch for a package whose license genuinely cannot be determined from
+the installed artifact.
 
 ### Run All Checks
 

@@ -55,6 +55,9 @@ jobs:
       - name: Python tests
         run: uv run inv test
 
+      - name: Verify licenses
+        run: uv run inv verify-licences
+
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@v2
         with:

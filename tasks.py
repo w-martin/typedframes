@@ -84,8 +84,8 @@ def docs(ctx: Context) -> None:
 
 @task
 def verify_licences(ctx: Context) -> None:
-    """Run licensecheck to verify dependency licenses."""
-    ctx.run("licensecheck")
+    """Verify dependency licenses against the policy in pyproject.toml."""
+    ctx.run("trustedlicenses --quiet")
 
 
 @task(name="all", pre=[build])

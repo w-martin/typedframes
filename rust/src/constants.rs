@@ -184,7 +184,37 @@ pub(crate) const LOAD_FUNCTIONS: &[&str] = &[
     "read_gbq",
 ];
 
-pub(crate) const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars"];
+pub(crate) const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars", "cudf"];
+
+// RAPIDS cuDF (experimental). Listed under its own module name only -- unlike pandas
+// and polars, cuDF has no conventional short alias: both the project README and the
+// "10 minutes to cuDF" guide import it as a bare `import cudf`.
+//
+// cuDF's `cudf.pandas` accelerator mode needs nothing here: source written for it still
+// says `import pandas as pd`, so it is already covered by the `pd`/`pandas` entries.
+pub(crate) const CUDF_MODULES: &[&str] = &["cudf"];
+
+// The load functions cuDF actually exports, checked against `cudf.__all__` rather than
+// assumed from pandas parity. cuDF is a near-drop-in pandas replacement, but its reader
+// surface is a strict SUBSET of pandas': there is no `read_excel`, no `read_sql*`, no
+// `read_html`, and no `read_clipboard`, nor any of polars' `scan_*` functions. Gating
+// cuDF on this list instead of the full `LOAD_FUNCTIONS` keeps the checker from
+// claiming to recognize `cudf.read_sql(...)` -- a call that cannot exist.
+//
+// `cudf.read_text` is deliberately absent: it returns a `Series`, not a `DataFrame`, so
+// it has no column set to seed.
+//
+// Every name here is also present in `LOAD_FUNCTIONS`, which the enclosing dispatch
+// checks first; this list narrows that set for cuDF rather than extending it.
+pub(crate) const CUDF_LOAD_FUNCTIONS: &[&str] = &[
+    "read_csv",
+    "read_parquet",
+    "read_json",
+    "read_orc",
+    "read_avro",
+    "read_feather",
+    "read_hdf",
+];
 
 // Load functions whose column set lives in a SQL SELECT list rather than a
 // usecols/columns/dtype/schema kwarg. `read_sql_table` is deliberately excluded: its

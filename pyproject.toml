@@ -58,7 +58,6 @@ branch = true
 omit = [
     "benchmarks/*",
     "examples/*",
-    "scripts/*",
     "tests/*",
     "tasks.py",
 ]
@@ -151,11 +150,14 @@ dev = [
     "fastexcel>=0.20.2",
     "pandas-stubs>=3.0.5.260730",
     "mypy>=2.3.1",
-    "scancode-toolkit-mini>=32.5.0",
+    "trustedlicenses>=0.1.1",
 ]
 
 [tool.bandit]
 exclude_dirs = ["tests", "examples"]
+
+[tool.trustedlicenses]
+allowed-categories = ["Permissive", "Public Domain", "Copyleft Limited"]
 
 [tool.coverage.report]
 exclude_lines = [

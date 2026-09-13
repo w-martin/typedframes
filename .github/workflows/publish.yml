@@ -34,9 +34,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
-      - name: Install libmagic (license check)
-        run: sudo apt-get update && sudo apt-get install -y libmagic1
-
       - name: Rust format check
         run: cargo fmt --all -- --check
         working-directory: rust

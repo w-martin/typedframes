@@ -116,7 +116,17 @@ pub fn find_project_root_opt(start_path: &Path) -> Option<PathBuf> {
     }
     loop {
         if current.join("pyproject.toml").exists() {
-            return Some(current);
+            // `current.pop()` can walk `current` all the way down to the empty
+            // `PathBuf` (when `start_path` was relative and its project root is the
+            // CWD itself). The empty PathBuf is a valid *join* target (joining onto
+            // it is a no-op) but `fs::canonicalize("")` errors -- unlike
+            // `fs::canonicalize(".")`, which resolves to the CWD -- so normalize here
+            // to keep that invariant for every caller that canonicalizes the root.
+            return Some(if current.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                current
+            });
         }
         if !current.pop() {
             return None;

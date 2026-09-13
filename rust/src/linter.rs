@@ -1935,7 +1935,20 @@ impl Linter {
         if let Expr::BinOp(binop) = expr {
             if binop.op == ast::Operator::Div && ast_extract::is_file_parent_expr(&binop.left) {
                 if let Some(s) = ast_extract::extract_string_literal(&binop.right) {
-                    return current_file.parent().map(|dir| dir.join(s));
+                    let joined = current_file.parent()?.join(s);
+                    // `joined` is anchored exactly the way `current_file` was passed to
+                    // the checker (CWD-relative, or absolute) -- never relative to
+                    // `project_root`. Absolutize it here so `read_sql_file` takes its
+                    // `is_absolute()` branch below instead of incorrectly re-joining a
+                    // CWD-relative path onto `project_root` (which either duplicates
+                    // path segments, or -- when `project_root` is itself the empty
+                    // PathBuf produced for a project root at the CWD -- fails outright,
+                    // since `fs::canonicalize("")` errors rather than meaning ".").
+                    return Some(if joined.is_absolute() {
+                        joined
+                    } else {
+                        std::env::current_dir().ok()?.join(joined)
+                    });
                 }
             }
         }

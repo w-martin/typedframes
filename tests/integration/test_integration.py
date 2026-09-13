@@ -56,6 +56,24 @@ class TestTypedFramesCheckerIntegration(unittest.TestCase):
         self.assertIn("wrong_column", result)
         self.assertIn("does not exist", result)
 
+    def test_should_give_same_diagnostics_for_a_relative_and_an_absolute_path(self) -> None:
+        """Regression test for #77.
+
+        A relative path must not silently break the sibling-file read behind
+        `Path(__file__).parent / "orders.sql"`, which used to make check_file()
+        disagree with itself depending only on path form.
+        """
+        # arrange
+        relative_path = "examples/sql_connectors/duckdb/example.py"
+        absolute_path = str(Path(relative_path).absolute())
+
+        # act
+        relative_errors = json.loads(check_file(relative_path, None))["errors"]
+        absolute_errors = json.loads(check_file(absolute_path, None))["errors"]
+
+        # assert
+        self.assertEqual(relative_errors, absolute_errors)
+
     def test_should_warn_about_reserved_method_names(self) -> None:
         """Test that the checker warns about column names that shadow pandas/polars methods."""
         # arrange

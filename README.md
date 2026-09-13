@@ -964,7 +964,7 @@ Runnable versions of everything shown in [Quick Start](#quick-start) and
   `Annotated[pd.DataFrame, Schema]` with string and `.s` descriptor column access
 - [`annotated_polars_example.py`](examples/features/annotated_polars_example.py) —
   the same, with `pl.col()` and `.col` descriptor expressions
-- [`annotated_cudf_example.py`](examples/features/annotated_cudf_example.py) —
+- [`backends/cudf/example.py`](examples/backends/cudf/example.py) —
   `Annotated[cudf.DataFrame, Schema]` on RAPIDS cuDF (experimental), checked without a
   GPU or a cuDF install
 - [`typedframes_example.py`](examples/features/typedframes_example.py) — pandas and

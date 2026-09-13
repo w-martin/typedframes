@@ -1,0 +1,12 @@
+services:
+  cudf-example:
+    build: .
+    # Requires the NVIDIA Container Toolkit on the Docker host and an NVIDIA GPU.
+    # See README.md for why this cannot be run on this repo's development machine.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -695,8 +695,9 @@ class TestCli(unittest.TestCase):
 
             # assert -- the DataFrame is recognised because the installed package's own
             # return annotation was indexed; without following the import it would not
-            # have been seen at all.
-            self.assertIn("1/1 DataFrames had column info", captured.getvalue())
+            # have been seen at all. It's still unresolved (a bare `-> pd.DataFrame`, no
+            # Schema), so it doesn't count as typed -- only that it was counted at all.
+            self.assertIn("/1 DataFrames had column info", captured.getvalue())
 
     def test_should_check_a_single_file_gracefully_when_there_is_no_project_root(self) -> None:
         """Test that a lone file with no pyproject.toml above it is checked, not errored on."""

@@ -670,6 +670,10 @@ impl Default for Linter {
     }
 }
 
+// (feature_cols, entity_cols) resolved for a Feast retrieval -- see
+// Linter::register_feast_dataframe.
+type FeastColumns = (Option<Vec<String>>, Option<Vec<String>>);
+
 impl Linter {
     pub fn new() -> Self {
         Self {
@@ -1731,8 +1735,7 @@ impl Linter {
     // partial credit for the feature columns alone.
     fn register_feast_dataframe(
         &mut self,
-        cols: Option<Vec<String>>,
-        entity_cols: Option<Vec<String>>,
+        (cols, entity_cols): FeastColumns,
         target_names: &[String],
         var_hint: &str,
         current_line: usize,
@@ -3303,8 +3306,10 @@ impl Linter {
                                 if let Some(cols) = self.extract_feast_feature_columns(call) {
                                     let entity_cols = self.resolve_feast_entity_columns(call);
                                     if let [Expr::Name(target_name)] = assign.targets.as_slice() {
-                                        self.retrieval_jobs
-                                            .insert(target_name.id.to_string(), (cols, entity_cols));
+                                        self.retrieval_jobs.insert(
+                                            target_name.id.to_string(),
+                                            (cols, entity_cols),
+                                        );
                                     }
                                 }
                             } else if func_name == "to_df" {
@@ -3317,27 +3322,26 @@ impl Linter {
                                 // (unrelated to Feast) is deliberately left alone —
                                 // matched only once one of these two specific shapes is
                                 // confirmed, not on the method name alone.
-                                let feast_cols: Option<(Option<Vec<String>>, Option<Vec<String>>)> =
-                                    match &*attr.value {
-                                        Expr::Name(recv) => self
-                                            .retrieval_jobs
-                                            .get(recv.id.as_str())
-                                            .cloned()
-                                            .map(|(cols, entity_cols)| (Some(cols), entity_cols)),
-                                        Expr::Call(inner_call) => match &*inner_call.func {
-                                            Expr::Attribute(inner_attr)
-                                                if FEAST_RETRIEVAL_METHODS
-                                                    .contains(&inner_attr.attr.as_str()) =>
-                                            {
-                                                Some((
-                                                    self.extract_feast_feature_columns(inner_call),
-                                                    self.resolve_feast_entity_columns(inner_call),
-                                                ))
-                                            }
-                                            _ => None,
-                                        },
+                                let feast_cols: Option<FeastColumns> = match &*attr.value {
+                                    Expr::Name(recv) => self
+                                        .retrieval_jobs
+                                        .get(recv.id.as_str())
+                                        .cloned()
+                                        .map(|(cols, entity_cols)| (Some(cols), entity_cols)),
+                                    Expr::Call(inner_call) => match &*inner_call.func {
+                                        Expr::Attribute(inner_attr)
+                                            if FEAST_RETRIEVAL_METHODS
+                                                .contains(&inner_attr.attr.as_str()) =>
+                                        {
+                                            Some((
+                                                self.extract_feast_feature_columns(inner_call),
+                                                self.resolve_feast_entity_columns(inner_call),
+                                            ))
+                                        }
                                         _ => None,
-                                    };
+                                    },
+                                    _ => None,
+                                };
                                 if let Some((cols, entity_cols)) = feast_cols {
                                     let target_names: Vec<String> = assign
                                         .targets
@@ -3353,8 +3357,7 @@ impl Linter {
                                     let var_name =
                                         target_names.first().map(|s| s.as_str()).unwrap_or("df");
                                     self.register_feast_dataframe(
-                                        cols,
-                                        entity_cols,
+                                        (cols, entity_cols),
                                         &target_names,
                                         var_name,
                                         current_line,
@@ -4380,8 +4383,7 @@ impl Linter {
                             ast_extract::extract_string_literal(&subscript.slice)
                         {
                             if self.schema_is_unresolved(schema_name) {
-                                let (line, col) =
-                                    self.source_location(subscript.range().start());
+                                let (line, col) = self.source_location(subscript.range().start());
                                 let schema_display =
                                     self.schema_display(schema_name, *defined_line);
                                 errors.push(LintError {

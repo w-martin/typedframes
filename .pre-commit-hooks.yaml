@@ -1,0 +1,13 @@
+- id: typedframes
+  name: typedframes check
+  description: Catch pandas/polars DataFrame column errors with the typedframes static checker.
+  entry: typedframes check
+  language: python
+  types_or: [python, jupyter]
+  # The checker takes a single path and builds its cross-file index from it, so it
+  # runs once over the project rather than once per staged file -- that index is what
+  # catches errors spanning modules the commit didn't touch.
+  pass_filenames: false
+  # --strict is what makes the hook block the commit: without it the CLI reports
+  # errors and still exits 0.
+  args: [., --strict]

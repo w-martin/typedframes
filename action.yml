@@ -1,0 +1,123 @@
+name: typedframes
+description: Catch pandas/polars DataFrame column errors in CI, annotated inline on the pull request diff.
+author: William Martin
+
+branding:
+  icon: columns
+  color: blue
+
+inputs:
+  path:
+    description: File or directory to check. Passed straight to `typedframes check`.
+    required: false
+    default: "."
+  version:
+    description: >-
+      Version of typedframes to install from PyPI, e.g. "0.5.0". The default,
+      "latest", installs the newest release.
+    required: false
+    default: latest
+  strict:
+    description: >-
+      Fail the step when the checker reports errors. `typedframes check` exits 0
+      by default even when it finds real errors, so this is what makes the action
+      actually fail on them. Set to "false" to get the annotations without
+      failing the build.
+    required: false
+    default: "true"
+  coverage-fail-under:
+    description: >-
+      Minimum DataFrame schema coverage, as a percentage, e.g. "90". Empty (the
+      default) leaves the gate off, matching the CLI: coverage enforcement is
+      opt-in. When set it overrides `[tool.typedframes.coverage]` entirely,
+      per-path overrides included.
+    required: false
+    default: ""
+  coverage-detail:
+    description: >-
+      How much coverage detail to print - "summary" (the default, one line) or
+      "term-missing" (per-file table plus the DataFrame sites lacking column
+      info). Only meaningful alongside `coverage-fail-under`.
+    required: false
+    default: summary
+  no-warnings:
+    description: >-
+      Set to "true" to suppress warning-level diagnostics
+      (untracked-dataframe, dropped-unknown-column).
+    required: false
+    default: "false"
+  args:
+    description: >-
+      Escape hatch for the rarer flags that have no input of their own -
+      `--no-index`, `--lenient-ingest`, `--no-info`. Split on whitespace and
+      appended last. Everything in common use has a named input above; reach for
+      this only when nothing up there fits.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Installed into a throwaway venv rather than the runner's Python: it leaves the
+    # caller's dependency set untouched and sidesteps PEP 668's externally-managed
+    # interpreters. typedframes publishes wheels for linux (x86_64/aarch64), macOS
+    # (x86_64/arm64) and windows (x86_64), so this is a download, not a Rust build.
+    - name: Install typedframes
+      shell: bash
+      env:
+        TYPEDFRAMES_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        py=python3
+        command -v python3 >/dev/null 2>&1 || py=python
+        venv="${RUNNER_TEMP}/typedframes-venv"
+        "$py" -m venv "$venv"
+        if [ -d "$venv/bin" ]; then
+          bindir="$venv/bin"
+        else
+          bindir="$venv/Scripts"
+        fi
+        if [ "$TYPEDFRAMES_VERSION" = "latest" ]; then
+          spec="typedframes"
+        else
+          spec="typedframes==${TYPEDFRAMES_VERSION}"
+        fi
+        "$bindir/python" -m pip install --disable-pip-version-check --quiet "$spec"
+        # An absolute path rather than a GITHUB_PATH entry, so no PATH string has to
+        # survive the runner's translation on Windows.
+        echo "TYPEDFRAMES_BIN=$bindir/typedframes" >> "$GITHUB_ENV"
+
+    # --output-format=github emits workflow-command annotations. The checker reports
+    # absolute paths; the runner rewrites any path under GITHUB_WORKSPACE to a
+    # repo-relative one, which is what puts the annotation on the diff.
+    - name: Run typedframes check
+      shell: bash
+      env:
+        TYPEDFRAMES_PATH: ${{ inputs.path }}
+        TYPEDFRAMES_STRICT: ${{ inputs.strict }}
+        TYPEDFRAMES_COVERAGE_FAIL_UNDER: ${{ inputs['coverage-fail-under'] }}
+        TYPEDFRAMES_COVERAGE_DETAIL: ${{ inputs['coverage-detail'] }}
+        TYPEDFRAMES_NO_WARNINGS: ${{ inputs['no-warnings'] }}
+        TYPEDFRAMES_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        cmd=("$TYPEDFRAMES_BIN" check "$TYPEDFRAMES_PATH" --output-format=github)
+        if [ "$TYPEDFRAMES_STRICT" = "true" ]; then
+          cmd+=(--strict)
+        fi
+        if [ -n "$TYPEDFRAMES_COVERAGE_FAIL_UNDER" ]; then
+          cmd+=("--coverage-fail-under=$TYPEDFRAMES_COVERAGE_FAIL_UNDER")
+        fi
+        # Passed only when it differs from the CLI's own default. --coverage-detail
+        # overrides the `detail` key in [tool.typedframes.coverage], so sending
+        # "summary" unconditionally would quietly clobber a project that configured
+        # term-missing for itself.
+        if [ "$TYPEDFRAMES_COVERAGE_DETAIL" != "summary" ]; then
+          cmd+=("--coverage-detail=$TYPEDFRAMES_COVERAGE_DETAIL")
+        fi
+        if [ "$TYPEDFRAMES_NO_WARNINGS" = "true" ]; then
+          cmd+=(--no-warnings)
+        fi
+        # $TYPEDFRAMES_ARGS is deliberately unquoted: it is a whitespace-separated
+        # argument list, not one argument.
+        "${cmd[@]}" $TYPEDFRAMES_ARGS

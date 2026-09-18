@@ -38,6 +38,27 @@ pub(crate) struct NotebookUntypedSite {
     pub var: String,
 }
 
+/// The [`crate::errors::TypedSite`] counterpart, relocated to notebook coordinates.
+#[derive(Debug, Serialize)]
+pub(crate) struct NotebookTypedSite {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub schema: String,
+}
+
+/// The [`crate::errors::DataFrameCallSite`] counterpart, relocated to notebook
+/// coordinates.
+#[derive(Debug, Serialize)]
+pub(crate) struct NotebookDataFrameCallSite {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub label: String,
+    pub context: String,
+}
+
 /// The notebook counterpart of [`FileStats`], nested under `stats` in
 /// [`NotebookCheckResult`] -- matching [`crate::errors::CheckFileResult`]'s shape so
 /// the Python side can treat both JSON payloads the same way.
@@ -46,6 +67,8 @@ pub(crate) struct NotebookFileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
     pub untyped_sites: Vec<NotebookUntypedSite>,
+    pub typed_sites: Vec<NotebookTypedSite>,
+    pub all_dataframe_calls: Vec<NotebookDataFrameCallSite>,
 }
 
 /// The JSON payload returned by the `check_notebook` entry point. Same shape as
@@ -134,12 +157,44 @@ pub(crate) fn translate_result(
         })
         .collect();
 
+    let typed_sites = stats
+        .typed_sites
+        .into_iter()
+        .map(|s| {
+            let (cell, line) = translate(index, s.line);
+            NotebookTypedSite {
+                cell,
+                line,
+                col: s.col,
+                var: s.var,
+                schema: s.schema,
+            }
+        })
+        .collect();
+
+    let all_dataframe_calls = stats
+        .all_dataframe_calls
+        .into_iter()
+        .map(|s| {
+            let (cell, line) = translate(index, s.line);
+            NotebookDataFrameCallSite {
+                cell,
+                line,
+                col: s.col,
+                label: s.label,
+                context: s.context,
+            }
+        })
+        .collect();
+
     NotebookCheckResult {
         errors,
         stats: NotebookFileStats {
             dataframes_total: stats.dataframes_total,
             dataframes_typed: stats.dataframes_typed,
             untyped_sites,
+            typed_sites,
+            all_dataframe_calls,
         },
     }
 }
@@ -147,7 +202,7 @@ pub(crate) fn translate_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::UntypedSite;
+    use crate::errors::{DataFrameCallSite, TypedSite, UntypedSite};
     use ruff_notebook::Notebook;
 
     // Four cells: markdown, code (2 lines), markdown, code (1 line). Cell numbers
@@ -249,6 +304,18 @@ mod tests {
                 col: 1,
                 var: "df".to_string(),
             }],
+            typed_sites: vec![TypedSite {
+                line: 1,
+                col: 1,
+                var: "df2".to_string(),
+                schema: "S".to_string(),
+            }],
+            all_dataframe_calls: vec![DataFrameCallSite {
+                line: 1,
+                col: 1,
+                label: "pd.DataFrame".to_string(),
+                context: "the direct value of a plain assignment".to_string(),
+            }],
         };
 
         // act
@@ -266,5 +333,14 @@ mod tests {
         assert_eq!(result.stats.untyped_sites[0].cell, 2);
         assert_eq!(result.stats.untyped_sites[0].line, 1);
         assert_eq!(result.stats.untyped_sites[0].var, "df");
+        assert_eq!(result.stats.typed_sites.len(), 1);
+        assert_eq!(result.stats.typed_sites[0].cell, 2);
+        assert_eq!(result.stats.typed_sites[0].line, 1);
+        assert_eq!(result.stats.typed_sites[0].var, "df2");
+        assert_eq!(result.stats.typed_sites[0].schema, "S");
+        assert_eq!(result.stats.all_dataframe_calls.len(), 1);
+        assert_eq!(result.stats.all_dataframe_calls[0].cell, 2);
+        assert_eq!(result.stats.all_dataframe_calls[0].line, 1);
+        assert_eq!(result.stats.all_dataframe_calls[0].label, "pd.DataFrame");
     }
 }

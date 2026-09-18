@@ -9,7 +9,7 @@ use crate::ast_extract;
 use crate::config::{find_project_root_opt, load_linter_config, LinterConfig};
 use crate::constants::DEFAULT_EXCLUDED_DIRS;
 use crate::errors::{LintError, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME};
-use crate::linter::{Linter, ParamGovernedTemplate};
+use crate::linter::{collect_self_attr_origins, Linter, ParamGovernedTemplate, SelfAttrOrigin};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, SourceCode};
@@ -139,6 +139,33 @@ pub(crate) struct ProjectIndex {
     // warning and it would be wrong to silently report nothing).
     #[serde(default)]
     pub(crate) resolved_governed: std::collections::HashSet<(String, String)>,
+    // Defining file -> bare function/method names confirmed called from a direct
+    // `x = name(...)` call site SOMEWHERE in the project (any file, including the
+    // defining file itself -- redundant with what same-file confirmation already
+    // finds there, but harmless: `Linter::functions_called` is a plain HashSet, and
+    // inserting an already-present name is a no-op).
+    //
+    // This is what lets `Linter::pending_passthrough_reversals` (see its doc comment
+    // in linter.rs) confirm a pass-through function's count across a file boundary --
+    // `loaders.py` defines `load_orders` with a bare `return df`; without this, only
+    // `pipeline.py`'s own call site would ever confirm it (via cross-file
+    // `self.functions` resolution), while `loaders.py`'s OWN per-file check has no way
+    // to know anyone calls it, so it would keep counting its internal origin too --
+    // the exact cross-file double-count this field closes. Seeded into each file's
+    // `Linter::functions_called` by `load_cross_file_symbols`, BEFORE that file's own
+    // statement walk runs, so the existing end-of-walk resolution loop
+    // (`check_parsed_module`) picks up a cross-file confirmation with no change to the
+    // reversal mechanism itself.
+    //
+    // Scoped to bare-name calls only (`resolve_delegate_target`'s own resolution
+    // capability, the same one `resolve_param_governed_call_sites` already relies on)
+    // -- a cross-file `self.<attr>.<method>()` call site is NOT covered (would need
+    // `current_self_attrs`-equivalent tracking reconstructed for every file in this
+    // lightweight re-scan, not just the `Linter`-based `index_file` pass), so that
+    // shape's cross-file confirmation remains a known, narrower follow-up gap; its
+    // SAME-FILE confirmation is unaffected and already works.
+    #[serde(default)]
+    pub(crate) called_functions: HashMap<String, std::collections::HashSet<String>>,
 }
 
 // Union schema name -> column list across every file's `schemas` map. First
@@ -638,6 +665,7 @@ pub(crate) fn finalise_index(
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
     let governed = resolve_param_governed_call_sites(project_root, &files);
+    let called_functions = resolve_called_functions(project_root, &files);
     ProjectIndex {
         version: 1,
         files,
@@ -645,6 +673,7 @@ pub(crate) fn finalise_index(
         all_schema_locations,
         call_site_errors: governed.call_site_errors,
         resolved_governed: governed.resolved_governed,
+        called_functions,
     }
 }
 
@@ -876,6 +905,291 @@ pub(crate) fn resolve_delegate_target(
         }
     }
     None
+}
+
+// Project-wide pass: for every direct `x = name(...)` call site anywhere in the
+// project, resolve the callee to its defining (file, func) via `resolve_delegate_target`
+// and record it unconditionally -- see `ProjectIndex.called_functions`'s doc comment
+// for what this is for. Much simpler than `resolve_param_governed_call_sites`/
+// `check_governed_call_site`: no template or literal-value resolution, every call site
+// that resolves at all is recorded.
+pub(crate) fn resolve_called_functions(
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, std::collections::HashSet<String>> {
+    let mut called: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let has_any_functions = files
+        .values()
+        .any(|entry| !entry.functions.is_empty() || !entry.class_methods.is_empty());
+    if !has_any_functions {
+        return called;
+    }
+
+    for file_path in files.keys() {
+        let Ok(source) = fs::read_to_string(file_path) else {
+            continue;
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            continue;
+        };
+        let module = parsed.into_syntax();
+        scan_stmts_for_called_functions(
+            &module.body,
+            file_path,
+            project_root,
+            files,
+            None,
+            &mut called,
+        );
+    }
+    called
+}
+
+// Resolve a `self.<attr>` origin (see `collect_self_attr_origins`) to the file that
+// defines its class: same-file first (a class defined in `from_file` itself), then
+// `imports`/`module_aliases` -- mirroring how a real `Linter`'s `self.class_methods`
+// ends up covering both cases (local class visits plus `import_name`'s cross-file
+// pull), just resolved fresh here since this lightweight re-scan has no `Linter`
+// instance whose state already merged them (see `index_file`, which never calls
+// `load_cross_file_symbols` before its own walk).
+fn resolve_self_attr_class_file(
+    from_file: &str,
+    origin: &SelfAttrOrigin,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+) -> Option<String> {
+    let from_entry = files.get(from_file)?;
+    if from_entry.class_methods.contains_key(&origin.class_name) {
+        return Some(from_file.to_string());
+    }
+    let module_name = if origin.is_attribute_call {
+        from_entry.module_aliases.get(&origin.resolve_name)
+    } else {
+        from_entry.imports.get(&origin.resolve_name)
+    }?;
+    let target_file = resolve_module_file(module_name, project_root, files)?;
+    if files
+        .get(&target_file)?
+        .class_methods
+        .contains_key(&origin.class_name)
+    {
+        Some(target_file)
+    } else {
+        None
+    }
+}
+
+// Traversal shape mirrors `scan_stmts_for_governed_calls`'s If/For/While/With
+// recursion, EXTENDED to also descend into function and class bodies (see the
+// FunctionDef/ClassDef arms below for why: unlike the narrower Feast-specific
+// scanner, this one's whole purpose depends on finding real call sites, which
+// overwhelmingly live inside a function or method body, not at module level).
+//
+// `self_attrs` is `Some` while inside a class body (recomputed fresh at each
+// `Stmt::ClassDef` from that class's own `__init__`, matching a real `Linter`'s
+// per-class `current_self_attrs` scoping -- a nested class does NOT inherit an
+// enclosing class's attrs) and `None` everywhere else (module level, a plain
+// function). It's what lets a `self.<attr>.<method>(...)` call site resolve, the
+// shape `resolve_delegate_target` alone can't cover (it only resolves bare names via
+// imports/module_aliases, with no notion of instance attributes).
+pub(crate) fn scan_stmts_for_called_functions(
+    stmts: &[Stmt],
+    file_path: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    self_attrs: Option<&HashMap<String, SelfAttrOrigin>>,
+    called: &mut HashMap<String, std::collections::HashSet<String>>,
+) {
+    for stmt in stmts {
+        let call = match stmt {
+            Stmt::Expr(expr_stmt) => match &*expr_stmt.value {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            Stmt::Assign(assign) => match &*assign.value {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(call) = call {
+            let callee_name = match &*call.func {
+                Expr::Name(n) => Some(n.id.as_str()),
+                Expr::Attribute(attr) => Some(attr.attr.as_str()),
+                _ => None,
+            };
+            if let Some(callee_name) = callee_name {
+                if let Some((target_file, target_func)) =
+                    resolve_delegate_target(file_path, callee_name, project_root, files)
+                {
+                    called.entry(target_file).or_default().insert(target_func);
+                }
+            }
+            // self.<attr>.<method>(...) -- a shape resolve_delegate_target can't
+            // cover (bare-name imports/module_aliases only, no notion of instance
+            // attributes). Resolved via `self_attrs`, this class's own `__init__`
+            // origins (see the ClassDef arm below).
+            if let (Expr::Attribute(attr), Some(attrs)) = (&*call.func, self_attrs) {
+                if let Expr::Attribute(recv_attr) = &*attr.value {
+                    if let Expr::Name(recv_base) = &*recv_attr.value {
+                        if recv_base.id.as_str() == "self" {
+                            if let Some(origin) = attrs.get(recv_attr.attr.as_str()) {
+                                if let Some(target_file) = resolve_self_attr_class_file(
+                                    file_path,
+                                    origin,
+                                    project_root,
+                                    files,
+                                ) {
+                                    let method_known = files
+                                        .get(&target_file)
+                                        .and_then(|e| e.class_methods.get(&origin.class_name))
+                                        .is_some_and(|methods| {
+                                            methods.contains_key(attr.attr.as_str())
+                                        });
+                                    if method_known {
+                                        called
+                                            .entry(target_file)
+                                            .or_default()
+                                            .insert(attr.attr.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match stmt {
+            Stmt::If(if_stmt) => {
+                scan_stmts_for_called_functions(
+                    &if_stmt.body,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+                for clause in &if_stmt.elif_else_clauses {
+                    scan_stmts_for_called_functions(
+                        &clause.body,
+                        file_path,
+                        project_root,
+                        files,
+                        self_attrs,
+                        called,
+                    );
+                }
+            }
+            Stmt::For(for_stmt) => {
+                scan_stmts_for_called_functions(
+                    &for_stmt.body,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+            }
+            Stmt::While(while_stmt) => {
+                scan_stmts_for_called_functions(
+                    &while_stmt.body,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+            }
+            Stmt::With(with_stmt) => {
+                scan_stmts_for_called_functions(
+                    &with_stmt.body,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+            }
+            Stmt::Try(try_stmt) => {
+                scan_stmts_for_called_functions(
+                    &try_stmt.body,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    scan_stmts_for_called_functions(
+                        &h.body,
+                        file_path,
+                        project_root,
+                        files,
+                        self_attrs,
+                        called,
+                    );
+                }
+                scan_stmts_for_called_functions(
+                    &try_stmt.orelse,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+                scan_stmts_for_called_functions(
+                    &try_stmt.finalbody,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+            }
+            // Function and class bodies -- deliberately recursed into, UNLIKE
+            // `scan_stmts_for_governed_calls`'s narrower traversal: almost every real
+            // call site lives inside a function or method body, not at module level,
+            // so skipping these (matching the Feast-specific scanner's scope) would
+            // make cross-file confirmation find close to nothing in practice.
+            Stmt::FunctionDef(func_def) => {
+                // `self_attrs` carries through unchanged -- a nested function defined
+                // inside a method still sees the enclosing class's `self.<attr>`
+                // origins, matching a real Linter's `current_self_attrs` staying in
+                // effect for a class's whole body, nested defs included.
+                scan_stmts_for_called_functions(
+                    &func_def.body,
+                    file_path,
+                    project_root,
+                    files,
+                    self_attrs,
+                    called,
+                );
+            }
+            Stmt::ClassDef(class_def) => {
+                // Fresh per class, from THIS class's own __init__ only -- a nested
+                // class does NOT inherit an enclosing class's attrs, matching
+                // `collect_self_attr_origins`'s same-class scoping in the real Linter.
+                let mut class_self_attrs = HashMap::new();
+                for body_stmt in &class_def.body {
+                    if let Stmt::FunctionDef(func_def) = body_stmt {
+                        if func_def.name.as_str() == "__init__" {
+                            collect_self_attr_origins(&func_def.body, &mut class_self_attrs);
+                        }
+                    }
+                }
+                scan_stmts_for_called_functions(
+                    &class_def.body,
+                    file_path,
+                    project_root,
+                    files,
+                    Some(&class_self_attrs),
+                    called,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 // Line/column for a source offset, without needing a full `Linter` instance — used by

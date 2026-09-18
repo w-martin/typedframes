@@ -102,6 +102,8 @@ pub(crate) fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyR
             dataframes_total: linter.dataframes_total,
             dataframes_typed: linter.dataframes_typed,
             untyped_sites: std::mem::take(&mut linter.untyped_sites),
+            typed_sites: std::mem::take(&mut linter.typed_sites),
+            all_dataframe_calls: std::mem::take(&mut linter.all_dataframe_calls),
         },
     };
 
@@ -199,6 +201,8 @@ pub(crate) fn check_notebook(file_path: String, index_bytes: Option<Vec<u8>>) ->
         dataframes_total: linter.dataframes_total,
         dataframes_typed: linter.dataframes_typed,
         untyped_sites: std::mem::take(&mut linter.untyped_sites),
+        typed_sites: std::mem::take(&mut linter.typed_sites),
+        all_dataframe_calls: std::mem::take(&mut linter.all_dataframe_calls),
     };
     let result = notebook::translate_result(errors, stats, &file_display, notebook.index());
 

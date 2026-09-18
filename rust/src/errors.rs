@@ -63,6 +63,15 @@ pub struct FileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
     pub untyped_sites: Vec<UntypedSite>,
+    pub typed_sites: Vec<TypedSite>,
+    /// Every `<load module>.<load function>(...)`-shaped call found anywhere in the
+    /// file by an unconditional, position-independent scan (see
+    /// `linter::LoadCallSiteCollector`) -- populated regardless of whether the site
+    /// was actually recognized as an origin by the targeted (`Assign`/`AnnAssign`-only)
+    /// counting logic. Powers `--coverage-detail=explain`: cross-referencing this list
+    /// against `typed_sites`/`untyped_sites` by line is what tells a reader whether a
+    /// given call was counted at all, not just whether it was typed.
+    pub all_dataframe_calls: Vec<DataFrameCallSite>,
 }
 
 /// One DataFrame origin the linter recognized but could not resolve columns for.
@@ -83,6 +92,41 @@ pub struct UntypedSite {
     pub col: usize,
     /// The assigned variable name where one was available, else a generic stand-in.
     pub var: String,
+}
+
+/// A recognized DataFrame origin that DID resolve to a concrete column set --
+/// the `dataframes_typed` counterpart of [`UntypedSite`]. Line and column are
+/// 1-indexed, matching [`LintError`].
+#[derive(Debug, Serialize)]
+pub struct TypedSite {
+    pub line: usize,
+    pub col: usize,
+    /// The assigned variable name where one was available, else a generic stand-in.
+    pub var: String,
+    /// A human-readable rendering of the resolved schema, from
+    /// `Linter::schema_display`: the schema's class name and column set for a named
+    /// `BaseSchema`, or `inferred column set {...}` (plus an origin, where known)
+    /// for one inferred from `usecols=`/a dict literal/etc.
+    pub schema: String,
+}
+
+/// One `<load module>.<load function>(...)`-shaped call site found anywhere in a
+/// file by [`crate::linter::LoadCallSiteCollector`]'s unconditional scan -- see
+/// [`FileStats::all_dataframe_calls`]. Line and column are 1-indexed and point at
+/// the call expression itself (e.g. the `pd` in `pd.DataFrame(...)`), NOT at an
+/// enclosing assignment statement the way [`UntypedSite`]/[`TypedSite`] do -- the two
+/// coordinate systems are cross-referenced by LINE only (see
+/// `--coverage-detail=explain` in the CLI), not by column.
+#[derive(Debug, Serialize)]
+pub struct DataFrameCallSite {
+    pub line: usize,
+    pub col: usize,
+    /// E.g. `"pd.DataFrame"`, `"pl.read_csv"`.
+    pub label: String,
+    /// Human-readable description of the syntactic position this call was found in
+    /// (direct assignment, return value, call argument, collection element, ...) --
+    /// see `linter::CallContext::describe`.
+    pub context: String,
 }
 
 /// The JSON payload returned by the `check_file` entry point: the diagnostics plus

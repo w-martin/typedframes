@@ -522,7 +522,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | `version` | `latest` | PyPI version to install, e.g. `"0.5.0"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
-| `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown |
+| `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
 | `no-warnings` | `false` | Suppress warning-level diagnostics |
 | `args` | *(empty)* | Escape hatch for `--no-index`, `--lenient-ingest`, `--no-info` |
 

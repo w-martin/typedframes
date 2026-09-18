@@ -483,9 +483,11 @@ silently improves the number the rest of your code is held to.
 ### Reporting: seeing what's missing
 
 The default one-line DataFrame schema coverage summary gives a ratio but nothing to act
-on. `--coverage-detail` controls how much more detail gets printed, and it takes exactly
-two values — `summary` (the default, one line, byte-for-byte what you already saw above)
-and `term-missing` (a per-file table naming the DataFrames that cost you coverage).
+on. `--coverage-detail` controls how much more detail gets printed, and it takes three
+values — `summary` (the default, one line, byte-for-byte what you already saw above),
+`term-missing` (a per-file table naming the DataFrames that cost you coverage), and
+`explain` (every DataFrame-shaped call found in a file, whether or not it was actually
+counted — see [Diagnosing a lower-than-expected total: explain](#diagnosing-a-lower-than-expected-total-explain) below).
 
 There's no `json` value on `--coverage-detail`. That's deliberate: **`--coverage-detail`
 picks how much to show, `--output-format` picks the shape it's shown in** — they're two
@@ -581,6 +583,63 @@ existed — asking for `term-missing` detail is what turns the key on, regardles
 `detail` is independent of `enabled`: you can get a detailed report with no threshold, or
 a threshold with only the one-line summary. The CLI flag wins over the config key, so a
 one-off `--coverage-detail=term-missing` needs no config edit.
+
+#### Diagnosing a lower-than-expected total: `explain`
+
+`term-missing` only ever shows DataFrames the checker already recognized as an origin —
+it can't tell you about ones it never counted at all. If `dataframes_total` looks lower
+than the number of `pd.DataFrame`/`pd.read_csv`/etc. calls you know are in your codebase,
+`--coverage-detail=explain` is the diagnostic for that: it scans each file for every
+`<module>.<load function>(...)`-shaped call — regardless of where it appears — and
+reports each one as counted or not, and why:
+
+```shell
+typedframes check src/ --coverage-detail=explain
+```
+
+```
+src/train.py
+  12:5   pd.read_csv    COUNTED, typed (schema: inferred column set {order_id, amount} (defined at line 12))
+  30:9   pd.DataFrame   COUNTED, untracked -- no static column info
+  41:13  pd.read_csv    NOT COUNTED — a `return` value, not assigned to a variable first
+```
+
+The checker only recognizes a load call as an origin when it is the direct value of a
+plain `x = ...` / `x: T = ...` assignment — a bare `return`, a call argument
+(`train(pd.DataFrame(...))`), or a list/dict element (`frames.append(pd.read_csv(...))`)
+is invisible to `dataframes_total` today, not just untyped. `explain` is what surfaces
+that gap so you can see exactly which lines it applies to, rather than guessing from the
+ratio alone.
+
+`--output-format=json` nests the same information under `coverage.files[].calls[]`, each
+entry carrying `counted`/`typed`/`schema` booleans and strings instead of prose:
+
+```shell
+typedframes check src/ --output-format=json --coverage-detail=explain
+```
+
+```json
+{
+  "coverage": {
+    "files": [
+      {
+        "file": "train.py",
+        "calls": [
+          {
+            "line": 12,
+            "col": 5,
+            "label": "pd.read_csv",
+            "counted": true,
+            "typed": true,
+            "schema": "inferred column set {order_id, amount} (defined at line 12)",
+            "context": "the direct value of a plain `x = ...` / `x: T = ...` assignment"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ### Behaviour notes
 

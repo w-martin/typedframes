@@ -13,7 +13,7 @@ use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
     CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
 };
-use crate::errors::{LintError, UntypedSite};
+use crate::errors::{DataFrameCallSite, LintError, TypedSite, UntypedSite};
 use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
 use crate::typo::find_best_match;
 use crate::{ast_extract, contract, sql};
@@ -139,6 +139,16 @@ pub(crate) struct SelfAttrOrigin {
     pub(crate) is_attribute_call: bool,
 }
 
+// A candidate pass-through-count reversal, recorded when a function's return schema
+// was inferred from a bare `return <var>` (see the `Stmt::FunctionDef` body-inference
+// arm) rather than removed immediately. `var`/`line` identify the exact
+// `typed_sites`/`untyped_sites` entry to remove -- see `Linter::pending_passthrough_reversals`.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPassthroughReversal {
+    pub(crate) var: String,
+    pub(crate) line: usize,
+}
+
 /// AST visitor that tracks DataFrame schemas and validates column access.
 ///
 /// # State model
@@ -203,6 +213,37 @@ pub struct Linter {
     // column set. Kept in step with the counters at each counting site rather than
     // reconstructed later.
     pub untyped_sites: Vec<UntypedSite>,
+    // The `dataframes_typed` counterpart of `untyped_sites` -- every origin that DID
+    // resolve to a concrete column set, with its location. Populated at the same
+    // choke point (`count_typed_dataframe`'s typed branch) rather than at each of the
+    // ~15 individual counting call sites, so this can't drift out of sync with
+    // `dataframes_typed` itself.
+    pub typed_sites: Vec<TypedSite>,
+    // Every `<load module>.<load function>(...)`-shaped call anywhere in the file,
+    // found by an unconditional, position-independent scan -- see
+    // `LoadCallSiteCollector`. Populated by a single pre-pass in `check_parsed_module`,
+    // same timing as `dataframe_shaped_usage`. Deliberately NOT filtered down to only
+    // the sites the targeted Assign/AnnAssign counting logic actually recognized: the
+    // whole point is to also surface the ones it doesn't (a bare `return`, a call
+    // argument, a collection element, ...) so `--coverage-detail=explain` can show
+    // them as NOT COUNTED rather than silently omitting them.
+    pub all_dataframe_calls: Vec<DataFrameCallSite>,
+    // Candidate pass-through-count reversals, func_name -> the origin site to remove
+    // once confirmed -- see `PendingPassthroughReversal`'s doc comment and the
+    // `Stmt::FunctionDef` body-inference arm that populates this. Resolved at the end
+    // of this file's walk (`check_parsed_module`): a candidate whose func_name is in
+    // `functions_called` has its origin actually removed; one that never gets
+    // confirmed keeps its original count exactly where it was, rather than risking a
+    // silent loss.
+    pub(crate) pending_passthrough_reversals: HashMap<String, PendingPassthroughReversal>,
+    // Every function/method name (the bare name, e.g. "fetch_orders") whose
+    // `self.functions`/`class_methods` entry was actually consulted by a resolving
+    // call site (a bare `Expr::Name` call or a same-file `self.<attr>.<method>()`)
+    // anywhere in THIS file -- the confirmation signal `pending_passthrough_reversals`
+    // waits for. Scoped to this file only: a function called solely from another file
+    // is never confirmed here (see the reversal site's doc comment for why that's a
+    // deliberate, documented gap rather than an oversight).
+    pub(crate) functions_called: std::collections::HashSet<String>,
     // Every bare-Name variable subscripted (`x["col"]`) or method-called with a
     // RESERVED_METHODS name (`x.groupby(...)`) anywhere in the module. Populated by a
     // whole-module pre-pass (see DataFrameShapedUsageCollector), same timing as
@@ -397,7 +438,7 @@ fn find_returned_var(stmts: &[Stmt]) -> Option<String> {
 // elsewhere in this file. Only the first assignment to a given attr name wins (a
 // later reassignment is silently ignored), matching this checker's existing
 // single-binding conventions (e.g. `string_var_candidates`).
-fn collect_self_attr_origins(stmts: &[Stmt], out: &mut HashMap<String, SelfAttrOrigin>) {
+pub(crate) fn collect_self_attr_origins(stmts: &[Stmt], out: &mut HashMap<String, SelfAttrOrigin>) {
     for stmt in stmts {
         match stmt {
             Stmt::Assign(assign) if assign.targets.len() == 1 => {
@@ -664,6 +705,174 @@ impl<'a> Visitor<'a> for DataFrameShapedUsageCollector {
     }
 }
 
+// Syntactic position a DataFrame-shaped call was found in, tracked by
+// `LoadCallSiteCollector` as it descends. Purely descriptive text for
+// `--coverage-detail=explain`'s "why wasn't this counted" message -- it never
+// affects `dataframes_total`/`dataframes_typed`, which come entirely from the
+// targeted Assign/AnnAssign-only counting logic elsewhere in this file. Because of
+// that separation, a site labelled `DirectAssignment` here is not a guarantee it WAS
+// counted (an unusual annotation on an AnnAssign might still not resolve, e.g.) --
+// only that its position matches the one shape the counting logic looks at. Counted
+// vs not-counted is decided downstream, by cross-referencing `all_dataframe_calls`
+// against `typed_sites`/`untyped_sites` by line.
+#[derive(Clone, Copy)]
+enum CallContext {
+    DirectAssignment,
+    ReturnValue,
+    CallArgument,
+    CollectionElement,
+    Other,
+}
+
+impl CallContext {
+    fn describe(self) -> &'static str {
+        match self {
+            CallContext::DirectAssignment => {
+                "the direct value of a plain `x = ...` / `x: T = ...` assignment"
+            }
+            CallContext::ReturnValue => "a `return` value, not assigned to a variable first",
+            CallContext::CallArgument => "passed directly as a call argument",
+            CallContext::CollectionElement => "an element of a list/tuple/set/dict literal",
+            CallContext::Other => {
+                "nested inside another expression (an operator, attribute chain, \
+                 comprehension, or similar)"
+            }
+        }
+    }
+}
+
+// AST visitor collecting every `<LOAD_MODULES>.<LOAD_FUNCTIONS>(...)`-shaped call
+// anywhere in the module -- see `Linter::all_dataframe_calls`. Deliberately does NOT
+// try to replicate the targeted counting logic's full pattern matching (merge/concat,
+// `DataFrame[Schema](...)`, `Schema.from_pandas(df)`, SQL connectors, ...): this is a
+// dumb, unconditional, position-independent scan by design, so it can never drift out
+// of sync with what the real counting logic recognizes as the project evolves.
+// Classifying a found site as COUNTED vs NOT COUNTED happens downstream (cli.py, by
+// cross-referencing line numbers against `typed_sites`/`untyped_sites`) -- this
+// collector's only job is finding sites and describing WHERE syntactically each one
+// was found, via `current_context`.
+struct LoadCallSiteCollector<'a> {
+    linter: &'a Linter,
+    sites: Vec<DataFrameCallSite>,
+    current_context: CallContext,
+}
+
+impl<'a> LoadCallSiteCollector<'a> {
+    fn load_call_label(call: &ast::ExprCall) -> Option<String> {
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        let Expr::Name(base) = &*attr.value else {
+            return None;
+        };
+        let module = base.id.as_str();
+        let func = attr.attr.as_str();
+        if LOAD_MODULES.contains(&module) && LOAD_FUNCTIONS.contains(&func) {
+            Some(format!("{module}.{func}"))
+        } else {
+            None
+        }
+    }
+
+    // Visit `expr` with `ctx` as the context for THIS node only -- restored
+    // afterward, so a call found deeper inside `expr` (e.g. a nested load call in an
+    // argument) gets its own, more specific context rather than inheriting `ctx`.
+    fn visit_in_context(&mut self, expr: &'a Expr, ctx: CallContext) {
+        let previous = self.current_context;
+        self.current_context = ctx;
+        self.visit_expr(expr);
+        self.current_context = previous;
+    }
+}
+
+impl<'a> Visitor<'a> for LoadCallSiteCollector<'a> {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        match expr {
+            Expr::Call(call) => {
+                if let Some(label) = Self::load_call_label(call) {
+                    let (line, col) = self.linter.source_location(call.range().start());
+                    self.sites.push(DataFrameCallSite {
+                        line,
+                        col,
+                        label,
+                        context: self.current_context.describe().to_string(),
+                    });
+                }
+                // Recurse into the call's own pieces with their own, more specific
+                // contexts instead of falling through to the generic walk_expr
+                // below, which would recurse everything with whatever context this
+                // Call node itself inherited -- wrong for the arguments, a
+                // different syntactic position than the call as a whole.
+                if let Expr::Attribute(attr) = &*call.func {
+                    self.visit_in_context(&attr.value, CallContext::Other);
+                } else {
+                    self.visit_in_context(&call.func, CallContext::Other);
+                }
+                for arg in &call.arguments.args {
+                    self.visit_in_context(arg, CallContext::CallArgument);
+                }
+                for kw in &call.arguments.keywords {
+                    self.visit_in_context(&kw.value, CallContext::CallArgument);
+                }
+            }
+            Expr::List(list) => {
+                for el in &list.elts {
+                    self.visit_in_context(el, CallContext::CollectionElement);
+                }
+            }
+            Expr::Tuple(tuple) => {
+                for el in &tuple.elts {
+                    self.visit_in_context(el, CallContext::CollectionElement);
+                }
+            }
+            Expr::Set(set) => {
+                for el in &set.elts {
+                    self.visit_in_context(el, CallContext::CollectionElement);
+                }
+            }
+            Expr::Dict(dict) => {
+                for item in &dict.items {
+                    if let Some(key) = &item.key {
+                        self.visit_in_context(key, CallContext::Other);
+                    }
+                    self.visit_in_context(&item.value, CallContext::CollectionElement);
+                }
+            }
+            // Everything else (BinOp, BoolOp, Compare, Subscript, Attribute,
+            // comprehensions, lambdas, f-strings, ...): descend via the trait's
+            // default recursion, resetting to Other first so a call found several
+            // levels down isn't mislabeled with a context that only applied to an
+            // ancestor several nodes back.
+            _ => {
+                self.current_context = CallContext::Other;
+                ast_visitor::walk_expr(self, expr);
+            }
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::Return(ret) => {
+                if let Some(value) = &ret.value {
+                    self.visit_in_context(value, CallContext::ReturnValue);
+                }
+            }
+            Stmt::Assign(assign) if matches!(assign.targets.as_slice(), [Expr::Name(_)]) => {
+                self.visit_in_context(&assign.value, CallContext::DirectAssignment);
+            }
+            Stmt::AnnAssign(ann) if matches!(&*ann.target, Expr::Name(_)) => {
+                if let Some(value) = &ann.value {
+                    self.visit_in_context(value, CallContext::DirectAssignment);
+                }
+            }
+            _ => {
+                self.current_context = CallContext::Other;
+                ast_visitor::walk_stmt(self, stmt);
+            }
+        }
+    }
+}
+
 impl Default for Linter {
     fn default() -> Self {
         Self::new()
@@ -692,6 +901,10 @@ impl Linter {
             dataframes_total: 0,
             dataframes_typed: 0,
             untyped_sites: Vec::new(),
+            typed_sites: Vec::new(),
+            all_dataframe_calls: Vec::new(),
+            pending_passthrough_reversals: HashMap::new(),
+            functions_called: std::collections::HashSet::new(),
             dataframe_shaped_usage: std::collections::HashSet::new(),
             unresolved_dataframe_shaped_calls: Vec::new(),
             sql_dialect: sql::SqlDialect::Generic,
@@ -816,10 +1029,49 @@ impl Linter {
             df_usage_collector.visit_stmt(stmt);
         }
         self.dataframe_shaped_usage = df_usage_collector.names;
+
+        self.all_dataframe_calls = {
+            let mut load_call_collector = LoadCallSiteCollector {
+                linter: &*self,
+                sites: Vec::new(),
+                current_context: CallContext::Other,
+            };
+            for stmt in &module.body {
+                load_call_collector.visit_stmt(stmt);
+            }
+            load_call_collector.sites
+        };
+
         let mut errors = Vec::new();
 
         for stmt in &module.body {
             self.visit_stmt(stmt, &mut errors);
+        }
+
+        // Resolve every pending pass-through-count reversal now that the whole file
+        // has been walked and `functions_called` is complete -- see
+        // `pending_passthrough_reversals`'s doc comment for why this can't happen
+        // eagerly, at the point each candidate was discovered.
+        for (func_name, reversal) in &self.pending_passthrough_reversals {
+            if !self.functions_called.contains(func_name) {
+                continue;
+            }
+            if let Some(pos) = self
+                .typed_sites
+                .iter()
+                .position(|s| s.line == reversal.line && s.var == reversal.var)
+            {
+                self.typed_sites.remove(pos);
+                self.dataframes_typed -= 1;
+                self.dataframes_total -= 1;
+            } else if let Some(pos) = self
+                .untyped_sites
+                .iter()
+                .position(|s| s.line == reversal.line && s.var == reversal.var)
+            {
+                self.untyped_sites.remove(pos);
+                self.dataframes_total -= 1;
+            }
         }
 
         errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
@@ -832,13 +1084,18 @@ impl Linter {
         &mut self,
         index: &ProjectIndex,
         source: &str,
-        _file_path: &Path,
+        file_path: &Path,
         project_root: &Path,
     ) {
         let Ok(parsed) = parse_module(source) else {
             return;
         };
-        self.load_cross_file_symbols_from_module(index, &parsed.into_syntax(), project_root);
+        self.load_cross_file_symbols_from_module(
+            index,
+            &parsed.into_syntax(),
+            project_root,
+            file_path.to_str(),
+        );
     }
 
     // Same as `load_cross_file_symbols`, but parses `source` in Jupyter/IPython mode
@@ -858,7 +1115,7 @@ impl Linter {
         let Some(module) = parsed.try_into_module() else {
             return;
         };
-        self.load_cross_file_symbols_from_module(index, &module.into_syntax(), project_root);
+        self.load_cross_file_symbols_from_module(index, &module.into_syntax(), project_root, None);
     }
 
     fn load_cross_file_symbols_from_module(
@@ -866,7 +1123,22 @@ impl Linter {
         index: &ProjectIndex,
         module: &ModModule,
         project_root: &Path,
+        file_path: Option<&str>,
     ) {
+        // Pre-seed cross-file confirmation for pending pass-through reversals (see
+        // `pending_passthrough_reversals`'s doc comment) BEFORE this file's own
+        // statement walk runs, so the existing end-of-walk resolution loop in
+        // `check_parsed_module` picks up a function called only from ANOTHER file with
+        // no change to the reversal mechanism itself. `None` for a notebook (which
+        // can never itself be a cross-file call TARGET, so `index.called_functions`
+        // would never have an entry keyed by its path anyway -- this is a genuine
+        // no-op there, not a gap).
+        if let Some(path) = file_path {
+            if let Some(names) = index.called_functions.get(path) {
+                self.functions_called.extend(names.iter().cloned());
+            }
+        }
+
         // A function's return-type schema (or a parameter's schema annotation) may be
         // defined in a THIRD file — neither the function's own file nor the file
         // importing the function. E.g. schemas.py defines CustomerSchema, loaders.py's
@@ -1120,6 +1392,27 @@ impl Linter {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // DataFrame({"a": [...], "b": [...]}) — a dict literal passed positionally to
+        // the constructor itself already names every column as its keys, the same
+        // signal `dtype=`/`schema=` gives explicitly. Gated on func_name so this
+        // never fires for read_csv/read_json/etc., whose first positional argument is
+        // a path or buffer, not column data — a dict there means something else
+        // entirely and inferring columns from it would be wrong.
+        if func_name == "DataFrame" {
+            if let Some(Expr::Dict(dict)) = call.arguments.args.first() {
+                let keys: Vec<String> = dict
+                    .items
+                    .iter()
+                    .filter_map(|item| item.key.as_ref())
+                    .filter_map(|k| ast_extract::extract_string_literal(k))
+                    .map(|s| s.to_string())
+                    .collect();
+                if !keys.is_empty() {
+                    return (Some(keys), LoadKind::File);
+                }
             }
         }
 
@@ -1655,7 +1948,54 @@ impl Linter {
             self.record_untyped_site(var_hint, current_line, current_col);
         } else {
             self.dataframes_typed += 1;
+            self.typed_sites.push(TypedSite {
+                line: current_line,
+                col: current_col,
+                var: var_hint.to_string(),
+                schema: self.schema_display(schema_name, current_line),
+            });
         }
+    }
+
+    // Count a schema-changing mutation (rename/drop/assign) as a new DataFrame origin
+    // in its own right, distinct from whatever origin its receiver came from -- the
+    // "a modification starts a new leg" half of the journey/leg model (see
+    // `pending_passthrough_reversals`'s doc comment for the pass-through half).
+    // `base_schema` is the receiver's CURRENT schema name, if tracked at all;
+    // `derived_cols` is the newly computed column set, when the specific edit could be
+    // resolved from a known base. Three outcomes:
+    //
+    // - The base itself is unresolved (`schema_is_unresolved`): the edit can't be
+    //   trusted to have produced any particular column set from an unknown starting
+    //   point, so the result propagates as unresolved too, rather than fabricating a
+    //   schema derived from an empty/placeholder base.
+    // - The base is resolved and `derived_cols` is `Some`: a genuine new schema,
+    //   counted and typed.
+    // - The base is resolved but `derived_cols` is `None` (the specific edit --
+    //   e.g. a dynamic `.drop(some_list)` -- couldn't be extracted): still a KNOWN
+    //   schema-changing method, so still counted as an origin, just untracked --
+    //   rather than silently falling through as an unlabelled pass-through of the
+    //   OLD schema, which risks validating later access against columns that are
+    //   now wrong.
+    fn count_mutation_leg(
+        &mut self,
+        base_schema: Option<&str>,
+        derived_cols: Option<Vec<String>>,
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+    ) -> String {
+        self.dataframes_total += 1;
+        let base_unresolved = base_schema.is_some_and(|s| self.schema_is_unresolved(s));
+        let resolved_cols = if base_unresolved { None } else { derived_cols };
+        let unresolved = resolved_cols.is_none();
+        let schema_name =
+            self.make_inferred_schema(resolved_cols.unwrap_or_default(), var_hint, current_line);
+        if unresolved {
+            self.unresolved_schemas.insert(schema_name.clone());
+        }
+        self.count_typed_dataframe(&schema_name, var_hint, current_line, current_col);
+        schema_name
     }
 
     // Called at the end of the `x = call(...)` origin dispatch in the Assign handler,
@@ -2190,6 +2530,15 @@ impl Linter {
         let Some((schema_name, def_line)) = base_info else {
             return;
         };
+        if self.schema_is_unresolved(&schema_name) {
+            // Can't verify a removal against an unknown column set -- and whether the
+            // named column actually existed to remove is itself unknown, so the
+            // result is its own new, unresolved leg (see `count_mutation_leg`) rather
+            // than a false "column doesn't exist" against an empty placeholder.
+            let new_schema = self.count_mutation_leg(Some(&schema_name), None, recv, line, col);
+            self.variables.insert(recv.to_string(), (new_schema, line));
+            return;
+        }
         let schema_display = self.schema_display(&schema_name, def_line);
         let Some(cols) = self.schemas.get(&schema_name).cloned() else {
             return;
@@ -2205,26 +2554,35 @@ impl Linter {
                 ),
                 severity: "error".to_string(),
             });
+            // Nothing was actually removed (the column never existed) -- the schema
+            // is unchanged, so this isn't its own new leg.
         } else {
             let new_cols: Vec<String> = cols
                 .into_iter()
                 .filter(|c| c.as_str() != col_name)
                 .collect();
-            let new_schema = self.make_inferred_schema(new_cols, recv, line);
+            let new_schema =
+                self.count_mutation_leg(Some(&schema_name), Some(new_cols), recv, line, col);
             self.variables.insert(recv.to_string(), (new_schema, line));
         }
     }
 
     // Add a column in-place to `recv`'s schema. Used for `df.insert(loc, col, value)`.
-    fn add_column_inplace(&mut self, recv: &str, col_name: &str, line: usize) {
+    fn add_column_inplace(&mut self, recv: &str, col_name: &str, line: usize, col: usize) {
         let base_info = self.variables.get(recv).map(|(s, l)| (s.clone(), *l));
         let Some((schema_name, _)) = base_info else {
             return;
         };
+        if self.schema_is_unresolved(&schema_name) {
+            let new_schema = self.count_mutation_leg(Some(&schema_name), None, recv, line, col);
+            self.variables.insert(recv.to_string(), (new_schema, line));
+            return;
+        }
         let mut cols = self.schemas.get(&schema_name).cloned().unwrap_or_default();
         if !cols.contains(&col_name.to_string()) {
             cols.push(col_name.to_string());
-            let new_schema = self.make_inferred_schema(cols, recv, line);
+            let new_schema =
+                self.count_mutation_leg(Some(&schema_name), Some(cols), recv, line, col);
             self.variables.insert(recv.to_string(), (new_schema, line));
         }
     }
@@ -2578,9 +2936,57 @@ impl Linter {
                 // local variable; look up the returned one and register the function.
                 if !self.functions.contains_key(func_def.name.as_str()) {
                     if let Some(var_name) = find_returned_var(&func_def.body) {
-                        if let Some((schema_name, _)) = self.variables.get(&var_name) {
+                        if let Some((schema_name, defined_line)) = self.variables.get(&var_name) {
                             let schema_name = schema_name.clone();
+                            let defined_line = *defined_line;
                             if self.schemas.contains_key(&schema_name) {
+                                // A bare `return <var>` hands this function's own
+                                // internal origin straight to its caller -- e.g.
+                                // `def b(): c = get_dataframe(); return c`. Ownership
+                                // of the count SHOULD move to every call site that
+                                // resolves through this function (`a = b()`, handled in
+                                // the Expr::Name/self.<attr> call-resolution sites,
+                                // which mark `functions_called` and count it there)
+                                // rather than double-counting both here AND at each
+                                // call site -- one `a = b()` is one DataFrame, not two.
+                                //
+                                // But whether any such call site actually EXISTS isn't
+                                // knowable yet at this point in the walk (a call site
+                                // may appear later in this same file, or nowhere at
+                                // all if this function is only reached via a same-file
+                                // transitive chain -- `return other_func()`, not
+                                // `return <var>` -- which isn't traced today). Removing
+                                // the count now, unconditionally, would risk losing it
+                                // with nowhere to land if nothing ever confirms a call.
+                                // So this only records a CANDIDATE; the actual removal
+                                // is deferred to the end of this file's walk (see
+                                // `check_parsed_module`), applied only for candidates
+                                // `functions_called` confirms were actually consulted
+                                // by a resolving call site anywhere in THIS file.
+                                //
+                                // Scoped to this file only: a function called solely
+                                // from ANOTHER file (defined in loaders.py, called from
+                                // pipeline.py) is never confirmed here, so its origin
+                                // stays counted in the defining file's own tally for
+                                // now -- cross-file confirmation needs project-wide
+                                // knowledge of call sites, which is a separate,
+                                // larger piece of work, not addressed by this patch.
+                                //
+                                // Also only ever matches a count that exactly matches
+                                // `var_name`'s CURRENT binding line: a pass-through hop
+                                // between the origin/mutation and this `return` (e.g.
+                                // `c = c.head(10)` in between) moves `defined_line`
+                                // without leaving a matching typed/untyped_sites entry
+                                // there, so the reversal silently doesn't fire and that
+                                // narrower case still double-counts -- a known gap, not
+                                // addressed here.
+                                self.pending_passthrough_reversals.insert(
+                                    func_def.name.to_string(),
+                                    PendingPassthroughReversal {
+                                        var: var_name.clone(),
+                                        line: defined_line,
+                                    },
+                                );
                                 self.functions
                                     .insert(func_def.name.to_string(), schema_name);
                             }
@@ -2724,6 +3130,21 @@ impl Linter {
                                             ),
                                             severity: "error".to_string(),
                                         });
+                                        // Still its own leg -- an edit attempted
+                                        // against an unresolved base can't be trusted
+                                        // to have produced any particular column set
+                                        // either. See count_mutation_leg's doc comment.
+                                        let new_schema = self.count_mutation_leg(
+                                            Some(&schema_name),
+                                            None,
+                                            name.id.as_str(),
+                                            current_line,
+                                            current_col,
+                                        );
+                                        self.variables.insert(
+                                            name.id.to_string(),
+                                            (new_schema, current_line),
+                                        );
                                     } else {
                                         let already_has_col =
                                             self.schema_has_column(&schema_name, col_name);
@@ -2740,12 +3161,33 @@ impl Linter {
                                                 ),
                                                 severity: "error".to_string(),
                                             });
+                                            // A genuine schema change (a new column
+                                            // was added) is its own new leg, rebinding
+                                            // this name to it rather than mutating the
+                                            // OLD schema object in place -- the old
+                                            // approach risked leaking the change into
+                                            // any other name that happened to share
+                                            // the same schema name.
+                                            let mut new_cols = self
+                                                .schemas
+                                                .get(&schema_name)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            new_cols.push(col_name.to_string());
+                                            let new_schema = self.count_mutation_leg(
+                                                Some(&schema_name),
+                                                Some(new_cols),
+                                                name.id.as_str(),
+                                                current_line,
+                                                current_col,
+                                            );
+                                            self.variables.insert(
+                                                name.id.to_string(),
+                                                (new_schema, current_line),
+                                            );
                                         }
-                                        if let Some(columns) = self.schemas.get_mut(&schema_name) {
-                                            if !already_has_col {
-                                                columns.push(col_name.to_string());
-                                            }
-                                        }
+                                        // else: the column already existed -- the
+                                        // schema is unchanged, so this isn't a new leg.
                                     }
                                 }
                             }
@@ -2929,6 +3371,10 @@ impl Linter {
                                                         func_name,
                                                         current_line,
                                                     );
+                                                // Confirms any pending pass-through
+                                                // reversal for this method name -- see
+                                                // `pending_passthrough_reversals`.
+                                                self.functions_called.insert(func_name.to_string());
                                                 self.dataframes_total += 1;
                                                 // A bare `-> pd.DataFrame` return (the
                                                 // common shape for a py.typed internal
@@ -3090,6 +3536,12 @@ impl Linter {
                                                          exist, or annotate the variable's \
                                                          type, e.g. `df: Annotated[pd.DataFrame, \
                                                          MySchema] = pd.read_sql(...)`"
+                                                    }
+                                                    LoadKind::File if func_name == "DataFrame" => {
+                                                        "pass a dict literal, or specify \
+                                                         `columns=`, or annotate the variable's \
+                                                         type, e.g. `df: Annotated[pd.DataFrame, \
+                                                         MySchema] = pd.DataFrame(...)`"
                                                     }
                                                     LoadKind::File => {
                                                         "specify `usecols`/`columns`, or \
@@ -3455,9 +3907,34 @@ impl Linter {
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
                                     let dropped = ast_extract::extract_drop_columns(call);
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_hint = target_names
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_else(|| recv_str.to_string());
+                                    let base_unresolved = base_info
+                                        .as_ref()
+                                        .is_some_and(|(s, _)| self.schema_is_unresolved(s));
                                     match (base_cols, dropped) {
                                         (Some(base_cols), Some(dropped_cols)) => {
-                                            for col in &dropped_cols {
+                                            // An unresolved base's column list is an
+                                            // empty placeholder, not a confirmed-empty
+                                            // schema -- validating a drop against it
+                                            // would falsely report every dropped
+                                            // column as nonexistent.
+                                            for col in
+                                                dropped_cols.iter().filter(|_| !base_unresolved)
+                                            {
                                                 if !base_cols.contains(col) {
                                                     let schema_display = base_info
                                                         .as_ref()
@@ -3479,25 +3956,14 @@ impl Linter {
                                                 .into_iter()
                                                 .filter(|c| !dropped_cols.contains(c))
                                                 .collect();
-                                            let target_names: Vec<String> = assign
-                                                .targets
-                                                .iter()
-                                                .filter_map(|t| {
-                                                    if let Expr::Name(n) = t {
-                                                        Some(n.id.to_string())
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                                .collect();
-                                            let var_name = target_names
-                                                .first()
-                                                .map(|s| s.as_str())
-                                                .unwrap_or("unknown");
-                                            let schema_name = self.make_inferred_schema(
-                                                new_cols,
-                                                var_name,
+                                            let base_schema =
+                                                base_info.as_ref().map(|(s, _)| s.as_str());
+                                            let schema_name = self.count_mutation_leg(
+                                                base_schema,
+                                                Some(new_cols),
+                                                &var_hint,
                                                 current_line,
+                                                current_col,
                                             );
                                             for name in &target_names {
                                                 self.variables.insert(
@@ -3506,19 +3972,32 @@ impl Linter {
                                                 );
                                             }
                                         }
-                                        _ => {
-                                            // Can't extract cols or no base — passthrough base
-                                            if let Some((base_schema, _)) = base_info {
-                                                for target in &assign.targets {
-                                                    if let Expr::Name(target_name) = target {
-                                                        self.variables.insert(
-                                                            target_name.id.to_string(),
-                                                            (base_schema.clone(), current_line),
-                                                        );
-                                                    }
-                                                }
+                                        (base_cols, _) if base_info.is_some() => {
+                                            // A recognized mutator (.drop()) whose
+                                            // specific edit couldn't be resolved --
+                                            // e.g. a dynamic column list -- still
+                                            // counts as its own origin (a known
+                                            // schema-changing method), just untracked
+                                            // rather than silently kept as the base's
+                                            // now possibly-wrong schema.
+                                            let _ = base_cols;
+                                            let base_schema =
+                                                base_info.as_ref().map(|(s, _)| s.as_str());
+                                            let schema_name = self.count_mutation_leg(
+                                                base_schema,
+                                                None,
+                                                &var_hint,
+                                                current_line,
+                                                current_col,
+                                            );
+                                            for name in &target_names {
+                                                self.variables.insert(
+                                                    name.clone(),
+                                                    (schema_name.clone(), current_line),
+                                                );
                                             }
                                         }
+                                        _ => {}
                                     }
                                 }
                             } else if func_name == "rename" {
@@ -3526,6 +4005,7 @@ impl Linter {
                                     let recv_str = recv.id.as_str();
                                     let base_info =
                                         self.variables.get(recv_str).map(|(s, l)| (s.clone(), *l));
+                                    let base_schema = base_info.as_ref().map(|(s, _)| s.as_str());
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
@@ -3535,29 +4015,34 @@ impl Linter {
                                     } else {
                                         None
                                     };
+                                    let target_names: Vec<String> = assign
+                                        .targets
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Expr::Name(n) = t {
+                                                Some(n.id.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let var_hint = target_names
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_else(|| recv_str.to_string());
+                                    let base_unresolved = base_info
+                                        .as_ref()
+                                        .is_some_and(|(s, _)| self.schema_is_unresolved(s));
                                     match (base_cols, mapping, case_fold) {
                                         (Some(base_cols), None, Some(fold)) => {
                                             let new_cols: Vec<String> =
                                                 base_cols.iter().map(|c| fold.apply(c)).collect();
-                                            let target_names: Vec<String> = assign
-                                                .targets
-                                                .iter()
-                                                .filter_map(|t| {
-                                                    if let Expr::Name(n) = t {
-                                                        Some(n.id.to_string())
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                                .collect();
-                                            let var_name = target_names
-                                                .first()
-                                                .map(|s| s.as_str())
-                                                .unwrap_or("unknown");
-                                            let schema_name = self.make_inferred_schema(
-                                                new_cols,
-                                                var_name,
+                                            let schema_name = self.count_mutation_leg(
+                                                base_schema,
+                                                Some(new_cols),
+                                                &var_hint,
                                                 current_line,
+                                                current_col,
                                             );
                                             for name in &target_names {
                                                 self.variables.insert(
@@ -3571,7 +4056,14 @@ impl Linter {
                                                 .as_ref()
                                                 .map(|(s, l)| self.schema_display(s, *l))
                                                 .unwrap_or_else(|| "unknown".to_string());
-                                            for old_col in mapping.keys() {
+                                            // An unresolved base's column list is an
+                                            // empty placeholder, not a confirmed-empty
+                                            // schema -- validating old_col names
+                                            // against it would falsely report every
+                                            // renamed column as nonexistent.
+                                            for old_col in
+                                                mapping.keys().filter(|_| !base_unresolved)
+                                            {
                                                 if !base_cols.contains(old_col) {
                                                     errors.push(LintError {
                                                         line: current_line,
@@ -3594,25 +4086,12 @@ impl Linter {
                                                         .unwrap_or_else(|| c.clone())
                                                 })
                                                 .collect();
-                                            let target_names: Vec<String> = assign
-                                                .targets
-                                                .iter()
-                                                .filter_map(|t| {
-                                                    if let Expr::Name(n) = t {
-                                                        Some(n.id.to_string())
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                                .collect();
-                                            let var_name = target_names
-                                                .first()
-                                                .map(|s| s.as_str())
-                                                .unwrap_or("unknown");
-                                            let schema_name = self.make_inferred_schema(
-                                                new_cols,
-                                                var_name,
+                                            let schema_name = self.count_mutation_leg(
+                                                base_schema,
+                                                Some(new_cols),
+                                                &var_hint,
                                                 current_line,
+                                                current_col,
                                             );
                                             for name in &target_names {
                                                 self.variables.insert(
@@ -3621,18 +4100,27 @@ impl Linter {
                                                 );
                                             }
                                         }
-                                        _ => {
-                                            if let Some((base_schema, _)) = base_info {
-                                                for target in &assign.targets {
-                                                    if let Expr::Name(target_name) = target {
-                                                        self.variables.insert(
-                                                            target_name.id.to_string(),
-                                                            (base_schema.clone(), current_line),
-                                                        );
-                                                    }
-                                                }
+                                        _ if base_info.is_some() => {
+                                            // A recognized mutator (.rename()) whose
+                                            // specific edit couldn't be resolved --
+                                            // e.g. a dynamic mapping -- still counts as
+                                            // its own origin, just untracked. See
+                                            // `count_mutation_leg`'s doc comment.
+                                            let schema_name = self.count_mutation_leg(
+                                                base_schema,
+                                                None,
+                                                &var_hint,
+                                                current_line,
+                                                current_col,
+                                            );
+                                            for name in &target_names {
+                                                self.variables.insert(
+                                                    name.clone(),
+                                                    (schema_name.clone(), current_line),
+                                                );
                                             }
                                         }
+                                        _ => {}
                                     }
                                 }
                             } else if func_name == "assign" {
@@ -3664,12 +4152,17 @@ impl Linter {
                                             }
                                         })
                                         .collect();
-                                    let var_name = target_names
+                                    let var_hint = target_names
                                         .first()
-                                        .map(|s| s.as_str())
-                                        .unwrap_or("unknown");
-                                    let schema_name =
-                                        self.make_inferred_schema(new_cols, var_name, current_line);
+                                        .cloned()
+                                        .unwrap_or_else(|| recv_str.to_string());
+                                    let schema_name = self.count_mutation_leg(
+                                        base_info.as_deref(),
+                                        Some(new_cols),
+                                        &var_hint,
+                                        current_line,
+                                        current_col,
+                                    );
                                     for name in &target_names {
                                         self.variables.insert(
                                             name.clone(),
@@ -3711,6 +4204,7 @@ impl Linter {
                                             recv.id.as_str(),
                                             col_name,
                                             current_line,
+                                            current_col,
                                         );
                                     }
                                 }
@@ -3909,6 +4403,9 @@ impl Linter {
                                 func_name.id.as_str(),
                                 current_line,
                             );
+                            // Confirms any pending pass-through reversal for this
+                            // function -- see `pending_passthrough_reversals`.
+                            self.functions_called.insert(func_name.id.to_string());
                             self.dataframes_total += 1;
                             let var_hint = assign_var_hint(assign, func_name.id.as_str());
                             self.count_typed_dataframe(
@@ -4132,7 +4629,7 @@ impl Linter {
                                     .get(1)
                                     .and_then(|a| ast_extract::extract_string_literal(a))
                                 {
-                                    self.add_column_inplace(recv.id.as_str(), col_name, line);
+                                    self.add_column_inplace(recv.id.as_str(), col_name, line, col);
                                 }
                             }
                         } else if func_name == "execute" {
@@ -4804,6 +5301,155 @@ df["new_column"] = 1
     }
 
     #[test]
+    fn test_should_count_subscript_column_addition_as_a_new_leg() {
+        // arrange: adding a genuinely new column via subscript assignment is a real
+        // schema change -- its own new leg, same as rename/drop/assign (see
+        // count_mutation_leg's doc comment), rather than mutating the old schema
+        // object in place.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df["c"] = 1
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_not_count_subscript_assignment_to_an_existing_column_as_a_new_leg() {
+        // arrange: overwriting an EXISTING column's values doesn't change the schema
+        // -- no new leg.
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df["a"] = 1
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_propagate_unresolved_base_through_subscript_mutation_without_false_positive() {
+        // arrange: regression coverage for the same false-positive class fixed for
+        // rename/drop -- an unresolved base's placeholder column list must not be
+        // treated as a confirmed-empty schema.
+        let source = r#"
+import pandas as pd
+
+
+def get_unresolved() -> pd.DataFrame:
+    return pd.read_sql(some_dynamic_query, conn)
+
+
+df = get_unresolved()
+df["a"] = 1
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: unverifiable, not a false unknown-column.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    #[test]
+    fn test_should_count_pop_as_a_new_leg() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df.pop("a")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_count_insert_as_a_new_leg() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df.insert(0, "c", 1)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_propagate_unresolved_base_through_pop_without_false_positive() {
+        // arrange: regression coverage -- pop() on an unresolved base used to report
+        // a false "column doesn't exist" (see remove_column_inplace).
+        let source = r#"
+import pandas as pd
+
+
+def get_unresolved() -> pd.DataFrame:
+    return pd.read_sql(some_dynamic_query, conn)
+
+
+df = get_unresolved()
+df.pop("a")
+print(df["b"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: only the expected unverifiable-column on the later access, no false
+        // unknown-column from pop() itself.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    #[test]
     fn test_should_lint_annotated_polars_pattern() {
         // arrange
         let source = r#"
@@ -4887,6 +5533,212 @@ print(df["a"])
     }
 
     #[test]
+    fn test_should_count_typed_dataframe_for_constructor_with_columns_kwarg() {
+        // arrange: columns= is the DataFrame() constructor's own analog of read_csv's
+        // usecols= -- same recognition path, reused via LOAD_FUNCTIONS.
+        let source = r#"
+import pandas as pd
+
+df = pd.DataFrame(data, columns=["a", "b"])
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_infer_columns_from_dataframe_constructor_dict_literal() {
+        // arrange: a dict literal passed directly to DataFrame() names its columns as
+        // its own keys, with no columns=/usecols= kwarg needed -- the checker should
+        // infer {a, b} from the literal itself, precisely enough to catch a typo.
+        let source = r#"
+import pandas as pd
+
+df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+print(df["a"])
+print(df["c"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("c"));
+    }
+
+    #[test]
+    fn test_should_count_untracked_dataframe_for_bare_constructor_call() {
+        // arrange: no columns=, no dict literal -- the checker has no static column
+        // information, so this should fall to the same untracked-dataframe treatment
+        // a bare read_csv(path) gets (recognized but untyped), not go unrecognized
+        // entirely.
+        let source = r#"
+import pandas as pd
+
+df = pd.DataFrame(records)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        // The constructor takes no usecols= kwarg -- the hint must not suggest one.
+        assert!(!errors[0].message.contains("usecols"));
+        assert!(errors[0].message.contains("columns="));
+    }
+
+    #[test]
+    fn test_should_count_typed_dataframe_for_polars_constructor_with_schema_dict() {
+        // arrange: schema={...} is polars' dtype=-shaped kwarg on its own DataFrame()
+        // constructor -- same dict-keys extraction LOAD_FUNCTIONS already gives dtype=.
+        let source = r#"
+import polars as pl
+
+df = pl.DataFrame(data, schema={"a": int, "b": str})
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_record_typed_site_location_for_a_recognized_load_call() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("data.csv", usecols=["a", "b"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.typed_sites.len(), 1);
+        assert_eq!(linter.typed_sites[0].line, 4);
+        assert_eq!(linter.typed_sites[0].var, "df");
+        assert!(linter.untyped_sites.is_empty());
+    }
+
+    #[test]
+    fn test_should_scan_dataframe_shaped_calls_regardless_of_syntactic_position() {
+        // arrange: none of these three load calls is the direct RHS of a plain
+        // `x = ...` assignment -- a bare return, a `.append(...)` argument, and a
+        // call argument -- so the targeted counting logic recognizes none of them.
+        // The position-independent scan must still find all three, each labelled
+        // with where it was actually found.
+        let source = r#"
+import pandas as pd
+
+
+def load(path):
+    return pd.read_csv(path, usecols=["a", "b"])
+
+
+def build():
+    frames = []
+    frames.append(pd.read_csv("x.csv", usecols=["a"]))
+    train(pd.DataFrame({"a": [1]}, columns=["a", "b"]))
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the targeted counting logic sees none of them.
+        assert_eq!(linter.dataframes_total, 0);
+        assert!(linter.typed_sites.is_empty());
+        assert!(linter.untyped_sites.is_empty());
+
+        // assert: the scan finds all three anyway, correctly labelled.
+        assert_eq!(linter.all_dataframe_calls.len(), 3);
+        let labels: Vec<&str> = linter
+            .all_dataframe_calls
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["pd.read_csv", "pd.read_csv", "pd.DataFrame"]);
+        assert!(linter.all_dataframe_calls[0].context.contains("return"));
+        assert!(linter.all_dataframe_calls[1]
+            .context
+            .contains("call argument"));
+        assert!(linter.all_dataframe_calls[2]
+            .context
+            .contains("call argument"));
+    }
+
+    #[test]
+    fn test_should_label_collection_element_and_direct_assignment_contexts() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+frames = [pd.read_csv("a.csv", usecols=["a"]), pd.read_csv("b.csv", usecols=["b"])]
+df = pd.read_csv("c.csv", usecols=["c"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: only the direct `df = ...` assignment is actually counted.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.typed_sites.len(), 1);
+
+        // assert: the scan finds all three, with the list elements and the direct
+        // assignment labelled distinctly, and the counted one's line matches the
+        // scan's own record of it -- the line-based cross-reference the CLI's
+        // `--coverage-detail=explain` relies on.
+        assert_eq!(linter.all_dataframe_calls.len(), 3);
+        assert!(linter.all_dataframe_calls[0].context.contains("element"));
+        assert!(linter.all_dataframe_calls[1].context.contains("element"));
+        assert!(linter.all_dataframe_calls[2]
+            .context
+            .contains("direct value"));
+        assert_eq!(
+            linter.all_dataframe_calls[2].line,
+            linter.typed_sites[0].line
+        );
+    }
+
+    #[test]
     fn test_should_count_typed_dataframe_for_load_call_inside_class_method() {
         // arrange: the exact same load call as
         // test_should_count_typed_dataframe_for_load_call_with_usecols, but written
@@ -4894,6 +5746,11 @@ print(df["a"])
         // at module level. `Loader` doesn't inherit from BaseSchema and has no
         // `__tablename__`, so nothing marks it as schema-bearing -- it's just a plain
         // class, the shape most OO/DI-style codebases actually use to group loaders.
+        //
+        // A call site is required -- see
+        // test_should_count_typed_dataframe_for_load_call_inside_if_block's comment on
+        // why -- reached here through self.<attr>, the proven-working resolution path
+        // (see test_should_resolve_self_attr_method_with_no_return_annotation_via_body_inference).
         let source = r#"
 import pandas as pd
 
@@ -4902,6 +5759,15 @@ class Loader:
         df = pd.read_csv("data.csv", usecols=["a", "b"])
         print(df["a"])
         return df
+
+
+class Runner:
+    def __init__(self):
+        self._loader = Loader()
+
+    def run(self):
+        result = self._loader.load()
+        print(result["a"])
 "#;
         let mut linter = Linter::new();
 
@@ -5037,16 +5903,17 @@ class Reporter:
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        // assert: 2 DataFrame origins, not 1 -- the inner pd.read_csv(usecols=...)
-        // inside fetch_orders' own body counts on its own (matching
-        // test_should_count_typed_dataframe_for_load_call_inside_class_method's
-        // existing precedent), independent of the outer self._warehouse.fetch_orders()
-        // assignment this test is actually about. Both resolve fully (usecols= for
-        // the inner one, body-inference for the outer one), so both are typed too.
+        // assert: 1 DataFrame origin, not 2 -- fetch_orders is a pure pass-through
+        // (`df = pd.read_csv(...); return df`, nothing modifies `df` before the
+        // return), so the inner read_csv's count moves to the outer
+        // `self._warehouse.fetch_orders()` call site this test is actually about,
+        // rather than being counted once inside fetch_orders' own body AND again at
+        // the call site (see the journey/leg model: one DataFrame per execution-path
+        // instance).
         assert_eq!(errors.len(), 1, "errors: {errors:#?}");
         assert!(errors[0].message.contains("not_a_real_column"));
-        assert_eq!(linter.dataframes_total, 2);
-        assert_eq!(linter.dataframes_typed, 2);
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
     }
 
     #[test]
@@ -5149,6 +6016,14 @@ def process(source: DataSource) -> None:
     fn test_should_count_typed_dataframe_for_load_call_inside_if_block() {
         // arrange: the same load call, but reached only through an `if` branch --
         // no nesting beyond that. Not a "deeply nested control flow" edge case.
+        //
+        // A call site (`result = load(True)`) is required here: a bare pass-through
+        // return moves its origin's count to each call site that resolves through it
+        // (see the journey/leg model -- one DataFrame per execution-path instance,
+        // not one per internal assignment plus one per call), so a `load` that is
+        // never actually called would count zero, which is NOT what this test is
+        // about -- it exists to verify the `if`-nested load call is still recognized
+        // once reached through a real call site.
         let source = r#"
 import pandas as pd
 
@@ -5158,6 +6033,8 @@ def load(flag):
         print(df["a"])
         return df
     return None
+
+result = load(True)
 "#;
         let mut linter = Linter::new();
 
@@ -5174,7 +6051,9 @@ def load(flag):
     #[test]
     fn test_should_count_typed_dataframe_for_load_call_inside_if_else_branch() {
         // arrange: the load lives in the `else` arm (an ElifElseClause), not the `if`
-        // arm -- a distinct AST path from the test above.
+        // arm -- a distinct AST path from the test above. A call site is required --
+        // see test_should_count_typed_dataframe_for_load_call_inside_if_block's
+        // comment on why.
         let source = r#"
 import pandas as pd
 
@@ -5185,6 +6064,8 @@ def load(flag):
         df = pd.read_csv("data.csv", usecols=["a", "b"])
         print(df["a"])
         return df
+
+result = load(False)
 "#;
         let mut linter = Linter::new();
 
@@ -5201,7 +6082,10 @@ def load(flag):
     #[test]
     fn test_should_count_typed_dataframe_for_load_call_inside_with_block() {
         // arrange: the pattern a real SQL connection almost always uses -- a
-        // context-managed connection/cursor wrapping the actual read call.
+        // context-managed connection/cursor wrapping the actual read call. A call
+        // site is required -- see
+        // test_should_count_typed_dataframe_for_load_call_inside_if_block's comment
+        // on why.
         let source = r#"
 import pandas as pd
 
@@ -5210,6 +6094,8 @@ def load(engine):
         df = pd.read_sql("SELECT order_id, amount FROM orders", conn)
         print(df["order_id"])
         return df
+
+result = load(some_engine)
 "#;
         let mut linter = Linter::new();
 
@@ -5226,7 +6112,9 @@ def load(engine):
     #[test]
     fn test_should_count_typed_dataframe_for_load_call_inside_try_and_except() {
         // arrange: a load call in the `try` body, and a second in the `except`
-        // fallback -- both bodies must be visited.
+        // fallback -- both bodies must be visited. A call site is required -- see
+        // test_should_count_typed_dataframe_for_load_call_inside_if_block's comment
+        // on why.
         let source = r#"
 import pandas as pd
 
@@ -5236,6 +6124,8 @@ def load(path):
     except FileNotFoundError:
         df = pd.read_csv("fallback.csv", usecols=["a", "b"])
     return df
+
+result = load("orders.csv")
 "#;
         let mut linter = Linter::new();
 
@@ -5244,7 +6134,11 @@ def load(path):
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        // assert: two independent load call sites, each its own origin
+        // assert: two independent origins -- the `try` branch's own (never reassigned
+        // before `return`, so its count stays right where it happened) and the
+        // `except` branch's, whose count moves to the call site (`result = load(...)`)
+        // since -- being the LAST binding of `df` before the bare `return df` -- it's
+        // the one a caller actually observes.
         assert_eq!(linter.dataframes_total, 2);
         assert_eq!(linter.dataframes_typed, 2);
     }
@@ -5803,6 +6697,121 @@ def process(path: str) -> None:
         assert!(errors[0].message.contains("available: {a, b}"));
         assert!(errors[0].message.contains("required: {c}"));
         assert!(errors[0].message.contains("passed to postproc"));
+    }
+
+    #[test]
+    fn test_should_confirm_pass_through_reversal_across_files() {
+        // arrange: loaders.py's `load` is a pure pass-through (`df = pd.read_csv(...);
+        // return df`), called only from pipeline.py -- a DIFFERENT file, never from
+        // within loaders.py itself. Regression coverage for the cross-file double-count
+        // this closes: before `ProjectIndex.called_functions` existed, loaders.py's own
+        // per-file check had no way to know anyone calls `load`, so it kept counting
+        // its internal origin (1) *in addition to* pipeline.py's own call-site count
+        // (1) -- two counts, project-wide, for what is really one DataFrame.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let loaders_source = r#"
+import pandas as pd
+
+def load(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=["a", "b"])
+    return df
+"#;
+        fs::write(root.join("loaders.py"), loaders_source).unwrap();
+        let pipeline_source = r#"
+from loaders import load
+
+def process(path: str) -> None:
+    df = load(path)
+    print(df)
+"#;
+        fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        let mut loaders_linter = Linter::new();
+        let loaders_path = root.join("loaders.py");
+        loaders_linter.load_cross_file_symbols(&index, loaders_source, &loaders_path, root);
+        loaders_linter
+            .check_file_internal(loaders_source, &loaders_path)
+            .unwrap();
+
+        let mut pipeline_linter = Linter::new();
+        let pipeline_path = root.join("pipeline.py");
+        pipeline_linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
+        pipeline_linter
+            .check_file_internal(pipeline_source, &pipeline_path)
+            .unwrap();
+
+        // assert: loaders.py's own internal origin was reversed (confirmed called from
+        // pipeline.py, via ProjectIndex.called_functions) -- its own per-file tally is
+        // now 0, not 1. pipeline.py's call site is the one and only count.
+        assert_eq!(loaders_linter.dataframes_total, 0);
+        assert_eq!(loaders_linter.dataframes_typed, 0);
+        assert_eq!(pipeline_linter.dataframes_total, 1);
+        assert_eq!(pipeline_linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_confirm_pass_through_reversal_across_files_via_self_attr() {
+        // arrange: the `self.<attr>.<method>()` counterpart to
+        // test_should_confirm_pass_through_reversal_across_files -- Warehouse.fetch_orders
+        // is a pure pass-through, called only from reporting.py's Reporter class, via
+        // `self._warehouse.fetch_orders()`, never from within warehouse.py itself.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        let warehouse_source = r#"
+import pandas as pd
+
+
+class Warehouse:
+    def fetch_orders(self) -> pd.DataFrame:
+        df = pd.read_csv("orders.csv", usecols=["a", "b"])
+        return df
+"#;
+        fs::write(root.join("warehouse.py"), warehouse_source).unwrap();
+        let reporting_source = r#"
+from warehouse import Warehouse
+
+
+class Reporter:
+    def __init__(self):
+        self._warehouse = Warehouse()
+
+    def summarize(self):
+        orders = self._warehouse.fetch_orders()
+        print(orders)
+"#;
+        fs::write(root.join("reporting.py"), reporting_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        let mut warehouse_linter = Linter::new();
+        let warehouse_path = root.join("warehouse.py");
+        warehouse_linter.load_cross_file_symbols(&index, warehouse_source, &warehouse_path, root);
+        warehouse_linter
+            .check_file_internal(warehouse_source, &warehouse_path)
+            .unwrap();
+
+        let mut reporting_linter = Linter::new();
+        let reporting_path = root.join("reporting.py");
+        reporting_linter.load_cross_file_symbols(&index, reporting_source, &reporting_path, root);
+        reporting_linter
+            .check_file_internal(reporting_source, &reporting_path)
+            .unwrap();
+
+        // assert: warehouse.py's own internal origin was reversed (confirmed called
+        // from reporting.py's self._warehouse.fetch_orders(), resolved via
+        // ProjectIndex.called_functions' self-attr handling) -- its own tally is now
+        // 0, not 1. reporting.py's call site is the one and only count.
+        assert_eq!(warehouse_linter.dataframes_total, 0);
+        assert_eq!(warehouse_linter.dataframes_typed, 0);
+        assert_eq!(reporting_linter.dataframes_total, 1);
+        assert_eq!(reporting_linter.dataframes_typed, 1);
     }
 
     #[test]
@@ -6543,6 +7552,12 @@ class DataRepository:
         )
         .unwrap();
 
+        // Orchestrator gives Pipeline.run() a real call site -- required so its
+        // count isn't reversed with nowhere to land; see
+        // test_should_count_typed_dataframe_for_load_call_inside_if_block's comment
+        // on why. `go`'s own body must NOT itself do anything DataFrame-shaped with
+        // `result` (no subscript, no reserved-method call) -- this test is
+        // specifically about py.typed tracing working WITHOUT dataframe_shaped_usage.
         let pipeline_source = r#"
 from internal_repo_pkg import DataRepository
 
@@ -6554,6 +7569,15 @@ class Pipeline:
     def run(self):
         df = self._data_repository.get("SELECT * FROM training")
         return df
+
+
+class Orchestrator:
+    def __init__(self):
+        self._pipeline = Pipeline()
+
+    def go(self):
+        result = self._pipeline.run()
+        print(result)
 "#;
         fs::write(root.join("pipeline.py"), pipeline_source).unwrap();
         fs::write(root.join("pyproject.toml"), "[tool.typedframes]\n").unwrap();
@@ -6570,11 +7594,15 @@ class Pipeline:
 
         // assert: recognized as a DataFrame (bare pd.DataFrame, no attached Schema),
         // but NOT counted as typed -- no column name could ever be validated against
-        // it, so it lands in untyped_sites like any other unresolved origin.
+        // it, so it lands in untyped_sites like any other unresolved origin. The
+        // count is attributed to Orchestrator.go's call site (`result`), not to
+        // Pipeline.run's own internal `df` -- Pipeline.run is a pure pass-through, so
+        // its count moves to the call site that actually resolves it, same as every
+        // other pass-through in the journey/leg model.
         assert_eq!(linter.dataframes_total, 1);
         assert_eq!(linter.dataframes_typed, 0);
         assert_eq!(linter.untyped_sites.len(), 1);
-        assert_eq!(linter.untyped_sites[0].var, "df");
+        assert_eq!(linter.untyped_sites[0].var, "result");
     }
 
     #[test]
@@ -7200,10 +8228,12 @@ print(df["ORDER_ID"])
     }
 
     #[test]
-    fn test_should_not_fold_columns_for_unrecognized_transform_function() {
-        // A custom/arbitrary transform function is NOT reverse-engineered -- the base
-        // schema passes through unchanged (neither folded nor flagged), same as any
-        // other unrecognized rename() argument shape.
+    fn test_should_mark_unresolved_for_unrecognized_transform_function() {
+        // A custom/arbitrary transform function is NOT reverse-engineered -- and
+        // unlike an unrecognized shape simply being ignored, `rename()` IS a known
+        // schema-changing method, so its result becomes its own new, unresolved
+        // origin rather than silently keeping the pre-rename schema (which risks
+        // validating access against columns that are now wrong).
         let source = r#"
 import pandas as pd
 import my_internal_pkg
@@ -7229,13 +8259,138 @@ print(lowered["ORDER_ID"])
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        // The base schema passes through UNCHANGED (still upper-cased) -- not folded,
-        // but also not flagged as an error just for being an unrecognized call shape.
-        assert_eq!(
-            errors.len(),
-            0,
-            "unrecognized transform should pass the pre-fold base schema through untouched: {errors:?}"
-        );
+        // `lowered` is now its own unresolved origin -- ANY access on it is
+        // unverifiable, not validated against the (possibly stale) pre-rename schema.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert!(errors[0].message.contains("ORDER_ID"));
+    }
+
+    #[test]
+    fn test_should_count_rename_as_a_new_leg_in_the_same_scope() {
+        // arrange: no function call at all -- a schema-changing mutation is its own
+        // counted origin even within one plain, linear scope (see
+        // `count_mutation_leg`'s doc comment).
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df = df.rename(columns={"a": "aa"})
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_count_drop_as_a_new_leg_in_the_same_scope() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df = df.drop(columns=["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_count_assign_as_a_new_leg_in_the_same_scope() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df = df.assign(c=1)
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 2);
+    }
+
+    #[test]
+    fn test_should_count_dynamic_drop_as_its_own_untracked_leg() {
+        // arrange: `.drop()` IS a known schema-changing method, so a dynamic
+        // (non-literal) column list still counts as a new origin -- just untracked,
+        // rather than silently keeping the pre-drop schema (which would validate
+        // `df["a"]` against columns that may no longer be there).
+        let source = r#"
+import pandas as pd
+
+cols_to_drop = compute_cols()
+df = pd.read_csv("x.csv", usecols=["a", "b"])
+df = df.drop(columns=cols_to_drop)
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_propagate_unresolved_base_through_rename_without_false_positive() {
+        // arrange: the base (`get_unresolved()`, a bare `-> pd.DataFrame` return with
+        // no attached Schema) is unresolved BEFORE the rename ever runs -- an empty
+        // placeholder column list, not a confirmed-empty schema. Regression coverage
+        // for a real bug this same change surfaced: the rename mapping's
+        // old-column-exists check used to run unconditionally against that empty
+        // placeholder, falsely reporting every renamed column as nonexistent.
+        let source = r#"
+import pandas as pd
+
+
+def get_unresolved() -> pd.DataFrame:
+    return pd.read_sql(some_dynamic_query, conn)
+
+
+df = get_unresolved()
+df = df.rename(columns={"a": "aa"})
+print(df["aa"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: no false unknown-column for 'a' -- only the real, expected
+        // unverifiable-column for accessing an unresolved result.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert_eq!(linter.dataframes_typed, 0);
     }
 
     #[test]

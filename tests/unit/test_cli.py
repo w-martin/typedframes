@@ -22,6 +22,10 @@ from typedframes.cli import (
     _coverage_json_payload,
     _coverage_message,
     _evaluate_coverage,
+    _explain_json_entry,
+    _explain_json_payload,
+    _explain_status,
+    _format_explain,
     _format_github,
     _format_term_missing,
     _format_text,
@@ -686,6 +690,15 @@ class TestCli(unittest.TestCase):
                 "    def run(self):\n"
                 '        df = self._data_repository.get("SELECT * FROM training")\n'
                 "        return df\n"
+                "\n"
+                "\n"
+                "class Orchestrator:\n"
+                "    def __init__(self):\n"
+                "        self._pipeline = Pipeline()\n"
+                "\n"
+                "    def go(self):\n"
+                "        result = self._pipeline.run()\n"
+                "        print(result)\n"
             )
             captured = StringIO()
 
@@ -697,6 +710,11 @@ class TestCli(unittest.TestCase):
             # return annotation was indexed; without following the import it would not
             # have been seen at all. It's still unresolved (a bare `-> pd.DataFrame`, no
             # Schema), so it doesn't count as typed -- only that it was counted at all.
+            # Orchestrator.go gives Pipeline.run() a real call site: run() is a pure
+            # pass-through (`df = ...; return df`), so its count moves to wherever it's
+            # actually called from -- an uncalled function's internal origin doesn't
+            # count at all under the journey/leg model (see linter.rs's
+            # test_should_count_typed_dataframe_for_load_call_inside_if_block).
             self.assertIn("/1 DataFrames had column info", captured.getvalue())
 
     def test_should_check_a_single_file_gracefully_when_there_is_no_project_root(self) -> None:
@@ -1903,6 +1921,104 @@ class TestCli(unittest.TestCase):
         self.assertIsNone(payload["percent"])
         self.assertIsNone(payload["files"][0]["percent"])
 
+    def test_should_classify_dataframe_call_sites_by_line(self) -> None:
+        """Test that _explain_status matches typed/untracked/uncounted sites by line, not column."""
+        # arrange
+        typed_by_line = {5: {"schema": "S"}}
+        untyped_lines = {10}
+
+        # act / assert
+        self.assertEqual(
+            "COUNTED, typed (schema: S)",
+            _explain_status({"line": 5, "context": "x"}, typed_by_line, untyped_lines),
+        )
+        self.assertEqual(
+            "COUNTED, untracked -- no static column info",
+            _explain_status({"line": 10, "context": "x"}, typed_by_line, untyped_lines),
+        )
+        self.assertEqual(
+            "NOT COUNTED — a call argument",
+            _explain_status({"line": 20, "context": "a call argument"}, typed_by_line, untyped_lines),
+        )
+
+    def test_should_render_explain_report_across_multiple_files(self) -> None:
+        """Test the per-file grouping, blank-line separator between files, and notebook cell prefix."""
+        # arrange
+        calls = [
+            {"file": "/proj/a.py", "line": 3, "col": 1, "label": "pd.read_csv", "context": "a call argument"},
+            {
+                "file": "/proj/b.ipynb",
+                "line": 5,
+                "col": 2,
+                "cell": 3,
+                "label": "pd.DataFrame",
+                "context": "a call argument",
+            },
+        ]
+        typed_sites = [{"file": "/proj/a.py", "line": 3, "schema": "S"}]
+
+        # act
+        report = _format_explain(calls, typed_sites, [], Path("/proj"))
+
+        # assert
+        self.assertIn("a.py", report)
+        self.assertIn("b.ipynb", report)
+        self.assertIn("COUNTED, typed (schema: S)", report)
+        self.assertIn("cell 3:5:2", report)
+        self.assertIn("\n\n", report)
+
+    def test_should_report_no_calls_found_for_explain(self) -> None:
+        """Test that an entirely call-free run says so rather than printing an empty report."""
+        # arrange / act / assert
+        self.assertEqual(
+            "No DataFrame-shaped calls found to check",
+            _format_explain([], [], [], Path("/proj")),
+        )
+
+    def test_should_build_explain_json_entry_for_each_status(self) -> None:
+        """Test that _explain_json_entry reports counted/typed/schema correctly for each status."""
+        # arrange
+        typed_by_line = {1: {"schema": "S"}}
+        untyped_lines = {2}
+
+        # act
+        typed_entry = _explain_json_entry(
+            {"line": 1, "col": 1, "label": "pd.DataFrame", "context": "x"}, typed_by_line, untyped_lines
+        )
+        untracked_entry = _explain_json_entry(
+            {"line": 2, "col": 1, "label": "pd.DataFrame", "context": "x"}, typed_by_line, untyped_lines
+        )
+        uncounted_entry = _explain_json_entry(
+            {"line": 3, "col": 1, "cell": 4, "label": "pd.DataFrame", "context": "a return value"},
+            typed_by_line,
+            untyped_lines,
+        )
+
+        # assert
+        self.assertEqual((True, True, "S"), (typed_entry["counted"], typed_entry["typed"], typed_entry["schema"]))
+        self.assertEqual(
+            (True, False, None),
+            (untracked_entry["counted"], untracked_entry["typed"], untracked_entry["schema"]),
+        )
+        self.assertEqual(
+            (False, False, None),
+            (uncounted_entry["counted"], uncounted_entry["typed"], uncounted_entry["schema"]),
+        )
+        self.assertEqual(4, uncounted_entry["cell"])
+        self.assertNotIn("cell", typed_entry)
+
+    def test_should_build_explain_json_payload_grouped_by_file(self) -> None:
+        """Test that _explain_json_payload groups calls by file, relative to root."""
+        # arrange
+        calls = [{"file": "/proj/a.py", "line": 1, "col": 1, "label": "pd.DataFrame", "context": "x"}]
+
+        # act
+        payload = _explain_json_payload(calls, [], [], Path("/proj"))
+
+        # assert
+        self.assertEqual("a.py", payload["files"][0]["file"])
+        self.assertEqual(1, len(payload["files"][0]["calls"]))
+
     def test_should_fail_the_gate_for_an_unresolved_schema_by_default(self) -> None:
         """Test that a DataFrame recognized but never resolved to concrete columns fails the gate.
 
@@ -2072,6 +2188,42 @@ class TestCli(unittest.TestCase):
             payload = json.loads(captured.getvalue())
             self.assertIn("coverage", payload)
             self.assertEqual("sales", payload["coverage"]["files"][0]["missing"][0]["var"])
+
+    def test_should_print_explain_report_end_to_end(self) -> None:
+        """Test that --coverage-detail=explain lists every DataFrame-shaped call, counted or not."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text(
+                'import pandas as pd\n\n\ndef load(path):\n    return pd.read_csv(path, usecols=["a"])\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "explain"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("NOT COUNTED", output)
+            self.assertIn("pd.read_csv", output)
+
+    def test_should_nest_explain_detail_inside_json_output_format(self) -> None:
+        """Test that --coverage-detail=explain nests as structured JSON under --output-format=json."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "load.py").write_text('import pandas as pd\nsales = pd.read_csv("a.csv", usecols=["a"])\n')
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--output-format", "json", "--coverage-detail", "explain"])
+
+            # assert
+            payload = json.loads(captured.getvalue())
+            self.assertIn("coverage", payload)
+            self.assertTrue(payload["coverage"]["files"][0]["calls"][0]["counted"])
 
     def test_should_omit_coverage_key_from_json_output_by_default(self) -> None:
         """Test that the default JSON payload is unchanged by this feature."""

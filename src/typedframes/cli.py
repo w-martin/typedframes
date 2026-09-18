@@ -106,12 +106,14 @@ _COVERAGE_DEFAULT_FAIL_UNDER = 100.0
 _COVERAGE_PCT_MAX = 100.0
 
 # Coverage detail levels: how much DataFrame schema coverage detail to print, as text
-# (or nested as structured JSON under --output-format=json). Deliberately just two
-# verbosity levels, not a format -- "summary" is the pre-existing one-line message and
-# the default, so an unconfigured project sees exactly what it saw before; JSON-ness is
-# --output-format's job alone, not a third value here (see --coverage-detail's help).
-# "term-missing" is named after `coverage report -m`.
-_COVERAGE_DETAILS = ("summary", "term-missing")
+# (or nested as structured JSON under --output-format=json). "summary" is the
+# pre-existing one-line message and the default, so an unconfigured project sees
+# exactly what it saw before; JSON-ness is --output-format's job alone, not a
+# separate value here (see --coverage-detail's help). "term-missing" is named after
+# `coverage report -m`. "explain" is the most verbose level: every DataFrame-shaped
+# call site found anywhere in each file, whether or not it was actually counted --
+# see `_format_explain`.
+_COVERAGE_DETAILS = ("summary", "term-missing", "explain")
 
 
 def _coverage_warn(message: str) -> None:
@@ -352,6 +354,8 @@ class _FileCheckResult(NamedTuple):
     errors: list[dict]
     tally: FileTally
     untyped_sites: list[dict]
+    typed_sites: list[dict]
+    all_dataframe_calls: list[dict]
 
 
 _CheckFileFn = Callable[[str, bytes | None], str]
@@ -376,6 +380,8 @@ def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
             typed=stats["dataframes_typed"],
         ),
         untyped_sites=[{**site, "file": str(file_path)} for site in stats.get("untyped_sites", [])],
+        typed_sites=[{**site, "file": str(file_path)} for site in stats.get("typed_sites", [])],
+        all_dataframe_calls=[{**site, "file": str(file_path)} for site in stats.get("all_dataframe_calls", [])],
     )
 
 
@@ -439,6 +445,12 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     no attached Schema). This is the "missing" listing behind
     ``--coverage-detail=term-missing``, the counterpart to `coverage report -m`'s
     missing line numbers.
+
+    Also returns ``typed_sites`` (the ``untyped_sites`` counterpart: every origin
+    that DID resolve) and ``all_dataframe_calls`` (every `<load module>.<load
+    function>(...)`-shaped call anywhere in the file, found by a position-
+    independent scan regardless of whether it was actually recognized as an
+    origin) -- together these back ``--coverage-detail=explain``.
     """
     try:
         from typedframes._rust_checker import check_file, check_notebook
@@ -454,6 +466,8 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     totals = {"dataframes_total": 0, "dataframes_typed": 0}
     per_file: dict[str, FileTally] = {}
     untyped_sites: list[dict] = []
+    typed_sites: list[dict] = []
+    all_dataframe_calls: list[dict] = []
     for file_path in files:
         if file_path.suffix == ".ipynb":
             outcome = _check_notebook_file(file_path, check_notebook, index_bytes)
@@ -466,10 +480,14 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         totals["dataframes_total"] += outcome.tally.total
         totals["dataframes_typed"] += outcome.tally.typed
         untyped_sites.extend(outcome.untyped_sites)
+        typed_sites.extend(outcome.typed_sites)
+        all_dataframe_calls.extend(outcome.all_dataframe_calls)
     return all_errors, {
         **totals,
         "per_file": per_file,
         "untyped_sites": untyped_sites,
+        "typed_sites": typed_sites,
+        "all_dataframe_calls": all_dataframe_calls,
     }
 
 
@@ -618,12 +636,14 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         dest="coverage_detail",
         help=(
-            "How much DataFrame schema coverage detail to print: summary (default, one line) or "
-            "term-missing (per-file table plus the DataFrame sites lacking column info). Combine "
-            "with --output-format=json to get the same detail as structured JSON, nested under a "
-            "'coverage' key, instead of text -- there is no separate json value here, since picking "
-            "a format is --output-format's job alone. Overrides the `detail` key in "
-            "[tool.typedframes.coverage]."
+            "How much DataFrame schema coverage detail to print: summary (default, one line), "
+            "term-missing (per-file table plus the DataFrame sites lacking column info), or "
+            "explain (every DataFrame-shaped call found in each file, whether or not it was "
+            "actually counted, and why not -- a diagnostic for 'why is my coverage lower than "
+            "expected'). Combine with --output-format=json to get the same detail as structured "
+            "JSON, nested under a 'coverage' key, instead of text -- there is no separate json "
+            "value here, since picking a format is --output-format's job alone. Overrides the "
+            "`detail` key in [tool.typedframes.coverage]."
         ),
     )
     args = parser.parse_args(argv)
@@ -820,6 +840,132 @@ def _format_term_missing(
     return "\n".join(lines)
 
 
+def _explain_status(site: dict, typed_by_line: dict[int, dict], untyped_lines: set[int]) -> str:
+    """Classify one `all_dataframe_calls` site against `typed_sites`/`untyped_sites`, by line.
+
+    Line-level, not column-level: `typed_sites`/`untyped_sites` record the position
+    of the enclosing statement (`current_line`/`current_col` come from the
+    assignment's own range, e.g. the `df` in `df = ...`), while `all_dataframe_calls`
+    records the call expression's own position (e.g. the `pd` in `pd.read_csv(...)`)
+    -- different columns on the same line by design, so columns aren't compared. Two
+    DataFrame-shaped calls landing on the exact same line would be ambiguous under
+    this scheme; accepted as a rare, and honestly documented, limitation rather than
+    chasing column-exact matching between two coordinate systems that don't agree
+    (see `LoadCallSiteCollector` in `rust/src/linter.rs`).
+    """
+    line = site["line"]
+    if line in typed_by_line:
+        return f"COUNTED, typed (schema: {typed_by_line[line]['schema']})"
+    if line in untyped_lines:
+        return "COUNTED, untracked -- no static column info"
+    return f"NOT COUNTED — {site['context']}"
+
+
+def _format_explain(
+    all_dataframe_calls: list[dict],
+    typed_sites: list[dict],
+    untyped_sites: list[dict],
+    root: Path,
+) -> str:
+    """Render every DataFrame-shaped call site found in each file, counted or not.
+
+    The ``--coverage-detail=explain`` report: unlike ``term-missing`` (which only
+    ever shows sites the targeted counting logic already recognized), this also
+    surfaces calls that logic doesn't look at all -- a bare ``return``, a call
+    argument, a list/dict element, ... -- since those are invisible to
+    ``dataframes_total`` entirely, not just untyped. See `_explain_status` for how
+    each site is classified.
+    """
+    if not all_dataframe_calls:
+        return "No DataFrame-shaped calls found to check"
+
+    calls_by_file = _sites_by_file(all_dataframe_calls)
+    typed_by_file = _sites_by_file(typed_sites)
+    untyped_by_file = _sites_by_file(untyped_sites)
+
+    lines: list[str] = []
+    for name in sorted(calls_by_file):
+        typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
+        untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
+        if lines:
+            lines.append("")
+        lines.append(_relative_posix(name, root))
+        for site in sorted(calls_by_file[name], key=lambda s: (s["line"], s["col"])):
+            cell = site.get("cell")
+            prefix = f"cell {cell}:" if cell is not None else ""
+            location = f"{prefix}{site['line']}:{site['col']}"
+            status = _explain_status(site, typed_by_line, untyped_lines)
+            lines.append(f"  {location:<12} {site['label']:<16} {status}")
+    return "\n".join(lines)
+
+
+def _explain_json_entry(site: dict, typed_by_line: dict[int, dict], untyped_lines: set[int]) -> dict:
+    """Render one `all_dataframe_calls` site as a JSON object for `_explain_json_payload`."""
+    line = site["line"]
+    if line in typed_by_line:
+        counted, typed, schema = True, True, typed_by_line[line]["schema"]
+    elif line in untyped_lines:
+        counted, typed, schema = True, False, None
+    else:
+        counted, typed, schema = False, False, None
+    return {
+        "line": line,
+        "col": site["col"],
+        **({"cell": site["cell"]} if "cell" in site else {}),
+        "label": site["label"],
+        "counted": counted,
+        "typed": typed,
+        "schema": schema,
+        "context": site["context"],
+    }
+
+
+def _explain_json_payload(
+    all_dataframe_calls: list[dict],
+    typed_sites: list[dict],
+    untyped_sites: list[dict],
+    root: Path,
+) -> dict:
+    """Build the machine-readable `--coverage-detail=explain` document.
+
+    The structured counterpart to `_format_explain`.
+    """
+    calls_by_file = _sites_by_file(all_dataframe_calls)
+    typed_by_file = _sites_by_file(typed_sites)
+    untyped_by_file = _sites_by_file(untyped_sites)
+
+    files = []
+    for name in sorted(calls_by_file):
+        typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
+        untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
+        files.append(
+            {
+                "file": _relative_posix(name, root),
+                "calls": [
+                    _explain_json_entry(site, typed_by_line, untyped_lines)
+                    for site in sorted(calls_by_file[name], key=lambda s: (s["line"], s["col"]))
+                ],
+            }
+        )
+    return {"files": files}
+
+
+def _coverage_detail_json_payload(coverage: dict, root: Path, *, detail: str) -> dict:
+    """Dispatch to the right `--coverage-detail` JSON builder for a non-`summary` detail level."""
+    if detail == "explain":
+        return _explain_json_payload(
+            coverage.get("all_dataframe_calls", []),
+            coverage.get("typed_sites", []),
+            coverage.get("untyped_sites", []),
+            root,
+        )
+    return _coverage_json_payload(
+        coverage.get("per_file", {}),
+        coverage.get("untyped_sites", []),
+        root,
+    )
+
+
 def _site_entries(sites: list[dict]) -> list[dict]:
     """Render one file's sites as JSON objects, in line order."""
     return [
@@ -876,18 +1022,28 @@ def _print_coverage_report(stats: dict, root: Path, *, detail: str) -> None:
     summary in `_print_results` already covers it, and keeping this a no-op is
     what makes the default path byte-for-byte unchanged.
 
-    Only reached for text/GitHub output -- `--coverage-detail` has just the two
-    text-shaped values (`summary`, `term-missing`); under `--output-format=json`
-    the same detail is nested into the single JSON payload by `_print_json_results`
-    instead, so stdout stays one valid document. There's no `json` value here to
-    branch on: picking a format is `--output-format`'s job alone.
+    Only reached for text/GitHub output -- under `--output-format=json` the same
+    detail is nested into the single JSON payload by `_print_json_results` instead,
+    so stdout stays one valid document. There's no `json` value here to branch on:
+    picking a format is `--output-format`'s job alone.
     """
     if detail == "summary":
         return
 
+    print()
+    if detail == "explain":
+        print(
+            _format_explain(
+                stats.get("all_dataframe_calls", []),
+                stats.get("typed_sites", []),
+                stats.get("untyped_sites", []),
+                root,
+            )
+        )
+        return
+
     per_file = stats.get("per_file", {})
     untyped_sites = stats.get("untyped_sites", [])
-    print()
     print(_format_term_missing(per_file, untyped_sites, root))
 
 
@@ -1068,11 +1224,7 @@ def _run_check(args: argparse.Namespace) -> None:
     # require editing (or temporarily undoing) project config.
     detail = args.coverage_detail or coverage_config.detail
     coverage_detail_payload = (
-        _coverage_json_payload(
-            coverage.get("per_file", {}),
-            coverage.get("untyped_sites", []),
-            path,
-        )
+        _coverage_detail_json_payload(coverage, path, detail=detail)
         if detail != "summary" and args.output_format == "json"
         else None
     )

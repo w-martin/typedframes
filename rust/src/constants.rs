@@ -182,6 +182,9 @@ pub(crate) const LOAD_FUNCTIONS: &[&str] = &[
     "read_database",
     "read_database_uri",
     "read_gbq",
+    // Not an I/O read, but shares the same usecols=/columns=/dtype=/schema= recognition
+    // and bare-load-without-a-hint fallback as every function above it.
+    "DataFrame",
 ];
 
 pub(crate) const LOAD_MODULES: &[&str] = &["pd", "pandas", "pl", "polars"];

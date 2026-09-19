@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.5.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.7.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -470,7 +470,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.5.0"]
+        additional_dependencies: ["typedframes==0.7.0"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -519,7 +519,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.5.0"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.7.0"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |

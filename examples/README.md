@@ -1,6 +1,6 @@
 # Examples
 
-Three groups, each with its own README/SPEC:
+Four groups, each with its own README/SPEC:
 
 ## [`features/`](features/)
 
@@ -8,6 +8,14 @@ Core typedframes usage: inference from `usecols=`/`columns=`, multi-file schema
 propagation, `Annotated` schemas for pandas/polars, schema algebra, Jupyter notebook
 (`.ipynb`) checking, and the Pandera bridge. Start here if you're new to typedframes. See
 [`features/README.md`](features/README.md).
+
+## [`backends/`](backends/)
+
+Column tracking through a DataFrame library's own native API rather than pandas/polars
+`usecols=`/`columns=` or a SQL `SELECT` list. One directory per backend (cuDF), each
+with a `run_example.py` and `docker-compose.yml` for actually running the real library
+against synthetic fixture data, separate from the checker. See
+[`backends/README.md`](backends/README.md).
 
 ## [`sql_connectors/`](sql_connectors/)
 

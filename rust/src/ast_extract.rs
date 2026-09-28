@@ -16,6 +16,19 @@ pub(crate) fn is_schema_base(name: &str) -> bool {
     )
 }
 
+// The bare name of a decorator expression: `staticmethod` for `@staticmethod`,
+// `wraps` for both `@wraps(f)` and `@functools.wraps(f)`. `None` for anything else
+// (an attribute chain deeper than one level, a subscript, a call with no simple
+// name, ...) -- callers treat that the same as an unrecognized name.
+pub(crate) fn decorator_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attr) => Some(attr.attr.as_str()),
+        Expr::Call(call) => decorator_name(&call.func),
+        _ => None,
+    }
+}
+
 pub(crate) fn extract_string_literal(expr: &Expr) -> Option<&str> {
     if let Expr::StringLiteral(s) = expr {
         Some(s.value.to_str())

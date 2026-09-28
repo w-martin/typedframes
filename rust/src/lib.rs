@@ -38,6 +38,7 @@ mod config;
 mod constants;
 mod contract;
 mod errors;
+mod frame_ops;
 mod index;
 mod linter;
 mod notebook;

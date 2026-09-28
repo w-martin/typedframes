@@ -244,6 +244,90 @@ pub(crate) const SQL_PRODUCING_METHODS: &[&str] = &["query", "sql"];
 // checker's existing "empty string = none" sentinel convention for the same fields.
 pub(crate) const OPEN_FRAME_MARKER: &str = "__typedframes_open_frame__";
 
+// Methods that return a frame with the same columns as their receiver, beyond
+// `ROW_PASSTHROUGH_METHODS` (which the assignment dispatch already propagates
+// into a new binding). Consulted only by `frame_ops::classify_rhs`, to tell a
+// reassignment that leaves a tracked frame's schema intact (`df = df.copy()`)
+// apart from one that may change it. Deliberately conservative: anything not
+// listed here is treated as possibly schema-changing.
+pub(crate) const SCHEMA_PRESERVING_METHODS: &[&str] = &[
+    "copy",
+    "drop_duplicates",
+    "astype",
+    "replace",
+    "round",
+    "abs",
+    "clip",
+    "where",
+    "mask",
+    "sort_index",
+    "interpolate",
+    "shift",
+    "convert_dtypes",
+    "infer_objects",
+    "explode",
+    "isna",
+    "isnull",
+    "notna",
+    "notnull",
+    "clone",
+    "unique",
+    "drop_nulls",
+    "fill_null",
+    "fill_nan",
+    "slice",
+    "limit",
+    "reverse",
+    "lazy",
+    "collect",
+    "to_pandas",
+    "to_polars",
+];
+
+// Methods whose result is a Series, scalar, list, dict, or a serialisation --
+// never a frame -- so a name reassigned from one is no longer the tracked frame.
+pub(crate) const NON_FRAME_METHODS: &[&str] = &[
+    "sum",
+    "mean",
+    "median",
+    "std",
+    "var",
+    "min",
+    "max",
+    "count",
+    "nunique",
+    "idxmax",
+    "idxmin",
+    "any",
+    "all",
+    "prod",
+    "value_counts",
+    "to_dict",
+    "to_list",
+    "tolist",
+    "to_numpy",
+    "to_csv",
+    "to_parquet",
+    "to_json",
+    "to_string",
+    "to_html",
+    "to_markdown",
+    "to_latex",
+    "to_excel",
+    "to_sql",
+    "to_records",
+    "memory_usage",
+    "iterrows",
+    "itertuples",
+    "items",
+    "pop",
+    "get",
+    "squeeze",
+    "item",
+    "keys",
+    "insert",
+];
+
 pub(crate) const ROW_PASSTHROUGH_METHODS: &[&str] = &[
     "filter",
     "query",

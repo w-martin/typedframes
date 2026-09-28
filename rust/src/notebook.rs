@@ -59,6 +59,17 @@ pub(crate) struct NotebookDataFrameCallSite {
     pub context: String,
 }
 
+/// The [`crate::errors::LegEvent`] counterpart, relocated to notebook coordinates.
+#[derive(Debug, Serialize)]
+pub(crate) struct NotebookLegEvent {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub outcome: String,
+    pub reason: String,
+}
+
 /// The notebook counterpart of [`FileStats`], nested under `stats` in
 /// [`NotebookCheckResult`] -- matching [`crate::errors::CheckFileResult`]'s shape so
 /// the Python side can treat both JSON payloads the same way.
@@ -69,6 +80,7 @@ pub(crate) struct NotebookFileStats {
     pub untyped_sites: Vec<NotebookUntypedSite>,
     pub typed_sites: Vec<NotebookTypedSite>,
     pub all_dataframe_calls: Vec<NotebookDataFrameCallSite>,
+    pub leg_events: Vec<NotebookLegEvent>,
 }
 
 /// The JSON payload returned by the `check_notebook` entry point. Same shape as
@@ -187,6 +199,22 @@ pub(crate) fn translate_result(
         })
         .collect();
 
+    let leg_events = stats
+        .leg_events
+        .into_iter()
+        .map(|e| {
+            let (cell, line) = translate(index, e.line);
+            NotebookLegEvent {
+                cell,
+                line,
+                col: e.col,
+                var: e.var,
+                outcome: e.outcome,
+                reason: e.reason,
+            }
+        })
+        .collect();
+
     NotebookCheckResult {
         errors,
         stats: NotebookFileStats {
@@ -195,6 +223,7 @@ pub(crate) fn translate_result(
             untyped_sites,
             typed_sites,
             all_dataframe_calls,
+            leg_events,
         },
     }
 }
@@ -202,7 +231,7 @@ pub(crate) fn translate_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::{DataFrameCallSite, TypedSite, UntypedSite};
+    use crate::errors::{DataFrameCallSite, LegEvent, TypedSite, UntypedSite};
     use ruff_notebook::Notebook;
 
     // Four cells: markdown, code (2 lines), markdown, code (1 line). Cell numbers
@@ -316,6 +345,13 @@ mod tests {
                 label: "pd.DataFrame".to_string(),
                 context: "the direct value of a plain assignment".to_string(),
             }],
+            leg_events: vec![LegEvent {
+                line: 1,
+                col: 1,
+                var: "df".to_string(),
+                outcome: "unresolved".to_string(),
+                reason: "`clean()` is not modelled".to_string(),
+            }],
         };
 
         // act
@@ -342,5 +378,8 @@ mod tests {
         assert_eq!(result.stats.all_dataframe_calls[0].cell, 2);
         assert_eq!(result.stats.all_dataframe_calls[0].line, 1);
         assert_eq!(result.stats.all_dataframe_calls[0].label, "pd.DataFrame");
+        assert_eq!(result.stats.leg_events.len(), 1);
+        assert_eq!(result.stats.leg_events[0].cell, 2);
+        assert_eq!(result.stats.leg_events[0].outcome, "unresolved");
     }
 }

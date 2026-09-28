@@ -611,8 +611,24 @@ is invisible to `dataframes_total` today, not just untyped. `explain` is what su
 that gap so you can see exactly which lines it applies to, rather than guessing from the
 ratio alone.
 
-`--output-format=json` nests the same information under `coverage.files[].calls[]`, each
-entry carrying `counted`/`typed`/`schema` booleans and strings instead of prose:
+When a tracked DataFrame stops carrying a known column set partway through a file,
+`explain` also lists the statement responsible, under `tracking ended:`. `unresolved`
+means the name still holds a DataFrame but its columns are no longer known (`df =
+clean(df)` where `clean` reshapes its input, `df.some_op(inplace=True)`, `df.columns =
+new_names`); `untracked` means the name no longer holds that frame, or the checker can
+make no claim about it (a Series result, `del df`, `for df in ...`, `with ... as df`):
+
+```
+src/train.py
+  12:5   pd.read_csv    COUNTED, typed (schema: inferred column set {order_id, amount} (defined at line 12))
+  tracking ended:
+    18:1   df               unresolved -- `.agg()` is not modelled, so the columns are unknown from here
+    27:1   df               untracked -- reassigned to a Series or scalar via `.sum()`
+```
+
+`--output-format=json` nests the same information under `coverage.files[].calls[]`
+(and `coverage.files[].tracking_ended[]`), each entry carrying `counted`/`typed`/`schema`
+booleans and strings instead of prose:
 
 ```shell
 typedframes check src/ --output-format=json --coverage-detail=explain

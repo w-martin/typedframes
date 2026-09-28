@@ -10,7 +10,7 @@ import re
 import sys
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -356,6 +356,7 @@ class _FileCheckResult(NamedTuple):
     untyped_sites: list[dict]
     typed_sites: list[dict]
     all_dataframe_calls: list[dict]
+    leg_events: list[dict]
 
 
 _CheckFileFn = Callable[[str, bytes | None], str]
@@ -382,6 +383,7 @@ def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
         untyped_sites=[{**site, "file": str(file_path)} for site in stats.get("untyped_sites", [])],
         typed_sites=[{**site, "file": str(file_path)} for site in stats.get("typed_sites", [])],
         all_dataframe_calls=[{**site, "file": str(file_path)} for site in stats.get("all_dataframe_calls", [])],
+        leg_events=[{**event, "file": str(file_path)} for event in stats.get("leg_events", [])],
     )
 
 
@@ -450,7 +452,9 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     that DID resolve) and ``all_dataframe_calls`` (every `<load module>.<load
     function>(...)`-shaped call anywhere in the file, found by a position-
     independent scan regardless of whether it was actually recognized as an
-    origin) -- together these back ``--coverage-detail=explain``.
+    origin) -- together these back ``--coverage-detail=explain``, as do
+    ``leg_events``: every statement after which a tracked frame's columns stopped
+    being known, and why.
     """
     try:
         from typedframes._rust_checker import check_file, check_notebook
@@ -468,6 +472,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     untyped_sites: list[dict] = []
     typed_sites: list[dict] = []
     all_dataframe_calls: list[dict] = []
+    leg_events: list[dict] = []
     for file_path in files:
         if file_path.suffix == ".ipynb":
             outcome = _check_notebook_file(file_path, check_notebook, index_bytes)
@@ -482,12 +487,14 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         untyped_sites.extend(outcome.untyped_sites)
         typed_sites.extend(outcome.typed_sites)
         all_dataframe_calls.extend(outcome.all_dataframe_calls)
+        leg_events.extend(outcome.leg_events)
     return all_errors, {
         **totals,
         "per_file": per_file,
         "untyped_sites": untyped_sites,
         "typed_sites": typed_sites,
         "all_dataframe_calls": all_dataframe_calls,
+        "leg_events": leg_events,
     }
 
 
@@ -861,11 +868,24 @@ def _explain_status(site: dict, typed_by_line: dict[int, dict], untyped_lines: s
     return f"NOT COUNTED — {site['context']}"
 
 
+def _position_key(site: dict) -> tuple[int, int, int]:
+    """Sort key placing a site in reading order: notebook cell first, then line, then column."""
+    return (site.get("cell", 0), site["line"], site["col"])
+
+
+def _event_location(event: dict) -> str:
+    """Render a site's position: `line:col`, or `cell N:line:col` for a notebook site."""
+    cell = event.get("cell")
+    prefix = f"cell {cell}:" if cell is not None else ""
+    return f"{prefix}{event['line']}:{event['col']}"
+
+
 def _format_explain(
     all_dataframe_calls: list[dict],
     typed_sites: list[dict],
     untyped_sites: list[dict],
     root: Path,
+    leg_events: Sequence[dict] = (),
 ) -> str:
     """Render every DataFrame-shaped call site found in each file, counted or not.
 
@@ -875,27 +895,35 @@ def _format_explain(
     argument, a list/dict element, ... -- since those are invisible to
     ``dataframes_total`` entirely, not just untyped. See `_explain_status` for how
     each site is classified.
+
+    Each file's list is followed by the statements after which a tracked frame's
+    columns stopped being known, with the reason.
     """
-    if not all_dataframe_calls:
+    if not all_dataframe_calls and not leg_events:
         return "No DataFrame-shaped calls found to check"
 
     calls_by_file = _sites_by_file(all_dataframe_calls)
     typed_by_file = _sites_by_file(typed_sites)
     untyped_by_file = _sites_by_file(untyped_sites)
+    events_by_file = _sites_by_file(list(leg_events))
 
     lines: list[str] = []
-    for name in sorted(calls_by_file):
+    for name in sorted(calls_by_file.keys() | events_by_file.keys()):
         typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
         untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
         if lines:
             lines.append("")
         lines.append(_relative_posix(name, root))
-        for site in sorted(calls_by_file[name], key=lambda s: (s["line"], s["col"])):
-            cell = site.get("cell")
-            prefix = f"cell {cell}:" if cell is not None else ""
-            location = f"{prefix}{site['line']}:{site['col']}"
+        for site in sorted(calls_by_file.get(name, []), key=_position_key):
             status = _explain_status(site, typed_by_line, untyped_lines)
-            lines.append(f"  {location:<12} {site['label']:<16} {status}")
+            lines.append(f"  {_event_location(site):<12} {site['label']:<16} {status}")
+        file_events = sorted(events_by_file.get(name, []), key=_position_key)
+        if file_events:
+            lines.append("  tracking ended:")
+            lines.extend(
+                f"    {_event_location(event):<12} {event['var']:<16} {event['outcome']} -- {event['reason']}"
+                for event in file_events
+            )
     return "\n".join(lines)
 
 
@@ -920,22 +948,37 @@ def _explain_json_entry(site: dict, typed_by_line: dict[int, dict], untyped_line
     }
 
 
+def _tracking_ended_entry(event: dict) -> dict:
+    """Render one leg event as a JSON object for `_explain_json_payload`."""
+    return {
+        "line": event["line"],
+        "col": event["col"],
+        **({"cell": event["cell"]} if "cell" in event else {}),
+        "var": event["var"],
+        "outcome": event["outcome"],
+        "reason": event["reason"],
+    }
+
+
 def _explain_json_payload(
     all_dataframe_calls: list[dict],
     typed_sites: list[dict],
     untyped_sites: list[dict],
     root: Path,
+    leg_events: Sequence[dict] = (),
 ) -> dict:
     """Build the machine-readable `--coverage-detail=explain` document.
 
-    The structured counterpart to `_format_explain`.
+    The structured counterpart to `_format_explain`. A file with tracking-ended
+    events but no DataFrame-shaped calls still appears, with an empty ``calls``.
     """
     calls_by_file = _sites_by_file(all_dataframe_calls)
     typed_by_file = _sites_by_file(typed_sites)
     untyped_by_file = _sites_by_file(untyped_sites)
+    events_by_file = _sites_by_file(list(leg_events))
 
     files = []
-    for name in sorted(calls_by_file):
+    for name in sorted(calls_by_file.keys() | events_by_file.keys()):
         typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
         untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
         files.append(
@@ -943,7 +986,10 @@ def _explain_json_payload(
                 "file": _relative_posix(name, root),
                 "calls": [
                     _explain_json_entry(site, typed_by_line, untyped_lines)
-                    for site in sorted(calls_by_file[name], key=lambda s: (s["line"], s["col"]))
+                    for site in sorted(calls_by_file.get(name, []), key=_position_key)
+                ],
+                "tracking_ended": [
+                    _tracking_ended_entry(event) for event in sorted(events_by_file.get(name, []), key=_position_key)
                 ],
             }
         )
@@ -958,6 +1004,7 @@ def _coverage_detail_json_payload(coverage: dict, root: Path, *, detail: str) ->
             coverage.get("typed_sites", []),
             coverage.get("untyped_sites", []),
             root,
+            coverage.get("leg_events", []),
         )
     return _coverage_json_payload(
         coverage.get("per_file", {}),
@@ -1038,6 +1085,7 @@ def _print_coverage_report(stats: dict, root: Path, *, detail: str) -> None:
                 stats.get("typed_sites", []),
                 stats.get("untyped_sites", []),
                 root,
+                stats.get("leg_events", []),
             )
         )
         return

@@ -7,13 +7,19 @@
 use crate::config::LinterConfig;
 use crate::constants::{
     CONNECTORX_MODULES, FEAST_RETRIEVAL_METHODS, LOAD_FUNCTIONS, LOAD_MODULES, OPEN_FRAME_MARKER,
-    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SQL_FINALIZE_METHODS, SQL_LOAD_FUNCTIONS,
+    RESERVED_METHODS, ROW_PASSTHROUGH_METHODS, SCHEMA_PRESERVING_METHODS, SQL_FINALIZE_METHODS,
+    SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
     is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
     CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
 };
-use crate::errors::{DataFrameCallSite, LintError, TypedSite, UntypedSite};
+use crate::errors::{DataFrameCallSite, LegEvent, LintError, TypedSite, UntypedSite};
+use crate::frame_ops::{
+    apply_edits, class_chain, classify_rhs, column_write_target, describe_rhs,
+    inplace_drop_columns, inplace_rename_mapping, keyword, resolve_delegates, summarize_helper,
+    ColumnEdit, FnKey, HelperSummary, InplaceColumns, Kind,
+};
 use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
 use crate::typo::find_best_match;
 use crate::{ast_extract, contract, sql};
@@ -228,6 +234,10 @@ pub struct Linter {
     // argument, a collection element, ...) so `--coverage-detail=explain` can show
     // them as NOT COUNTED rather than silently omitting them.
     pub all_dataframe_calls: Vec<DataFrameCallSite>,
+    // Every statement after which a tracked frame stopped carrying its column set, with
+    // the reason -- see `LegEvent`. Recorded at each point a leg is ended, so
+    // `--coverage-detail=explain` can answer "why did this frame lose tracking".
+    pub leg_events: Vec<LegEvent>,
     // Candidate pass-through-count reversals, func_name -> the origin site to remove
     // once confirmed -- see `PendingPassthroughReversal`'s doc comment and the
     // `Stmt::FunctionDef` body-inference arm that populates this. Resolved at the end
@@ -280,6 +290,9 @@ pub struct Linter {
     // absent from this map entirely — see `StringBindingCollector::record` for the
     // poison-on-any-second-binding policy this relies on.
     pub(crate) string_var_candidates: HashMap<String, String>,
+    // Names bound exactly once in the whole file, to a `True`/`False` literal -- the
+    // boolean counterpart of `string_var_candidates`, for `inplace=flag`.
+    pub(crate) bool_var_candidates: HashMap<String, bool>,
     // Names bound to a resolved SQLAlchemy Core `select(...)` column list — e.g.
     // `stmt = select(Order.id, Order.amount)`. Populated inline during the main
     // top-to-bottom statement walk (unlike `string_var_candidates`, which needs a
@@ -323,6 +336,41 @@ pub struct Linter {
     // literal list or f-string) as a valid call target for eval_feast_call, which
     // re-parses the target file itself rather than needing anything precomputed here.
     pub(crate) all_function_names: std::collections::BTreeSet<String>,
+    // Every function/method name defined ANYWHERE in this file, collected by a
+    // pre-pass -- unlike `all_function_names`, which only grows as the walk reaches each
+    // definition. Lets a reassignment from a call to a helper defined further down the
+    // file be told apart from a call to a genuinely unknown function: the walk simply
+    // hasn't inferred that helper's return schema yet.
+    pub(crate) file_function_names: std::collections::HashSet<String>,
+    // What a call does to the frame it is handed, per function (or method) defined in
+    // this file -- see `frame_ops::summarize_helper`. Keyed by defining class (`None` for a
+    // plain function), so a `self.m()` call only ever meets its own class's `m`.
+    pub(crate) helper_summaries: HashMap<FnKey, HelperSummary>,
+    // Set only by `index::index_file`: a call to a name this file does not itself define
+    // may still be a cross-file helper the project index hasn't resolved yet, so
+    // `resolve_delegates` keeps the raw reference for `resolve_transitive_helper_summaries`
+    // to finish, rather than dropping it as a confirmed no-op. Never set for a real check
+    // (`check_file`/`check_notebook`), where every resolvable name is already merged into
+    // `imported_summaries` beforehand, so "not found" there does mean no effect.
+    pub(crate) preserve_unresolved_delegates: bool,
+    // Summaries of functions imported from other files, keyed like `helper_summaries`: a
+    // plain function under `None`, and one reached as `module.f(...)` under the class slot
+    // `module:<alias>`. Seeded by `load_cross_file_symbols`; a local definition wins.
+    pub(crate) imported_summaries: HashMap<FnKey, HelperSummary>,
+    // Names of the methods defined directly in the class currently being visited, so a
+    // `self.<method>()` call resolves against this class rather than any same-named
+    // function elsewhere in the flat `functions` map.
+    pub(crate) current_class_methods: std::collections::HashSet<String>,
+    // Return schema (or `OPEN_FRAME_MARKER`) of each method of the current class that
+    // has been visited so far, keyed by method name -- `self.functions` is one flat map
+    // across classes and modules, so `self.<method>()` reads this instead.
+    pub(crate) current_class_functions: HashMap<String, String>,
+    pub(crate) current_class_name: Option<String>,
+    // Names known to hold an instance of a class defined in this file -- parameters
+    // annotated with it (`source: DataSource`) and variables assigned from its constructor
+    // (`loader = Loader()`) -- so `source.load()` can be resolved against that class's
+    // methods. Per function; a nested function starts from its enclosing function's.
+    pub(crate) receiver_classes: HashMap<String, String>,
     // Instance attribute name -> class name, for `self.<attr> = <ClassName>(...)` /
     // `self.<attr> = <module>.<ClassName>(...)` assignments found in the CURRENTLY
     // VISITED class's own `__init__`. Populated by a pre-scan in the `Stmt::ClassDef`
@@ -365,6 +413,9 @@ pub struct Linter {
     // `self.schemas`/`self.functions` accumulate. A class defined in another file
     // needs the project index's own `class_methods` (see index.rs) instead.
     pub(crate) class_methods: HashMap<String, HashMap<String, String>>,
+    // Base-class names of every class defined in this file, so an inherited method can be
+    // found. Populated before the walk, so a class may inherit from one defined later.
+    pub(crate) class_bases: HashMap<String, Vec<String>>,
 }
 
 // The first plain-name assignment target, used to label a coverage site with the
@@ -517,6 +568,10 @@ struct StringBindingCollector<'a> {
     current_file: &'a Path,
     reads_used: u32,
     bindings: HashMap<String, StringBinding>,
+    // Every binding site of every name, and the bool literal each single-name
+    // assignment bound: together they give `bool_var_candidates`.
+    binding_counts: HashMap<String, u32>,
+    bool_values: HashMap<String, bool>,
 }
 
 impl<'a> StringBindingCollector<'a> {
@@ -527,6 +582,7 @@ impl<'a> StringBindingCollector<'a> {
     // binding exists but isn't a literal we can use" (e.g. a for-loop variable, a
     // function parameter, an import) — poisons on first sight too.
     fn record(&mut self, name: &str, resolved: Option<String>) {
+        *self.binding_counts.entry(name.to_string()).or_default() += 1;
         if self.bindings.contains_key(name) {
             self.bindings
                 .insert(name.to_string(), StringBinding::Poisoned);
@@ -578,6 +634,9 @@ impl<'a> Visitor<'a> for StringBindingCollector<'a> {
                         self.current_file,
                         &mut self.reads_used,
                     );
+                    if let Expr::BooleanLiteral(b) = &*assign.value {
+                        self.bool_values.insert(n.id.to_string(), b.value);
+                    }
                     self.record(n.id.as_str(), resolved);
                 } else {
                     for target in &assign.targets {
@@ -667,6 +726,184 @@ impl<'a> Visitor<'a> for StringBindingCollector<'a> {
             }
         }
         ast_visitor::walk_expr(self, expr);
+    }
+}
+
+// The row indexer of a `df.loc[rows, cols]` target.
+fn loc_row_indexer(target: &Expr) -> Option<&Expr> {
+    let Expr::Subscript(subscript) = target else {
+        return None;
+    };
+    let Expr::Attribute(indexer) = &*subscript.value else {
+        return None;
+    };
+    if indexer.attr.as_str() != "loc" {
+        return None;
+    }
+    let Expr::Tuple(indexers) = &*subscript.slice else {
+        return None;
+    };
+    indexers.elts.first()
+}
+
+fn collect_name_targets(target: &Expr, why: &'static str, out: &mut Vec<(String, &'static str)>) {
+    match target {
+        Expr::Name(name) => out.push((name.id.to_string(), why)),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .for_each(|e| collect_name_targets(e, why, out)),
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .for_each(|e| collect_name_targets(e, why, out)),
+        Expr::Starred(starred) => collect_name_targets(&starred.value, why, out),
+        _ => {}
+    }
+}
+
+// The expressions a statement evaluates itself, excluding those in nested bodies (each
+// nested statement is visited on its own).
+fn own_expressions(stmt: &Stmt) -> Vec<&Expr> {
+    match stmt {
+        Stmt::Expr(s) => vec![&*s.value],
+        Stmt::Assign(s) => vec![&*s.value],
+        Stmt::AnnAssign(s) => s.value.as_deref().into_iter().collect(),
+        Stmt::AugAssign(s) => vec![&*s.value],
+        Stmt::Return(s) => s.value.as_deref().into_iter().collect(),
+        Stmt::If(s) => std::iter::once(&*s.test)
+            .chain(s.elif_else_clauses.iter().filter_map(|c| c.test.as_ref()))
+            .collect(),
+        Stmt::While(s) => vec![&*s.test],
+        Stmt::For(s) => vec![&*s.iter],
+        Stmt::With(s) => s.items.iter().map(|item| &item.context_expr).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// Collects the target of every assignment expression (`(df := ...)`) it visits.
+struct WalrusCollector {
+    names: Vec<String>,
+}
+
+impl<'a> Visitor<'a> for WalrusCollector {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Named(named) = expr {
+            if let Expr::Name(target) = &*named.target {
+                self.names.push(target.id.to_string());
+            }
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
+}
+
+// Names a function body declares `global` (not descending into nested scopes).
+fn global_names(body: &[Stmt]) -> Vec<String> {
+    struct GlobalCollector(Vec<String>);
+    impl<'a> Visitor<'a> for GlobalCollector {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::Global(global) => self.0.extend(global.names.iter().map(|n| n.to_string())),
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => ast_visitor::walk_stmt(self, stmt),
+            }
+        }
+    }
+    let mut collector = GlobalCollector(Vec::new());
+    for stmt in body {
+        collector.visit_stmt(stmt);
+    }
+    collector.0
+}
+
+// AST visitor collecting the name of every function and method defined anywhere in the
+// module -- see `Linter::file_function_names`.
+struct FunctionNameCollector {
+    names: std::collections::HashSet<String>,
+    summaries: HashMap<FnKey, HelperSummary>,
+    seen: std::collections::HashSet<FnKey>,
+    current_class: Option<String>,
+    bases: HashMap<String, Vec<String>>,
+    // Return annotations of each class's methods -- the part of `class_methods` that needs
+    // no body inference, so it can be known before the walk reaches the class.
+    annotated_methods: HashMap<String, HashMap<String, String>>,
+}
+
+impl<'a> Visitor<'a> for FunctionNameCollector {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::ClassDef(class_def) => {
+                let bases = class_def
+                    .bases()
+                    .iter()
+                    .filter_map(|base| match base {
+                        Expr::Name(name) => Some(name.id.to_string()),
+                        Expr::Attribute(attr) => Some(attr.attr.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                self.bases.insert(class_def.name.to_string(), bases);
+                self.annotated_methods
+                    .entry(class_def.name.to_string())
+                    .or_default();
+                let outer = self.current_class.replace(class_def.name.to_string());
+                ast_visitor::walk_stmt(self, stmt);
+                self.current_class = outer;
+                return;
+            }
+            Stmt::FunctionDef(func_def) => {
+                let key = (self.current_class.clone(), func_def.name.to_string());
+                self.names.insert(func_def.name.to_string());
+                if let (Some(class), Some(returns)) = (&self.current_class, &func_def.returns) {
+                    let annotated = if let Some(schema) =
+                        ast_extract::extract_schema_from_annotation(returns)
+                    {
+                        Some(schema.to_string())
+                    } else {
+                        ast_extract::extract_bare_dataframe_type(returns)
+                            .then(|| OPEN_FRAME_MARKER.to_string())
+                    };
+                    if let Some(annotated) = annotated {
+                        self.annotated_methods
+                            .entry(class.clone())
+                            .or_default()
+                            .insert(func_def.name.to_string(), annotated);
+                    }
+                }
+                // A decorator can change what a call actually does or returns in ways this
+                // checker has no way to see (memoization returning a stale/shared object,
+                // a wrapper substituting its own return value, a context manager, ...).
+                // `staticmethod`/`classmethod`/`abstractmethod`/`override` are transparent
+                // -- they don't touch the call at runtime -- so a function bearing only
+                // those still gets a summary; anything else forfeits one entirely, same as
+                // a function this scan can't otherwise characterize.
+                let opaque_decorator = func_def.decorator_list.iter().any(|decorator| {
+                    !matches!(
+                        ast_extract::decorator_name(&decorator.expression),
+                        Some("staticmethod" | "classmethod" | "abstractmethod" | "override")
+                    )
+                });
+                // A second definition of the same key (overload, conditional
+                // redefinition) is only trusted if it agrees.
+                let summary = (!opaque_decorator)
+                    .then(|| summarize_helper(func_def))
+                    .flatten();
+                if !self.seen.insert(key.clone()) {
+                    if self.summaries.get(&key) != summary.as_ref() {
+                        self.summaries.remove(&key);
+                    }
+                } else if let Some(summary) = summary {
+                    self.summaries.insert(key, summary);
+                }
+                // Functions nested in a method are not methods of the class.
+                let outer = self.current_class.take();
+                ast_visitor::walk_stmt(self, stmt);
+                self.current_class = outer;
+                return;
+            }
+            _ => {}
+        }
+        ast_visitor::walk_stmt(self, stmt);
     }
 }
 
@@ -903,6 +1140,7 @@ impl Linter {
             untyped_sites: Vec::new(),
             typed_sites: Vec::new(),
             all_dataframe_calls: Vec::new(),
+            leg_events: Vec::new(),
             pending_passthrough_reversals: HashMap::new(),
             functions_called: std::collections::HashSet::new(),
             dataframe_shaped_usage: std::collections::HashSet::new(),
@@ -910,15 +1148,25 @@ impl Linter {
             sql_dialect: sql::SqlDialect::Generic,
             project_root: None,
             string_var_candidates: HashMap::new(),
+            bool_var_candidates: HashMap::new(),
             stmt_var_candidates: HashMap::new(),
             retrieval_jobs: HashMap::new(),
             unresolved_schemas: std::collections::HashSet::new(),
             cursor_sql: HashMap::new(),
             param_governed_templates: HashMap::new(),
             all_function_names: std::collections::BTreeSet::new(),
+            file_function_names: std::collections::HashSet::new(),
+            helper_summaries: HashMap::new(),
+            preserve_unresolved_delegates: false,
+            imported_summaries: HashMap::new(),
+            current_class_methods: std::collections::HashSet::new(),
+            current_class_functions: HashMap::new(),
+            current_class_name: None,
+            receiver_classes: HashMap::new(),
             current_self_attrs: HashMap::new(),
             all_self_attr_origins: HashMap::new(),
             class_methods: HashMap::new(),
+            class_bases: HashMap::new(),
         }
     }
 
@@ -1021,7 +1269,8 @@ impl Linter {
         self.source = source.to_string();
         self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
-        self.string_var_candidates = self.collect_string_var_candidates(&module.body, path);
+        (self.string_var_candidates, self.bool_var_candidates) =
+            self.collect_literal_var_candidates(&module.body, path);
         let mut df_usage_collector = DataFrameShapedUsageCollector {
             names: std::collections::HashSet::new(),
         };
@@ -1029,6 +1278,33 @@ impl Linter {
             df_usage_collector.visit_stmt(stmt);
         }
         self.dataframe_shaped_usage = df_usage_collector.names;
+        let mut function_names = FunctionNameCollector {
+            names: std::collections::HashSet::new(),
+            summaries: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+            current_class: None,
+            bases: HashMap::new(),
+            annotated_methods: HashMap::new(),
+        };
+        for stmt in &module.body {
+            function_names.visit_stmt(stmt);
+        }
+        self.file_function_names = function_names.names;
+        self.class_bases = function_names.bases;
+        for (class, methods) in function_names.annotated_methods {
+            self.class_methods.insert(class, methods);
+        }
+        self.helper_summaries = function_names.summaries;
+        for (key, summary) in &self.imported_summaries {
+            self.helper_summaries
+                .entry(key.clone())
+                .or_insert_with(|| summary.clone());
+        }
+        resolve_delegates(
+            &mut self.helper_summaries,
+            &self.class_bases,
+            self.preserve_unresolved_delegates,
+        );
 
         self.all_dataframe_calls = {
             let mut load_call_collector = LoadCallSiteCollector {
@@ -1208,6 +1484,7 @@ impl Linter {
                         all_schemas,
                         all_schema_locations,
                     );
+                    self.import_helper_summary(entry, name, None, name);
                 }
                 continue;
             }
@@ -1220,6 +1497,8 @@ impl Linter {
                     all_schemas,
                     all_schema_locations,
                 );
+                let local = alias.asname.as_ref().map_or(name, |a| a.id.as_str());
+                self.import_helper_summary(entry, name, None, local);
             }
         }
 
@@ -1251,6 +1530,11 @@ impl Linter {
                 };
                 let file_path_display = resolved_path.display().to_string();
                 let names: Vec<String> = entry.functions.keys().cloned().collect();
+                let module_alias = alias
+                    .asname
+                    .as_ref()
+                    .map(|a| a.id.to_string())
+                    .or_else(|| (!dotted.contains('.')).then(|| dotted.to_string()));
                 for name in &names {
                     self.import_name(
                         entry,
@@ -1259,8 +1543,35 @@ impl Linter {
                         all_schemas,
                         all_schema_locations,
                     );
+                    if let Some(module_alias) = &module_alias {
+                        self.import_helper_summary(
+                            entry,
+                            name,
+                            Some(format!("module:{module_alias}")),
+                            name,
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    // Records the helper summary of `entry`'s function `name` under the local name it is
+    // called by, in the class slot `slot` (`None` for a plain function).
+    fn import_helper_summary(
+        &mut self,
+        entry: &IndexEntry,
+        name: &str,
+        slot: Option<String>,
+        local: &str,
+    ) {
+        if let Some(summary) = entry
+            .functions
+            .get(name)
+            .and_then(|f| f.helper_summary.as_ref())
+        {
+            self.imported_summaries
+                .insert((slot, local.to_string()), summary.clone());
         }
     }
 
@@ -1316,6 +1627,18 @@ impl Linter {
                             .insert(schema_name.clone(), loc.clone());
                     }
                 }
+            }
+        }
+        // The class's own methods' fully cross-file-resolved column edits (see
+        // `resolve_transitive_helper_summaries`), the `helper_summaries` counterpart to
+        // `class_methods` just above -- lets `self.<method>()` inside THIS file's own
+        // classes follow a mutating method inherited from `name`, one hop deep. Same
+        // same-file-wins guard.
+        if let Some(methods) = entry.class_helper_summaries.get(name) {
+            for (method, summary) in methods {
+                self.imported_summaries
+                    .entry((Some(name.to_string()), method.clone()))
+                    .or_insert_with(|| summary.clone());
             }
         }
         let Some(func) = entry.functions.get(name) else {
@@ -2342,29 +2665,50 @@ impl Linter {
     // over every binding site inherits that same simplicity for free — a name assigned
     // once in each of two different functions is two bindings of one flat name, and is
     // correctly excluded as ambiguous, rather than requiring real scope resolution.
-    fn collect_string_var_candidates(&self, body: &[Stmt], path: &Path) -> HashMap<String, String> {
+    fn collect_literal_var_candidates(
+        &self,
+        body: &[Stmt],
+        path: &Path,
+    ) -> (HashMap<String, String>, HashMap<String, bool>) {
         let mut collector = StringBindingCollector {
             linter: self,
             current_file: path,
             reads_used: 0,
             bindings: HashMap::new(),
+            binding_counts: HashMap::new(),
+            bool_values: HashMap::new(),
         };
         for stmt in body {
             collector.visit_stmt(stmt);
         }
-        collector
+        let counts = collector.binding_counts;
+        let bools = collector
+            .bool_values
+            .into_iter()
+            .filter(|(name, _)| counts.get(name) == Some(&1))
+            .collect();
+        let strings = collector
             .bindings
             .into_iter()
             .filter_map(|(name, binding)| match binding {
                 StringBinding::Literal(s) => Some((name, s)),
                 StringBinding::Poisoned => None,
             })
-            .collect()
+            .collect();
+        (strings, bools)
     }
 
     // Extract dropped column names from a drop() call.
     fn make_inferred_schema(&mut self, cols: Vec<String>, var: &str, line: usize) -> String {
-        let name = format!("__inferred_{}_at_{}", var, line);
+        // Two legs made on the same line for the same variable must not share a name: the
+        // second would inherit the first's unresolved status.
+        let base = format!("__inferred_{}_at_{}", var, line);
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while self.schemas.contains_key(&name) {
+            name = format!("{base}_{suffix}");
+            suffix += 1;
+        }
         self.schemas.insert(name.clone(), cols);
         name
     }
@@ -2516,6 +2860,298 @@ impl Linter {
         }
     }
 
+    // A write of one or more columns into a tracked frame (`df["c"] = ...`,
+    // `df[["a", "b"]] = ...`, `df.loc[rows, "c"] = ...`). A column the schema does not
+    // hold is reported, then the frame moves to a new leg that includes it; against an
+    // unresolved frame the write is unverifiable and the leg stays unresolved.
+    fn record_column_writes(
+        &mut self,
+        recv: &str,
+        col_names: &[String],
+        line: usize,
+        col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Some((schema_name, defined_line)) = self.variables.get(recv).cloned() else {
+            return;
+        };
+        if self.schema_is_unresolved(&schema_name) {
+            let schema_display = self.schema_display(&schema_name, defined_line);
+            for col_name in col_names {
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNVERIFIABLE_COLUMN.to_string(),
+                    message: format!(
+                        "Column '{}' cannot be verified (mutation tracking): {} has no concrete column list",
+                        col_name, schema_display
+                    ),
+                    severity: "error".to_string(),
+                });
+            }
+            // An edit attempted against an unresolved base can't be trusted to have
+            // produced any particular column set either -- see `count_mutation_leg`.
+            let new_schema = self.count_mutation_leg(Some(&schema_name), None, recv, line, col);
+            self.variables.insert(recv.to_string(), (new_schema, line));
+            return;
+        }
+        let missing: Vec<&String> = col_names
+            .iter()
+            .filter(|c| !self.schema_has_column(&schema_name, c))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let schema_display = self.schema_display(&schema_name, defined_line);
+        let mut new_cols = self.schemas.get(&schema_name).cloned().unwrap_or_default();
+        for col_name in missing {
+            errors.push(LintError {
+                line,
+                col,
+                code: CODE_UNKNOWN_COLUMN.to_string(),
+                message: format!(
+                    "Column '{}' does not exist in {} (mutation tracking)",
+                    col_name, schema_display
+                ),
+                severity: "error".to_string(),
+            });
+            if !new_cols.contains(col_name) {
+                new_cols.push(col_name.clone());
+            }
+        }
+        // A new leg rather than an edit of the old schema object, which another name
+        // may share.
+        let new_schema =
+            self.count_mutation_leg(Some(&schema_name), Some(new_cols), recv, line, col);
+        self.variables.insert(recv.to_string(), (new_schema, line));
+    }
+
+    // Whether a call runs in place: a literal `inplace=True`, or a name that the whole
+    // file binds exactly once, to a literal. Anything else is assumed not to.
+    fn runs_in_place(&self, call: &ast::ExprCall) -> bool {
+        match keyword(call, "inplace").map(|k| &k.value) {
+            Some(Expr::BooleanLiteral(b)) => b.value,
+            Some(Expr::Name(name)) => self
+                .bool_var_candidates
+                .get(name.id.as_str())
+                .copied()
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    // `df.method(..., inplace=True)` as a statement. Methods that keep the columns are
+    // left alone; `drop`/`rename` with literal arguments produce the resulting column
+    // set; anything else leaves the frame's columns unknown from here.
+    fn apply_inplace_method(
+        &mut self,
+        attr: &ast::ExprAttribute,
+        call: &ast::ExprCall,
+        line: usize,
+        col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Expr::Name(recv) = &*attr.value else {
+            return;
+        };
+        let recv = recv.id.as_str();
+        let Some((schema_name, defined_line)) = self.variables.get(recv).cloned() else {
+            return;
+        };
+        let method = attr.attr.as_str();
+        if !self.runs_in_place(call)
+            || ROW_PASSTHROUGH_METHODS.contains(&method)
+            || SCHEMA_PRESERVING_METHODS.contains(&method)
+        {
+            return;
+        }
+        let base_cols = if self.schema_is_unresolved(&schema_name) {
+            None
+        } else {
+            self.schemas.get(&schema_name).cloned()
+        };
+        let schema_display = self.schema_display(&schema_name, defined_line);
+        let new_cols = base_cols.and_then(|base| match method {
+            "drop" => match inplace_drop_columns(call) {
+                InplaceColumns::Unchanged => Some(base),
+                InplaceColumns::Edit(dropped) => {
+                    for col_name in dropped.iter().filter(|c| !base.contains(c)) {
+                        errors.push(LintError {
+                            line,
+                            col,
+                            code: CODE_DROPPED_UNKNOWN_COLUMN.to_string(),
+                            message: format!(
+                                "Dropped column '{}' does not exist in {}",
+                                col_name, schema_display
+                            ),
+                            severity: "warning".to_string(),
+                        });
+                    }
+                    Some(base.into_iter().filter(|c| !dropped.contains(c)).collect())
+                }
+                InplaceColumns::Unknown => None,
+            },
+            "rename" => {
+                let mapping = match inplace_rename_mapping(call) {
+                    InplaceColumns::Unchanged => return Some(base),
+                    InplaceColumns::Unknown => return None,
+                    InplaceColumns::Edit(mapping) => mapping,
+                };
+                for old_col in mapping.keys().filter(|c| !base.contains(c)) {
+                    errors.push(LintError {
+                        line,
+                        col,
+                        code: CODE_UNKNOWN_COLUMN.to_string(),
+                        message: format!(
+                            "Column '{}' does not exist in {} (rename)",
+                            old_col, schema_display
+                        ),
+                        severity: "error".to_string(),
+                    });
+                }
+                Some(
+                    base.iter()
+                        .map(|c| mapping.get(c).cloned().unwrap_or_else(|| c.clone()))
+                        .collect(),
+                )
+            }
+            _ => None,
+        });
+        if new_cols.as_ref() == self.schemas.get(&schema_name) && new_cols.is_some() {
+            return;
+        }
+        let resolved = new_cols.is_some();
+        let was_unresolved = self.schema_is_unresolved(&schema_name);
+        let new_schema = self.count_mutation_leg(Some(&schema_name), new_cols, recv, line, col);
+        self.variables.insert(recv.to_string(), (new_schema, line));
+        if !resolved && !was_unresolved {
+            self.record_leg_event(
+                recv,
+                line,
+                col,
+                "unresolved",
+                format!("`.{method}(inplace=True)` is not modelled, so the columns are unknown from here"),
+            );
+        }
+    }
+
+    // `df.columns = [...]`: a literal list of strings is the new column set, anything
+    // else (other than the case-fold handled with the assignment dispatch) leaves it
+    // unknown.
+    fn apply_columns_assignment(&mut self, assign: &ast::StmtAssign, line: usize, col: usize) {
+        for target in &assign.targets {
+            let Expr::Attribute(target_attr) = target else {
+                continue;
+            };
+            let Expr::Name(recv) = &*target_attr.value else {
+                continue;
+            };
+            if target_attr.attr.as_str() != "columns" {
+                continue;
+            }
+            let recv = recv.id.as_str();
+            let Some((schema_name, _)) = self.variables.get(recv).cloned() else {
+                continue;
+            };
+            if self.schema_is_unresolved(&schema_name) {
+                continue;
+            }
+            let literal = ast_extract::extract_string_list(&assign.value);
+            let is_case_fold = ast_extract::extract_columns_str_fold(&assign.value)
+                .is_some_and(|(rhs_recv, _)| rhs_recv == recv);
+            if is_case_fold {
+                continue;
+            }
+            let resolved = literal.is_some();
+            let new_schema = self.count_mutation_leg(Some(&schema_name), literal, recv, line, col);
+            self.variables.insert(recv.to_string(), (new_schema, line));
+            if !resolved {
+                self.record_leg_event(
+                    recv,
+                    line,
+                    col,
+                    "unresolved",
+                    "`.columns` is assigned a value that is not a literal list of strings"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // `loader = Loader(...)` makes `loader` a known instance of a class defined in this file
+    // (see `receiver_classes`); any other assignment to the name forgets it.
+    fn track_instance_binding(&mut self, stmt: &Stmt) {
+        let (target, value) = match stmt {
+            Stmt::Assign(assign) => match assign.targets.as_slice() {
+                [Expr::Name(target)] => (target, Some(&*assign.value)),
+                _ => return,
+            },
+            Stmt::AnnAssign(ann) => match &*ann.target {
+                Expr::Name(target) => (target, ann.value.as_deref()),
+                _ => return,
+            },
+            _ => return,
+        };
+        let constructed = match value {
+            Some(Expr::Call(call)) => match &*call.func {
+                Expr::Name(class) if self.class_methods.contains_key(class.id.as_str()) => {
+                    Some(class.id.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match constructed {
+            Some(class) => self.receiver_classes.insert(target.id.to_string(), class),
+            None => self.receiver_classes.remove(target.id.as_str()),
+        };
+    }
+
+    // `del df`, `for df in ...`, `with ... as df`, `(df := ...)`: the name stops holding
+    // the tracked frame. Runs before the statement's body is walked.
+    fn untrack_rebound_names(&mut self, stmt: &Stmt) {
+        let (line, col) = self.source_location(stmt.range().start());
+        let mut rebound: Vec<(String, &'static str)> = Vec::new();
+        let mut targets: Vec<(&Expr, &'static str)> = Vec::new();
+        match stmt {
+            Stmt::Delete(delete) => {
+                targets.extend(delete.targets.iter().map(|t| (t, "was deleted with `del`")));
+            }
+            Stmt::For(for_stmt) => {
+                targets.push((&for_stmt.target, "is rebound as a loop variable"));
+            }
+            Stmt::With(with_stmt) => {
+                targets.extend(
+                    with_stmt
+                        .items
+                        .iter()
+                        .filter_map(|item| item.optional_vars.as_deref())
+                        .map(|t| (t, "is rebound by `with ... as`")),
+                );
+            }
+            _ => {}
+        }
+        for (target, why) in targets {
+            collect_name_targets(target, why, &mut rebound);
+        }
+        let mut walrus = WalrusCollector { names: Vec::new() };
+        for expr in own_expressions(stmt) {
+            walrus.visit_expr(expr);
+        }
+        rebound.extend(
+            walrus
+                .names
+                .into_iter()
+                .map(|name| (name, "is rebound by an assignment expression")),
+        );
+        for (name, why) in rebound {
+            if self.variables.remove(&name).is_none() {
+                continue;
+            }
+            self.record_leg_event(&name, line, col, "untracked", format!("`{name}` {why}"));
+        }
+    }
+
     // Remove a column in-place from `recv`'s schema. Used for `del df['col']` and `df.pop('col')`.
     fn remove_column_inplace(
         &mut self,
@@ -2596,6 +3232,390 @@ impl Linter {
         }
     }
 
+    fn record_leg_event(
+        &mut self,
+        var: &str,
+        line: usize,
+        col: usize,
+        outcome: &str,
+        reason: String,
+    ) {
+        self.leg_events.push(LegEvent {
+            line,
+            col,
+            var: var.to_string(),
+            outcome: outcome.to_string(),
+            reason,
+        });
+    }
+
+    // Every plain name the statement rebinds that already carries a tracked schema,
+    // with that binding and whether the name is a direct target (`df = ...`) rather
+    // than one unpacked from a tuple/list. Captured BEFORE the statement is walked so
+    // `end_stale_legs` can tell afterwards whether the dispatch rebound it.
+    fn snapshot_rebinding_targets(&self, stmt: &Stmt) -> Vec<(String, (String, usize), bool)> {
+        fn collect<'e>(target: &'e Expr, direct: bool, out: &mut Vec<(&'e str, bool)>) {
+            match target {
+                Expr::Name(name) => out.push((name.id.as_str(), direct)),
+                Expr::Tuple(tuple) => tuple.elts.iter().for_each(|e| collect(e, false, out)),
+                Expr::List(list) => list.elts.iter().for_each(|e| collect(e, false, out)),
+                Expr::Starred(starred) => collect(&starred.value, false, out),
+                _ => {}
+            }
+        }
+        let mut names = Vec::new();
+        match stmt {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    collect(target, matches!(target, Expr::Name(_)), &mut names);
+                }
+            }
+            Stmt::AnnAssign(ann) if ann.value.is_some() => collect(&ann.target, true, &mut names),
+            _ => {}
+        }
+        names
+            .into_iter()
+            .filter_map(|(name, direct)| {
+                self.variables
+                    .get(name)
+                    .map(|binding| (name.to_string(), binding.clone(), direct))
+            })
+            .collect()
+    }
+
+    // `class` followed by its ancestors defined in this file, nearest first.
+    fn class_chain(&self, class: &str) -> Vec<String> {
+        class_chain(&self.class_bases, class)
+    }
+
+    // The return schema of `self.<method>()` in the class being visited: its own method if
+    // already visited, else an inherited one.
+    fn resolve_self_method(&self, method: &str) -> Option<String> {
+        if let Some(schema) = self.current_class_functions.get(method) {
+            return Some(schema.clone());
+        }
+        let class = self.current_class_name.as_ref()?;
+        self.class_chain(class)
+            .iter()
+            .skip(1)
+            .find_map(|ancestor| self.class_methods.get(ancestor)?.get(method).cloned())
+    }
+
+    // The return schema (or `OPEN_FRAME_MARKER`) of `class.method`, for a call through a
+    // parameter annotated with that class. An interface's own method is usually a bare
+    // `-> pd.DataFrame`; when it is, and every other class in the file that defines the
+    // method returns one and the same column set, that is the answer.
+    fn resolve_method_on_class(&self, class: &str, method: &str) -> Option<String> {
+        let chain = self.class_chain(class);
+        let own = chain
+            .iter()
+            .find_map(|c| self.class_methods.get(c)?.get(method))?
+            .clone();
+        if own != OPEN_FRAME_MARKER {
+            return Some(own);
+        }
+        let mut implementations = self
+            .class_methods
+            .iter()
+            .filter(|(name, _)| !chain.contains(name))
+            .filter_map(|(_, methods)| methods.get(method))
+            .filter(|s| s.as_str() != OPEN_FRAME_MARKER);
+        let Some(first) = implementations.next() else {
+            return Some(own);
+        };
+        let columns = |schema: &String| {
+            (!self.schema_is_unresolved(schema))
+                .then(|| self.schemas.get(schema).cloned())
+                .flatten()
+        };
+        let agreed = columns(first).is_some_and(|expected| {
+            implementations.all(|other| columns(other).as_ref() == Some(&expected))
+        });
+        Some(if agreed { first.clone() } else { own })
+    }
+
+    // Binds every plain-name target of `assign` to the schema a function or method with
+    // a recognized return annotation (or a body-inferred return) produces, counting the
+    // result as one DataFrame.
+    fn bind_function_result(
+        &mut self,
+        assign: &ast::StmtAssign,
+        marker_or_schema: &str,
+        func_name: &str,
+        line: usize,
+        col: usize,
+    ) {
+        let schema_name = self.resolve_open_or_named_schema(marker_or_schema, func_name, line);
+        // Confirms any pending pass-through reversal for this function -- see
+        // `pending_passthrough_reversals`.
+        self.functions_called.insert(func_name.to_string());
+        self.dataframes_total += 1;
+        let var_hint = assign_var_hint(assign, func_name);
+        self.count_typed_dataframe(&schema_name, &var_hint, line, col);
+        for target in &assign.targets {
+            if let Expr::Name(target_name) = target {
+                self.variables
+                    .insert(target_name.id.to_string(), (schema_name.clone(), line));
+            }
+        }
+    }
+
+    // A call `f(x)` to a helper whose summary is known, `x` a tracked frame.
+    //
+    // - Edits the helper makes to the caller's own object (`in_place`) move `x` to a new
+    //   leg regardless of what the call's result is used for -- a bare statement
+    //   (`normalize(x)`), an assignment whose target is `targets` (which may or may not
+    //   include `x` itself), or the return value being discarded entirely (`msg =
+    //   validate(x)`, where `validate` mutates `x` but returns a status string).
+    // - When the helper returns its parameter, each of `targets` ALSO carries the
+    //   returned frame: `x`'s schema with the helper's edits applied. With no edits the
+    //   frame is the one `x` already counted; with edits it is a new leg. `targets` is
+    //   left untouched when the helper doesn't return its parameter (`end_stale_legs`,
+    //   run after every statement, untracks a target whose binding still doesn't
+    //   otherwise account for the assignment).
+    fn apply_helper_call(&mut self, value: &Expr, targets: &[String], line: usize, col: usize) {
+        let Some((arg, summary)) = self.helper_call(value) else {
+            return;
+        };
+        let Some(original) = self.variables.get(&arg).cloned() else {
+            return;
+        };
+        let what = describe_rhs(value);
+        // Rebinding the argument's own name to the result makes an update to it moot.
+        let arg_binding = if targets.contains(&arg) && summary.returned.is_some() {
+            None
+        } else {
+            let binding = self.edited_binding(&original, &summary.in_place, &arg, &what, line, col);
+            self.variables.insert(arg.clone(), binding.clone());
+            Some(binding)
+        };
+        let Some(returned) = &summary.returned else {
+            return;
+        };
+        let result = match arg_binding {
+            Some(binding) if *returned == summary.in_place => binding,
+            _ => {
+                let var = targets.first().unwrap_or(&arg);
+                self.edited_binding(&original, returned, var, &what, line, col)
+            }
+        };
+        for target in targets {
+            self.variables.insert(target.clone(), result.clone());
+        }
+    }
+
+    // `binding` with `edits` applied: itself when there are none (or its columns are
+    // already unknown), else a new counted leg -- unresolved if an edit is not understood.
+    fn edited_binding(
+        &mut self,
+        binding: &(String, usize),
+        edits: &[ColumnEdit],
+        var: &str,
+        what: &str,
+        line: usize,
+        col: usize,
+    ) -> (String, usize) {
+        if edits.is_empty() || self.schema_is_unresolved(&binding.0) {
+            return binding.clone();
+        }
+        let base = self.schemas.get(&binding.0).cloned().unwrap_or_default();
+        let columns = apply_edits(&base, edits);
+        let resolved = columns.is_some();
+        let schema = self.count_mutation_leg(Some(&binding.0), columns, var, line, col);
+        if !resolved {
+            self.record_leg_event(
+                var,
+                line,
+                col,
+                "unresolved",
+                format!("{what} edits the columns in a way that is not modelled"),
+            );
+        }
+        (schema, line)
+    }
+
+    fn assign_target_names(assign: &ast::StmtAssign) -> Vec<String> {
+        assign
+            .targets
+            .iter()
+            .filter_map(|t| match t {
+                Expr::Name(n) => Some(n.id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A call to a helper defined further down this file: the walk has not reached its
+    // definition yet, so its return schema is not inferred yet -- not evidence the
+    // callee is unknown.
+    fn calls_later_defined_function(&self, value: &Expr) -> bool {
+        let mut expr = value;
+        while let Expr::Await(awaited) = expr {
+            expr = &awaited.value;
+        }
+        let Expr::Call(call) = expr else {
+            return false;
+        };
+        let Some(name) = self.callee_name(call) else {
+            return false;
+        };
+        self.file_function_names.contains(name) && !self.all_function_names.contains(name)
+    }
+
+    // `f` for `f(...)`, `m` for `self.m(...)` / `cls.m(...)`.
+    fn callee_name<'c>(&self, call: &'c ast::ExprCall) -> Option<&'c str> {
+        match &*call.func {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Attribute(attr) => match &*attr.value {
+                Expr::Name(receiver) if matches!(receiver.id.as_str(), "self" | "cls") => {
+                    Some(attr.attr.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // For `clean(df)` / `self._clean(df)` where the callee's summary is known: the tracked
+    // variable it is handed, and that summary.
+    fn helper_call(&self, value: &Expr) -> Option<(String, HelperSummary)> {
+        let mut expr = value;
+        while let Expr::Await(awaited) = expr {
+            expr = &awaited.value;
+        }
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let summary = match &*call.func {
+            Expr::Name(name) => self.helper_summaries.get(&(None, name.id.to_string()))?,
+            Expr::Attribute(attr) => match &*attr.value {
+                Expr::Name(receiver) if matches!(receiver.id.as_str(), "self" | "cls") => {
+                    let class = self.current_class_name.as_ref()?;
+                    self.class_chain(class).into_iter().find_map(|c| {
+                        self.helper_summaries.get(&(Some(c), attr.attr.to_string()))
+                    })?
+                }
+                // `module.f(df)` for a module imported with `import module`.
+                Expr::Name(module) => self.helper_summaries.get(&(
+                    Some(format!("module:{}", module.id.as_str())),
+                    attr.attr.to_string(),
+                ))?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        match call.arguments.args.first()? {
+            Expr::Name(arg) if self.variables.contains_key(arg.id.as_str()) => {
+                Some((arg.id.to_string(), summary.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    // A tracked name reassigned by a statement the dispatch did not model keeps its OLD
+    // schema, which is either wrong (the name now holds something else) or only right
+    // by luck. Ends that stale leg:
+    //
+    // - same-name, schema-preserving (`df = df.copy()`, `df = df.head()`): nothing to do.
+    // - same-name, derived via an op the checker does not model (`df = clean(df)`,
+    //   `df = df.groupby(...).agg(...)`): the frame's columns are now unknown, so it
+    //   becomes an unresolved leg -- counted once, when a resolved leg is lost. An
+    //   already-unresolved leg passing through another unknown op stays one leg.
+    // - anything else (a Series/scalar result, an unrelated source, tuple unpacking, a
+    //   call to a helper defined later in the file): the name no longer carries that
+    //   frame, so it goes untracked. No claim is made about it.
+    fn end_stale_legs(&mut self, stmt: &Stmt, rebinding: Vec<(String, (String, usize), bool)>) {
+        let (value, start) = match stmt {
+            Stmt::Assign(assign) => (Some(&*assign.value), assign.range().start()),
+            Stmt::AnnAssign(ann) => (ann.value.as_deref(), ann.range().start()),
+            _ => return,
+        };
+        let (current_line, current_col) = self.source_location(start);
+        let what = value.map_or_else(|| "this statement".to_string(), describe_rhs);
+        for (name, old, direct) in rebinding {
+            if self.variables.get(&name) != Some(&old) {
+                continue;
+            }
+            if let Some(v) = value.filter(|v| {
+                direct
+                    && self
+                        .helper_call(v)
+                        .is_some_and(|(arg, summary)| arg == name && summary.returned.is_some())
+            }) {
+                self.apply_helper_call(v, std::slice::from_ref(&name), current_line, current_col);
+                continue;
+            }
+            let derivation = if direct {
+                value.and_then(|v| {
+                    let variables = &self.variables;
+                    classify_rhs(v, &|n| variables.contains_key(n))
+                })
+            } else {
+                None
+            };
+            match derivation {
+                Some(d) if d.root == name && d.kind == Kind::Preserves => {}
+                Some(d) if d.root == name && d.kind == Kind::Derived => {
+                    if value.is_some_and(|v| self.calls_later_defined_function(v)) {
+                        self.variables.remove(&name);
+                        self.record_leg_event(
+                            &name,
+                            current_line,
+                            current_col,
+                            "untracked",
+                            format!(
+                                "{what} is defined later in this file, so its result cannot be inferred yet"
+                            ),
+                        );
+                    } else if !self.schema_is_unresolved(&old.0) {
+                        let schema = self.count_mutation_leg(
+                            Some(&old.0),
+                            None,
+                            &name,
+                            current_line,
+                            current_col,
+                        );
+                        self.variables.insert(name.clone(), (schema, current_line));
+                        self.record_leg_event(
+                            &name,
+                            current_line,
+                            current_col,
+                            "unresolved",
+                            format!("{what} is not modelled, so the columns are unknown from here"),
+                        );
+                    }
+                }
+                other => {
+                    let reason = match other {
+                        _ if !direct => "rebound by tuple unpacking".to_string(),
+                        Some(d) if d.kind == Kind::NotAFrame => {
+                            format!("reassigned to a Series or scalar via {what}")
+                        }
+                        _ => format!("reassigned to a value the checker does not track ({what})"),
+                    };
+                    self.variables.remove(&name);
+                    self.record_leg_event(&name, current_line, current_col, "untracked", reason);
+                }
+            }
+        }
+    }
+
+    // Wraps `visit_stmt_inner` so that, for any assignment, a tracked name the dispatch
+    // left untouched can be checked afterwards -- see `end_stale_legs`.
+    fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
+        self.untrack_rebound_names(stmt);
+        let rebinding = self.snapshot_rebinding_targets(stmt);
+        if let Stmt::Assign(assign) = stmt {
+            let (line, col) = self.source_location(assign.range().start());
+            self.apply_columns_assignment(assign, line, col);
+        }
+        self.visit_stmt_inner(stmt, errors);
+        self.track_instance_binding(stmt);
+        if !rebinding.is_empty() {
+            self.end_stale_legs(stmt, rebinding);
+        }
+    }
+
     // Walk a statement node, updating linter state and collecting diagnostics.
     //
     // ClassDef      — detect BaseSchema subclasses; collect inherited + declared columns.
@@ -2606,7 +3626,7 @@ impl Linter {
     // Expr          — delegate column-access checks to visit_expr.
     // Delete        — handle `del df["col"]` in-place mutations.
     // If/For/While/With/Try — recurse into every nested body (see visit_body).
-    fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
+    fn visit_stmt_inner(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
                 let (class_def_line, _) = self.source_location(class_def.range().start());
@@ -2824,6 +3844,18 @@ impl Linter {
                 }
                 self.all_self_attr_origins.extend(self_attrs.clone());
                 let prev_self_attrs = std::mem::replace(&mut self.current_self_attrs, self_attrs);
+                let own_method_names = class_def
+                    .body
+                    .iter()
+                    .filter_map(|body_stmt| match body_stmt {
+                        Stmt::FunctionDef(func_def) => Some(func_def.name.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let prev_class_methods =
+                    std::mem::replace(&mut self.current_class_methods, own_method_names);
+                let prev_class_functions = std::mem::take(&mut self.current_class_functions);
+                let prev_class_name = self.current_class_name.replace(class_def.name.to_string());
 
                 // Visit the class body regardless of which branch above matched (or
                 // none did). A schema/ORM class's body is a declarative column list
@@ -2837,37 +3869,123 @@ impl Linter {
                 // plain `class Loader:` is invisible to the entire rest of this
                 // checker, the same way it would be if the file were never linted at
                 // all.
-                self.visit_body(&class_def.body, errors);
+                //
+                // Each method is visited with any same-named entry in the flat
+                // `functions` map set aside, so a module-level function or another
+                // class's method of that name cannot block this method's own return
+                // inference or be mistaken for it; the result is also recorded per class
+                // in `current_class_functions`, which `self.<method>()` reads.
+                //
+                // Names bound directly in the class body live in the class's own
+                // scope: methods do not see them, and they do not outlive the class.
+                let mut module_variables = self.variables.clone();
+                for body_stmt in &class_def.body {
+                    let method_name = match body_stmt {
+                        Stmt::FunctionDef(func_def) => Some(func_def.name.to_string()),
+                        _ => None,
+                    };
+                    let set_aside = method_name
+                        .as_deref()
+                        .and_then(|name| self.functions.remove(name));
+                    if let Stmt::FunctionDef(func_def) = body_stmt {
+                        let class_variables =
+                            std::mem::replace(&mut self.variables, module_variables.clone());
+                        self.visit_stmt(body_stmt, errors);
+                        let after_method = std::mem::replace(&mut self.variables, class_variables);
+                        // `global` writes made by the method belong to the module.
+                        for name in global_names(&func_def.body) {
+                            match after_method.get(&name) {
+                                Some(binding) => module_variables.insert(name, binding.clone()),
+                                None => module_variables.remove(&name),
+                            };
+                        }
+                    } else {
+                        self.visit_stmt(body_stmt, errors);
+                    }
+                    if let Some(name) = method_name {
+                        // The flat entry stays: attribute calls on an untracked receiver
+                        // (`source.load()` through a Protocol) resolve by method name.
+                        match self.functions.get(&name).cloned() {
+                            Some(schema_or_marker) => {
+                                self.current_class_functions.insert(name, schema_or_marker);
+                            }
+                            None => {
+                                if let Some(previous) = set_aside {
+                                    self.functions.insert(name, previous);
+                                }
+                            }
+                        }
+                    }
+                }
 
+                self.variables = module_variables;
                 self.current_self_attrs = prev_self_attrs;
+                self.current_class_methods = prev_class_methods;
+                let own_methods =
+                    std::mem::replace(&mut self.current_class_functions, prev_class_functions);
+                self.current_class_name = prev_class_name;
 
                 // Record this class's own methods' return schemas into class_methods
                 // (see its doc comment) -- accumulated, never reset, so a DIFFERENT
                 // class visited later in the file can resolve a self.<attr> typed as
-                // THIS class. Done AFTER visit_body, by reading back self.functions --
-                // NOT by re-deriving from each method's annotation, so a method with
-                // no explicit return annotation at all still resolves here exactly the
-                // way a module-level function does (via find_returned_var's body
-                // inference, a few lines up), instead of needing that inference
-                // duplicated. Reading self.functions immediately after this class's own
-                // visit_body — before any later class's same-named method can
-                // overwrite the flat map — is what keeps this correct even though
-                // self.functions itself has no notion of "which class" a method
-                // belongs to.
-                let mut own_methods = HashMap::new();
-                for body_stmt in &class_def.body {
-                    if let Stmt::FunctionDef(func_def) = body_stmt {
-                        if let Some(schema_or_marker) = self.functions.get(func_def.name.as_str()) {
-                            own_methods.insert(func_def.name.to_string(), schema_or_marker.clone());
-                        }
-                    }
-                }
+                // THIS class. A method with no explicit return annotation resolves here
+                // exactly the way a module-level function does (via body inference).
                 self.class_methods
                     .insert(class_def.name.to_string(), own_methods);
             }
             Stmt::FunctionDef(func_def) => {
                 let (fn_def_line, _) = self.source_location(func_def.range().start());
                 self.all_function_names.insert(func_def.name.to_string());
+
+                // The body gets its own copy of the variable map: enclosing frames stay
+                // readable, parameters shadow them, and nothing bound inside leaks back
+                // out (bar names declared `global`) -- see the restore below.
+                let outer_variables = self.variables.clone();
+                let parameters = &func_def.parameters;
+                // A nested function sees its enclosing function's instances, except where a
+                // parameter shadows one.
+                let mut receiver_classes_init = self.receiver_classes.clone();
+                for name in parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(parameters.args.iter())
+                    .chain(parameters.kwonlyargs.iter())
+                    .map(|p| p.parameter.name.id.as_str())
+                    .chain(parameters.vararg.iter().map(|p| p.name.id.as_str()))
+                    .chain(parameters.kwarg.iter().map(|p| p.name.id.as_str()))
+                {
+                    receiver_classes_init.remove(name);
+                }
+                let annotated_params: Vec<(String, String)> = parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(parameters.args.iter())
+                    .chain(parameters.kwonlyargs.iter())
+                    .filter_map(|p| {
+                        let class = match &**p.parameter.annotation.as_ref()? {
+                            Expr::Name(name) => name.id.to_string(),
+                            Expr::StringLiteral(text) => text.value.to_str().to_string(),
+                            _ => return None,
+                        };
+                        self.class_methods
+                            .contains_key(&class)
+                            .then(|| (p.parameter.name.id.to_string(), class))
+                    })
+                    .collect();
+                receiver_classes_init.extend(annotated_params);
+                let outer_receiver_classes =
+                    std::mem::replace(&mut self.receiver_classes, receiver_classes_init);
+                for name in parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(parameters.args.iter())
+                    .chain(parameters.kwonlyargs.iter())
+                    .map(|p| p.parameter.name.id.as_str())
+                    .chain(parameters.vararg.iter().map(|p| p.name.id.as_str()))
+                    .chain(parameters.kwarg.iter().map(|p| p.name.id.as_str()))
+                {
+                    self.variables.remove(name);
+                }
 
                 // Track return type annotations like -> DataFrame[Schema]. A bare
                 // `-> pd.DataFrame` / `-> pl.DataFrame` (no attached Schema) is a
@@ -3004,6 +4122,15 @@ impl Linter {
                     self.functions
                         .insert(func_def.name.to_string(), OPEN_FRAME_MARKER.to_string());
                 }
+                self.receiver_classes = outer_receiver_classes;
+                let mut function_variables =
+                    std::mem::replace(&mut self.variables, outer_variables);
+                for name in global_names(&func_def.body) {
+                    match function_variables.remove(&name) {
+                        Some(binding) => self.variables.insert(name, binding),
+                        None => self.variables.remove(&name),
+                    };
+                }
                 // Infer a column *contract* for the function's first parameter: every
                 // column subscripted directly off that parameter or a variable derived
                 // from it (`param["col"]`, or `x["col"]` where `x = param` / `x = f(param)`),
@@ -3105,93 +4232,11 @@ impl Linter {
             Stmt::Assign(assign) => {
                 let (current_line, current_col) = self.source_location(assign.range().start());
 
-                // Check for mutations: df["new_col"] = ...
+                // Check for mutations: df["new_col"] = ..., df[["a", "b"]] = ...,
+                // df.loc[rows, "new_col"] = ...
                 for target in &assign.targets {
-                    if let Expr::Subscript(subscript) = target {
-                        if let Expr::Name(name) = &*subscript.value {
-                            if let Some((schema_name, defined_line)) =
-                                self.variables.get(name.id.as_str())
-                            {
-                                if let Some(col_name) =
-                                    ast_extract::extract_string_literal(&subscript.slice)
-                                {
-                                    let schema_name = schema_name.clone();
-                                    let defined_line = *defined_line;
-                                    if self.schema_is_unresolved(&schema_name) {
-                                        let schema_display =
-                                            self.schema_display(&schema_name, defined_line);
-                                        errors.push(LintError {
-                                            line: current_line,
-                                            col: current_col,
-                                            code: CODE_UNVERIFIABLE_COLUMN.to_string(),
-                                            message: format!(
-                                                "Column '{}' cannot be verified (mutation tracking): {} has no concrete column list",
-                                                col_name, schema_display
-                                            ),
-                                            severity: "error".to_string(),
-                                        });
-                                        // Still its own leg -- an edit attempted
-                                        // against an unresolved base can't be trusted
-                                        // to have produced any particular column set
-                                        // either. See count_mutation_leg's doc comment.
-                                        let new_schema = self.count_mutation_leg(
-                                            Some(&schema_name),
-                                            None,
-                                            name.id.as_str(),
-                                            current_line,
-                                            current_col,
-                                        );
-                                        self.variables.insert(
-                                            name.id.to_string(),
-                                            (new_schema, current_line),
-                                        );
-                                    } else {
-                                        let already_has_col =
-                                            self.schema_has_column(&schema_name, col_name);
-                                        if !already_has_col {
-                                            let schema_display =
-                                                self.schema_display(&schema_name, defined_line);
-                                            errors.push(LintError {
-                                                line: current_line,
-                                                col: current_col,
-                                                code: CODE_UNKNOWN_COLUMN.to_string(),
-                                                message: format!(
-                                                    "Column '{}' does not exist in {} (mutation tracking)",
-                                                    col_name, schema_display
-                                                ),
-                                                severity: "error".to_string(),
-                                            });
-                                            // A genuine schema change (a new column
-                                            // was added) is its own new leg, rebinding
-                                            // this name to it rather than mutating the
-                                            // OLD schema object in place -- the old
-                                            // approach risked leaking the change into
-                                            // any other name that happened to share
-                                            // the same schema name.
-                                            let mut new_cols = self
-                                                .schemas
-                                                .get(&schema_name)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            new_cols.push(col_name.to_string());
-                                            let new_schema = self.count_mutation_leg(
-                                                Some(&schema_name),
-                                                Some(new_cols),
-                                                name.id.as_str(),
-                                                current_line,
-                                                current_col,
-                                            );
-                                            self.variables.insert(
-                                                name.id.to_string(),
-                                                (new_schema, current_line),
-                                            );
-                                        }
-                                        // else: the column already existed -- the
-                                        // schema is unchanged, so this isn't a new leg.
-                                    }
-                                }
-                            }
-                        }
+                    if let Some((recv, cols)) = column_write_target(target) {
+                        self.record_column_writes(&recv, &cols, current_line, current_col, errors);
                     }
                 }
 
@@ -3285,6 +4330,8 @@ impl Linter {
                                         .insert(name.clone(), (schema_name.clone(), current_line));
                                 }
                             }
+                            // `df["a"]` is a Series, not a frame: nothing to propagate.
+                            None if ast_extract::extract_string_literal(&sub.slice).is_some() => {}
                             None => {
                                 // Boolean mask / unknown — passthrough base schema to target
                                 if let Some((base_schema, _)) =
@@ -3398,6 +4445,33 @@ impl Linter {
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                            }
+
+                            // Handle df = self.load() / self.clean(df): a method of the
+                            // class being visited (or one it inherits), resolved the way a
+                            // bare function is.
+                            if let Expr::Name(receiver) = &*attr.value {
+                                if matches!(receiver.id.as_str(), "self" | "cls") {
+                                    if let Some(marker_or_schema) =
+                                        self.resolve_self_method(func_name)
+                                    {
+                                        self.bind_function_result(
+                                            assign,
+                                            &marker_or_schema,
+                                            func_name,
+                                            current_line,
+                                            current_col,
+                                        );
+                                    } else {
+                                        let targets = Self::assign_target_names(assign);
+                                        self.apply_helper_call(
+                                            &assign.value,
+                                            &targets,
+                                            current_line,
+                                            current_col,
+                                        );
                                     }
                                 }
                             }
@@ -4382,6 +5456,22 @@ impl Linter {
                             // genuine method call (`df.merge(other)`) is never treated
                             // as a call to a same-named cross-file delegate function.
                             if !self.variables.contains_key(base.id.as_str()) {
+                                let resolved = self
+                                    .receiver_classes
+                                    .get(base.id.as_str())
+                                    .cloned()
+                                    .and_then(|class| {
+                                        self.resolve_method_on_class(&class, attr.attr.as_str())
+                                    });
+                                if let Some(marker_or_schema) = resolved {
+                                    self.bind_function_result(
+                                        assign,
+                                        &marker_or_schema,
+                                        attr.attr.as_str(),
+                                        current_line,
+                                        current_col,
+                                    );
+                                }
                                 self.check_call_requirements(
                                     attr.attr.as_str(),
                                     call,
@@ -4398,30 +5488,21 @@ impl Linter {
                         if let Some(marker_or_schema) =
                             self.functions.get(func_name.id.as_str()).cloned()
                         {
-                            let schema_name = self.resolve_open_or_named_schema(
+                            self.bind_function_result(
+                                assign,
                                 &marker_or_schema,
                                 func_name.id.as_str(),
                                 current_line,
+                                current_col,
                             );
-                            // Confirms any pending pass-through reversal for this
-                            // function -- see `pending_passthrough_reversals`.
-                            self.functions_called.insert(func_name.id.to_string());
-                            self.dataframes_total += 1;
-                            let var_hint = assign_var_hint(assign, func_name.id.as_str());
-                            self.count_typed_dataframe(
-                                &schema_name,
-                                &var_hint,
+                        } else {
+                            let targets = Self::assign_target_names(assign);
+                            self.apply_helper_call(
+                                &assign.value,
+                                &targets,
                                 current_line,
                                 current_col,
                             );
-                            for target in &assign.targets {
-                                if let Expr::Name(target_name) = target {
-                                    self.variables.insert(
-                                        target_name.id.to_string(),
-                                        (schema_name.clone(), current_line),
-                                    );
-                                }
-                            }
                         }
                         // Validate the call's first argument against the callee's
                         // parameter contract, e.g. `trimmed = trim_customers(customers)`.
@@ -4444,14 +5525,14 @@ impl Linter {
                     // `name["literal"] = ...` was already handled by the mutation-tracking
                     // check above; revisiting it here would double-report an unresolved
                     // schema (no backstop like the concrete case's `self.schemas` append).
-                    let already_handled_as_mutation = matches!(
-                        target,
-                        Expr::Subscript(s)
-                            if matches!(&*s.value, Expr::Name(_))
-                                && ast_extract::extract_string_literal(&s.slice).is_some()
-                    );
+                    let already_handled_as_mutation = column_write_target(target)
+                        .is_some_and(|(recv, _)| self.variables.contains_key(&recv));
                     if !already_handled_as_mutation {
                         self.visit_expr(target, errors);
+                    } else if let Some(rows) = loc_row_indexer(target) {
+                        // The written columns were recorded above; a mask that reads
+                        // other columns is still an ordinary read.
+                        self.visit_expr(rows, errors);
                     }
                 }
                 self.visit_expr(&assign.value, errors);
@@ -4598,11 +5679,15 @@ impl Linter {
                 }
             }
             Stmt::Expr(expr_stmt) => {
+                // A helper that edits the frame it is handed, called for its side effect.
+                let (stmt_line, stmt_col) = self.source_location(expr_stmt.range().start());
+                self.apply_helper_call(&expr_stmt.value, &[], stmt_line, stmt_col);
                 // Intercept in-place mutations before generic expression visiting.
                 if let Expr::Call(call) = &*expr_stmt.value {
                     if let Expr::Attribute(attr) = &*call.func {
                         let func_name = attr.attr.as_str();
                         let (line, col) = self.source_location(call.range().start());
+                        self.apply_inplace_method(attr, call, line, col, errors);
                         if func_name == "pop" {
                             if let Expr::Name(recv) = &*attr.value {
                                 if let Some(col_name) = call
@@ -5449,6 +6534,1796 @@ print(df["b"])
         assert_eq!(linter.dataframes_typed, 0);
     }
 
+    fn lint_for_leg_tests(body: &str) -> (Linter, Vec<LintError>) {
+        let source = format!(
+            "import pandas as pd\ndf = pd.read_csv(\"x.csv\", usecols=[\"a\", \"b\"])\n{body}"
+        );
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(&source, Path::new("test.py"))
+            .unwrap();
+        (linter, errors)
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_an_unknown_method_reassignment() {
+        // arrange / act: `some_unknown` is not a method the checker models, so `df`
+        // no longer has a column set anyone can vouch for.
+        let (linter, errors) = lint_for_leg_tests("df = df.some_unknown()\nprint(df[\"zzz\"])\n");
+
+        // assert: a resolved leg was lost, so it counts once as an unresolved origin,
+        // and access is unverifiable rather than checked against the stale schema.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_an_unknown_function_reassignment() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests("df = clean(df)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_count_a_chain_of_unknown_ops_as_one_unresolved_leg() {
+        // arrange / act: the second op has nothing left to lose.
+        let (linter, errors) =
+            lint_for_leg_tests("df = clean(df)\ndf = clean_more(df)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_untrack_a_name_reassigned_from_an_unrelated_source() {
+        // arrange / act: `df` now holds whatever `load_other()` returns.
+        let (linter, errors) = lint_for_leg_tests("df = load_other()\nprint(df[\"zzz\"])\n");
+
+        // assert: no stale unknown-column, and no claim about the new value.
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_untrack_a_name_reassigned_to_a_series() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests("df = df[\"a\"]\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_untrack_a_name_reassigned_to_a_scalar_result() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests("df = df.sum()\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_keep_validating_after_schema_preserving_reassignments() {
+        // arrange: ops that return a frame with the same columns must not lose the
+        // leg -- `df["zzz"]` is still a real unknown column.
+        for rhs in [
+            "df[df[\"a\"] > 1]",
+            "df.copy()",
+            "df.drop_duplicates()",
+            "df.astype({\"a\": \"int\"})",
+            "df.loc[df[\"a\"] > 1]",
+            "df.head().reset_index()",
+        ] {
+            // act
+            let (linter, errors) = lint_for_leg_tests(&format!("df = {rhs}\nprint(df[\"zzz\"])\n"));
+
+            // assert
+            assert_eq!(linter.dataframes_total, 1, "{rhs}");
+            assert_eq!(errors.len(), 1, "{rhs}: {errors:?}");
+            assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN, "{rhs}");
+        }
+    }
+
+    #[test]
+    fn test_should_not_touch_a_module_level_binding_from_a_function_local_reassignment() {
+        // arrange / act: the function's `df` is a different variable.
+        let (_, errors) = lint_for_leg_tests(
+            "def helper():\n    df = load_other()\n    return df\n\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: the module-level `df` is still validated.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_untrack_rather_than_unresolve_a_call_to_a_helper_defined_later() {
+        // arrange / act: `clean` is defined below its caller, so its return schema is
+        // simply not inferred yet -- that is not evidence it is unknown.
+        let source = "import pandas as pd\n\n\ndef main():\n    df = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n    df = clean(df)\n    print(df[\"zzz\"])\n\n\ndef clean(d):\n    return d.groupby(\"a\").sum()\n";
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: no unresolved leg counted, no false unverifiable-column.
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_untrack_names_rebound_by_tuple_unpacking() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests("df, extra = split(df)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_end_a_stale_leg_for_an_annotated_reassignment() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("df: pd.DataFrame = clean(df)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    fn lint_source(source: &str) -> (Linter, Vec<LintError>) {
+        let mut linter = Linter::new();
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+        (linter, errors)
+    }
+
+    #[test]
+    fn test_should_keep_the_schema_through_a_passthrough_helper_defined_earlier() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef clean(d):\n    return d.dropna()\n\n\ndf = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ndf = clean(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: validated against the original columns, and still one origin.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_keep_the_schema_through_a_passthrough_helper_defined_later() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef main():\n    df = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n    df = clean(df)\n    print(df[\"zzz\"])\n\n\ndef clean(d):\n    return d\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_carry_the_schema_to_a_differently_named_passthrough_result() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef clean(d):\n    return d.dropna()\n\n\ndf = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ncleaned = clean(df)\nprint(cleaned[\"zzz\"])\n",
+        );
+
+        // assert: not counted again, and validated against `df`'s columns.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_resolve_a_passthrough_method_called_on_self() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    def _clean(self, df):\n        return df.dropna()\n\n    def run(self):\n        df = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n        df = self._clean(df)\n        print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_resolve_a_passthrough_method_defined_after_its_caller() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    def run(self):\n        df = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n        df = self._clean(df)\n        print(df[\"zzz\"])\n\n    def _clean(self, df):\n        return df.dropna()\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_treat_a_reshaping_helper_as_passthrough() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef clean(d):\n    return d.groupby(\"a\").sum()\n\n\ndf = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ndf = clean(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: the helper changes columns, so it is an unresolved leg.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_bind_a_self_method_with_a_schema_return_annotation() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\nfrom typing import Annotated\nfrom typedframes import BaseSchema, Column\n\n\nclass S(BaseSchema):\n    a = Column(type=int)\n\n\nclass Job:\n    def load(self) -> Annotated[pd.DataFrame, S]:\n        return pd.read_csv(\"x.csv\")\n\n    def run(self):\n        df = self.load()\n        print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_borrow_another_classs_passthrough_method() {
+        // arrange / act: `Other.clean` is a pass-through, but `Job` has no `clean` of its
+        // own (it could be inherited or mixed in), so the call is opaque.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Other:\n    def clean(self, d):\n        return d\n\n\nclass Job:\n    def run(self):\n        df = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n        df = self.clean(df)\n        print(df[\"zzz\"])\n",
+        );
+
+        // assert: unverifiable, not checked against `df`'s old columns.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_borrow_a_same_named_method_return_schema_from_another_class() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom typing import Annotated\nfrom typedframes import BaseSchema, Column\n\n\nclass S1(BaseSchema):\n    a = Column(type=int)\n\n\nclass A:\n    def load(self) -> Annotated[pd.DataFrame, S1]:\n        return pd.read_csv(\"x.csv\")\n\n\nclass B:\n    def load(self):\n        return pd.read_csv(\"x.csv\", usecols=[\"q\"])\n\n    def run(self):\n        df = self.load()\n        print(df[\"q\"])\n",
+        );
+
+        // assert: `B.load` is B's own, so `q` is a column of `df`.
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_match_a_library_function_to_a_passthrough_method_of_the_same_name() {
+        // arrange / act: `clean` is imported, `Job.clean` is a pass-through method.
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom lib import clean\n\n\nclass Job:\n    def clean(self, d):\n        return d\n\n\ndf = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ndf = clean(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_apply_columns_a_helper_adds() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add(df):\n    df[\"z\"] = 1\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\ndf = add(df)\nprint(df[\"z\"])\nprint(df[\"a\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert: `z` now exists, `nope` still does not; the edit is one new leg.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_apply_columns_a_helper_removes_and_renames_in_order() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef fix(df):\n    del df[\"b\"]\n    df.rename(columns={\"a\": \"x\"}, inplace=True)\n    df.columns = [\"p\", \"q\"]\n    df.insert(0, \"r\", 1)\n    df.pop(\"q\")\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\nout = fix(df)\nprint(out[\"p\"], out[\"r\"])\nprint(out[\"q\"])\nprint(df[\"b\"])\n",
+        );
+
+        // assert: `out` is {p, r}, and since the helper edits its argument in place
+        // `df` is too: `q` is gone from `out`, `b` is gone from `df`.
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'q'"));
+        assert!(errors[1].message.contains("'b'"));
+    }
+
+    #[test]
+    fn test_should_apply_a_columns_edit_made_by_a_helper_method_on_self() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    def _add(self, df):\n        df[[\"z\", \"y\"]] = 1\n        return df\n\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = self._add(df)\n        print(df[\"z\"], df[\"y\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_a_helper_with_a_conditional_edit() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add(df, flag):\n    if flag:\n        df[\"z\"] = 1\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = add(df, True)\nprint(df[\"z\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert!(linter.leg_events[0].reason.contains("edits the columns"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_a_helper_with_an_unmodelled_inplace_edit() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef fix(df):\n    df.set_index(\"a\", inplace=True)\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = fix(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_count_a_helper_edit_against_an_unresolved_frame_again() {
+        // arrange / act
+        let (linter, _) = lint_source(
+            "import pandas as pd\n\n\ndef add(df):\n    df[\"z\"] = 1\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = df.some_unknown()\ndf = add(df)\n",
+        );
+
+        // assert: one origin, one unresolved leg -- the helper does not add a third.
+        assert_eq!(linter.dataframes_total, 2);
+    }
+
+    #[test]
+    fn test_should_apply_helper_edits_through_await() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nasync def add(df):\n    df[\"z\"] = 1\n    return df\n\n\nasync def main():\n    df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n    df = await add(df)\n    print(df[\"z\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_record_why_tracking_ended() {
+        // arrange / act
+        let (linter, _) = lint_for_leg_tests(
+            "df = df.some_unknown()\nseries = df[\"a\"]\ndf = df[\"a\"]\ndf, extra = split(df)\n",
+        );
+
+        // assert
+        let outcomes: Vec<(&str, &str)> = linter
+            .leg_events
+            .iter()
+            .map(|e| (e.var.as_str(), e.outcome.as_str()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![("df", "unresolved"), ("df", "untracked")],
+            "events: {:?}",
+            linter.leg_events
+        );
+        assert!(linter.leg_events[0].reason.contains("some_unknown"));
+        assert!(linter.leg_events[1].reason.contains("Series or scalar"));
+    }
+
+    #[test]
+    fn test_should_apply_an_inplace_drop_of_a_literal_column() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests(
+            "df.drop(columns=[\"a\"], inplace=True)\nprint(df[\"a\"])\nprint(df[\"b\"])\n",
+        );
+
+        // assert: `a` is gone, `b` remains, and the edit is its own leg.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_treat_an_inplace_row_drop_as_leaving_columns_alone() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("df.drop([0, 1], inplace=True)\nprint(df[\"a\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_apply_an_inplace_rename_of_literal_columns() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "df.rename(columns={\"a\": \"z\"}, inplace=True)\nprint(df[\"z\"])\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_leave_columns_alone_for_an_inplace_method_that_keeps_them() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests(
+            "df.dropna(inplace=True)\ndf.sort_values(\"a\", inplace=True)\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_an_unmodelled_inplace_method() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("df.some_unknown(inplace=True)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert_eq!(linter.leg_events.len(), 1);
+        assert!(linter.leg_events[0].reason.contains("inplace=True"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_an_inplace_drop_with_a_dynamic_list() {
+        // arrange / act
+        let (_, errors) =
+            lint_for_leg_tests("df.drop(columns=to_drop, inplace=True)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_ignore_a_method_call_with_inplace_false() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("df.some_unknown(inplace=False)\nprint(df[\"a\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_replace_columns_with_a_literal_list_assignment() {
+        // arrange / act
+        let (_, errors) =
+            lint_for_leg_tests("df.columns = [\"x\", \"y\"]\nprint(df[\"x\"])\nprint(df[\"a\"])\n");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_a_dynamic_columns_assignment() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests("df.columns = new_names\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert!(linter.leg_events[0].reason.contains("`.columns`"));
+    }
+
+    #[test]
+    fn test_should_keep_the_case_fold_columns_assignment_unchanged() {
+        // arrange / act
+        let (_, errors) =
+            lint_for_leg_tests("df.columns = df.columns.str.upper()\nprint(df[\"A\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_add_columns_written_through_a_list_subscript() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("df[[\"c\", \"d\"]] = other\nprint(df[\"c\"])\nprint(df[\"d\"])\n");
+
+        // assert: each new column is reported once at the write, none at the reads, and
+        // the write is a single new leg.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.line == 3));
+    }
+
+    #[test]
+    fn test_should_add_columns_written_through_loc() {
+        // arrange / act
+        let (_, errors) =
+            lint_for_leg_tests("df.loc[df[\"a\"] > 1, \"flag\"] = True\nprint(df[\"flag\"])\n");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].line, 3);
+        assert!(errors[0].message.contains("'flag'"));
+    }
+
+    #[test]
+    fn test_should_not_report_a_list_subscript_write_to_existing_columns() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("df[[\"a\", \"b\"]] = other\ndf.loc[:, \"a\"] = 0\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_report_a_column_write_to_an_unresolved_frame_as_unverifiable() {
+        // arrange / act
+        let (_, errors) =
+            lint_for_leg_tests("df = df.some_unknown()\ndf[[\"c\", \"d\"]] = other\n");
+
+        // assert
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.code == CODE_UNVERIFIABLE_COLUMN));
+    }
+
+    #[test]
+    fn test_should_untrack_a_frame_that_is_deleted() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests("del df\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(linter.leg_events[0].reason.contains("`del`"));
+    }
+
+    #[test]
+    fn test_should_untrack_a_frame_rebound_as_a_loop_variable() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("for df in frames:\n    print(df[\"zzz\"])\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(linter.leg_events[0].reason.contains("loop variable"));
+    }
+
+    #[test]
+    fn test_should_untrack_a_frame_rebound_by_with() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests("with opener() as df:\n    print(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(linter.leg_events[0].reason.contains("`with ... as`"));
+    }
+
+    #[test]
+    fn test_should_untrack_a_frame_rebound_by_a_walrus() {
+        // arrange / act
+        let (linter, errors) =
+            lint_for_leg_tests("if (df := fetch()) is not None:\n    print(df[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(linter.leg_events[0]
+            .reason
+            .contains("assignment expression"));
+    }
+
+    #[test]
+    fn test_should_not_untrack_a_module_frame_rebound_inside_a_function() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "def f():\n    for df in frames:\n        pass\n\n\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: the module-level `df` is still validated.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_leave_unrelated_names_alone_on_rebinding_forms() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests(
+            "for other in frames:\n    pass\ndel other\nwith opener() as fh:\n    pass\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(linter.leg_events.is_empty());
+    }
+
+    #[test]
+    fn test_should_not_treat_a_positional_inplace_rename_as_a_column_rename() {
+        // arrange / act: in pandas a positional mapper renames row labels.
+        let (linter, errors) =
+            lint_for_leg_tests("df.rename({\"a\": \"x\"}, inplace=True)\nprint(df[\"a\"])\n");
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_rename_columns_for_a_positional_mapper_with_axis_one() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "df.rename({\"a\": \"x\"}, axis=1, inplace=True)\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_for_an_inplace_rename_with_a_dynamic_mapper() {
+        // arrange / act
+        let (_, errors) =
+            lint_for_leg_tests("df.rename(columns=str.lower, inplace=True)\nprint(df[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_trace_an_inplace_flag_bound_once_to_true() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "flag = True\ndf.drop(columns=[\"a\"], inplace=flag)\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_trace_an_inplace_flag_bound_once_to_false() {
+        // arrange / act
+        let (linter, errors) = lint_for_leg_tests(
+            "flag = False\ndf.drop(columns=[\"a\"], inplace=flag)\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_assume_not_in_place_for_an_untraceable_inplace_flag() {
+        // arrange / act: `flag` is bound twice, so its value is unknown.
+        let (linter, errors) = lint_for_leg_tests(
+            "flag = True\nflag = compute()\ndf.drop(columns=[\"a\"], inplace=flag)\nprint(df[\"a\"])\ndf.drop(columns=[\"a\"], inplace=other())\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_column_reads_inside_a_loc_mask() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests("df.loc[df[\"zz\"] > 1, \"flag\"] = True\n");
+
+        // assert: the misspelled mask column and the new written column are both reported.
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(errors.len(), 2, "errors: {messages:?}");
+        assert!(messages.iter().any(|m| m.contains("'zz'")));
+        assert!(messages.iter().any(|m| m.contains("'flag'")));
+    }
+
+    #[test]
+    fn test_should_not_leak_a_function_local_frame_into_module_scope() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef g():\n    df = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\n\n\ndf = build()\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_leak_a_local_frame_between_methods() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass C:\n    def m1(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\n        return df\n\n    def m2(self, p):\n        df = p.load()\n        return df[\"zzz\"]\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_let_a_parameter_shadow_a_module_level_frame() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests("def f(df):\n    return df[\"zzz\"]\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_still_read_a_module_level_frame_from_inside_a_function() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests("def f():\n    return df[\"zzz\"]\n");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_apply_a_global_rebinding_to_module_scope() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "def f():\n    global df\n    df = df.pipe(g)\n\n\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: the module frame is unresolved after `f` rebinds it.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_scope_a_rebinding_inside_a_function_to_that_function() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "def f():\n    df = other()\n    return df[\"zzz\"]\n\n\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: only the module-level read is checked.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].line, 8);
+    }
+
+    #[test]
+    fn test_should_not_count_a_row_mask_write_as_a_helper_column_edit() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef fix(df):\n    df[df[\"a\"] > 1] = 0\n    df[1:3] = 0\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = fix(df)\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_apply_a_helpers_in_place_edit_when_called_as_a_statement() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add_features(df):\n    df[\"z\"] = 1\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nadd_features(df)\nprint(df[\"z\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert: `z` now exists, `nope` does not; the edit is one new leg.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_apply_a_method_helpers_in_place_edit_called_on_self() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    def _add(self, df):\n        df.drop(columns=[\"a\"], inplace=True)\n        df[\"z\"] = 1\n\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\n        self._add(df)\n        print(df[\"z\"], df[\"b\"])\n        print(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_apply_an_in_place_edit_through_await_as_a_statement() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nasync def add(df):\n    df[\"z\"] = 1\n\n\nasync def main():\n    df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n    await add(df)\n    print(df[\"z\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_apply_edits_a_helper_makes_to_its_own_copy() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add(df):\n    df = df.copy()\n    df[\"z\"] = 1\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nout = add(df)\nadd(df)\nprint(out[\"z\"])\nprint(df[\"z\"])\n",
+        );
+
+        // assert: the result has `z`; the caller's `df` does not, whether or not the
+        // result was kept.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].line, 14);
+    }
+
+    #[test]
+    fn test_should_edit_both_the_argument_and_the_result_of_an_in_place_helper_once() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add(df):\n    df[\"z\"] = 1\n    return df\n\n\nx = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ny = add(x)\nprint(x[\"z\"], y[\"z\"])\n",
+        );
+
+        // assert: same object, so one new leg, and both names see the column.
+        assert_eq!(linter.dataframes_total, 2);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_apply_the_in_place_edit_when_a_helper_that_returns_nothing_is_assigned() {
+        // arrange / act: `add` returns `None`, so `df = add(df)` binds `df` to `None` at
+        // the return-value level -- but `add` still mutates the object `df` already
+        // named, and `df` is the only name in play (`df = ...` rebinds it to the very
+        // thing it already pointed at), so the in-place edit is still `df`'s own.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add(df):\n    df[\"z\"] = 1\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = add(df)\nprint(df[\"z\"])\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: `z` was added, `zzz` genuinely is not a column -- a real unknown-column,
+        // not merely unverifiable.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'zzz'"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_a_conditionally_copied_helper_edit() {
+        // arrange / act: whether the edit reaches the caller depends on `flag`.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef add(df, flag):\n    if flag:\n        df = df.copy()\n    df[\"z\"] = 1\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nadd(df, True)\nprint(df[\"z\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_follow_a_helper_that_passes_the_frame_to_another_mutating_helper() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _fix(df):\n    df[\"z\"] = 1\n\n\ndef normalize(df):\n    _fix(df)\n    df[\"y\"] = 2\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"z\"], df[\"y\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert: both edits arrive as one new leg.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_follow_a_chain_of_delegating_helpers_through_self_and_await() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    async def top(self, df):\n        await self.middle(df)\n\n    async def middle(self, df):\n        self.bottom(df)\n\n    def bottom(self, df):\n        df.drop(columns=[\"a\"], inplace=True)\n        df[\"z\"] = 1\n\n    async def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\n        await self.top(df)\n        print(df[\"z\"], df[\"b\"])\n        print(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_ignore_delegation_to_a_function_that_does_not_edit_the_frame() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef show(df):\n    print(df)\n\n\ndef report(df):\n    show(df)\n    log(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nreport(df)\nprint(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_when_a_mutating_helper_is_called_conditionally() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _fix(df):\n    df[\"z\"] = 1\n\n\ndef normalize(df, flag):\n    if flag:\n        _fix(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df, True)\nprint(df[\"z\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_loop_on_mutually_delegating_helpers() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef ping(df):\n    df[\"z\"] = 1\n    pong(df)\n\n\ndef pong(df):\n    ping(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nping(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: the cycle makes the columns unknown rather than hanging.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_apply_delegated_edits_made_after_the_parameter_is_copied() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _fix(df):\n    df[\"z\"] = 1\n\n\ndef normalize(df):\n    df = df.copy()\n    _fix(df)\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"z\"])\n",
+        );
+
+        // assert: the copy was edited, not the caller's frame.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_let_a_class_level_frame_leak_out_of_the_class_body() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass C:\n    df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n\n\ndf = build()\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_show_a_class_level_frame_to_its_methods() {
+        // arrange / act: `df` inside `run` is a global lookup, not the class attribute.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass C:\n    df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n\n    def run(self):\n        return df[\"zzz\"]\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_still_check_a_class_level_frame_within_the_class_body() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass C:\n    df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n    bad = df[\"zzz\"]\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_still_show_a_module_frame_to_methods_and_class_body() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "class C:\n    bad = df[\"zzz\"]\n\n    def run(self):\n        return df[\"yyy\"]\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_follow_a_helper_that_returns_another_helpers_result() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _add(df):\n    df = df.copy()\n    df[\"z\"] = 1\n    return df\n\n\ndef normalize(df):\n    return _add(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nout = normalize(df)\nprint(out[\"z\"])\nprint(out[\"nope\"])\nprint(df[\"z\"])\n",
+        );
+
+        // assert: `out` has `z` (added on a copy), `df` does not.
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+        assert!(errors[1].message.contains("'z'"));
+    }
+
+    #[test]
+    fn test_should_follow_a_method_that_returns_a_sibling_methods_result_through_await() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    async def top(self, df):\n        return await self.bottom(df)\n\n    async def bottom(self, df):\n        df[\"z\"] = 1\n        return df\n\n    async def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = await self.top(df)\n        print(df[\"z\"])\n        print(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_returning_an_unknown_functions_result_as_a_passthrough() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom lib import validate\n\n\ndef check(df):\n    return validate(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = check(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: `validate` may return anything, so the columns are unknown.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_treat_returning_a_reshaping_helpers_result_as_a_passthrough() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _agg(df):\n    return df.groupby(\"a\").sum()\n\n\ndef top(df):\n    return _agg(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = top(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_loop_on_helpers_that_return_each_other() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef ping(df):\n    return pong(df)\n\n\ndef pong(df):\n    return ping(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = ping(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_apply_a_global_rebinding_made_inside_a_method() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "class C:\n    def refresh(self):\n        global df\n        df = df.pipe(g)\n\n\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: the module frame is unresolved after the method rebinds it.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_check_an_unannotated_receiver_against_another_functions_local_frame() {
+        // arrange / act: `source` has no class annotation, so `load()` is not resolved,
+        // and `df` must not be checked against the `df` local to `SqlDataSource.load`.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass SqlDataSource:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"data.csv\", usecols=[\"a\", \"b\"])\n        return df\n\n\ndef process(source) -> None:\n    df = source.load()\n    print(df[\"c\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_use_the_annotated_classs_own_concrete_method_over_other_classes() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass A:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\nclass B:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"b.csv\", usecols=[\"b\"])\n        return df\n\n\ndef process(src: A) -> None:\n    df = src.load()\n    print(df[\"a\"])\n    print(df[\"b\"])\n",
+        );
+
+        // assert: A's columns, not B's.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'b'"));
+        assert!(errors[0].message.contains("{a}"));
+    }
+
+    #[test]
+    fn test_should_leave_an_interface_call_open_when_implementations_disagree() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Source:\n    def load(self) -> pd.DataFrame: ...\n\n\nclass A(Source):\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\nclass B(Source):\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"b.csv\", usecols=[\"b\"])\n        return df\n\n\ndef process(src: Source) -> None:\n    df = src.load()\n    print(df[\"anything\"])\n",
+        );
+
+        // assert: which implementation runs is unknown, so no column is claimed wrong.
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_accept_a_quoted_class_annotation_for_a_method_call_receiver() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass A:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\ndef process(src: \"A\") -> None:\n    df = src.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_method_the_annotated_class_does_not_define() {
+        // arrange / act: `Source` has no `load`; only an unrelated class does.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Source:\n    def other(self) -> int: ...\n\n\nclass A:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\ndef process(src: Source) -> None:\n    df = src.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_parameter_annotated_with_an_unknown_class() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass A:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\ndef process(src: ExternalClient) -> None:\n    df = src.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_carry_a_parameter_class_out_of_its_function() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass A:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\ndef first(src: A) -> None:\n    pass\n\n\ndef second(src) -> None:\n    df = src.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_follow_a_helper_that_rebinds_its_parameter_to_another_helpers_result() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _add(df):\n    df = df.copy()\n    df[\"z\"] = 1\n    return df\n\n\ndef normalize(df):\n    df = _add(df)\n    df[\"y\"] = 2\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = normalize(df)\nprint(df[\"z\"], df[\"y\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_treat_edits_after_a_delegating_rebind_as_possibly_in_place() {
+        // arrange / act: `_id` may or may not copy, so whether `df["y"] = 2` reaches the
+        // caller's frame is unknown.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef _id(df):\n    return df\n\n\ndef normalize(df):\n    df = _id(df)\n    df[\"y\"] = 2\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"y\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_follow_a_rebind_to_an_unknown_functions_result() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom lib import shape\n\n\ndef normalize(df):\n    df = shape(df)\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = normalize(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_resolve_an_inherited_method_called_on_self() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Base:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\nclass Child(Base):\n    def run(self):\n        df = self.load()\n        print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_prefer_an_overriding_method_over_the_inherited_one() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Base:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\nclass Child(Base):\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"b.csv\", usecols=[\"b\"])\n        return df\n\n    def run(self):\n        df = self.load()\n        print(df[\"b\"])\n        print(df[\"a\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_resolve_a_method_inherited_through_a_typed_parameter() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Base:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\nclass Child(Base):\n    pass\n\n\ndef process(src: Child) -> None:\n    df = src.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_follow_an_inherited_passthrough_helper_and_inherited_delegate() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Base:\n    def _fix(self, df):\n        df[\"z\"] = 1\n\n    def _clean(self, df):\n        return df.dropna()\n\n\nclass Mid(Base):\n    def _norm(self, df):\n        self._fix(df)\n\n\nclass Child(Mid):\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = self._clean(df)\n        self._norm(df)\n        print(df[\"z\"])\n        print(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_not_loop_on_cyclic_inheritance() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass A(B):\n    def run(self):\n        df = self.load()\n        return df\n\n\nclass B(A):\n    pass\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_resolve_an_annotated_method_of_a_class_defined_later() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom typing import Annotated\nfrom typedframes import BaseSchema, Column\n\n\nclass S(BaseSchema):\n    a = Column(type=int)\n\n\ndef process(src: Later) -> None:\n    df = src.load()\n    print(df[\"zzz\"])\n\n\nclass Later:\n    def load(self) -> Annotated[pd.DataFrame, S]:\n        return pd.read_csv(\"a.csv\")\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_resolve_a_method_called_on_a_locally_constructed_instance() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Loader:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\ndef main() -> None:\n    loader = Loader()\n    df = loader.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_see_a_module_level_instance_from_inside_a_function() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Loader:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\nloader = Loader()\n\n\ndef main() -> None:\n    df = loader.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_forget_an_instance_when_its_name_is_reassigned_or_shadowed() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Loader:\n    def load(self) -> pd.DataFrame:\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        return df\n\n\ndef reassigned() -> None:\n    loader = Loader()\n    loader = make()\n    df = loader.load()\n    print(df[\"zzz\"])\n\n\nloader = Loader()\n\n\ndef shadowed(loader) -> None:\n    df = loader.load()\n    print(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    // Indexes `helpers_source` as helpers.py and checks `main_source` as main.py against it.
+    fn check_against_helpers(helpers_source: &str, main_source: &str) -> (Linter, Vec<LintError>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(root.join("helpers.py"), helpers_source).unwrap();
+        fs::write(root.join("main.py"), main_source).unwrap();
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+        (linter, errors)
+    }
+
+    const HELPERS: &str = "def add(df):\n    df[\"z\"] = 1\n    return df\n\n\ndef clean(df):\n    return df.dropna()\n\n\ndef fix_in_place(df):\n    df[\"y\"] = 2\n\n\ndef reshape(df):\n    return df.groupby(\"a\").sum()\n";
+
+    #[test]
+    fn test_should_apply_an_imported_helpers_edits() {
+        // arrange / act
+        let (linter, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nfrom helpers import add, clean, fix_in_place\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = clean(df)\ndf = add(df)\nfix_in_place(df)\nprint(df[\"z\"], df[\"y\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert: `z` and `y` exist, `nope` does not, and no unverifiable noise.
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_apply_a_helper_imported_under_an_alias() {
+        // arrange / act
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nfrom helpers import add as add_z\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = add_z(df)\nprint(df[\"z\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_apply_a_helper_reached_through_a_module_import() {
+        // arrange / act
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nimport helpers\nimport helpers as h\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = helpers.add(df)\nh.fix_in_place(df)\nprint(df[\"z\"], df[\"y\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_reshaping_imported_helper_as_a_passthrough() {
+        // arrange / act
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nfrom helpers import reshape\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = reshape(df)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_apply_a_module_helper_that_was_not_imported_by_that_name() {
+        // arrange / act: only `clean` is imported by name, so a bare `add(df)` is not it.
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nfrom helpers import clean\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = add(df)\nprint(df[\"z\"])\n",
+        );
+
+        // assert: `add` is unknown here, so the frame is unresolved, not `{a, z}`.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_let_a_local_definition_win_over_an_imported_helper() {
+        // arrange / act
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nfrom helpers import add\n\n\ndef add(df):\n    return df.dropna()\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = add(df)\nprint(df[\"z\"])\n",
+        );
+
+        // assert: the local `add` adds nothing.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_resolve_a_local_helper_that_delegates_to_an_imported_one() {
+        // arrange / act
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nfrom helpers import fix_in_place\n\n\ndef normalize(df):\n    fix_in_place(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"y\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_resolve_a_delegate_to_a_helper_imported_into_the_defining_file() {
+        // arrange: main.py imports `normalize` from middle.py, whose own body delegates
+        // to `add`, imported (into middle.py) from base.py -- neither file this file's
+        // own indexing pass has any visibility into on its own.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("base.py"),
+            "def add(df):\n    df[\"z\"] = 1\n    return df\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("middle.py"),
+            "from base import add\n\n\ndef normalize(df):\n    add(df)\n    log(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom middle import normalize\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"z\"])\nprint(df[\"nope\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert: `z` reached `df` through two import hops; `log(df)`, resolving nowhere
+        // in the project, contributed nothing, and did not make anything unresolved.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_resolve_a_returned_delegate_across_two_files() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("base.py"),
+            "def add(df):\n    df = df.copy()\n    df[\"z\"] = 1\n    return df\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("middle.py"),
+            "from base import add\n\n\ndef normalize(df):\n    return add(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom middle import normalize\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nout = normalize(df)\nprint(out[\"z\"])\nprint(df[\"z\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert: `out` has `z` (added on a copy inside `add`), `df` does not.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'z'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_delegate_to_an_unresolvable_return_as_a_passthrough_across_files() {
+        // arrange: `normalize` (in middle.py) returns the result of a name main.py's
+        // indexing pass has never heard of at all.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("middle.py"),
+            "def normalize(df):\n    return opaque_transform(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom middle import normalize\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = normalize(df)\nprint(df[\"zzz\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_loop_on_a_cross_file_delegation_cycle() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("a.py"),
+            "from b import pong\n\n\ndef ping(df):\n    df[\"z\"] = 1\n    pong(df)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.py"),
+            "from a import ping\n\n\ndef pong(df):\n    ping(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom a import ping\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nping(df)\nprint(df[\"zzz\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert: the cycle makes the columns unknown rather than hanging.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_treat_a_decorated_helper_as_a_passthrough() {
+        // arrange / act: `@lru_cache` can hand back a shared/stale object; the checker
+        // has no way to know that a `df["z"] = 1` inside it is safe to trust.
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom functools import lru_cache\n\n\n@lru_cache\ndef add(df):\n    df[\"z\"] = 1\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = add(df)\nprint(df[\"z\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_still_resolve_a_staticmethod_or_classmethod_helper() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    @staticmethod\n    def add(df):\n        df[\"z\"] = 1\n        return df\n\n    @classmethod\n    def run(cls):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = cls.add(df)\n        print(df[\"z\"])\n        print(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_decorated_helper_call_as_in_place_when_called_as_a_statement() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef audited(f):\n    return f\n\n\n@audited\ndef add(df):\n    df[\"z\"] = 1\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nadd(df)\nprint(df[\"z\"])\n",
+        );
+
+        // assert: `audited` may hand back a wrapper with entirely different behaviour, so
+        // the call is not known to mutate `df` at all -- old columns still validated.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_follow_a_delegate_reached_through_a_plainly_imported_module() {
+        // arrange / act
+        let (_, errors) = check_against_helpers(
+            HELPERS,
+            "import pandas as pd\nimport helpers\n\n\ndef normalize(df):\n    helpers.fix_in_place(df)\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"y\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_method_call_on_the_parameter_as_a_module_delegate() {
+        // arrange / act: `df.merge(df)` -- `df` is both receiver and argument, not a
+        // delegate to a module named `df`.
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef combine(df):\n    df.merge(df)\n    return df\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\ndf = combine(df)\nprint(df[\"a\"])\n",
+        );
+
+        // assert: still recognized as a plain pass-through.
+        assert_eq!(linter.dataframes_total, 1);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_resolve_a_module_qualified_delegate_across_files() {
+        // arrange: `middle.py`'s own helper reaches `base.py` through a plain `import base`
+        // -- not `from base import add` -- which `resolve_delegate_target` alone can't
+        // follow (it only matches `from X import name`/attribute-call-via-any-import).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("base.py"),
+            "def add(df):\n    df[\"z\"] = 1\n    return df\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("middle.py"),
+            "import base\n\n\ndef normalize(df):\n    base.add(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom middle import normalize\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nnormalize(df)\nprint(df[\"z\"])\nprint(df[\"nope\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_resolve_a_self_method_inherited_from_a_base_class_in_another_file() {
+        // arrange: Job (main.py) extends Base (base.py); Job's own method mutates `df`
+        // through an inherited method it never overrides itself.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("base.py"),
+            "class Base:\n    def _add(self, df):\n        df[\"z\"] = 1\n        return df\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom base import Base\n\n\nclass Job(Base):\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = self._add(df)\n        print(df[\"z\"])\n        print(df[\"nope\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_prefer_an_override_over_a_cross_file_inherited_method() {
+        // arrange: Job overrides `_add` itself, so base.py's version must not apply.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("base.py"),
+            "class Base:\n    def _add(self, df):\n        df[\"z\"] = 1\n        return df\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom base import Base\n\n\nclass Job(Base):\n    def _add(self, df):\n        return df.dropna()\n\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = self._add(df)\n        print(df[\"z\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert: Job's own dropna()-only override wins, so `z` was never added -- a
+        // known-unknown column against the concrete {a} schema, not merely unverifiable.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'z'"));
+    }
+
+    #[test]
+    fn test_should_follow_a_cross_file_base_that_delegates_to_a_module_function() {
+        // arrange: base.py's own method delegates to a module-level helper it imports --
+        // two independent kinds of resolution composed in one chain.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("edits.py"),
+            "def add(df):\n    df[\"z\"] = 1\n    return df\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("base.py"),
+            "from edits import add\n\n\nclass Base:\n    def _add(self, df):\n        return add(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom base import Base\n\n\nclass Job(Base):\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = self._add(df)\n        print(df[\"z\"])\n        print(df[\"nope\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_an_unresolvable_cross_file_base_method_as_a_passthrough() {
+        // arrange: `_add` (in base.py) returns the result of something no file defines.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("base.py"),
+            "class Base:\n    def _add(self, df):\n        return opaque_transform(df)\n",
+        )
+        .unwrap();
+        let main_source = "import pandas as pd\nfrom base import Base\n\n\nclass Job(Base):\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        df = self._add(df)\n        print(df[\"zzz\"])\n";
+        fs::write(root.join("main.py"), main_source).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        let errors = linter.check_file_internal(main_source, &main_path).unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_not_loop_on_a_cross_file_inheritance_cycle() {
+        // arrange: a.py's A extends b.py's B, which extends a.py's A right back --
+        // pathological, but must not hang the indexer.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(
+            root.join("a.py"),
+            "from b import B\n\n\nclass A(B):\n    def run(self):\n        return self.other()\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.py"),
+            "from a import A\n\n\nclass B(A):\n    pass\n",
+        )
+        .unwrap();
+
+        // act: must terminate.
+        let index = build_index_internal(root);
+
+        // assert: indexing completed at all (the assertion above already proves it did).
+        assert!(index
+            .files
+            .contains_key(root.join("a.py").to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_should_apply_an_in_place_edit_when_the_return_value_is_captured_as_something_else() {
+        // arrange / act: `clean` mutates `df` in place but returns a status string --
+        // an assignment (`msg = clean(df)`) must not lose that mutation just because the
+        // captured value isn't the frame itself.
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef clean(df):\n    df[\"z\"] = 1\n    return \"done\"\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\nmsg = clean(df)\nprint(df[\"z\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(linter.dataframes_total, 2);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_apply_a_self_methods_in_place_edit_when_its_return_value_is_captured() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\nclass Job:\n    def clean(self, df):\n        df[\"z\"] = 1\n        return \"done\"\n\n    def run(self):\n        df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n        msg = self.clean(df)\n        print(df[\"z\"])\n        print(df[\"nope\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_untrack_a_name_reassigned_from_a_frame_to_a_helpers_non_frame_result() {
+        // arrange / act: `df` is reassigned to `clean`'s return value, a plain string --
+        // the OLD `df` binding must not survive under the new name.
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef clean(other):\n    other[\"z\"] = 1\n    return \"done\"\n\n\ndf = pd.read_csv(\"a.csv\", usecols=[\"a\"])\nother = pd.read_csv(\"b.csv\", usecols=[\"a\"])\ndf = clean(other)\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert: `df` no longer names a frame at all, so no unknown/unverifiable claim.
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
     #[test]
     fn test_should_lint_annotated_polars_pattern() {
         // arrange
@@ -5971,15 +8846,11 @@ class Pipeline:
 
     #[test]
     fn test_should_resolve_dataframe_returned_through_a_protocol_typed_call() {
-        // arrange: SOLID/DI-style structural typing -- `process` takes a
-        // `DataSource` Protocol (an interface, never instantiated) and calls its
-        // `load()` method; the concrete return schema lives on `SqlDataSource`, a
-        // wholly separate, unrelated-by-inheritance class. This only works at all
-        // because the checker's function-name resolution is name-based rather than
-        // type-based throughout (the same mechanism that resolves
-        // `module.trim_customers(customers)`), so a class body being visited (see
-        // test_should_count_typed_dataframe_for_load_call_inside_class_method) is
-        // both necessary and sufficient -- no Protocol-specific handling needed.
+        // arrange: SOLID/DI-style structural typing -- `process` takes a `DataSource`
+        // Protocol (an interface, never instantiated) and calls its `load()` method; the
+        // concrete return schema lives on `SqlDataSource`, an unrelated-by-inheritance
+        // class. The parameter's annotation names the interface, whose own `load` is a bare
+        // `-> pd.DataFrame`; the one implementation in the file settles the columns.
         let source = r#"
 from typing import Protocol
 import pandas as pd

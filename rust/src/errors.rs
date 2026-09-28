@@ -72,6 +72,8 @@ pub struct FileStats {
     /// against `typed_sites`/`untyped_sites` by line is what tells a reader whether a
     /// given call was counted at all, not just whether it was typed.
     pub all_dataframe_calls: Vec<DataFrameCallSite>,
+    /// Every place a tracked frame stopped carrying its column set -- see [`LegEvent`].
+    pub leg_events: Vec<LegEvent>,
 }
 
 /// One DataFrame origin the linter recognized but could not resolve columns for.
@@ -108,6 +110,23 @@ pub struct TypedSite {
     /// `BaseSchema`, or `inferred column set {...}` (plus an origin, where known)
     /// for one inferred from `usecols=`/a dict literal/etc.
     pub schema: String,
+}
+
+/// A statement after which a tracked DataFrame no longer has a column set the checker
+/// can vouch for. Powers `--coverage-detail=explain`'s "tracking ended" listing, so a
+/// run can say exactly which line lost a frame and why.
+///
+/// `outcome` is `"unresolved"` (the frame is still a DataFrame, but its columns are
+/// unknown from here) or `"untracked"` (the name no longer holds that frame, or the
+/// checker can make no claim about it). Line and column are 1-indexed, matching
+/// [`LintError`].
+#[derive(Debug, Serialize)]
+pub struct LegEvent {
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub outcome: String,
+    pub reason: String,
 }
 
 /// One `<load module>.<load function>(...)`-shaped call site found anywhere in a

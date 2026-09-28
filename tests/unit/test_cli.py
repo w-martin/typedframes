@@ -2019,6 +2019,153 @@ class TestCli(unittest.TestCase):
         self.assertEqual("a.py", payload["files"][0]["file"])
         self.assertEqual(1, len(payload["files"][0]["calls"]))
 
+    def test_should_list_tracking_ended_events_after_a_files_calls(self) -> None:
+        """Test that explain text lists why tracking ended, with a cell prefix for notebooks."""
+        # arrange
+        calls = [{"file": "/proj/a.py", "line": 1, "col": 1, "label": "pd.read_csv", "context": "x"}]
+        events = [
+            {
+                "file": "/proj/a.py",
+                "line": 4,
+                "col": 1,
+                "var": "df",
+                "outcome": "unresolved",
+                "reason": "`clean()` is not modelled, so the columns are unknown from here",
+            },
+            {
+                "file": "/proj/b.ipynb",
+                "line": 2,
+                "col": 1,
+                "cell": 3,
+                "var": "df",
+                "outcome": "untracked",
+                "reason": "`df` was deleted with `del`",
+            },
+        ]
+
+        # act
+        report = _format_explain(calls, [], [], Path("/proj"), events)
+
+        # assert: a file with events but no calls still gets a section.
+        self.assertIn("  tracking ended:", report)
+        self.assertIn("4:1", report)
+        self.assertIn("unresolved -- `clean()` is not modelled", report)
+        self.assertIn("cell 3:2:1", report)
+        self.assertIn("b.ipynb", report)
+
+    def test_should_order_notebook_sites_by_cell_before_line(self) -> None:
+        """Test that explain text and JSON sort notebook sites by cell, then line, then column."""
+        # arrange
+        calls = [
+            {"file": "/proj/n.ipynb", "line": 2, "col": 1, "cell": 3, "label": "pd.DataFrame", "context": "x"},
+            {"file": "/proj/n.ipynb", "line": 5, "col": 1, "cell": 1, "label": "pd.read_csv", "context": "x"},
+        ]
+        events = [
+            {
+                "file": "/proj/n.ipynb",
+                "line": 2,
+                "col": 1,
+                "cell": 3,
+                "var": "b",
+                "outcome": "untracked",
+                "reason": "r",
+            },
+            {
+                "file": "/proj/n.ipynb",
+                "line": 5,
+                "col": 1,
+                "cell": 1,
+                "var": "a",
+                "outcome": "untracked",
+                "reason": "r",
+            },
+        ]
+
+        # act
+        report = _format_explain(calls, [], [], Path("/proj"), events)
+        payload = _explain_json_payload(calls, [], [], Path("/proj"), events)
+
+        # assert
+        self.assertLess(report.index("cell 1:5:1"), report.index("cell 3:2:1"))
+        self.assertLess(report.rindex("cell 1:5:1"), report.rindex("cell 3:2:1"))
+        entry = payload["files"][0]
+        self.assertEqual([1, 3], [c["cell"] for c in entry["calls"]])
+        self.assertEqual(["a", "b"], [e["var"] for e in entry["tracking_ended"]])
+
+    def test_should_apply_an_imported_helpers_column_edits_through_the_project_index(self) -> None:
+        """Test that a helper's summary survives the serialised project index and reaches its importer."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "pyproject.toml").write_text("")
+            (Path(tmpdir) / "helpers.py").write_text('def add(df):\n    df["z"] = 1\n    return df\n')
+            (Path(tmpdir) / "main.py").write_text(
+                "import pandas as pd\nfrom helpers import add\n\n"
+                'df = pd.read_csv("a.csv", usecols=["a"])\ndf = add(df)\nprint(df["z"])\nprint(df["nope"])\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--output-format", "json"])
+
+            # assert: `z` exists, `nope` does not, and nothing is merely unverifiable.
+            codes_and_messages = [(e["code"], e["message"]) for e in json.loads(captured.getvalue())["errors"]]
+            self.assertEqual(1, len(codes_and_messages))
+            self.assertEqual("unknown-column", codes_and_messages[0][0])
+            self.assertIn("'nope'", codes_and_messages[0][1])
+
+    def test_should_omit_tracking_ended_header_for_a_file_without_events(self) -> None:
+        """Test that a file with no events prints no tracking-ended section."""
+        # arrange
+        calls = [{"file": "/proj/a.py", "line": 1, "col": 1, "label": "pd.read_csv", "context": "x"}]
+
+        # act
+        report = _format_explain(calls, [], [], Path("/proj"))
+
+        # assert
+        self.assertNotIn("tracking ended", report)
+
+    def test_should_include_events_only_files_in_explain_json_payload(self) -> None:
+        """Test that the JSON payload carries tracking_ended, including for a file with no calls."""
+        # arrange
+        events = [
+            {"file": "/proj/a.py", "line": 4, "col": 1, "var": "df", "outcome": "untracked", "reason": "why"},
+            {"file": "/proj/a.py", "line": 6, "col": 1, "cell": 2, "var": "df", "outcome": "untracked", "reason": "y"},
+        ]
+
+        # act
+        payload = _explain_json_payload([], [], [], Path("/proj"), events)
+
+        # assert
+        entry = payload["files"][0]
+        self.assertEqual("a.py", entry["file"])
+        self.assertEqual([], entry["calls"])
+        self.assertEqual(
+            {"line": 4, "col": 1, "var": "df", "outcome": "untracked", "reason": "why"},
+            entry["tracking_ended"][0],
+        )
+        self.assertEqual(2, entry["tracking_ended"][1]["cell"])
+
+    def test_should_report_tracking_ended_end_to_end(self) -> None:
+        """Test that a reassignment the checker cannot follow is explained in the report."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text(
+                'import pandas as pd\ndf = pd.read_csv("a.csv", usecols=["a"])\ndf = df.some_unknown()\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "explain"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("tracking ended:", output)
+            self.assertIn("`.some_unknown()` is not modelled", output)
+
     def test_should_fail_the_gate_for_an_unresolved_schema_by_default(self) -> None:
         """Test that a DataFrame recognized but never resolved to concrete columns fails the gate.
 

@@ -22,7 +22,7 @@ use crate::frame_ops::{
 };
 use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
 use crate::typo::find_best_match;
-use crate::{ast_extract, contract, sql};
+use crate::{ast_extract, column_usage, contract, sql};
 use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
 use ruff_python_parser::{parse, parse_module, Mode, ParseOptions};
@@ -219,6 +219,14 @@ pub struct Linter {
     // column set. Kept in step with the counters at each counting site rather than
     // reconstructed later.
     pub untyped_sites: Vec<UntypedSite>,
+    // Downstream usage observed for each `untyped_sites` entry whose own origin
+    // statement sits at the top level of its function/module body -- see
+    // `column_usage`'s module doc comment for exactly what "top level" excludes and
+    // why. Keyed by the same (line, col) an entry's own `UntypedSite` carries;
+    // absent for a site this pass didn't attempt (nested origin) or found nothing
+    // for. Populated once, after the main statement walk, by
+    // `observe_untyped_site_usage`.
+    pub(crate) untyped_site_usage: HashMap<(usize, usize), column_usage::ColumnUsage>,
     // The `dataframes_typed` counterpart of `untyped_sites` -- every origin that DID
     // resolve to a concrete column set, with its location. Populated at the same
     // choke point (`count_typed_dataframe`'s typed branch) rather than at each of the
@@ -1377,6 +1385,7 @@ impl Linter {
             dataframes_total: 0,
             dataframes_typed: 0,
             untyped_sites: Vec::new(),
+            untyped_site_usage: HashMap::new(),
             typed_sites: Vec::new(),
             all_dataframe_calls: Vec::new(),
             leg_events: Vec::new(),
@@ -1591,9 +1600,67 @@ impl Linter {
             }
         }
 
+        self.observe_untyped_site_usage(&module.body);
+
         errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
 
         errors
+    }
+
+    // For each `untyped_sites` entry whose own origin statement sits at the top
+    // level of its function/module body, records how the rest of that same scope
+    // uses the variable -- see `column_usage`'s module doc comment for exactly what
+    // this does and does not attempt. Runs once, after the main walk (and after the
+    // pass-through-reversal pass above may have removed some sites), so every
+    // remaining site is final and its own body slice is fully known.
+    fn observe_untyped_site_usage(&mut self, body: &[Stmt]) {
+        if self.untyped_sites.is_empty() {
+            return;
+        }
+        let by_position: HashMap<(usize, usize), &str> = self
+            .untyped_sites
+            .iter()
+            .map(|site| ((site.line, site.col), site.var.as_str()))
+            .collect();
+        let mut usage = HashMap::new();
+        self.scan_scope_for_untyped_usage(body, &by_position, &mut usage);
+        self.untyped_site_usage = usage;
+    }
+
+    fn scan_scope_for_untyped_usage(
+        &self,
+        body: &[Stmt],
+        by_position: &HashMap<(usize, usize), &str>,
+        out: &mut HashMap<(usize, usize), column_usage::ColumnUsage>,
+    ) {
+        for (i, stmt) in body.iter().enumerate() {
+            let assign_start = match stmt {
+                Stmt::Assign(assign) if matches!(assign.targets.as_slice(), [Expr::Name(_)]) => {
+                    Some(assign.range().start())
+                }
+                Stmt::AnnAssign(ann) if matches!(&*ann.target, Expr::Name(_)) => {
+                    Some(ann.range().start())
+                }
+                _ => None,
+            };
+            if let Some(start) = assign_start {
+                let pos = self.source_location(start);
+                if let Some(&var) = by_position.get(&pos) {
+                    let usage = column_usage::scan_usage(var, &body[i + 1..]);
+                    if !usage.accesses.is_empty() || !usage.other_uses.is_empty() {
+                        out.insert(pos, usage);
+                    }
+                }
+            }
+            // Deliberately NOT descending into ClassDef/If/For/While/With/Try bodies
+            // -- a class body is its own declarative scope (methods reached via the
+            // FunctionDef case below when THEY are visited), and a site nested
+            // inside control flow is out of scope for this pass (see
+            // `observe_untyped_site_usage`'s doc comment).
+            if let Stmt::FunctionDef(func_def) = stmt {
+                self.scan_scope_for_untyped_usage(&func_def.body, by_position, out);
+            }
+        }
     }
 
     // Load schemas and functions from cross-file index based on import statements.
@@ -4618,6 +4685,91 @@ impl Linter {
                     }
                 }
 
+                // B. `.loc[:, ["foo", "bar"]]`: the column-list counterpart of A above,
+                // for the one other syntax pandas offers for the same "pick these exact
+                // columns" read. On any base (tracked or not), same as A -- unlike a
+                // WRITE through `.loc[rows, cols] = ...` (see `column_write_target`),
+                // this is a read that produces a new, narrower frame. The row part is
+                // ignored here (not a column, nothing to infer from); its own column
+                // references, if any, are still validated normally by `visit_expr`
+                // walking `assign.value` at the end of this arm.
+                if let Expr::Subscript(sub) = &*assign.value {
+                    if let Expr::Attribute(indexer) = &*sub.value {
+                        if indexer.attr.as_str() == "loc" {
+                            if let Expr::Name(base_name) = &*indexer.value {
+                                let base_str = base_name.id.as_str();
+                                if let Expr::Tuple(indexers) = &*sub.slice {
+                                    if indexers.elts.len() == 2 {
+                                        if let Some(cols) =
+                                            ast_extract::extract_string_list(&indexers.elts[1])
+                                        {
+                                            let base_info = self
+                                                .variables
+                                                .get(base_str)
+                                                .map(|(s, l)| (s.clone(), *l));
+                                            if let Some((base_schema, base_def_line)) = &base_info {
+                                                let base_cols = self
+                                                    .schemas
+                                                    .get(base_schema)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                if !base_cols.is_empty() {
+                                                    for col in &cols {
+                                                        if !base_cols.contains(col) {
+                                                            let schema_display = self
+                                                                .schema_display(
+                                                                    base_schema,
+                                                                    *base_def_line,
+                                                                );
+                                                            errors.push(LintError {
+                                                                line: current_line,
+                                                                col: current_col,
+                                                                code: CODE_UNKNOWN_COLUMN
+                                                                    .to_string(),
+                                                                message: format!(
+                                                                    "Column '{}' does not exist in {}",
+                                                                    col, schema_display
+                                                                ),
+                                                                severity: "error".to_string(),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            let target_names: Vec<String> = assign
+                                                .targets
+                                                .iter()
+                                                .filter_map(|t| {
+                                                    if let Expr::Name(n) = t {
+                                                        Some(n.id.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect();
+                                            let var_name = target_names
+                                                .first()
+                                                .map(|s| s.as_str())
+                                                .unwrap_or(base_str);
+                                            let schema_name = self.make_inferred_schema(
+                                                cols,
+                                                var_name,
+                                                current_line,
+                                            );
+                                            for name in &target_names {
+                                                self.variables.insert(
+                                                    name.clone(),
+                                                    (schema_name.clone(), current_line),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Expr::Call(call) = &*assign.value {
                     let dataframes_total_before_call_dispatch = self.dataframes_total;
                     // Handle stmt = select(Order.id, Order.amount) — and the same
@@ -4994,6 +5146,88 @@ impl Linter {
                                         }
                                     }
                                 }
+                            } else if func_name == "filter"
+                                && ast_extract::filter_is_column_selecting(call)
+                            {
+                                // pandas' `.filter(items=/like=/regex=)` selects
+                                // COLUMNS (or index labels, depending on axis=), unlike
+                                // the positional-mask/callable shape the
+                                // ROW_PASSTHROUGH_METHODS branch below handles for this
+                                // same method name -- checked first since the two
+                                // shapes are otherwise indistinguishable by name alone.
+                                if let Expr::Name(recv) = &*attr.value {
+                                    let recv_str = recv.id.as_str();
+                                    let base_info =
+                                        self.variables.get(recv_str).map(|(s, l)| (s.clone(), *l));
+                                    match ast_extract::extract_filter_items_columns(call) {
+                                        Some(cols) => {
+                                            if let Some((base_schema, base_def_line)) = &base_info {
+                                                let base_cols = self
+                                                    .schemas
+                                                    .get(base_schema)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                for col in &cols {
+                                                    if !base_cols.contains(col) {
+                                                        let schema_display = self.schema_display(
+                                                            base_schema,
+                                                            *base_def_line,
+                                                        );
+                                                        errors.push(LintError {
+                                                            line: current_line,
+                                                            col: current_col,
+                                                            code: CODE_UNKNOWN_COLUMN.to_string(),
+                                                            message: format!(
+                                                                "Column '{}' does not exist in {}",
+                                                                col, schema_display
+                                                            ),
+                                                            severity: "error".to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            let var_name = assign_var_hint(assign, recv_str);
+                                            let schema_name = self.make_inferred_schema(
+                                                cols,
+                                                &var_name,
+                                                current_line,
+                                            );
+                                            for target in &assign.targets {
+                                                if let Expr::Name(target_name) = target {
+                                                    self.variables.insert(
+                                                        target_name.id.to_string(),
+                                                        (schema_name.clone(), current_line),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            // `like=`/`regex=`, or a non-literal
+                                            // `items=` -- still known to select
+                                            // columns, just not which ones, so this
+                                            // becomes unresolved rather than silently
+                                            // keeping the base's full column set.
+                                            if let Some((base_schema, _)) = base_info {
+                                                let var_name = assign_var_hint(assign, recv_str);
+                                                let schema_name = self.count_mutation_leg(
+                                                    Some(&base_schema),
+                                                    None,
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
+                                                );
+                                                for target in &assign.targets {
+                                                    if let Expr::Name(target_name) = target {
+                                                        self.variables.insert(
+                                                            target_name.id.to_string(),
+                                                            (schema_name.clone(), current_line),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             } else if ROW_PASSTHROUGH_METHODS.contains(&func_name) {
                                 // Row-preserving ops: propagate base schema unchanged
                                 if let Expr::Name(recv) = &*attr.value {
@@ -5019,34 +5253,46 @@ impl Linter {
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
-                                    let selected_cols = call
+                                    let selected_cols =
+                                        ast_extract::extract_select_args_columns(call);
+                                    // A `pl.col(...)`/`col(...)` argument is already
+                                    // validated, unconditionally, by
+                                    // `validate_pl_col_args_on_receiver` below --
+                                    // skip it here so a bad name isn't reported twice.
+                                    // Only relevant to this shape (plain string-literal
+                                    // args, `.filter(items=...)`, `.loc[:, [...]]` never
+                                    // overlap with that check).
+                                    let has_pl_col_arg = call
                                         .arguments
                                         .args
-                                        .first()
-                                        .and_then(ast_extract::extract_string_list);
+                                        .iter()
+                                        .any(|a| ast_extract::extract_pl_col_name(a).is_some());
                                     match selected_cols {
                                         Some(cols) => {
-                                            if let Some(ref bc) = base_cols {
-                                                for col in &cols {
-                                                    if !bc.contains(col) {
-                                                        let schema_display = base_info
-                                                            .as_ref()
-                                                            .map(|(s, l)| {
-                                                                self.schema_display(s, *l)
-                                                            })
-                                                            .unwrap_or_else(|| {
-                                                                "unknown".to_string()
+                                            if !has_pl_col_arg {
+                                                if let Some(ref bc) = base_cols {
+                                                    for col in &cols {
+                                                        if !bc.contains(col) {
+                                                            let schema_display = base_info
+                                                                .as_ref()
+                                                                .map(|(s, l)| {
+                                                                    self.schema_display(s, *l)
+                                                                })
+                                                                .unwrap_or_else(|| {
+                                                                    "unknown".to_string()
+                                                                });
+                                                            errors.push(LintError {
+                                                                line: current_line,
+                                                                col: current_col,
+                                                                code: CODE_UNKNOWN_COLUMN
+                                                                    .to_string(),
+                                                                message: format!(
+                                                                    "Column '{}' does not exist in {}",
+                                                                    col, schema_display
+                                                                ),
+                                                                severity: "error".to_string(),
                                                             });
-                                                        errors.push(LintError {
-                                                            line: current_line,
-                                                            col: current_col,
-                                                            code: CODE_UNKNOWN_COLUMN.to_string(),
-                                                            message: format!(
-                                                                "Column '{}' does not exist in {}",
-                                                                col, schema_display
-                                                            ),
-                                                            severity: "error".to_string(),
-                                                        });
+                                                        }
                                                     }
                                                 }
                                             }
@@ -5078,12 +5324,30 @@ impl Linter {
                                             }
                                         }
                                         None => {
+                                            // A `.select(...)` whose specific columns
+                                            // couldn't be resolved (`pl.all()`,
+                                            // `pl.exclude(...)`, a dynamic expression,
+                                            // ...) is still a known column-selecting
+                                            // op -- its result must not be assumed to
+                                            // keep the base's full column set, the way
+                                            // an actually row-only op does. Mirrors how
+                                            // `.drop()`/`.rename()` handle an
+                                            // unresolvable specific edit elsewhere in
+                                            // this same dispatch.
                                             if let Some((base_schema, _)) = base_info {
+                                                let var_name = assign_var_hint(assign, recv_str);
+                                                let schema_name = self.count_mutation_leg(
+                                                    Some(&base_schema),
+                                                    None,
+                                                    &var_name,
+                                                    current_line,
+                                                    current_col,
+                                                );
                                                 for target in &assign.targets {
                                                     if let Expr::Name(target_name) = target {
                                                         self.variables.insert(
                                                             target_name.id.to_string(),
-                                                            (base_schema.clone(), current_line),
+                                                            (schema_name.clone(), current_line),
                                                         );
                                                     }
                                                 }
@@ -9784,6 +10048,143 @@ df = pd.read_csv("data.csv", usecols=["a", "b"])
     }
 
     #[test]
+    fn test_should_observe_downstream_usage_for_a_module_level_untyped_site() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+sales = pd.read_csv("data.csv")
+print(sales["a"])
+if flag:
+    print(sales["b"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.untyped_sites.len(), 1);
+        let site = &linter.untyped_sites[0];
+        let usage = linter
+            .untyped_site_usage
+            .get(&(site.line, site.col))
+            .expect("usage recorded for the module-level site");
+        assert_eq!(
+            usage.accesses,
+            vec![
+                column_usage::ColumnAccess {
+                    column: "a".to_string(),
+                    conditional: false
+                },
+                column_usage::ColumnAccess {
+                    column: "b".to_string(),
+                    conditional: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_should_observe_downstream_usage_for_a_function_level_untyped_site() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+def run():
+    sales = pd.read_csv("data.csv")
+    print(sales["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        let site = &linter.untyped_sites[0];
+        let usage = linter
+            .untyped_site_usage
+            .get(&(site.line, site.col))
+            .unwrap();
+        assert_eq!(usage.accesses[0].column, "a");
+    }
+
+    #[test]
+    fn test_should_not_observe_usage_for_an_origin_nested_inside_control_flow() {
+        // arrange: a known scope limit of this first pass -- see `column_usage`'s
+        // module doc comment.
+        let source = r#"
+import pandas as pd
+
+if flag:
+    sales = pd.read_csv("data.csv")
+    print(sales["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the site is still recorded (coverage is unaffected), just no usage
+        assert_eq!(linter.untyped_sites.len(), 1);
+        assert!(linter.untyped_site_usage.is_empty());
+    }
+
+    #[test]
+    fn test_should_record_separate_usage_per_untyped_site() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+a = pd.read_csv("a.csv")
+print(a["x"])
+b = pd.read_csv("b.csv")
+print(b["y"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.untyped_sites.len(), 2);
+        assert_eq!(linter.untyped_site_usage.len(), 2);
+        let usage_a = &linter.untyped_site_usage
+            [&(linter.untyped_sites[0].line, linter.untyped_sites[0].col)];
+        let usage_b = &linter.untyped_site_usage
+            [&(linter.untyped_sites[1].line, linter.untyped_sites[1].col)];
+        assert_eq!(usage_a.accesses[0].column, "x");
+        assert_eq!(usage_b.accesses[0].column, "y");
+    }
+
+    #[test]
+    fn test_should_omit_usage_when_nothing_downstream_was_observed() {
+        // arrange: the site is recorded, but nothing ever reads from it.
+        let source = r#"
+import pandas as pd
+
+sales = pd.read_csv("data.csv")
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: no entry at all, rather than one holding two empty vecs.
+        assert!(linter.untyped_site_usage.is_empty());
+    }
+
+    #[test]
     fn test_should_keep_untyped_site_count_equal_to_total_minus_typed() {
         // arrange: a mix of resolved and unresolved origins, including a SELECT *
         // that resolves as a load rather than an inferable column list
@@ -12893,6 +13294,162 @@ bad = df.select(col("cost"))
         // assert
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("cost"));
+    }
+
+    #[test]
+    fn test_should_narrow_to_an_exact_schema_through_loc_column_selection() {
+        // arrange: `.loc[:, [...]]` -- the row part is irrelevant to the column set.
+        let (_, errors) =
+            lint_for_leg_tests("out = df.loc[:, [\"a\"]]\nprint(out[\"a\"])\nprint(out[\"b\"])\n");
+
+        // assert: `b` was dropped by the selection, correctly flagged against {a}, not
+        // silently allowed through a preserved {a, b}.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'b'"));
+        assert!(errors[0].message.contains("{a}"));
+    }
+
+    #[test]
+    fn test_should_narrow_to_an_exact_schema_through_loc_on_an_untracked_base() {
+        // arrange: `.loc[:, [...]]` on a base the checker never resolved a schema for
+        // still narrows to an exact, typed one -- same principle as `df[["a", "b"]]`.
+        let (_linter, errors) = lint_source(
+            "import pandas as pd\n\n\ndef load() -> pd.DataFrame:\n    ...\n\n\ndf = load()\nout = df.loc[:, [\"a\", \"b\"]]\nprint(out[\"a\"])\nprint(out[\"nope\"])\n",
+        );
+
+        // assert: same "narrowing, not a new counted origin" accounting as `[[...]]`
+        // above -- what matters here is that `nope` is correctly caught at all.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_leave_a_single_indexer_loc_read_untracked() {
+        // arrange: `.loc[mask]` (one indexer, a row mask) is a different shape this
+        // change doesn't touch -- a fresh target from it is untracked before and after
+        // (a separate, pre-existing gap: the general same-name-rebind reclassification
+        // this checker has elsewhere doesn't extend to a brand-new target name here).
+        // Confirms this PR doesn't regress it into a false claim either way.
+        let (linter, errors) =
+            lint_for_leg_tests("mask = df[\"a\"] > 1\nout = df.loc[mask]\nprint(out[\"zzz\"])\n");
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(!linter.variables.contains_key("out"));
+    }
+
+    #[test]
+    fn test_should_narrow_to_an_exact_schema_through_filter_items() {
+        // arrange: pandas' `.filter(items=[...])` selects COLUMNS -- this used to be
+        // wrongly treated as a row-preserving op (same method name, different meaning
+        // from polars/pandas' own row-filtering `.filter(mask)`), silently keeping the
+        // full base schema and missing a real typo on an excluded column.
+        let (_, errors) = lint_for_leg_tests("out = df.filter(items=[\"a\"])\nprint(out[\"b\"])\n");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'b'"));
+        assert!(errors[0].message.contains("{a}"));
+    }
+
+    #[test]
+    fn test_should_leave_a_positional_filter_mask_as_row_preserving() {
+        // arrange: no items=/like=/regex= kwarg -- the ROW-filtering shape, unaffected.
+        let (_, errors) =
+            lint_for_leg_tests("out = df.filter(df[\"a\"] > 1)\nprint(out[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("{a, b}"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_filter_items_with_a_dynamic_list() {
+        // arrange: still a column selection, just not one whose result is knowable --
+        // must not be reported as a false unknown-column against the stale full schema.
+        let (_, errors) = lint_for_leg_tests(
+            "cols = get_cols()\nout = df.filter(items=cols)\nprint(out[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_filter_like() {
+        // arrange: `like=`/`regex=` are inherently dynamic pattern selections.
+        let (_, errors) =
+            lint_for_leg_tests("out = df.filter(like=\"prefix_\")\nprint(out[\"zzz\"])\n");
+
+        // assert
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+    }
+
+    #[test]
+    fn test_should_narrow_to_an_exact_schema_through_select_variadic_pl_col_args() {
+        // arrange: `select(pl.col("a"), pl.col("b"))` -- the variadic polars form, as
+        // opposed to the already-supported single-list-literal `select(["a", "b"])`.
+        let source = r#"
+import polars as pl
+
+class S:
+    pass
+
+df = pl.read_csv("x.csv", columns=["a", "b", "c"])
+out = df.select(pl.col("a"), pl.col("b"))
+print(out["a"])
+print(out["c"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: narrowed to the exact {a, b}, not the base's full {a, b, c} --
+        // exactly one error (the pre-existing pl.col validator and this narrowing must
+        // not both separately flag the same bad reference).
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'c'"));
+        assert!(errors[0].message.contains("{a, b}"));
+    }
+
+    #[test]
+    fn test_should_narrow_to_an_exact_schema_through_select_variadic_string_args() {
+        // arrange: bare string positional args, `select("a", "b")` -- pandas has no
+        // such form, but polars does, and it shares no code path with `pl.col(...)`.
+        let (_, errors) = lint_for_leg_tests("out = df.select(\"a\", \"b\")\nprint(out[\"c\"])\n");
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'c'"));
+        assert!(errors[0].message.contains("{a, b}"));
+    }
+
+    #[test]
+    fn test_should_mark_unresolved_after_a_select_this_checker_cannot_resolve() {
+        // arrange: `pl.all()` selects every column dynamically -- not a knowable exact
+        // set, and (the bug this fixes) must not be reported as a safe pass-through of
+        // the base's full schema either.
+        let source = r#"
+import polars as pl
+
+df = pl.read_csv("x.csv", columns=["a", "b"])
+out = df.select(pl.all())
+print(out["zzz"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
     }
 
     #[test]

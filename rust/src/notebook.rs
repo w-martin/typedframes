@@ -70,6 +70,18 @@ pub(crate) struct NotebookLegEvent {
     pub reason: String,
 }
 
+/// The [`crate::errors::UntypedSiteUsage`] counterpart, relocated to notebook
+/// coordinates.
+#[derive(Debug, Serialize)]
+pub(crate) struct NotebookUntypedSiteUsage {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub accesses: Vec<crate::column_usage::ColumnAccess>,
+    pub other_uses: Vec<crate::column_usage::OtherUse>,
+}
+
 /// The notebook counterpart of [`FileStats`], nested under `stats` in
 /// [`NotebookCheckResult`] -- matching [`crate::errors::CheckFileResult`]'s shape so
 /// the Python side can treat both JSON payloads the same way.
@@ -81,6 +93,7 @@ pub(crate) struct NotebookFileStats {
     pub typed_sites: Vec<NotebookTypedSite>,
     pub all_dataframe_calls: Vec<NotebookDataFrameCallSite>,
     pub leg_events: Vec<NotebookLegEvent>,
+    pub untyped_site_usage: Vec<NotebookUntypedSiteUsage>,
 }
 
 /// The JSON payload returned by the `check_notebook` entry point. Same shape as
@@ -215,6 +228,22 @@ pub(crate) fn translate_result(
         })
         .collect();
 
+    let untyped_site_usage = stats
+        .untyped_site_usage
+        .into_iter()
+        .map(|u| {
+            let (cell, line) = translate(index, u.line);
+            NotebookUntypedSiteUsage {
+                cell,
+                line,
+                col: u.col,
+                var: u.var,
+                accesses: u.accesses,
+                other_uses: u.other_uses,
+            }
+        })
+        .collect();
+
     NotebookCheckResult {
         errors,
         stats: NotebookFileStats {
@@ -224,6 +253,7 @@ pub(crate) fn translate_result(
             typed_sites,
             all_dataframe_calls,
             leg_events,
+            untyped_site_usage,
         },
     }
 }
@@ -352,6 +382,16 @@ mod tests {
                 outcome: "unresolved".to_string(),
                 reason: "`clean()` is not modelled".to_string(),
             }],
+            untyped_site_usage: vec![crate::errors::UntypedSiteUsage {
+                line: 1,
+                col: 1,
+                var: "df".to_string(),
+                accesses: vec![crate::column_usage::ColumnAccess {
+                    column: "a".to_string(),
+                    conditional: false,
+                }],
+                other_uses: vec![],
+            }],
         };
 
         // act
@@ -381,5 +421,9 @@ mod tests {
         assert_eq!(result.stats.leg_events.len(), 1);
         assert_eq!(result.stats.leg_events[0].cell, 2);
         assert_eq!(result.stats.leg_events[0].outcome, "unresolved");
+        assert_eq!(result.stats.untyped_site_usage.len(), 1);
+        assert_eq!(result.stats.untyped_site_usage[0].cell, 2);
+        assert_eq!(result.stats.untyped_site_usage[0].line, 1);
+        assert_eq!(result.stats.untyped_site_usage[0].accesses[0].column, "a");
     }
 }

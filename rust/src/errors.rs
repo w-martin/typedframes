@@ -74,6 +74,11 @@ pub struct FileStats {
     pub all_dataframe_calls: Vec<DataFrameCallSite>,
     /// Every place a tracked frame stopped carrying its column set -- see [`LegEvent`].
     pub leg_events: Vec<LegEvent>,
+    /// Downstream column usage observed for an `untyped_sites` entry -- see
+    /// [`UntypedSiteUsage`]. One entry per site that had SOME usage to report; a site
+    /// this pass didn't attempt (its origin is nested inside control flow) or found
+    /// nothing downstream for has none here at all.
+    pub untyped_site_usage: Vec<UntypedSiteUsage>,
 }
 
 /// One DataFrame origin the linter recognized but could not resolve columns for.
@@ -94,6 +99,22 @@ pub struct UntypedSite {
     pub col: usize,
     /// The assigned variable name where one was available, else a generic stand-in.
     pub var: String,
+}
+
+/// Downstream usage the checker observed for one [`UntypedSite`] -- what a schema for
+/// it would need to cover, going by how the rest of its own scope actually uses it.
+/// See `column_usage`'s module doc comment for the top-level-of-scope-only scope
+/// limit this is subject to, and `column_consuming_methods` for how an `OtherUse`'s
+/// `consumes` verdict is decided. Line and column match the `UntypedSite` this
+/// belongs to, matched by callers via that pair rather than nested inside
+/// `UntypedSite` itself, since most sites have no usage to report at all.
+#[derive(Debug, Serialize)]
+pub struct UntypedSiteUsage {
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub accesses: Vec<crate::column_usage::ColumnAccess>,
+    pub other_uses: Vec<crate::column_usage::OtherUse>,
 }
 
 /// A recognized DataFrame origin that DID resolve to a concrete column set --

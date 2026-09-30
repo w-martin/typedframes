@@ -357,6 +357,7 @@ class _FileCheckResult(NamedTuple):
     typed_sites: list[dict]
     all_dataframe_calls: list[dict]
     leg_events: list[dict]
+    untyped_site_usage: list[dict]
 
 
 _CheckFileFn = Callable[[str, bytes | None], str]
@@ -384,6 +385,7 @@ def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
         typed_sites=[{**site, "file": str(file_path)} for site in stats.get("typed_sites", [])],
         all_dataframe_calls=[{**site, "file": str(file_path)} for site in stats.get("all_dataframe_calls", [])],
         leg_events=[{**event, "file": str(file_path)} for event in stats.get("leg_events", [])],
+        untyped_site_usage=[{**usage, "file": str(file_path)} for usage in stats.get("untyped_site_usage", [])],
     )
 
 
@@ -454,7 +456,9 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     independent scan regardless of whether it was actually recognized as an
     origin) -- together these back ``--coverage-detail=explain``, as do
     ``leg_events``: every statement after which a tracked frame's columns stopped
-    being known, and why.
+    being known, and why. ``untyped_site_usage`` is the downstream-usage counterpart
+    for an ``untyped_sites`` entry -- see `column_usage`'s own doc comment in the
+    Rust source for exactly what this observes and the scope limit it has.
     """
     try:
         from typedframes._rust_checker import check_file, check_notebook
@@ -473,6 +477,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     typed_sites: list[dict] = []
     all_dataframe_calls: list[dict] = []
     leg_events: list[dict] = []
+    untyped_site_usage: list[dict] = []
     for file_path in files:
         if file_path.suffix == ".ipynb":
             outcome = _check_notebook_file(file_path, check_notebook, index_bytes)
@@ -488,6 +493,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         typed_sites.extend(outcome.typed_sites)
         all_dataframe_calls.extend(outcome.all_dataframe_calls)
         leg_events.extend(outcome.leg_events)
+        untyped_site_usage.extend(outcome.untyped_site_usage)
     return all_errors, {
         **totals,
         "per_file": per_file,
@@ -495,6 +501,7 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         "typed_sites": typed_sites,
         "all_dataframe_calls": all_dataframe_calls,
         "leg_events": leg_events,
+        "untyped_site_usage": untyped_site_usage,
     }
 
 
@@ -954,13 +961,56 @@ def _event_location(event: dict) -> str:
     return f"{prefix}{event['line']}:{event['col']}"
 
 
-def _format_explain(
-    all_dataframe_calls: list[dict],
-    typed_sites: list[dict],
-    untyped_sites: list[dict],
-    root: Path,
-    leg_events: Sequence[dict] = (),
-) -> str:
+def _usage_lines(usage: dict) -> list[str]:
+    """One text line per observed access/other-use in `usage`.
+
+    In the "tracking ended" style -- location, variable, then what was seen, each
+    flagged "(conditional)" when it doesn't happen on every execution path.
+    """
+    location = f"{_event_location(usage):<12} {usage['var']:<16} "
+    lines = []
+    for access in usage["accesses"]:
+        suffix = " (conditional)" if access["conditional"] else ""
+        lines.append(f"{location}'{access['column']}'{suffix}")
+    for use in usage["other_uses"]:
+        suffix = " (conditional)" if use["conditional"] else ""
+        lines.append(f"{location}{use['description']}{suffix}")
+    return lines
+
+
+@dataclass(frozen=True)
+class ExplainSources:
+    """The raw per-file lists `--coverage-detail=explain` draws its report from.
+
+    Bundled into one object (rather than a handful of separate parameters) since
+    `_format_explain` and `_explain_json_payload` both need every one of these and
+    only ever receive them from the same `coverage`/`stats` dict a caller already
+    has -- see `_coverage_detail_json_payload`/`_print_coverage_report`.
+    """
+
+    all_dataframe_calls: list[dict]
+    typed_sites: list[dict]
+    untyped_sites: list[dict]
+    leg_events: Sequence[dict] = ()
+    untyped_site_usage: Sequence[dict] = ()
+
+    @classmethod
+    def from_coverage(cls, coverage: dict) -> ExplainSources:
+        """Pull every field from a `coverage`/`stats` dict by its own key.
+
+        Defaults each to empty when absent -- the shape both `_check_files`'
+        return value and a notebook-translated `stats` payload already have.
+        """
+        return cls(
+            all_dataframe_calls=coverage.get("all_dataframe_calls", []),
+            typed_sites=coverage.get("typed_sites", []),
+            untyped_sites=coverage.get("untyped_sites", []),
+            leg_events=coverage.get("leg_events", []),
+            untyped_site_usage=coverage.get("untyped_site_usage", []),
+        )
+
+
+def _format_explain(sources: ExplainSources, root: Path) -> str:
     """Render every DataFrame-shaped call site found in each file, counted or not.
 
     The ``--coverage-detail=explain`` report: unlike ``term-missing`` (which only
@@ -971,18 +1021,21 @@ def _format_explain(
     each site is classified.
 
     Each file's list is followed by the statements after which a tracked frame's
-    columns stopped being known, with the reason.
+    columns stopped being known, with the reason, and then -- for an untyped site
+    whose own downstream usage this pass could observe (see `column_usage`'s doc
+    comment in the Rust source) -- which columns and other operations were seen.
     """
-    if not all_dataframe_calls and not leg_events:
+    if not sources.all_dataframe_calls and not sources.leg_events and not sources.untyped_site_usage:
         return "No DataFrame-shaped calls found to check"
 
-    calls_by_file = _sites_by_file(all_dataframe_calls)
-    typed_by_file = _sites_by_file(typed_sites)
-    untyped_by_file = _sites_by_file(untyped_sites)
-    events_by_file = _sites_by_file(list(leg_events))
+    calls_by_file = _sites_by_file(sources.all_dataframe_calls)
+    typed_by_file = _sites_by_file(sources.typed_sites)
+    untyped_by_file = _sites_by_file(sources.untyped_sites)
+    events_by_file = _sites_by_file(list(sources.leg_events))
+    usage_by_file = _sites_by_file(list(sources.untyped_site_usage))
 
     lines: list[str] = []
-    for name in sorted(calls_by_file.keys() | events_by_file.keys()):
+    for name in sorted(calls_by_file.keys() | events_by_file.keys() | usage_by_file.keys()):
         typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
         untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
         if lines:
@@ -998,6 +1051,11 @@ def _format_explain(
                 f"    {_event_location(event):<12} {event['var']:<16} {event['outcome']} -- {event['reason']}"
                 for event in file_events
             )
+        file_usage = sorted(usage_by_file.get(name, []), key=_position_key)
+        if file_usage:
+            lines.append("  columns used downstream:")
+            for usage in file_usage:
+                lines.extend(f"    {line}" for line in _usage_lines(usage))
     return "\n".join(lines)
 
 
@@ -1034,25 +1092,32 @@ def _tracking_ended_entry(event: dict) -> dict:
     }
 
 
-def _explain_json_payload(
-    all_dataframe_calls: list[dict],
-    typed_sites: list[dict],
-    untyped_sites: list[dict],
-    root: Path,
-    leg_events: Sequence[dict] = (),
-) -> dict:
+def _columns_used_entry(usage: dict) -> dict:
+    """Render one `untyped_site_usage` entry as a JSON object for `_explain_json_payload`."""
+    return {
+        "line": usage["line"],
+        "col": usage["col"],
+        **({"cell": usage["cell"]} if "cell" in usage else {}),
+        "var": usage["var"],
+        "accesses": usage["accesses"],
+        "other_uses": usage["other_uses"],
+    }
+
+
+def _explain_json_payload(sources: ExplainSources, root: Path) -> dict:
     """Build the machine-readable `--coverage-detail=explain` document.
 
     The structured counterpart to `_format_explain`. A file with tracking-ended
     events but no DataFrame-shaped calls still appears, with an empty ``calls``.
     """
-    calls_by_file = _sites_by_file(all_dataframe_calls)
-    typed_by_file = _sites_by_file(typed_sites)
-    untyped_by_file = _sites_by_file(untyped_sites)
-    events_by_file = _sites_by_file(list(leg_events))
+    calls_by_file = _sites_by_file(sources.all_dataframe_calls)
+    typed_by_file = _sites_by_file(sources.typed_sites)
+    untyped_by_file = _sites_by_file(sources.untyped_sites)
+    events_by_file = _sites_by_file(list(sources.leg_events))
+    usage_by_file = _sites_by_file(list(sources.untyped_site_usage))
 
     files = []
-    for name in sorted(calls_by_file.keys() | events_by_file.keys()):
+    for name in sorted(calls_by_file.keys() | events_by_file.keys() | usage_by_file.keys()):
         typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
         untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
         files.append(
@@ -1065,6 +1130,9 @@ def _explain_json_payload(
                 "tracking_ended": [
                     _tracking_ended_entry(event) for event in sorted(events_by_file.get(name, []), key=_position_key)
                 ],
+                "columns_used": [
+                    _columns_used_entry(usage) for usage in sorted(usage_by_file.get(name, []), key=_position_key)
+                ],
             }
         )
     return {"files": files}
@@ -1073,13 +1141,7 @@ def _explain_json_payload(
 def _coverage_detail_json_payload(coverage: dict, root: Path, *, detail: str) -> dict:
     """Dispatch to the right `--coverage-detail` JSON builder for a non-`summary` detail level."""
     if detail == "explain":
-        return _explain_json_payload(
-            coverage.get("all_dataframe_calls", []),
-            coverage.get("typed_sites", []),
-            coverage.get("untyped_sites", []),
-            root,
-            coverage.get("leg_events", []),
-        )
+        return _explain_json_payload(ExplainSources.from_coverage(coverage), root)
     return _coverage_json_payload(
         coverage.get("per_file", {}),
         coverage.get("untyped_sites", []),
@@ -1153,15 +1215,7 @@ def _print_coverage_report(stats: dict, root: Path, *, detail: str) -> None:
 
     print()
     if detail == "explain":
-        print(
-            _format_explain(
-                stats.get("all_dataframe_calls", []),
-                stats.get("typed_sites", []),
-                stats.get("untyped_sites", []),
-                root,
-                stats.get("leg_events", []),
-            )
-        )
+        print(_format_explain(ExplainSources.from_coverage(stats), root))
         return
 
     per_file = stats.get("per_file", {})

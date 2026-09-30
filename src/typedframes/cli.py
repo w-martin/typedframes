@@ -671,6 +671,80 @@ class RunStats:
     dataframes_typed: int
 
 
+def _split_errors_by_confidence(errors_only: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split error-severity diagnostics into confirmed and unverifiable ones.
+
+    "Confirmed" means definitely wrong; "unverifiable" means the checker couldn't
+    check the access at all, not "checked and it's wrong" -- the summary line
+    counts them separately so "1 error" never quietly means "1 access the checker
+    had no basis to judge".
+    """
+    confirmed = [e for e in errors_only if e.get("code") != "unverifiable-column"]
+    unverifiable = [e for e in errors_only if e.get("code") == "unverifiable-column"]
+    return confirmed, unverifiable
+
+
+def _error_summary_parts(errors_only: list[dict], warnings: list[dict]) -> list[str]:
+    """The comma-joined pieces of the "Found ..." summary line.
+
+    Confirmed errors, unverifiable ones, and warnings, each omitted when there are
+    none of that kind. Confirmed and unverifiable are only split into two phrases
+    when at least one unverifiable-column diagnostic is present -- with none, this
+    reads exactly as it always has ("N errors"), so the common case is unchanged.
+    """
+    confirmed, unverifiable = _split_errors_by_confidence(errors_only)
+    parts = []
+    if confirmed or not unverifiable:
+        label = "error" if len(confirmed) == 1 else "errors"
+        parts.append(f"{len(confirmed)} {label}")
+    if unverifiable:
+        label = "unverifiable error" if len(unverifiable) == 1 else "unverifiable errors"
+        parts.append(f"{len(unverifiable)} {label}")
+    if warnings:
+        label = "warning" if len(warnings) == 1 else "warnings"
+        parts.append(f"{len(warnings)} {label}")
+    return parts
+
+
+# Below this fraction of tracked DataFrames having a concrete column list, the
+# error/warning summary leads with a coverage caveat instead of trailing it -- see
+# `_low_coverage_caveat`.
+_LOW_COVERAGE_THRESHOLD = 0.5
+
+
+def _low_coverage_caveat(stats: RunStats, all_errors: list[dict]) -> str | None:
+    """A coverage-ratio line noting that the diagnostics below only reflect what little could be tracked.
+
+    Printed FIRST, ahead of the diagnostics themselves, whenever under half the
+    DataFrames the checker saw had a concrete column list. Below that threshold a
+    small "N errors" count reads as reassuring ("only N problems") when the more
+    important fact is that most of the run was never actually checked;
+    `_coverage_message` carries the same caveat in its usual, easy-to-miss spot at
+    the very end of the output, for everything above the threshold.
+
+    `all_errors` must be the exact list about to be printed (post `--no-warnings`/
+    `--no-info`/`--lenient-ingest` filtering, done by `_apply_diagnostic_policy`
+    before this is ever called) -- not `errors_only`/`warnings`, which exclude
+    info-severity diagnostics (e.g. `--lenient-ingest`'s untracked-dataframe
+    downgrade) that still print in the body, and would otherwise undercount. With
+    `all_errors` empty -- genuinely nothing found, or everything filtered out by one
+    of those flags -- this returns `None` rather than a "0 findings below" caveat
+    with nothing actually below it; `_coverage_message`'s own plain wording already
+    covers that case correctly, with no claim about what's printed alongside it.
+    """
+    if not all_errors:
+        return None
+    if stats.dataframes_total == 0 or stats.dataframes_typed / stats.dataframes_total >= _LOW_COVERAGE_THRESHOLD:
+        return None
+    pct = round(100 * stats.dataframes_typed / stats.dataframes_total)
+    findings = len(all_errors)
+    noun, verb = ("finding", "covers") if findings == 1 else ("findings", "cover")
+    return (
+        f"\u2139 {stats.dataframes_typed}/{stats.dataframes_total} DataFrames had column info "
+        f"({pct}%) \u2014 the {findings} {noun} below only {verb} what little could be tracked"
+    )
+
+
 def _coverage_message(stats: RunStats) -> str:
     """Build the low-key DataFrame schema coverage summary line.
 
@@ -1151,11 +1225,18 @@ def _print_results(
     use_color = output_format == "text" and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
     if output_format == "github":
+        caveat = _low_coverage_caveat(stats, all_errors) if show_info else None
+        if caveat:
+            print(f"::notice title=typedframes DataFrame schema coverage::{caveat[2:]}")
         if all_errors:
             print(_format_github(all_errors))
-        if show_info:
+        if show_info and not caveat:
             print(f"::notice title=typedframes DataFrame schema coverage::{_coverage_message(stats)[2:]}")
         return
+
+    caveat = _low_coverage_caveat(stats, all_errors) if show_info else None
+    if caveat:
+        print(f"{_DIM}{caveat}{_RESET}" if use_color else caveat)
 
     # text format
     if all_errors:
@@ -1164,21 +1245,14 @@ def _print_results(
 
     file_label = "file" if len(files) == 1 else "files"
     if errors_only or warnings:
-        parts = []
-        if errors_only:
-            error_label = "error" if len(errors_only) == 1 else "errors"
-            parts.append(f"{len(errors_only)} {error_label}")
-        if warnings:
-            warn_label = "warning" if len(warnings) == 1 else "warnings"
-            parts.append(f"{len(warnings)} {warn_label}")
-        summary = ", ".join(parts)
+        summary = ", ".join(_error_summary_parts(errors_only, warnings))
         msg = f"\u2717 Found {summary} in {len(files)} {file_label} ({stats.elapsed:.1f}s)"
         print(f"{_BOLD_RED}{msg}{_RESET}" if use_color else msg)
     else:
         msg = f"\u2713 Checked {len(files)} {file_label} in {stats.elapsed:.1f}s"
         print(f"{_BOLD_GREEN}{msg}{_RESET}" if use_color else msg)
 
-    if show_info:
+    if show_info and not caveat:
         coverage_msg = _coverage_message(stats)
         print(f"{_DIM}{coverage_msg}{_RESET}" if use_color else coverage_msg)
 

@@ -21,6 +21,7 @@ from typedframes.cli import (
     _coverage_failure_message,
     _coverage_json_payload,
     _coverage_message,
+    _error_summary_parts,
     _evaluate_coverage,
     _explain_json_entry,
     _explain_json_payload,
@@ -32,6 +33,7 @@ from typedframes.cli import (
     _glob_to_regex,
     _load_configured_excludes,
     _load_coverage_config,
+    _low_coverage_caveat,
     _override_for,
     _percentage,
     _relative_posix,
@@ -1891,6 +1893,201 @@ class TestCli(unittest.TestCase):
 
         # assert
         self.assertEqual("\u2139 No DataFrames with recognized loads/schemas found to check", message)
+
+    def test_should_summarize_errors_as_a_single_count_with_no_unverifiable_ones(self) -> None:
+        """Test that the summary reads exactly as before when nothing is unverifiable."""
+        # arrange
+        errors = [{"code": "unknown-column"}, {"code": "reserved-name"}]
+
+        # act
+        parts = _error_summary_parts(errors, [])
+
+        # assert
+        self.assertEqual(["2 errors"], parts)
+
+    def test_should_split_unverifiable_errors_out_from_confirmed_ones(self) -> None:
+        """Test that a mix of confirmed and unverifiable errors gets two separate phrases."""
+        # arrange
+        errors = [
+            {"code": "unknown-column"},
+            {"code": "unverifiable-column"},
+            {"code": "unverifiable-column"},
+        ]
+
+        # act
+        parts = _error_summary_parts(errors, [{"code": "untracked-dataframe"}])
+
+        # assert
+        self.assertEqual(["1 error", "2 unverifiable errors", "1 warning"], parts)
+
+    def test_should_omit_the_confirmed_count_when_every_error_is_unverifiable(self) -> None:
+        """Test that "0 errors" never appears -- only unverifiable ones are reported."""
+        # arrange
+        errors = [{"code": "unverifiable-column"}]
+
+        # act
+        parts = _error_summary_parts(errors, [])
+
+        # assert
+        self.assertEqual(["1 unverifiable error"], parts)
+
+    def test_should_return_no_low_coverage_caveat_when_nothing_was_seen(self) -> None:
+        """Test that a zero denominator is not treated as low coverage."""
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=0, dataframes_typed=0)
+
+        # act / assert
+        self.assertIsNone(_low_coverage_caveat(stats, []))
+
+    def test_should_return_no_low_coverage_caveat_at_or_above_half(self) -> None:
+        """Test that the caveat only fires below 50% coverage, not at or above it."""
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=2, dataframes_typed=1)
+
+        # act / assert
+        self.assertIsNone(_low_coverage_caveat(stats, []))
+
+    def test_should_build_a_low_coverage_caveat_below_half(self) -> None:
+        """Test the caveat's wording, including singular/plural finding count."""
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=11, dataframes_typed=0)
+
+        # act
+        one_finding = _low_coverage_caveat(stats, [{"code": "unverifiable-column"}])
+        many_findings = _low_coverage_caveat(
+            stats, [{"code": "unverifiable-column"}, *[{"code": "untracked-dataframe"}] * 4]
+        )
+
+        # assert
+        expected = (
+            "\u2139 0/11 DataFrames had column info (0%) "
+            "\u2014 the 1 finding below only covers what little could be tracked"
+        )
+        self.assertEqual(expected, one_finding)
+        assert many_findings is not None
+        self.assertIn("the 5 findings below only cover", many_findings)
+
+    def test_should_print_the_low_coverage_caveat_before_the_diagnostics_and_suppress_the_repeat(self) -> None:
+        """Test that low coverage leads with the caveat, not the usual trailing coverage line.
+
+        Also checks that the confirmed/unverifiable split shows in the "Found ..." summary.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "open.py"
+            py_file.write_text(
+                "import pandas as pd\n\n\ndef load() -> pd.DataFrame:\n    ...\n\n\ndf = load()\nprint(df['zzz'])\n"
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file)])
+
+            # assert
+            output = captured.getvalue()
+            caveat_index = output.index("only covers what little could be tracked")
+            found_index = output.index("Found")
+            self.assertLess(caveat_index, found_index)
+            self.assertEqual(1, output.count("DataFrames had column info"))
+            self.assertIn("1 unverifiable error", output)
+
+    def test_should_return_no_low_coverage_caveat_when_there_is_nothing_to_report(self) -> None:
+        """Test that an empty error list never produces a "0 findings below" caveat."""
+        # arrange
+        stats = RunStats(elapsed=0.1, dataframes_total=11, dataframes_typed=0)
+
+        # act / assert
+        self.assertIsNone(_low_coverage_caveat(stats, []))
+
+    def test_should_count_info_severity_diagnostics_in_the_low_coverage_caveat(self) -> None:
+        """Test that --lenient-ingest's info-downgraded diagnostics are not invisible to the count.
+
+        Regression test: the caveat used to be built from `errors_only`/`warnings`,
+        both of which exclude severity="info", undercounting a diagnostic that still
+        prints in the body.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "untyped.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv')\nprint(df['a'])\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--lenient-ingest"])
+
+            # assert: the caveat counts the (info-severity) diagnostic it sits above,
+            # rather than claiming "0 findings" while one prints right below it.
+            output = captured.getvalue()
+            self.assertIn("the 1 finding below only covers", output)
+            self.assertIn("info[untracked-dataframe]", output)
+
+    def test_should_omit_the_low_coverage_caveat_when_no_warnings_filters_everything_out(self) -> None:
+        """Test that suppressing every diagnostic present also suppresses the caveat about them.
+
+        Regression test: with a file whose only diagnostics are warnings, --no-warnings
+        used to still print "the 0 findings below only cover..." with nothing printed
+        below it at all.
+        """
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "untyped.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv')\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--no-warnings"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertNotIn("findings below", output)
+            self.assertIn("0/1 DataFrames had column info (0%)", output)
+            self.assertIn("✓ Checked 1 file", output)
+
+    def test_should_lead_github_notices_with_the_low_coverage_caveat_too(self) -> None:
+        """Test that --output-format=github gets the same low-coverage caveat text as the text format."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "open.py"
+            py_file.write_text(
+                "import pandas as pd\n\n\ndef load() -> pd.DataFrame:\n    ...\n\n\ndf = load()\nprint(df['zzz'])\n"
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--output-format", "github"])
+
+            # assert: the caveat notice comes before the per-diagnostic annotation, and
+            # the plain unconditional coverage notice is not ALSO printed alongside it.
+            output = captured.getvalue()
+            caveat_index = output.index("only covers what little could be tracked")
+            annotation_index = output.index("::error")
+            self.assertLess(caveat_index, annotation_index)
+            self.assertEqual(1, output.count("title=typedframes DataFrame schema coverage"))
+
+    def test_should_keep_the_plain_github_coverage_notice_above_the_threshold(self) -> None:
+        """Test that github output is unaffected when coverage doesn't warrant the caveat."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "typed.py"
+            py_file.write_text("import pandas as pd\ndf = pd.read_csv('x.csv', usecols=['a', 'b'])\n")
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", str(py_file), "--output-format", "github"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("::notice title=typedframes DataFrame schema coverage::1/1 DataFrames", output)
 
     def test_should_build_json_coverage_payload_with_unrounded_percentages(self) -> None:
         """Test that the JSON report keeps the exact ratio for machine consumers."""

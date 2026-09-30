@@ -201,27 +201,58 @@ jobs:
           allow-prereleases: true
 
       - name: Install published package
+        id: install
+        # Doesn't fail the run: PyPI availability lagging behind a successful
+        # publish (see the step's own comment) isn't evidence anything is wrong
+        # with the release, so it's a warning annotation, not a red workflow --
+        # `continue-on-error` plus the `if` on the next step is what keeps a
+        # download hiccup from crying wolf about the release itself.
+        continue-on-error: true
         run: |
-          # 20 attempts / 30s apart = up to 10 minutes. Was 10 attempts (5 min):
-          # too tight for PyPI's Fastly CDN, which can serve a stale simple-index
-          # page from a not-yet-invalidated edge node for several minutes after a
-          # publish -- seen in practice on the v0.4.1 release, where this job alone
-          # (of five running the same install within the same second) kept missing
-          # the new version for the full 5-minute window while its matrix siblings
-          # found it on their first attempt.
+          # 30 attempts / 60s apart = up to 30 minutes. Was 20 attempts / 30s (10
+          # min), before that 10 attempts / 30s (5 min): too tight for PyPI's
+          # Fastly CDN, which can serve a stale simple-index page from a
+          # not-yet-invalidated edge node for several minutes after a publish --
+          # seen in practice on the v0.4.1 release, where this job alone (of five
+          # running the same install within the same second) kept missing the new
+          # version for the full 5-minute window while its matrix siblings found
+          # it on their first attempt, and again on v0.8.0, where the 10-minute
+          # window itself ran out.
+          #
+          # v0.8.0 also showed this isn't uniform propagation delay: the other
+          # four Python versions in this same matrix all found the release on
+          # their FIRST retry, within a second of each other, while this one kept
+          # missing it for the entire window -- one runner stuck on one stale
+          # Fastly edge, not PyPI-wide lag. Polling through pip can't dodge that:
+          # `pip install --index-url <url>?cb=...` doesn't help, since pip's own
+          # URL-joining drops a base index URL's query string when it resolves the
+          # package path onto it. Polling PyPI's per-version JSON endpoint with
+          # curl instead, with a fresh random query string every attempt, at
+          # least gives a stuck edge node a reason to treat each request as a
+          # fresh cache miss rather than replaying the same stale answer.
           VERSION="${GITHUB_REF#refs/tags/v}"
-          for i in {1..20}; do
-            pip install typedframes==${VERSION} && break
-            if [ "$i" -eq 20 ]; then
-              echo "Error: typedframes==${VERSION} not available on PyPI after 20 attempts (10 minutes)"
-              exit 1
+          FOUND=false
+          for i in {1..30}; do
+            if curl -fsS "https://pypi.org/pypi/typedframes/${VERSION}/json?cb=${RANDOM}-$(date +%s%N)" -o /dev/null; then
+              FOUND=true
+              break
             fi
-            echo "Attempt $i failed, retrying in 30s..."
-            sleep 30
+            if [ "$i" -eq 30 ]; then
+              break
+            fi
+            echo "Attempt $i: typedframes==${VERSION} not yet visible on PyPI, retrying in 60s..."
+            sleep 60
           done
-          pip install pytest mypy pandera pandas polars
+          if [ "$FOUND" = "false" ]; then
+            echo "::warning::typedframes==${VERSION} was not visible on PyPI within 30 minutes of publish (likely a stale CDN edge stuck on this one runner -- see this step's comment). The release itself (wheels + sdist + GitHub release) already succeeded; only this post-publish smoke test couldn't confirm it this cycle."
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          pip install "typedframes==${VERSION}" pytest mypy pandera pandas polars
+          echo "installed=true" >> "$GITHUB_OUTPUT"
 
       - name: Run tests against published package
+        if: steps.install.outputs.installed == 'true'
         run: |
           rm -rf src pyproject.toml
           pytest tests/integration/

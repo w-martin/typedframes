@@ -293,6 +293,19 @@ pub struct Linter {
     // Names bound exactly once in the whole file, to a `True`/`False` literal -- the
     // boolean counterpart of `string_var_candidates`, for `inplace=flag`.
     pub(crate) bool_var_candidates: HashMap<String, bool>,
+    // Names initialized as `name = []` and thereafter only ever added to via
+    // `name.append({...})` with a literal dict of string-literal keys, right up to
+    // being read (as the first positional argument) by a `DataFrame(name)` call --
+    // the accumulator counterpart of `pd.DataFrame([{...}, {...}])`. Maps to the
+    // union of every append's keys, in first-seen order. Populated by a
+    // `DictListBindingCollector` pre-pass alongside `string_var_candidates`; poisoned
+    // (absent from this map) by a second `= []`, any other reassignment, any
+    // `.append()` call whose argument isn't such a dict literal, or any other bare
+    // reference to the name at all (passed to a function, checked for truthiness,
+    // indexed, ...) -- same "give up rather than guess" policy as
+    // `string_var_candidates`, deliberately conservative since a missed mutation here
+    // would mean inferring a schema real code could add columns past.
+    pub(crate) dict_list_var_candidates: HashMap<String, Vec<String>>,
     // Names bound to a resolved SQLAlchemy Core `select(...)` column list — e.g.
     // `stmt = select(Order.id, Order.amount)`. Populated inline during the main
     // top-to-bottom statement walk (unlike `string_var_candidates`, which needs a
@@ -729,6 +742,232 @@ impl<'a> Visitor<'a> for StringBindingCollector<'a> {
     }
 }
 
+// One `name = []` candidate's state -- see `Linter::dict_list_var_candidates`.
+enum DictListBinding {
+    // The union of every recognized `.append({...})` call's keys, in first-seen
+    // order.
+    Building(Vec<String>),
+    Poisoned,
+}
+
+// AST visitor backing `Linter::dict_list_var_candidates` -- see that field's doc
+// comment for the exact policy. `accounted_for` holds the source range of every Name
+// node already explained by a recognized `.append({...})` receiver or `DataFrame(name)`
+// argument, so the generic "any other appearance poisons it" rule in `visit_expr`
+// doesn't also fire for those two approved occurrences.
+struct DictListBindingCollector {
+    bindings: HashMap<String, DictListBinding>,
+    accounted_for: std::collections::HashSet<ruff_text_size::TextRange>,
+}
+
+impl DictListBindingCollector {
+    fn poison(&mut self, name: &str) {
+        self.bindings
+            .insert(name.to_string(), DictListBinding::Poisoned);
+    }
+
+    // Poison every bare name an assignment/for/with/del target touches -- mirrors
+    // `StringBindingCollector::record_target_names`.
+    fn record_target_names(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(n) => self.poison(n.id.as_str()),
+            Expr::Tuple(t) => t.elts.iter().for_each(|e| self.record_target_names(e)),
+            Expr::List(l) => l.elts.iter().for_each(|e| self.record_target_names(e)),
+            Expr::Starred(s) => self.record_target_names(&s.value),
+            _ => {}
+        }
+    }
+
+    // `name.append(arg)`: extends the candidate with `arg`'s keys if it's a dict
+    // literal of string-literal keys, else poisons it. A no-op for a name that was
+    // never initialized as `= []` in the first place.
+    fn record_append(&mut self, name: &str, arg: Option<&Expr>) {
+        if !self.bindings.contains_key(name) {
+            return;
+        }
+        let extracted = match arg {
+            Some(Expr::Dict(dict)) => dict
+                .items
+                .iter()
+                .map(|item| {
+                    item.key
+                        .as_ref()
+                        .and_then(|k| ast_extract::extract_string_literal(k))
+                        .map(str::to_string)
+                })
+                .collect::<Option<Vec<String>>>(),
+            _ => None,
+        };
+        let Some(binding) = self.bindings.get_mut(name) else {
+            return;
+        };
+        match (binding, extracted) {
+            (DictListBinding::Poisoned, _) => {}
+            (binding, None) => *binding = DictListBinding::Poisoned,
+            (DictListBinding::Building(keys), Some(new_keys)) => {
+                for key in new_keys {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Visitor<'a> for DictListBindingCollector {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::Assign(assign) => {
+                if let [Expr::Name(target)] = assign.targets.as_slice() {
+                    let name = target.id.as_str();
+                    if matches!(&*assign.value, Expr::List(list) if list.elts.is_empty()) {
+                        if self.bindings.contains_key(name) {
+                            self.poison(name);
+                        } else {
+                            self.bindings
+                                .insert(name.to_string(), DictListBinding::Building(Vec::new()));
+                            // The defining target itself is a bare Name reference too --
+                            // exempt it from the generic poison-on-any-appearance rule
+                            // below, the same way an `.append` receiver or a
+                            // `DataFrame(name)` argument is.
+                            self.accounted_for.insert(target.range());
+                        }
+                    } else {
+                        self.poison(name);
+                    }
+                } else {
+                    for target in &assign.targets {
+                        self.record_target_names(target);
+                    }
+                }
+            }
+            Stmt::AnnAssign(ann) => {
+                if let Expr::Name(n) = &*ann.target {
+                    self.poison(n.id.as_str());
+                }
+            }
+            Stmt::AugAssign(aug) => self.record_target_names(&aug.target),
+            Stmt::For(for_stmt) => self.record_target_names(&for_stmt.target),
+            Stmt::Global(g) => {
+                for name in &g.names {
+                    self.poison(name.as_str());
+                }
+            }
+            Stmt::Nonlocal(nl) => {
+                for name in &nl.names {
+                    self.poison(name.as_str());
+                }
+            }
+            Stmt::Delete(del) => {
+                for target in &del.targets {
+                    self.record_target_names(target);
+                }
+            }
+            Stmt::Import(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.poison(bound.as_str());
+                }
+            }
+            Stmt::ImportFrom(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.poison(bound.as_str());
+                }
+            }
+            _ => {}
+        }
+        ast_visitor::walk_stmt(self, stmt);
+    }
+
+    fn visit_except_handler(&mut self, handler: &'a ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(h) = handler;
+        if let Some(name) = &h.name {
+            self.poison(name.as_str());
+        }
+        ast_visitor::walk_except_handler(self, handler);
+    }
+
+    fn visit_parameter(&mut self, parameter: &'a ast::Parameter) {
+        self.poison(parameter.name.as_str());
+        ast_visitor::walk_parameter(self, parameter);
+    }
+
+    fn visit_with_item(&mut self, item: &'a ast::WithItem) {
+        if let Some(vars) = &item.optional_vars {
+            self.record_target_names(vars);
+        }
+        ast_visitor::walk_with_item(self, item);
+    }
+
+    fn visit_comprehension(&mut self, comp: &'a ast::Comprehension) {
+        self.record_target_names(&comp.target);
+        ast_visitor::walk_comprehension(self, comp);
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Call(call) = expr {
+            if let Expr::Attribute(attr) = &*call.func {
+                if attr.attr.as_str() == "append" {
+                    if let Expr::Name(recv) = &*attr.value {
+                        self.accounted_for.insert(attr.value.range());
+                        self.record_append(recv.id.as_str(), call.arguments.args.first());
+                    }
+                }
+            }
+            if is_dataframe_constructor_callee(&call.func) {
+                if let Some(first @ Expr::Name(_)) = call.arguments.args.first() {
+                    self.accounted_for.insert(first.range());
+                }
+            }
+        }
+        if let Expr::Named(named) = expr {
+            if let Expr::Name(n) = &*named.target {
+                self.poison(n.id.as_str());
+            }
+        }
+        if let Expr::Name(name) = expr {
+            if !self.accounted_for.contains(&expr.range()) {
+                if let Some(DictListBinding::Building(_)) = self.bindings.get(name.id.as_str()) {
+                    self.poison(name.id.as_str());
+                }
+            }
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
+}
+
+// `DataFrame(...)` or `<anything>.DataFrame(...)` -- the constructor shape
+// `dict_list_var_candidates`/`extract_load_columns` both recognize, matching how the
+// rest of the checker treats a `DataFrame` call regardless of its receiver (`pd.`,
+// `pl.`, an aliased import, ...).
+fn is_dataframe_constructor_callee(func: &Expr) -> bool {
+    match func {
+        Expr::Name(name) => name.id.as_str() == "DataFrame",
+        Expr::Attribute(attr) => attr.attr.as_str() == "DataFrame",
+        _ => false,
+    }
+}
+
+fn collect_dict_list_var_candidates(body: &[Stmt]) -> HashMap<String, Vec<String>> {
+    let mut collector = DictListBindingCollector {
+        bindings: HashMap::new(),
+        accounted_for: std::collections::HashSet::new(),
+    };
+    for stmt in body {
+        collector.visit_stmt(stmt);
+    }
+    collector
+        .bindings
+        .into_iter()
+        .filter_map(|(name, binding)| match binding {
+            DictListBinding::Building(keys) if !keys.is_empty() => Some((name, keys)),
+            _ => None,
+        })
+        .collect()
+}
+
 // The row indexer of a `df.loc[rows, cols]` target.
 fn loc_row_indexer(target: &Expr) -> Option<&Expr> {
     let Expr::Subscript(subscript) = target else {
@@ -1148,6 +1387,7 @@ impl Linter {
             sql_dialect: sql::SqlDialect::Generic,
             project_root: None,
             string_var_candidates: HashMap::new(),
+            dict_list_var_candidates: HashMap::new(),
             bool_var_candidates: HashMap::new(),
             stmt_var_candidates: HashMap::new(),
             retrieval_jobs: HashMap::new(),
@@ -1271,6 +1511,7 @@ impl Linter {
         self.line_index = Some(LineIndex::from_source_text(source));
         (self.string_var_candidates, self.bool_var_candidates) =
             self.collect_literal_var_candidates(&module.body, path);
+        self.dict_list_var_candidates = collect_dict_list_var_candidates(&module.body);
         let mut df_usage_collector = DataFrameShapedUsageCollector {
             names: std::collections::HashSet::new(),
         };
@@ -1724,18 +1965,35 @@ impl Linter {
         // never fires for read_csv/read_json/etc., whose first positional argument is
         // a path or buffer, not column data — a dict there means something else
         // entirely and inferring columns from it would be wrong.
+        // `DataFrame([{...}, {...}])` -- a literal list of per-row dict literals
+        // (records orientation), or `DataFrame(records)` where `records` is a name
+        // this file's own pre-pass traced back to such a list built via `.append()`
+        // in a loop -- see `Linter::dict_list_var_candidates`.
         if func_name == "DataFrame" {
-            if let Some(Expr::Dict(dict)) = call.arguments.args.first() {
-                let keys: Vec<String> = dict
-                    .items
-                    .iter()
-                    .filter_map(|item| item.key.as_ref())
-                    .filter_map(|k| ast_extract::extract_string_literal(k))
-                    .map(|s| s.to_string())
-                    .collect();
-                if !keys.is_empty() {
-                    return (Some(keys), LoadKind::File);
+            match call.arguments.args.first() {
+                Some(Expr::Dict(dict)) => {
+                    let keys: Vec<String> = dict
+                        .items
+                        .iter()
+                        .filter_map(|item| item.key.as_ref())
+                        .filter_map(|k| ast_extract::extract_string_literal(k))
+                        .map(|s| s.to_string())
+                        .collect();
+                    if !keys.is_empty() {
+                        return (Some(keys), LoadKind::File);
+                    }
                 }
+                Some(Expr::List(list)) => {
+                    if let Some(cols) = ast_extract::extract_records_list_columns(list) {
+                        return (Some(cols), LoadKind::File);
+                    }
+                }
+                Some(Expr::Name(name)) => {
+                    if let Some(cols) = self.dict_list_var_candidates.get(name.id.as_str()) {
+                        return (Some(cols.clone()), LoadKind::File);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -8427,6 +8685,301 @@ print(df["a"])
         // assert
         assert_eq!(linter.dataframes_total, 1);
         assert_eq!(linter.dataframes_typed, 1);
+    }
+
+    #[test]
+    fn test_should_infer_columns_from_a_literal_list_of_dict_literals() {
+        // arrange: pandas' "records" orientation -- one dict literal per row, passed
+        // directly as a list literal. Columns are the union of every row's keys.
+        let source = r#"
+import pandas as pd
+
+df = pd.DataFrame([{"a": 1, "b": 2}, {"a": 3, "c": 4}])
+print(df["a"])
+print(df["c"])
+print(df["nope"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: union is {a, b, c}, in first-seen order; only the genuine typo flags.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+        assert!(errors[0].message.contains("{a, b, c}"));
+    }
+
+    #[test]
+    fn test_should_leave_a_list_of_non_dict_elements_untracked() {
+        // arrange: not every element is a dict literal -- can't infer columns from it.
+        let source = r#"
+import pandas as pd
+
+df = pd.DataFrame([{"a": 1}, "not a dict"])
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: recognized as a DataFrame origin, but not typed -- no false claim.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_infer_columns_from_an_append_loop_accumulator() {
+        // arrange: `records = []` then `.append({literal dict})` calls in a loop --
+        // the shape a `pd.DataFrame([{...}])` literal can't cover on its own.
+        let source = r#"
+import pandas as pd
+
+records = []
+for row in rows:
+    records.append({"a": row.a, "b": row.b})
+
+df = pd.DataFrame(records)
+print(df["a"])
+print(df["nope"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+        assert!(errors[0].message.contains("{a, b}"));
+    }
+
+    #[test]
+    fn test_should_union_keys_across_nested_loop_appends_in_first_seen_order() {
+        // arrange: a nested loop, appending the same shape of dict every iteration --
+        // the pattern this feature exists for.
+        let source = r#"
+import pandas as pd
+
+records = []
+for x in xs:
+    for y in ys:
+        records.append({"sku": x, "date": y, "price": 1})
+
+df = pd.DataFrame(records)
+print(df["sku"])
+print(df["price"])
+print(df["nope"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"));
+        assert!(errors[0].message.contains("{sku, date, price}"));
+    }
+
+    #[test]
+    fn test_should_leave_an_accumulator_untracked_when_mutated_by_another_function() {
+        // arrange: `helper` could append anything -- a call we can't see into must not
+        // be silently assumed harmless.
+        let source = r#"
+import pandas as pd
+
+def helper(records):
+    records.append({"weird_key": 1})
+
+records = []
+records.append({"a": 1})
+helper(records)
+df = pd.DataFrame(records)
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: no false unknown-column against an incomplete {a}-only schema.
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_leave_an_accumulator_untracked_after_a_non_append_mutation() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+records = []
+records.append({"a": 1})
+records.extend([{"b": 2}])
+df = pd.DataFrame(records)
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_leave_an_accumulator_untracked_after_an_append_with_a_dynamic_key() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+records = []
+key = "a"
+records.append({key: 1})
+df = pd.DataFrame(records)
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_leave_an_accumulator_untracked_after_a_read_only_reference() {
+        // arrange: even a harmless-looking `len(records)` before construction poisons
+        // it -- deliberately conservative, since distinguishing "definitely read-only"
+        // calls from ones that might mutate isn't attempted.
+        let source = r#"
+import pandas as pd
+
+records = []
+records.append({"a": 1})
+print(len(records))
+df = pd.DataFrame(records)
+print(df["a"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_leave_an_accumulator_untracked_after_being_reinitialized() {
+        // arrange: two separate `records = []` bindings -- ambiguous which loop's
+        // appends belong to "the" list by the time DataFrame(records) is reached.
+        let source = r#"
+import pandas as pd
+
+records = []
+records.append({"a": 1})
+records = []
+records.append({"b": 2})
+df = pd.DataFrame(records)
+print(df["b"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_infer_columns_for_an_unrelated_name_that_happens_to_hold_a_list() {
+        // arrange: `items` is never initialized as `[]`, so it's simply never a
+        // candidate -- not poisoned, just never tracked in the first place.
+        let source = r#"
+import pandas as pd
+
+items = get_items()
+df = pd.DataFrame(items)
+print(df["anything"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 0);
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
+            "errors: {errors:?}"
+        );
     }
 
     #[test]

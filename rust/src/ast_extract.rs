@@ -29,6 +29,31 @@ pub(crate) fn decorator_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+// Column names for `pd.DataFrame([{...}, {...}])` -- a literal list of per-row dict
+// literals (pandas' "records" orientation). Every element must be a dict literal with
+// only string-literal keys; the result is the union of every row's keys, in
+// first-seen order (matching how pandas itself orders the resulting columns) -- a row
+// missing a key another row has doesn't invalidate the inference, it's just NaN for
+// that row.
+pub(crate) fn extract_records_list_columns(list: &ast::ExprList) -> Option<Vec<String>> {
+    if list.elts.is_empty() {
+        return None;
+    }
+    let mut columns = Vec::new();
+    for elt in &list.elts {
+        let Expr::Dict(dict) = elt else {
+            return None;
+        };
+        for item in &dict.items {
+            let key = item.key.as_ref().and_then(|k| extract_string_literal(k))?;
+            if !columns.iter().any(|c: &String| c == key) {
+                columns.push(key.to_string());
+            }
+        }
+    }
+    Some(columns)
+}
+
 pub(crate) fn extract_string_literal(expr: &Expr) -> Option<&str> {
     if let Expr::StringLiteral(s) = expr {
         Some(s.value.to_str())

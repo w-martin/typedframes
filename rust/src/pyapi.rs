@@ -4,7 +4,9 @@
 //! `#[pyfunction]`s and the process-wide deserialised-index cache.
 
 use crate::config::{find_project_root, load_linter_config};
-use crate::errors::{CheckFileResult, FileStats, LintError, CODE_UNTRACKED_DATAFRAME};
+use crate::errors::{
+    CheckFileResult, FileStats, LintError, UntypedSiteUsage, CODE_UNTRACKED_DATAFRAME,
+};
 use crate::index::{build_index_internal, build_single_file_index_internal, ProjectIndex};
 use crate::notebook::{self, NotebookCheckResult, NotebookFileStats};
 use crate::Linter;
@@ -14,6 +16,28 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+// Joins `linter.untyped_sites` (which has var/line/col) with `linter.untyped_site_usage`
+// (keyed by position only) into the flat, self-contained list `FileStats` exposes --
+// must run before either map is taken/cleared, so it's a read-only borrow, not a take.
+fn collect_untyped_site_usage(linter: &Linter) -> Vec<UntypedSiteUsage> {
+    linter
+        .untyped_sites
+        .iter()
+        .filter_map(|site| {
+            linter
+                .untyped_site_usage
+                .get(&(site.line, site.col))
+                .map(|usage| UntypedSiteUsage {
+                    line: site.line,
+                    col: site.col,
+                    var: site.var.clone(),
+                    accesses: usage.accesses.clone(),
+                    other_uses: usage.other_uses.clone(),
+                })
+        })
+        .collect()
+}
 
 /// Check a single Python file for DataFrame column errors.
 ///
@@ -96,6 +120,7 @@ pub(crate) fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyR
         errors.retain(|e| e.severity != "warning");
     }
 
+    let untyped_site_usage = collect_untyped_site_usage(&linter);
     let result = CheckFileResult {
         errors,
         stats: FileStats {
@@ -105,6 +130,7 @@ pub(crate) fn check_file(file_path: String, index_bytes: Option<Vec<u8>>) -> PyR
             typed_sites: std::mem::take(&mut linter.typed_sites),
             all_dataframe_calls: std::mem::take(&mut linter.all_dataframe_calls),
             leg_events: std::mem::take(&mut linter.leg_events),
+            untyped_site_usage,
         },
     };
 
@@ -198,6 +224,7 @@ pub(crate) fn check_notebook(file_path: String, index_bytes: Option<Vec<u8>>) ->
         errors.retain(|e| e.severity != "warning");
     }
 
+    let untyped_site_usage = collect_untyped_site_usage(&linter);
     let stats = FileStats {
         dataframes_total: linter.dataframes_total,
         dataframes_typed: linter.dataframes_typed,
@@ -205,6 +232,7 @@ pub(crate) fn check_notebook(file_path: String, index_bytes: Option<Vec<u8>>) ->
         typed_sites: std::mem::take(&mut linter.typed_sites),
         all_dataframe_calls: std::mem::take(&mut linter.all_dataframe_calls),
         leg_events: std::mem::take(&mut linter.leg_events),
+        untyped_site_usage,
     };
     let result = notebook::translate_result(errors, stats, &file_display, notebook.index());
 

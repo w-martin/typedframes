@@ -34,6 +34,8 @@
 //! after all errors have been collected.
 
 mod ast_extract;
+mod column_consuming_methods;
+mod column_usage;
 mod config;
 mod constants;
 mod contract;

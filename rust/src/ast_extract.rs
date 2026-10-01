@@ -616,6 +616,87 @@ pub(crate) fn extract_pl_col_name(expr: &Expr) -> Option<String> {
 
 // Recursively collect all column names referenced via `pl.col("name")` / `col("name")`
 // in an expression tree. Handles chained calls, lists, tuples, comparisons, and binary ops.
+// Column names for `df.select(...)`: either a single list-literal argument
+// (`select(["a", "b"])`, the existing pandas-`.filter`-adjacent shape), or one or
+// more positional arguments each resolving to a single column name -- a bare string
+// literal or a `pl.col("name")` call (`select("a", "b")`,
+// `select(pl.col("a"), pl.col("b"))`, or a mix of the two). `None` when any argument
+// isn't one of those recognized shapes (`pl.all()`, `pl.exclude(...)`, a dynamic
+// expression, ...) -- the caller treats that the same as an unrecognized edit, not as
+// "no columns selected".
+// Whether `df.filter(...)` is pandas' column/index-label-selecting form
+// (`items=`/`like=`/`regex=`) rather than the row-filtering positional-mask/callable
+// form (`df.filter(mask)`) both pandas and polars also spell this same method name
+// for -- the two do fundamentally different things and must not share handling.
+pub(crate) fn filter_is_column_selecting(call: &ast::ExprCall) -> bool {
+    let has_selector_kwarg = call.arguments.keywords.iter().any(|kw| {
+        matches!(
+            kw.arg.as_ref().map(|a| a.as_str()),
+            Some("items") | Some("like") | Some("regex")
+        )
+    });
+    if !has_selector_kwarg {
+        return false;
+    }
+    // `.filter`'s default axis is columns; `axis=0`/`axis="index"` redirects
+    // items=/like=/regex= to INDEX LABELS instead, which this checker has no model
+    // for -- treat that the same as the row-filtering `.filter(mask)` form (leave it
+    // alone entirely) rather than validate it against the column schema.
+    let axis_kwarg = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("axis"));
+    match axis_kwarg {
+        Some(axis_kw) => !axis_kwarg_selects_index(&axis_kw.value),
+        None => true,
+    }
+}
+
+fn axis_kwarg_selects_index(value: &Expr) -> bool {
+    match value {
+        Expr::NumberLiteral(n) => matches!(&n.value, ast::Number::Int(i) if i.as_u64() == Some(0)),
+        Expr::StringLiteral(s) => s.value.to_str() == "index",
+        _ => false,
+    }
+}
+
+// The literal column list from `df.filter(items=[...])`. `None` for `like=`/`regex=`
+// (pattern-based, inherently dynamic) or a non-literal `items=` -- still a column
+// selection, just not one whose exact result can be known statically.
+pub(crate) fn extract_filter_items_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
+    let items = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("items"))?;
+    extract_string_list(&items.value)
+}
+
+pub(crate) fn extract_select_args_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
+    if call.arguments.args.len() == 1 {
+        if let Expr::List(list) = &call.arguments.args[0] {
+            let mut cols = Vec::new();
+            for el in &list.elts {
+                cols.push(extract_string_literal(el)?.to_string());
+            }
+            return Some(cols);
+        }
+    }
+    if call.arguments.args.is_empty() {
+        return None;
+    }
+    call.arguments
+        .args
+        .iter()
+        .map(|arg| {
+            extract_string_literal(arg)
+                .map(str::to_string)
+                .or_else(|| extract_pl_col_name(arg))
+        })
+        .collect()
+}
+
 pub(crate) fn collect_pl_col_names(expr: &Expr) -> Vec<String> {
     if let Some(name) = extract_pl_col_name(expr) {
         return vec![name];
@@ -746,6 +827,55 @@ mod tests {
         )));
         assert!(!extract_bare_dataframe_type(&annotation_of(
             "def f() -> None: ..."
+        )));
+    }
+
+    fn filter_call_of(source: &str) -> ast::ExprCall {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Expr(expr_stmt) = &parsed.into_syntax().body[0] else {
+            panic!("Expected an expression statement");
+        };
+        let Expr::Call(call) = (*expr_stmt.value).clone() else {
+            panic!("Expected a call expression");
+        };
+        call
+    }
+
+    #[test]
+    fn test_should_treat_filter_items_as_column_selecting_when_axis_is_absent() {
+        assert!(filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"])"
+        )));
+    }
+
+    #[test]
+    fn test_should_treat_filter_items_as_column_selecting_when_axis_is_columns() {
+        assert!(filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=1)"
+        )));
+        assert!(filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=\"columns\")"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_treat_filter_items_as_column_selecting_when_axis_is_index() {
+        // arrange/act/assert: axis=0 / axis="index" redirects items=/like=/regex= to
+        // INDEX LABELS, not columns -- this checker has no model for that, so it
+        // must be left alone entirely, the same as the row-filtering
+        // `.filter(mask)` form.
+        assert!(!filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=0)"
+        )));
+        assert!(!filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=\"index\")"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_plain_positional_filter_as_column_selecting() {
+        assert!(!filter_is_column_selecting(&filter_call_of(
+            "df.filter(mask)"
         )));
     }
 }

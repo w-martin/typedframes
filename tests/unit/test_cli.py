@@ -12,6 +12,7 @@ from unittest.mock import patch
 from typedframes.cli import (
     CoverageBucket,
     CoverageConfig,
+    ExplainSources,
     FileTally,
     RunStats,
     _check_files,
@@ -37,6 +38,7 @@ from typedframes.cli import (
     _override_for,
     _percentage,
     _relative_posix,
+    _usage_lines,
     main,
 )
 
@@ -2155,7 +2157,7 @@ class TestCli(unittest.TestCase):
         typed_sites = [{"file": "/proj/a.py", "line": 3, "schema": "S"}]
 
         # act
-        report = _format_explain(calls, typed_sites, [], Path("/proj"))
+        report = _format_explain(ExplainSources(calls, typed_sites, []), Path("/proj"))
 
         # assert
         self.assertIn("a.py", report)
@@ -2169,7 +2171,7 @@ class TestCli(unittest.TestCase):
         # arrange / act / assert
         self.assertEqual(
             "No DataFrame-shaped calls found to check",
-            _format_explain([], [], [], Path("/proj")),
+            _format_explain(ExplainSources([], [], []), Path("/proj")),
         )
 
     def test_should_build_explain_json_entry_for_each_status(self) -> None:
@@ -2210,7 +2212,7 @@ class TestCli(unittest.TestCase):
         calls = [{"file": "/proj/a.py", "line": 1, "col": 1, "label": "pd.DataFrame", "context": "x"}]
 
         # act
-        payload = _explain_json_payload(calls, [], [], Path("/proj"))
+        payload = _explain_json_payload(ExplainSources(calls, [], []), Path("/proj"))
 
         # assert
         self.assertEqual("a.py", payload["files"][0]["file"])
@@ -2241,7 +2243,7 @@ class TestCli(unittest.TestCase):
         ]
 
         # act
-        report = _format_explain(calls, [], [], Path("/proj"), events)
+        report = _format_explain(ExplainSources(calls, [], [], events), Path("/proj"))
 
         # assert: a file with events but no calls still gets a section.
         self.assertIn("  tracking ended:", report)
@@ -2279,8 +2281,8 @@ class TestCli(unittest.TestCase):
         ]
 
         # act
-        report = _format_explain(calls, [], [], Path("/proj"), events)
-        payload = _explain_json_payload(calls, [], [], Path("/proj"), events)
+        report = _format_explain(ExplainSources(calls, [], [], events), Path("/proj"))
+        payload = _explain_json_payload(ExplainSources(calls, [], [], events), Path("/proj"))
 
         # assert
         self.assertLess(report.index("cell 1:5:1"), report.index("cell 3:2:1"))
@@ -2318,7 +2320,7 @@ class TestCli(unittest.TestCase):
         calls = [{"file": "/proj/a.py", "line": 1, "col": 1, "label": "pd.read_csv", "context": "x"}]
 
         # act
-        report = _format_explain(calls, [], [], Path("/proj"))
+        report = _format_explain(ExplainSources(calls, [], []), Path("/proj"))
 
         # assert
         self.assertNotIn("tracking ended", report)
@@ -2332,7 +2334,7 @@ class TestCli(unittest.TestCase):
         ]
 
         # act
-        payload = _explain_json_payload([], [], [], Path("/proj"), events)
+        payload = _explain_json_payload(ExplainSources([], [], [], events), Path("/proj"))
 
         # assert
         entry = payload["files"][0]
@@ -2362,6 +2364,197 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("tracking ended:", output)
             self.assertIn("`.some_unknown()` is not modelled", output)
+
+    def test_should_render_usage_lines_for_accesses_and_other_uses(self) -> None:
+        """Test _usage_lines' text rendering, including the conditional marker."""
+        # arrange
+        usage = {
+            "line": 3,
+            "col": 1,
+            "var": "sales",
+            "accesses": [
+                {"column": "a", "conditional": False},
+                {"column": "b", "conditional": True},
+            ],
+            "other_uses": [{"description": "`.to_dict()`", "conditional": False, "consumes": "all"}],
+        }
+
+        # act
+        lines = _usage_lines(usage)
+
+        # assert
+        self.assertEqual(
+            [
+                "3:1          sales            'a'",
+                "3:1          sales            'b' (conditional)",
+                "3:1          sales            `.to_dict()` [touches every column]",
+            ],
+            lines,
+        )
+
+    def test_should_tag_a_non_consuming_other_use_in_text(self) -> None:
+        """Test that a `consumes: none` other-use is tagged in the text rendering."""
+        # arrange
+        usage = {
+            "line": 3,
+            "col": 1,
+            "var": "sales",
+            "accesses": [],
+            "other_uses": [{"description": "`.shape`", "conditional": False, "consumes": "none"}],
+        }
+
+        # act
+        lines = _usage_lines(usage)
+
+        # assert
+        self.assertEqual(["3:1          sales            `.shape` [touches no columns]"], lines)
+
+    def test_should_omit_the_consumption_tag_for_an_unknown_other_use(self) -> None:
+        """Test that `consumes: unknown` -- the common case -- adds no tag, kept unremarkable."""
+        # arrange
+        usage = {
+            "line": 3,
+            "col": 1,
+            "var": "sales",
+            "accesses": [],
+            "other_uses": [{"description": "passed to a call", "conditional": False, "consumes": "unknown"}],
+        }
+
+        # act
+        lines = _usage_lines(usage)
+
+        # assert
+        self.assertEqual(["3:1          sales            passed to a call"], lines)
+
+    def test_should_include_columns_used_section_in_explain_text(self) -> None:
+        """Test that _format_explain lists observed usage under its own file section."""
+        # arrange
+        usage = [
+            {
+                "file": "/proj/a.py",
+                "line": 3,
+                "col": 1,
+                "var": "sales",
+                "accesses": [{"column": "a", "conditional": False}],
+                "other_uses": [],
+            }
+        ]
+
+        # act
+        report = _format_explain(ExplainSources([], [], [], untyped_site_usage=usage), Path("/proj"))
+
+        # assert
+        self.assertIn("columns used downstream:", report)
+        self.assertIn("'a'", report)
+
+    def test_should_omit_columns_used_section_for_a_file_without_usage(self) -> None:
+        """Test that a file with no observed usage prints no columns-used section."""
+        # arrange
+        calls = [{"file": "/proj/a.py", "line": 1, "col": 1, "label": "pd.read_csv", "context": "x"}]
+
+        # act
+        report = _format_explain(ExplainSources(calls, [], []), Path("/proj"))
+
+        # assert
+        self.assertNotIn("columns used downstream", report)
+
+    def test_should_include_columns_used_only_files_in_explain_json_payload(self) -> None:
+        """Test that the JSON payload carries columns_used, including for a file with no calls."""
+        # arrange
+        usage = [
+            {
+                "file": "/proj/a.py",
+                "line": 3,
+                "col": 1,
+                "var": "sales",
+                "accesses": [{"column": "a", "conditional": False}],
+                "other_uses": [],
+            }
+        ]
+
+        # act
+        payload = _explain_json_payload(ExplainSources([], [], [], untyped_site_usage=usage), Path("/proj"))
+
+        # assert
+        entry = payload["files"][0]
+        self.assertEqual("a.py", entry["file"])
+        self.assertEqual([], entry["calls"])
+        self.assertEqual(
+            {
+                "line": 3,
+                "col": 1,
+                "var": "sales",
+                "accesses": [{"column": "a", "conditional": False}],
+                "other_uses": [],
+            },
+            entry["columns_used"][0],
+        )
+
+    def test_should_report_columns_used_downstream_end_to_end(self) -> None:
+        """Test that real downstream usage of an untyped origin is explained in the report."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text(
+                'import pandas as pd\n\nsales = pd.read_csv("data.csv")\nprint(sales["a"])\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "explain"])
+
+            # assert
+            output = captured.getvalue()
+            self.assertIn("columns used downstream:", output)
+            self.assertIn("sales", output)
+            self.assertIn("'a'", output)
+
+    def test_should_classify_a_whole_frame_consuming_method_in_json_output(self) -> None:
+        """Test that a `.to_dict()` other-use carries the Rust-computed `consumes` verdict."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text(
+                'import pandas as pd\n\nsales = pd.read_csv("data.csv")\nsales.to_dict()\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(
+                    [
+                        "check",
+                        tmpdir,
+                        "--no-warnings",
+                        "--coverage-detail",
+                        "explain",
+                        "--output-format",
+                        "json",
+                    ]
+                )
+
+            # assert
+            payload = json.loads(captured.getvalue())
+            other_uses = payload["coverage"]["files"][0]["columns_used"][0]["other_uses"]
+            self.assertEqual([{"description": "`.to_dict()`", "conditional": False, "consumes": "all"}], other_uses)
+
+    def test_should_show_the_consumption_tag_in_text_output_end_to_end(self) -> None:
+        """Test that the text report, not just JSON, surfaces the `consumes` verdict."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text(
+                'import pandas as pd\n\nsales = pd.read_csv("data.csv")\nsales.to_dict()\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "explain"])
+
+            # assert
+            self.assertIn("`.to_dict()` [touches every column]", captured.getvalue())
 
     def test_should_fail_the_gate_for_an_unresolved_schema_by_default(self) -> None:
         """Test that a DataFrame recognized but never resolved to concrete columns fails the gate.

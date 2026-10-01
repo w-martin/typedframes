@@ -5255,44 +5255,49 @@ impl Linter {
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
                                     let selected_cols =
                                         ast_extract::extract_select_args_columns(call);
-                                    // A `pl.col(...)`/`col(...)` argument is already
-                                    // validated, unconditionally, by
-                                    // `validate_pl_col_args_on_receiver` below --
-                                    // skip it here so a bad name isn't reported twice.
-                                    // Only relevant to this shape (plain string-literal
-                                    // args, `.filter(items=...)`, `.loc[:, [...]]` never
-                                    // overlap with that check).
-                                    let has_pl_col_arg = call
+                                    // A name from a `pl.col(...)`/`col(...)` argument is
+                                    // already validated, unconditionally, by
+                                    // `validate_pl_col_args_on_receiver` below -- skip
+                                    // just those names here so they aren't reported
+                                    // twice. A plain string-literal argument mixed into
+                                    // the same call (`select("a", pl.col("b"))`) is NOT
+                                    // covered by that other check (it only ever looks at
+                                    // `pl.col()` names), so it must still be validated
+                                    // here -- skipping the whole call whenever ANY
+                                    // `pl.col()` arg was present used to let a bad
+                                    // literal column through unvalidated.
+                                    let pl_col_names: std::collections::HashSet<String> = call
                                         .arguments
                                         .args
                                         .iter()
-                                        .any(|a| ast_extract::extract_pl_col_name(a).is_some());
+                                        .filter_map(ast_extract::extract_pl_col_name)
+                                        .collect();
                                     match selected_cols {
                                         Some(cols) => {
-                                            if !has_pl_col_arg {
-                                                if let Some(ref bc) = base_cols {
-                                                    for col in &cols {
-                                                        if !bc.contains(col) {
-                                                            let schema_display = base_info
-                                                                .as_ref()
-                                                                .map(|(s, l)| {
-                                                                    self.schema_display(s, *l)
-                                                                })
-                                                                .unwrap_or_else(|| {
-                                                                    "unknown".to_string()
-                                                                });
-                                                            errors.push(LintError {
-                                                                line: current_line,
-                                                                col: current_col,
-                                                                code: CODE_UNKNOWN_COLUMN
-                                                                    .to_string(),
-                                                                message: format!(
-                                                                    "Column '{}' does not exist in {}",
-                                                                    col, schema_display
-                                                                ),
-                                                                severity: "error".to_string(),
+                                            if let Some(ref bc) = base_cols {
+                                                for col in &cols {
+                                                    if pl_col_names.contains(col) {
+                                                        continue;
+                                                    }
+                                                    if !bc.contains(col) {
+                                                        let schema_display = base_info
+                                                            .as_ref()
+                                                            .map(|(s, l)| {
+                                                                self.schema_display(s, *l)
+                                                            })
+                                                            .unwrap_or_else(|| {
+                                                                "unknown".to_string()
                                                             });
-                                                        }
+                                                        errors.push(LintError {
+                                                            line: current_line,
+                                                            col: current_col,
+                                                            code: CODE_UNKNOWN_COLUMN.to_string(),
+                                                            message: format!(
+                                                                "Column '{}' does not exist in {}",
+                                                                col, schema_display
+                                                            ),
+                                                            severity: "error".to_string(),
+                                                        });
                                                     }
                                                 }
                                             }
@@ -13353,6 +13358,21 @@ bad = df.select(col("cost"))
     }
 
     #[test]
+    fn test_should_leave_filter_items_alone_when_axis_selects_the_index() {
+        // arrange: `axis=0` redirects `items=` to INDEX LABELS, not columns --
+        // regression test for a bug where this was still treated as a column
+        // selection regardless of axis=, producing a false positive on the bogus
+        // "column" AND corrupting the schema so a genuinely valid column access
+        // failed too.
+        let (_, errors) =
+            lint_for_leg_tests("out = df.filter(items=[\"row1\"], axis=0)\nprint(out[\"a\"])\n");
+
+        // assert: row-preserving, same as `.filter(mask)` -- base schema {a, b}
+        // unchanged, zero errors.
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
     fn test_should_leave_a_positional_filter_mask_as_row_preserving() {
         // arrange: no items=/like=/regex= kwarg -- the ROW-filtering shape, unaffected.
         let (_, errors) =
@@ -13414,6 +13434,31 @@ print(out["c"])
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].message.contains("'c'"));
         assert!(errors[0].message.contains("{a, b}"));
+    }
+
+    #[test]
+    fn test_should_validate_a_string_literal_mixed_with_a_pl_col_arg_in_select() {
+        // arrange: a bad bare string literal alongside a valid `pl.col(...)` arg in
+        // the SAME call -- regression test for a bug where the presence of ANY
+        // `pl.col()` arg skipped validating every OTHER arg's literal too, since
+        // the generic `pl.col()` checker only ever looks at `pl.col()` names, never
+        // string literals mixed in alongside them.
+        let source = r#"
+import polars as pl
+
+df = pl.read_csv("x.csv", columns=["a", "b"])
+out = df.select("bad_col", pl.col("a"))
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'bad_col'"));
     }
 
     #[test]

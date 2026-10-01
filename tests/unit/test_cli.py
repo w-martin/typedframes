@@ -2376,7 +2376,7 @@ class TestCli(unittest.TestCase):
                 {"column": "a", "conditional": False},
                 {"column": "b", "conditional": True},
             ],
-            "other_uses": [{"description": "`.to_dict()`", "conditional": False}],
+            "other_uses": [{"description": "`.to_dict()`", "conditional": False, "consumes": "all"}],
         }
 
         # act
@@ -2387,10 +2387,44 @@ class TestCli(unittest.TestCase):
             [
                 "3:1          sales            'a'",
                 "3:1          sales            'b' (conditional)",
-                "3:1          sales            `.to_dict()`",
+                "3:1          sales            `.to_dict()` [touches every column]",
             ],
             lines,
         )
+
+    def test_should_tag_a_non_consuming_other_use_in_text(self) -> None:
+        """Test that a `consumes: none` other-use is tagged in the text rendering."""
+        # arrange
+        usage = {
+            "line": 3,
+            "col": 1,
+            "var": "sales",
+            "accesses": [],
+            "other_uses": [{"description": "`.shape`", "conditional": False, "consumes": "none"}],
+        }
+
+        # act
+        lines = _usage_lines(usage)
+
+        # assert
+        self.assertEqual(["3:1          sales            `.shape` [touches no columns]"], lines)
+
+    def test_should_omit_the_consumption_tag_for_an_unknown_other_use(self) -> None:
+        """Test that `consumes: unknown` -- the common case -- adds no tag, kept unremarkable."""
+        # arrange
+        usage = {
+            "line": 3,
+            "col": 1,
+            "var": "sales",
+            "accesses": [],
+            "other_uses": [{"description": "passed to a call", "conditional": False, "consumes": "unknown"}],
+        }
+
+        # act
+        lines = _usage_lines(usage)
+
+        # assert
+        self.assertEqual(["3:1          sales            passed to a call"], lines)
 
     def test_should_include_columns_used_section_in_explain_text(self) -> None:
         """Test that _format_explain lists observed usage under its own file section."""
@@ -2504,6 +2538,23 @@ class TestCli(unittest.TestCase):
             payload = json.loads(captured.getvalue())
             other_uses = payload["coverage"]["files"][0]["columns_used"][0]["other_uses"]
             self.assertEqual([{"description": "`.to_dict()`", "conditional": False, "consumes": "all"}], other_uses)
+
+    def test_should_show_the_consumption_tag_in_text_output_end_to_end(self) -> None:
+        """Test that the text report, not just JSON, surfaces the `consumes` verdict."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text(
+                'import pandas as pd\n\nsales = pd.read_csv("data.csv")\nsales.to_dict()\n'
+            )
+
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-warnings", "--coverage-detail", "explain"])
+
+            # assert
+            self.assertIn("`.to_dict()` [touches every column]", captured.getvalue())
 
     def test_should_fail_the_gate_for_an_unresolved_schema_by_default(self) -> None:
         """Test that a DataFrame recognized but never resolved to concrete columns fails the gate.

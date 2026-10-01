@@ -75,6 +75,7 @@ pub(crate) fn scan_usage(root: &str, body: &[Stmt]) -> ColumnUsage {
         tainted: HashSet::from([root.to_string()]),
         depth: 0,
         usage: ColumnUsage::default(),
+        suppressed_self_reference: None,
     };
     for stmt in body {
         scan.visit_stmt(stmt);
@@ -88,11 +89,46 @@ struct UsageScan {
     // rather than something every execution path is known to reach.
     depth: u32,
     usage: ColumnUsage,
+    // While walking a tainted-receiver subscript's slice (`df[<slice>]`), the
+    // receiver's own bare name is already summarized by the observation just
+    // recorded for the whole subscript (specific columns, or "this subscript") --
+    // set to that receiver's name for the duration of the slice walk so a bare
+    // self-reference found inside it (`df[df > 0]`, `df[df.values]`) isn't ALSO
+    // recorded as a second, separate use of the same logical operation. A name
+    // found via something more specific than a bare reference (a nested
+    // `df["col"]`) is unaffected -- it never reaches the suppressed checks below.
+    suppressed_self_reference: Option<String>,
 }
 
 impl UsageScan {
     fn is_tainted(&self, expr: &Expr) -> bool {
         matches!(expr, Expr::Name(n) if self.tainted.contains(n.id.as_str()))
+    }
+
+    // `visit_expr` records a bare tainted `Name` reached generically (no more
+    // specific handling applied) as an "Unknown" other-use -- see its own `Expr::Name`
+    // arm. A pure alias (`out = df`, a walrus `y := df`) is NOT such a case: it's
+    // already fully captured by `retaint`, so callers that are about to retaint from
+    // this same expression call this instead of `visit_expr` directly, to avoid
+    // double-reporting a plain rename as if it were an unrecognized use.
+    fn visit_unless_tainted(&mut self, expr: &Expr) {
+        if !self.is_tainted(expr) {
+            self.visit_expr(expr);
+        }
+    }
+
+    // Like `is_tainted`, but returns the name itself -- callers that need to set
+    // `suppressed_self_reference` to it (Subscript) or check it against an already-
+    // suppressed name (Attribute, Call) use this instead.
+    fn tainted_name<'e>(&self, expr: &'e Expr) -> Option<&'e str> {
+        match expr {
+            Expr::Name(n) if self.tainted.contains(n.id.as_str()) => Some(n.id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_suppressed(&self, name: &str) -> bool {
+        self.suppressed_self_reference.as_deref() == Some(name)
     }
 
     // A name being (re)assigned either joins the tainted set (its value forwards an
@@ -136,6 +172,30 @@ impl UsageScan {
         self.depth -= 1;
     }
 
+    // See the `Expr::ListComp` etc. arms in `visit_expr` for why only the first
+    // generator's iterable is visited here.
+    fn visit_outer_comprehension_iter(&mut self, generators: &[ruff_python_ast::Comprehension]) {
+        let Some(first) = generators.first() else {
+            return;
+        };
+        if self.is_tainted(&first.iter) {
+            self.record_other("iterated over directly", Consumption::Unknown);
+        } else {
+            self.visit_expr(&first.iter);
+        }
+    }
+
+    fn visit_interpolated<'a>(
+        &mut self,
+        elements: impl Iterator<Item = &'a ruff_python_ast::InterpolatedStringElement>,
+    ) {
+        for element in elements {
+            if let ruff_python_ast::InterpolatedStringElement::Interpolation(interp) = element {
+                self.visit_expr(&interp.expression);
+            }
+        }
+    }
+
     fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             // A nested scope has its own bindings; the taint set built up so far
@@ -151,7 +211,11 @@ impl UsageScan {
             },
             Stmt::Expr(expr_stmt) => self.visit_expr(&expr_stmt.value),
             Stmt::Assign(assign) => {
-                self.visit_expr(&assign.value);
+                // A bare `out = df` is pure aliasing, already fully captured by
+                // `retaint` below -- must NOT also fall through to `visit_expr`'s
+                // generic `Expr::Name` fallback, or a plain rename would wrongly
+                // register as an "unrecognized use" alongside becoming tainted.
+                self.visit_unless_tainted(&assign.value);
                 let forwards = expr_forwards_tainted(&self.tainted, &assign.value);
                 for target in &assign.targets {
                     if let Expr::Name(t) = target {
@@ -161,7 +225,7 @@ impl UsageScan {
             }
             Stmt::AnnAssign(ann) => {
                 if let Some(value) = &ann.value {
-                    self.visit_expr(value);
+                    self.visit_unless_tainted(value);
                     if let Expr::Name(t) = &*ann.target {
                         self.retaint(t.id.as_str(), expr_forwards_tainted(&self.tainted, value));
                     }
@@ -210,6 +274,33 @@ impl UsageScan {
                 self.visit_conditional_body(&try_stmt.orelse);
                 self.visit_conditional_body(&try_stmt.finalbody);
             }
+            Stmt::Assert(assert_stmt) => {
+                self.visit_expr(&assert_stmt.test);
+                if let Some(msg) = &assert_stmt.msg {
+                    self.visit_expr(msg);
+                }
+            }
+            Stmt::Raise(raise_stmt) => {
+                if let Some(exc) = &raise_stmt.exc {
+                    self.visit_expr(exc);
+                }
+                if let Some(cause) = &raise_stmt.cause {
+                    self.visit_expr(cause);
+                }
+            }
+            Stmt::Match(match_stmt) => {
+                self.visit_expr(&match_stmt.subject);
+                for case in &match_stmt.cases {
+                    // A case only runs if its pattern (and guard) matched -- every
+                    // case is conditional, the same as an `if`/`elif` branch.
+                    self.depth += 1;
+                    if let Some(guard) = &case.guard {
+                        self.visit_expr(guard);
+                    }
+                    self.visit_body(&case.body);
+                    self.depth -= 1;
+                }
+            }
             _ => {}
         }
     }
@@ -217,7 +308,7 @@ impl UsageScan {
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Subscript(sub) => {
-                if self.is_tainted(&sub.value) {
+                if let Some(receiver) = self.tainted_name(&sub.value) {
                     match crate::ast_extract::extract_string_list_or_single(&sub.slice) {
                         Some(cols) => {
                             for col in cols {
@@ -226,15 +317,28 @@ impl UsageScan {
                         }
                         None => self.record_other("this subscript", Consumption::Unknown),
                     }
+                    // The whole subscript is already summarized by the observation
+                    // just recorded above (specific columns, or "this subscript" for
+                    // an unrecognized shape) -- suppress a bare self-reference found
+                    // while walking the slice (`df[df > 0]`, `df[df.values]`), or one
+                    // subscript operation double-counts as two separate uses. A
+                    // MORE SPECIFIC nested reference (`df[df["age"] > 30]`'s inner
+                    // `df["age"]`) is unaffected -- it's a real, distinct fact (which
+                    // column), not a restatement of this one.
+                    let previous = self.suppressed_self_reference.replace(receiver.to_string());
+                    self.visit_expr(&sub.slice);
+                    self.suppressed_self_reference = previous;
                 } else {
                     self.visit_expr(&sub.value);
+                    self.visit_expr(&sub.slice);
                 }
-                self.visit_expr(&sub.slice);
             }
             Expr::Attribute(attr) => {
-                if self.is_tainted(&attr.value) {
-                    let name = attr.attr.as_str();
-                    self.record_other(format!("`.{name}`"), classify_name(name));
+                if let Some(receiver) = self.tainted_name(&attr.value) {
+                    if !self.is_suppressed(receiver) {
+                        let name = attr.attr.as_str();
+                        self.record_other(format!("`.{name}`"), classify_name(name));
+                    }
                 } else {
                     self.visit_expr(&attr.value);
                 }
@@ -244,10 +348,14 @@ impl UsageScan {
                     // A method call ON the tainted var: `var.method(...)` -- one
                     // "other use" for the whole call, not also the generic
                     // attribute-access case above.
-                    Expr::Attribute(attr) if self.is_tainted(&attr.value) => {
-                        let name = attr.attr.as_str();
-                        self.record_other(format!("`.{name}()`"), classify_name(name));
-                    }
+                    Expr::Attribute(attr) => match self.tainted_name(&attr.value) {
+                        Some(receiver) if !self.is_suppressed(receiver) => {
+                            let name = attr.attr.as_str();
+                            self.record_other(format!("`.{name}()`"), classify_name(name));
+                        }
+                        Some(_) => {}
+                        None => self.visit_expr(&call.func),
+                    },
                     _ => self.visit_expr(&call.func),
                 }
                 for arg in &call.arguments.args {
@@ -265,6 +373,77 @@ impl UsageScan {
                     }
                 }
             }
+            // A bare reference reached generically -- nothing more specific above
+            // (Subscript/Attribute/Call-as-receiver/Call-argument) already recorded
+            // it. Still a real use the checker can't otherwise characterize (e.g.
+            // `pd.concat([df, other])`, `df + 1`, `total += df`) -- record it rather
+            // than silently drop it, consistent with this module's own stated
+            // philosophy of recording every observation it can, even unclassified.
+            Expr::Name(name)
+                if self.tainted.contains(name.id.as_str())
+                    && !self.is_suppressed(name.id.as_str()) =>
+            {
+                self.record_other("referenced", Consumption::Unknown);
+            }
+            Expr::Name(_) => {}
+            // Same treatment as `FunctionDef`/`ClassDef` in `visit_stmt`: a lambda
+            // body is its own scope, not walked.
+            Expr::Lambda(_) => {}
+            Expr::Named(named) => {
+                // A walrus target (`y := df`) binds a real name in the ENCLOSING
+                // scope -- unlike `Lambda`, this isn't a nested scope, so it needs
+                // the same alias-vs-use handling `Stmt::Assign` gets, not a skip.
+                self.visit_unless_tainted(&named.value);
+                if let Expr::Name(t) = &*named.target {
+                    self.retaint(
+                        t.id.as_str(),
+                        expr_forwards_tainted(&self.tainted, &named.value),
+                    );
+                }
+            }
+            Expr::Dict(dict) => {
+                for item in &dict.items {
+                    if let Some(key) = &item.key {
+                        self.visit_expr(key);
+                    }
+                    self.visit_expr(&item.value);
+                }
+            }
+            Expr::Set(set) => {
+                for el in &set.elts {
+                    self.visit_expr(el);
+                }
+            }
+            // A comprehension/generator expression is its own scope, like `Lambda`
+            // -- EXCEPT for one CPython-documented exception: the iterable of the
+            // OUTERMOST `for` clause is evaluated in the enclosing scope, before the
+            // comprehension's own scope even exists. That one sub-expression is a
+            // real access happening HERE (e.g. `sum(x for x in df["a"])` must still
+            // record `"a"`); the element/key/value, `if` filters, and any nested
+            // `for` clauses are not walked, matching `Lambda`.
+            Expr::ListComp(comp) => self.visit_outer_comprehension_iter(&comp.generators),
+            Expr::SetComp(comp) => self.visit_outer_comprehension_iter(&comp.generators),
+            Expr::DictComp(comp) => self.visit_outer_comprehension_iter(&comp.generators),
+            Expr::Generator(comp) => self.visit_outer_comprehension_iter(&comp.generators),
+            Expr::Yield(y) => {
+                if let Some(value) = &y.value {
+                    self.visit_expr(value);
+                }
+            }
+            Expr::YieldFrom(yf) => self.visit_expr(&yf.value),
+            Expr::Slice(slice) => {
+                if let Some(lower) = &slice.lower {
+                    self.visit_expr(lower);
+                }
+                if let Some(upper) = &slice.upper {
+                    self.visit_expr(upper);
+                }
+                if let Some(step) = &slice.step {
+                    self.visit_expr(step);
+                }
+            }
+            Expr::FString(fstring) => self.visit_interpolated(fstring.value.elements()),
+            Expr::TString(tstring) => self.visit_interpolated(tstring.value.elements()),
             Expr::BinOp(binop) => {
                 self.visit_expr(&binop.left);
                 self.visit_expr(&binop.right);
@@ -369,6 +548,10 @@ mod tests {
     fn test_should_follow_a_variable_derived_from_the_root_via_reassignment() {
         let u = usage("out = df\nprint(out[\"a\"])\n");
         assert_eq!(cols(&u), vec![("a", false)]);
+        // A pure alias must not ALSO register as a generic "referenced" use of the
+        // RHS `df` -- it's fully captured by becoming tainted, not an unrecognized
+        // use (regression test: `visit_expr`'s bare-Name fallback must not fire here).
+        assert!(u.other_uses.is_empty());
     }
 
     #[test]
@@ -498,5 +681,227 @@ mod tests {
 
         // assert
         assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_record_a_bare_reference_nested_in_a_list_literal() {
+        // arrange / act: regression test -- `pd.concat([df, other])` used to
+        // produce ZERO observations (not even Unknown), since `Expr::List` visits
+        // its elements generically with no taint check, and there was no
+        // `Expr::Name` fallback at all for a bare reference reached that way.
+        let u = usage("pd.concat([df, other])\n");
+
+        // assert
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_record_a_bare_reference_in_a_binop() {
+        let u = usage("total = df + 1\n");
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_record_a_bare_reference_in_an_augmented_assignment() {
+        let u = usage("total += df\n");
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_not_record_anything_for_an_unrelated_name() {
+        // arrange / act: the new `Expr::Name` fallback must only fire for the
+        // TAINTED name, not any bare name reached the same way.
+        let u = usage("pd.concat([other, another])\n");
+
+        // assert
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_record_an_assert_expression_use() {
+        let u = usage("assert df[\"a\"].notna().all()\n");
+        assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_record_a_raise_expression_use() {
+        let u = usage("raise ValueError(df)\n");
+        assert_eq!(
+            others(&u),
+            vec![("passed to a call", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_mark_a_match_case_body_as_conditional() {
+        let u = usage("match x:\n    case 1:\n        print(df[\"a\"])\n");
+        assert_eq!(cols(&u), vec![("a", true)]);
+    }
+
+    #[test]
+    fn test_should_record_a_dict_literal_value_as_a_use() {
+        let u = usage("summary = {\"total\": df}\n");
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_record_a_set_literal_element_as_a_use() {
+        let u = usage("s = {df}\n");
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_record_an_fstring_interpolation_as_a_use() {
+        let u = usage("msg = f\"{df}\"\n");
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_record_a_slice_bound_as_a_use() {
+        let u = usage("out = other[df:]\n");
+        assert_eq!(
+            others(&u),
+            vec![("referenced", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_record_a_yield_value_as_a_use() {
+        // arrange / act: `yield` inside a nested `def` isn't walked (own scope,
+        // same as `return` -- see `test_should_record_being_returned_as_an_other_use`)
+        // -- construct a bare top-level yield instead, the same way that test does.
+        let u = usage("if flag:\n    yield df\n");
+
+        // assert
+        assert_eq!(others(&u), vec![("referenced", true, Consumption::Unknown)]);
+    }
+
+    #[test]
+    fn test_should_not_descend_into_a_lambda_body() {
+        // arrange / act: same "own scope" treatment as a nested `def`.
+        let u = usage("f = lambda: df[\"a\"]\n");
+
+        // assert
+        assert!(u.accesses.is_empty());
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_record_the_outer_generator_iterable_as_a_real_access() {
+        // arrange / act: CPython evaluates the outermost `for` clause's iterable in
+        // the ENCLOSING scope, before the generator's own scope exists -- this is a
+        // real, unconditional access happening here, not inside a skipped scope.
+        let u = usage("total = sum(x for x in df[\"a\"])\n");
+
+        // assert
+        assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_not_descend_into_a_comprehension_body() {
+        // arrange / act: the element expression and any nested `for` clauses ARE the
+        // comprehension's own scope -- unlike the outermost iterable, not walked.
+        let u = usage("out = [df[\"a\"] for x in xs]\n");
+
+        // assert
+        assert!(u.accesses.is_empty());
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_track_a_walrus_assignment_target() {
+        // arrange / act: `y := df` binds `y` in the ENCLOSING scope, unlike a
+        // lambda/comprehension -- must be tracked the same as a plain `y = df`.
+        let u = usage("if (y := df):\n    pass\nprint(y[\"a\"])\n");
+
+        // assert
+        assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_not_double_report_a_walrus_pure_alias() {
+        // arrange / act: regression test, the `Expr::Named` counterpart of
+        // `test_should_follow_a_variable_derived_from_the_root_via_reassignment` --
+        // a pure walrus alias must not ALSO register as a generic "referenced" use.
+        let u = usage("y = (z := df)\n");
+
+        // assert
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_not_double_report_an_annassign_pure_alias() {
+        // arrange / act: the `Stmt::AnnAssign` counterpart of
+        // `test_should_follow_a_variable_derived_from_the_root_via_reassignment` --
+        // same guard, previously untested for this specific statement form.
+        let u = usage("out: object = df\nprint(out[\"a\"])\n");
+
+        // assert
+        assert_eq!(cols(&u), vec![("a", false)]);
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_not_double_report_a_self_referencing_boolean_mask() {
+        // arrange / act: regression test -- `df[df > 0]` is a real, documented
+        // whole-frame boolean-mask idiom. The tainted `Expr::Subscript` branch
+        // already records ONE observation for the whole operation ("this
+        // subscript"); the slice must not ALSO be walked generically afterward, or
+        // the bare `df` inside the mask gets counted as a SECOND, separate use of
+        // the same logical operation.
+        let u = usage("print(df[df > 0])\n");
+
+        // assert
+        assert_eq!(
+            others(&u),
+            vec![("this subscript", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_not_double_report_a_self_referencing_attribute_mask() {
+        // arrange / act: same root cause, via the `Expr::Attribute` arm instead --
+        // `df[df.values]` must not record both "this subscript" and `.values`.
+        let u = usage("print(df[df.values])\n");
+
+        // assert
+        assert_eq!(
+            others(&u),
+            vec![("this subscript", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_still_record_a_real_column_access_in_a_mask_built_from_one_column() {
+        // arrange / act: the much more common "mask built from one column" idiom,
+        // `df[df["age"] > 30]`, must NOT be affected by the self-mask fix above --
+        // the inner occurrence is a proper Subscript (a real access), not a bare
+        // Name, so it was never part of the double-count in the first place.
+        let u = usage("print(df[df[\"age\"] > 30])\n");
+
+        // assert
+        assert_eq!(cols(&u), vec![("age", false)]);
+        assert_eq!(
+            others(&u),
+            vec![("this subscript", false, Consumption::Unknown)]
+        );
     }
 }

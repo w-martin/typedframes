@@ -28,6 +28,9 @@ Thumbs.db
 .claude
 coverage.json
 coverage.lcov
+
+# Working specs -- drafted before/during implementation, not part of the shipped repo
+specs/
 .complexipy_cache
 **/target
 site/

@@ -961,11 +961,18 @@ def _event_location(event: dict) -> str:
     return f"{prefix}{event['line']}:{event['col']}"
 
 
+_CONSUMPTION_TAGS = {"all": " [touches every column]", "none": " [touches no columns]"}
+
+
 def _usage_lines(usage: dict) -> list[str]:
     """One text line per observed access/other-use in `usage`.
 
     In the "tracking ended" style -- location, variable, then what was seen, each
-    flagged "(conditional)" when it doesn't happen on every execution path.
+    flagged "(conditional)" when it doesn't happen on every execution path. An
+    other-use also carries its `consumes` classification (see
+    `column_consuming_methods` in the Rust source) as a bracketed tag -- omitted for
+    "unknown" (the common case) to keep an unremarkable line unremarkable, same as
+    "(conditional)" is only shown when true, not "(unconditional)" when false.
     """
     location = f"{_event_location(usage):<12} {usage['var']:<16} "
     lines = []
@@ -974,6 +981,7 @@ def _usage_lines(usage: dict) -> list[str]:
         lines.append(f"{location}'{access['column']}'{suffix}")
     for use in usage["other_uses"]:
         suffix = " (conditional)" if use["conditional"] else ""
+        suffix += _CONSUMPTION_TAGS.get(use.get("consumes", ""), "")
         lines.append(f"{location}{use['description']}{suffix}")
     return lines
 

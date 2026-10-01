@@ -629,12 +629,36 @@ pub(crate) fn extract_pl_col_name(expr: &Expr) -> Option<String> {
 // form (`df.filter(mask)`) both pandas and polars also spell this same method name
 // for -- the two do fundamentally different things and must not share handling.
 pub(crate) fn filter_is_column_selecting(call: &ast::ExprCall) -> bool {
-    call.arguments.keywords.iter().any(|kw| {
+    let has_selector_kwarg = call.arguments.keywords.iter().any(|kw| {
         matches!(
             kw.arg.as_ref().map(|a| a.as_str()),
             Some("items") | Some("like") | Some("regex")
         )
-    })
+    });
+    if !has_selector_kwarg {
+        return false;
+    }
+    // `.filter`'s default axis is columns; `axis=0`/`axis="index"` redirects
+    // items=/like=/regex= to INDEX LABELS instead, which this checker has no model
+    // for -- treat that the same as the row-filtering `.filter(mask)` form (leave it
+    // alone entirely) rather than validate it against the column schema.
+    let axis_kwarg = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("axis"));
+    match axis_kwarg {
+        Some(axis_kw) => !axis_kwarg_selects_index(&axis_kw.value),
+        None => true,
+    }
+}
+
+fn axis_kwarg_selects_index(value: &Expr) -> bool {
+    match value {
+        Expr::NumberLiteral(n) => matches!(&n.value, ast::Number::Int(i) if i.as_u64() == Some(0)),
+        Expr::StringLiteral(s) => s.value.to_str() == "index",
+        _ => false,
+    }
 }
 
 // The literal column list from `df.filter(items=[...])`. `None` for `like=`/`regex=`
@@ -803,6 +827,55 @@ mod tests {
         )));
         assert!(!extract_bare_dataframe_type(&annotation_of(
             "def f() -> None: ..."
+        )));
+    }
+
+    fn filter_call_of(source: &str) -> ast::ExprCall {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Expr(expr_stmt) = &parsed.into_syntax().body[0] else {
+            panic!("Expected an expression statement");
+        };
+        let Expr::Call(call) = (*expr_stmt.value).clone() else {
+            panic!("Expected a call expression");
+        };
+        call
+    }
+
+    #[test]
+    fn test_should_treat_filter_items_as_column_selecting_when_axis_is_absent() {
+        assert!(filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"])"
+        )));
+    }
+
+    #[test]
+    fn test_should_treat_filter_items_as_column_selecting_when_axis_is_columns() {
+        assert!(filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=1)"
+        )));
+        assert!(filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=\"columns\")"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_treat_filter_items_as_column_selecting_when_axis_is_index() {
+        // arrange/act/assert: axis=0 / axis="index" redirects items=/like=/regex= to
+        // INDEX LABELS, not columns -- this checker has no model for that, so it
+        // must be left alone entirely, the same as the row-filtering
+        // `.filter(mask)` form.
+        assert!(!filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=0)"
+        )));
+        assert!(!filter_is_column_selecting(&filter_call_of(
+            "df.filter(items=[\"a\"], axis=\"index\")"
+        )));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_plain_positional_filter_as_column_selecting() {
+        assert!(!filter_is_column_selecting(&filter_call_of(
+            "df.filter(mask)"
         )));
     }
 }

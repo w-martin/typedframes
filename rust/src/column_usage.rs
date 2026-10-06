@@ -1,29 +1,26 @@
 //! Downstream column-usage observation for a DataFrame origin the checker recognized
 //! but couldn't resolve a schema for (an `UntypedSite`).
 //!
-//! Phase A3 of the guided-suggestion groundwork: before anything can suggest a
-//! schema, it needs to know which columns the rest of the file actually reads off
-//! such a frame. This module answers that, purely observationally -- it records
-//! what it sees and makes no claim about correctness (there is no schema here to
-//! validate against in the first place).
+//! Records which columns the rest of a scope reads off such a frame, as evidence for
+//! suggesting a column selection or schema. It makes no claim about correctness: there is
+//! no schema here to validate against.
 //!
-//! Two deliberate scope limits, both disclosed rather than silently worked around:
+//! A suggestion edits real code, so the scan errs toward recording an `Unknown` other-use:
+//! anything it can't attribute to a column, or that lets the frame escape, is one.
 //!
-//! - Only an origin sitting at the TOP LEVEL of its own function or module body is
-//!   scanned -- one nested inside an `if`/`for`/`while`/`with`/`try` is skipped
-//!   entirely (see `Linter::observe_untyped_site_usage`), since "the rest of this
-//!   scope" isn't a single contiguous statement slice once control flow is
-//!   involved. Most real origins are a plain top-level `df = ...`, so this covers
-//!   the common case without the complexity of resuming a walk mid-tree.
-//! - A `.method()`/`.attribute` use is tagged with its [`Consumption`] at record
-//!   time, but the classification RULES (which names read every column, which read
-//!   none) live in `column_consuming_methods`, not here -- this module only ever
-//!   calls that table, it doesn't decide what's in it.
+//! Scope limits:
+//! - A nested function, class, lambda or comprehension body is its own scope and is not
+//!   walked. `first_nested_scope_mention` reports whether any of them mention the frame,
+//!   since a closure can read columns this scan never sees.
+//! - A `.method()`/`.attribute` use is tagged with its [`Consumption`], but which names
+//!   read every column or none is decided by the table in `column_consuming_methods`.
 
 use crate::column_consuming_methods::classify_name;
 use crate::contract::expr_forwards_tainted;
-use ruff_python_ast::{Expr, Stmt};
-use serde::Serialize;
+use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
+use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_text_size::{Ranged, TextSize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// One column subscripted directly off a tracked origin, or a variable derived from
@@ -35,6 +32,65 @@ pub struct ColumnAccess {
     /// Reached only under a branch/loop/`with`/`try`, not on every execution path --
     /// still a real access, but the checker cannot promise it always happens.
     pub(crate) conditional: bool,
+    /// 1-indexed source line. Not serialized: in a notebook it would be a line of the
+    /// concatenated source. Only suggestions use it.
+    #[serde(skip)]
+    pub(crate) line: usize,
+    /// The helper function this read happens inside, when the frame was passed to one.
+    #[serde(skip)]
+    pub(crate) via: Option<String>,
+}
+
+/// What a function does with one of its parameters, when every use of it is a read of a
+/// named column. A parameter with any other use has no summary at all: the caller must
+/// then treat passing a frame to it as an unknown use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ParamUsage {
+    /// Index among the positional parameters; `usize::MAX` for a keyword-only one.
+    pub(crate) position: usize,
+    pub(crate) name: String,
+    /// Each column read, and whether every such read is conditional.
+    pub(crate) accesses: Vec<(String, bool)>,
+}
+
+/// Looks up what a called function does with its parameters.
+pub(crate) trait HelperResolver {
+    /// The summaries of the function `callee` names (one per parameter that has one), or
+    /// `None` when the name can't be tied to a single known function.
+    fn usage_of(&self, callee: &ast::ExprName) -> Option<Vec<ParamUsage>>;
+
+    /// Whether `callee` is certainly the builtin of that name, not something this file
+    /// defines, imports or rebinds.
+    fn is_unshadowed_builtin(&self, callee: &ast::ExprName) -> bool;
+}
+
+/// A resolver that knows no function: every call is an unknown use.
+#[cfg(test)]
+pub(crate) struct NoHelpers;
+
+#[cfg(test)]
+impl HelperResolver for NoHelpers {
+    fn usage_of(&self, _callee: &ast::ExprName) -> Option<Vec<ParamUsage>> {
+        None
+    }
+
+    // Tests have no file to check against, so builtins are taken as unshadowed.
+    fn is_unshadowed_builtin(&self, _callee: &ast::ExprName) -> bool {
+        true
+    }
+}
+
+/// Uses of the frame that narrowing the columns can't affect.
+pub(crate) const HARMLESS_USES: &[&str] = &["`.index`", "`.empty`", "passed to `len()`"];
+
+/// Prefix of the description of a use that only displays the frame. Narrowing changes what
+/// is shown, never whether the program runs, so it asks for review rather than blocking.
+pub(crate) const OUTPUT_USE_PREFIX: &str = "output via ";
+
+/// Whether a use stops the frame's columns from being narrowed.
+pub(crate) fn blocks_narrowing(other: &OtherUse) -> bool {
+    !HARMLESS_USES.contains(&other.description.as_str())
+        && !other.description.starts_with(OUTPUT_USE_PREFIX)
 }
 
 /// Whether a `.method()`/`.attribute` use is known to read every column's actual
@@ -60,22 +116,51 @@ pub struct OtherUse {
     pub(crate) description: String,
     pub(crate) conditional: bool,
     pub(crate) consumes: Consumption,
+    /// See `ColumnAccess::line`.
+    #[serde(skip)]
+    pub(crate) line: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ColumnUsage {
     pub(crate) accesses: Vec<ColumnAccess>,
     pub(crate) other_uses: Vec<OtherUse>,
+    /// Every name that referred to the origin at any point during the scan (the root
+    /// plus each alias it was assigned to). Feeds `first_nested_scope_mention`.
+    pub(crate) ever_tainted: HashSet<String>,
+    /// A column was assigned into the frame (`df["new"] = ...`) somewhere in the scan.
+    pub(crate) wrote_columns: bool,
 }
 
-/// Scans `body` -- the statements AFTER an origin, in its own scope -- for downstream
-/// usage of `root`.
-pub(crate) fn scan_usage(root: &str, body: &[Stmt]) -> ColumnUsage {
+/// Scans `body` -- the statements that can run AFTER an origin, in its own scope -- for downstream
+/// usage of `root`. `line_of` maps a source offset to its 1-indexed line.
+#[cfg(test)]
+pub(crate) fn scan_usage<'s>(
+    root: &str,
+    body: impl IntoIterator<Item = &'s Stmt>,
+    line_of: &dyn Fn(TextSize) -> usize,
+) -> ColumnUsage {
+    scan_usage_with(root, body, line_of, &NoHelpers)
+}
+
+/// [`scan_usage`], following the frame into functions `helpers` can summarize.
+pub(crate) fn scan_usage_with<'s>(
+    root: &str,
+    body: impl IntoIterator<Item = &'s Stmt>,
+    line_of: &dyn Fn(TextSize) -> usize,
+    helpers: &dyn HelperResolver,
+) -> ColumnUsage {
     let mut scan = UsageScan {
+        helpers,
         tainted: HashSet::from([root.to_string()]),
         depth: 0,
-        usage: ColumnUsage::default(),
+        written: HashSet::new(),
+        usage: ColumnUsage {
+            ever_tainted: HashSet::from([root.to_string()]),
+            ..ColumnUsage::default()
+        },
         suppressed_self_reference: None,
+        line_of,
     };
     for stmt in body {
         scan.visit_stmt(stmt);
@@ -83,11 +168,199 @@ pub(crate) fn scan_usage(root: &str, body: &[Stmt]) -> ColumnUsage {
     scan.usage
 }
 
-struct UsageScan {
+/// The offset of the first mention of any of `names` inside a nested function, class,
+/// lambda or comprehension anywhere in `body` -- the scan above deliberately does not
+/// walk those scopes, but a closure can read columns it never sees. Pass the WHOLE
+/// scope body (not just the statements after the origin): a function defined above
+/// the origin can still read the variable once called.
+///
+/// A comprehension's outermost iterable is evaluated in the enclosing scope and is
+/// not a nested mention (the scan already records it); the same goes for decorators,
+/// parameter defaults and class bases.
+pub(crate) fn first_nested_scope_mention(
+    body: &[Stmt],
+    names: &HashSet<String>,
+) -> Option<TextSize> {
+    let mut finder = NestedMentionFinder {
+        names,
+        depth: 0,
+        first: None,
+    };
+    for stmt in body {
+        finder.visit_stmt(stmt);
+    }
+    finder.first
+}
+
+/// Whether `body` (not descending into nested functions/classes) declares `name`
+/// `global` or `nonlocal` -- its assignments then bind a variable other code can
+/// read, so the scope no longer contains every use of it.
+pub(crate) fn declares_global_or_nonlocal(body: &[Stmt], name: &str) -> bool {
+    let mut finder = ScopeDeclFinder { name, found: false };
+    for stmt in body {
+        finder.visit_stmt(stmt);
+    }
+    finder.found
+}
+
+struct NestedMentionFinder<'n> {
+    names: &'n HashSet<String>,
+    depth: u32,
+    first: Option<TextSize>,
+}
+
+impl NestedMentionFinder<'_> {
+    fn visit_parameter_defaults(&mut self, parameters: &ast::Parameters) {
+        for param in parameters
+            .posonlyargs
+            .iter()
+            .chain(parameters.args.iter())
+            .chain(parameters.kwonlyargs.iter())
+        {
+            if let Some(default) = &param.default {
+                self.visit_expr(default);
+            }
+        }
+    }
+
+    fn visit_comprehension<'a>(
+        &mut self,
+        generators: &'a [ast::Comprehension],
+        elements: &[&'a Expr],
+    ) {
+        if let Some(first) = generators.first() {
+            self.visit_expr(&first.iter);
+        }
+        self.depth += 1;
+        for (i, generator) in generators.iter().enumerate() {
+            self.visit_expr(&generator.target);
+            if i > 0 {
+                self.visit_expr(&generator.iter);
+            }
+            for condition in &generator.ifs {
+                self.visit_expr(condition);
+            }
+        }
+        for element in elements {
+            self.visit_expr(element);
+        }
+        self.depth -= 1;
+    }
+}
+
+impl<'a> Visitor<'a> for NestedMentionFinder<'_> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                for decorator in &f.decorator_list {
+                    self.visit_expr(&decorator.expression);
+                }
+                self.visit_parameter_defaults(&f.parameters);
+                self.depth += 1;
+                for s in &f.body {
+                    self.visit_stmt(s);
+                }
+                self.depth -= 1;
+            }
+            Stmt::ClassDef(c) => {
+                for decorator in &c.decorator_list {
+                    self.visit_expr(&decorator.expression);
+                }
+                if let Some(arguments) = &c.arguments {
+                    for arg in &arguments.args {
+                        self.visit_expr(arg);
+                    }
+                    for keyword in &arguments.keywords {
+                        self.visit_expr(&keyword.value);
+                    }
+                }
+                self.depth += 1;
+                for s in &c.body {
+                    self.visit_stmt(s);
+                }
+                self.depth -= 1;
+            }
+            _ => ast_visitor::walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        match expr {
+            Expr::Name(name) => {
+                if self.depth > 0 && self.first.is_none() && self.names.contains(name.id.as_str()) {
+                    self.first = Some(name.range().start());
+                }
+            }
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameter_defaults(parameters);
+                }
+                self.depth += 1;
+                self.visit_expr(&lambda.body);
+                self.depth -= 1;
+            }
+            Expr::ListComp(c) => self.visit_comprehension(&c.generators, &[&c.elt]),
+            Expr::SetComp(c) => self.visit_comprehension(&c.generators, &[&c.elt]),
+            Expr::Generator(c) => self.visit_comprehension(&c.generators, &[&c.elt]),
+            Expr::DictComp(c) => {
+                let mut elements: Vec<&Expr> = Vec::with_capacity(2);
+                if let Some(key) = &c.key {
+                    elements.push(key);
+                }
+                elements.push(&c.value);
+                self.visit_comprehension(&c.generators, &elements);
+            }
+            _ => ast_visitor::walk_expr(self, expr),
+        }
+    }
+}
+
+struct ScopeDeclFinder<'n> {
+    name: &'n str,
+    found: bool,
+}
+
+impl<'a> Visitor<'a> for ScopeDeclFinder<'_> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            Stmt::Global(g) => {
+                if g.names.iter().any(|n| n.as_str() == self.name) {
+                    self.found = true;
+                }
+            }
+            Stmt::Nonlocal(n) => {
+                if n.names.iter().any(|n| n.as_str() == self.name) {
+                    self.found = true;
+                }
+            }
+            _ => ast_visitor::walk_stmt(self, stmt),
+        }
+    }
+}
+
+// "passed to `clean()`" for `clean(df)`, "passed to `np.log()`" for `np.log(df)`, and the
+// generic "passed to a call" when the callee isn't a plain name or `module.name`.
+fn passed_to(func: &Expr) -> String {
+    match func {
+        Expr::Name(name) => format!("passed to `{}()`", name.id),
+        Expr::Attribute(attr) => match &*attr.value {
+            Expr::Name(base) => format!("passed to `{}.{}()`", base.id, attr.attr),
+            _ => "passed to a call".to_string(),
+        },
+        _ => "passed to a call".to_string(),
+    }
+}
+
+struct UsageScan<'a> {
+    helpers: &'a dyn HelperResolver,
     tainted: HashSet<String>,
-    // Nesting inside if/for/while/with/try -- marks an access/use `conditional`
+    // Nesting inside if/for/while/with/try/match -- marks an access/use `conditional`
     // rather than something every execution path is known to reach.
     depth: u32,
+    // Columns assigned into the frame on every path so far (`df["new"] = ...`): a later
+    // read of one is not a read of the source, so it isn't recorded as an access.
+    written: HashSet<String>,
     usage: ColumnUsage,
     // While walking a tainted-receiver subscript's slice (`df[<slice>]`), the
     // receiver's own bare name is already summarized by the observation just
@@ -98,9 +371,10 @@ struct UsageScan {
     // found via something more specific than a bare reference (a nested
     // `df["col"]`) is unaffected -- it never reaches the suppressed checks below.
     suppressed_self_reference: Option<String>,
+    line_of: &'a dyn Fn(TextSize) -> usize,
 }
 
-impl UsageScan {
+impl UsageScan<'_> {
     fn is_tainted(&self, expr: &Expr) -> bool {
         matches!(expr, Expr::Name(n) if self.tainted.contains(n.id.as_str()))
     }
@@ -108,8 +382,8 @@ impl UsageScan {
     // `visit_expr` records a bare tainted `Name` reached generically (no more
     // specific handling applied) as an "Unknown" other-use -- see its own `Expr::Name`
     // arm. A pure alias (`out = df`, a walrus `y := df`) is NOT such a case: it's
-    // already fully captured by `retaint`, so callers that are about to retaint from
-    // this same expression call this instead of `visit_expr` directly, to avoid
+    // already fully captured by `rebind_name`, so callers that are about to rebind
+    // from this same expression call this instead of `visit_expr` directly, to avoid
     // double-reporting a plain rename as if it were an unrecognized use.
     fn visit_unless_tainted(&mut self, expr: &Expr) {
         if !self.is_tainted(expr) {
@@ -131,32 +405,127 @@ impl UsageScan {
         self.suppressed_self_reference.as_deref() == Some(name)
     }
 
-    // A name being (re)assigned either joins the tainted set (its value forwards an
+    // The frame is passed as an argument. If the callee's use of that parameter is known
+    // it counts as those column reads, made here; otherwise it is an unknown use.
+    fn passed_argument(
+        &mut self,
+        at: TextSize,
+        passed: &str,
+        callee: Option<&ast::ExprName>,
+        summary: Option<&ParamUsage>,
+    ) {
+        let (Some(summary), Some(callee)) = (summary, callee) else {
+            self.record_other(at, passed.to_string(), Consumption::Unknown);
+            return;
+        };
+        let line = (self.line_of)(at);
+        for (column, conditional) in &summary.accesses {
+            // A column this scope created first isn't a source column.
+            if self.written.contains(column) {
+                continue;
+            }
+            self.usage.accesses.push(ColumnAccess {
+                column: column.clone(),
+                conditional: self.depth > 0 || *conditional,
+                line,
+                via: Some(callee.id.to_string()),
+            });
+        }
+    }
+
+    // Whether every tainted argument of `call` goes to a parameter whose use is known, so
+    // the call's result is a new value rather than the tracked frame under another name
+    // (a summarized function that handed its parameter back would not have a summary).
+    fn call_is_fully_summarized(&self, call: &ast::ExprCall) -> bool {
+        let Expr::Name(callee) = &*call.func else {
+            return false;
+        };
+        let Some(summaries) = self.helpers.usage_of(callee) else {
+            return false;
+        };
+        let positional_ok = call
+            .arguments
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| self.is_tainted(arg))
+            .all(|(i, _)| summaries.iter().any(|p| p.position == i));
+        let keywords_ok = call
+            .arguments
+            .keywords
+            .iter()
+            .filter(|kw| self.is_tainted(&kw.value))
+            .all(|kw| {
+                kw.arg
+                    .as_ref()
+                    .is_some_and(|name| summaries.iter().any(|p| p.name == name.as_str()))
+            });
+        positional_ok && keywords_ok
+    }
+
+    // Whether `value` hands the tracked frame on: a plain alias or a call that returns it,
+    // but not a call whose use of the frame is fully known.
+    fn forwards(&self, value: &Expr) -> bool {
+        expr_forwards_tainted(&self.tainted, value)
+            && !matches!(value, Expr::Call(call) if self.call_is_fully_summarized(call))
+    }
+
+    fn taint(&mut self, name: &str) {
+        self.tainted.insert(name.to_string());
+        self.usage.ever_tainted.insert(name.to_string());
+    }
+
+    // A name being assigned either joins the tainted set (its value forwards an
     // already-tainted one) or, if it was PREVIOUSLY tainted, leaves it -- a name
     // reassigned to something unrelated no longer refers to the tracked origin, the
     // same "the old leg ends here" rule `Linter::end_stale_legs` applies elsewhere.
     // Without this, a name reassigned away from the origin would keep contributing
     // observations that aren't actually about it.
-    fn retaint(&mut self, name: &str, forwards: bool) {
+    //
+    // Only true for a reassignment that always runs: under a branch it may or may
+    // not happen, so a later read could still be of the original frame. Keep the
+    // taint and record an unclassified use instead of dropping reads on the floor.
+    fn rebind_name(&mut self, at: TextSize, name: &str, forwards: bool) {
         if forwards {
-            self.tainted.insert(name.to_string());
-        } else {
-            self.tainted.remove(name);
+            self.taint(name);
+        } else if self.tainted.contains(name) {
+            if self.depth > 0 {
+                self.record_other(
+                    at,
+                    format!("`{name}` conditionally reassigned"),
+                    Consumption::Unknown,
+                );
+            } else {
+                self.tainted.remove(name);
+            }
         }
     }
 
-    fn record_column(&mut self, column: String) {
+    fn record_column(&mut self, at: TextSize, column: String) {
+        if self.written.contains(&column) {
+            return;
+        }
+        let line = (self.line_of)(at);
         self.usage.accesses.push(ColumnAccess {
             column,
             conditional: self.depth > 0,
+            line,
+            via: None,
         });
     }
 
-    fn record_other(&mut self, description: impl Into<String>, consumes: Consumption) {
+    fn record_other(
+        &mut self,
+        at: TextSize,
+        description: impl Into<String>,
+        consumes: Consumption,
+    ) {
+        let line = (self.line_of)(at);
         self.usage.other_uses.push(OtherUse {
             description: description.into(),
             conditional: self.depth > 0,
             consumes,
+            line,
         });
     }
 
@@ -174,37 +543,155 @@ impl UsageScan {
 
     // See the `Expr::ListComp` etc. arms in `visit_expr` for why only the first
     // generator's iterable is visited here.
-    fn visit_outer_comprehension_iter(&mut self, generators: &[ruff_python_ast::Comprehension]) {
+    fn visit_outer_comprehension_iter(&mut self, generators: &[ast::Comprehension]) {
         let Some(first) = generators.first() else {
             return;
         };
         if self.is_tainted(&first.iter) {
-            self.record_other("iterated over directly", Consumption::Unknown);
+            self.record_other(
+                first.iter.range().start(),
+                "iterated over directly",
+                Consumption::Unknown,
+            );
         } else {
             self.visit_expr(&first.iter);
         }
     }
 
-    fn visit_interpolated<'a>(
+    fn visit_interpolated<'e>(
         &mut self,
-        elements: impl Iterator<Item = &'a ruff_python_ast::InterpolatedStringElement>,
+        elements: impl Iterator<Item = &'e ast::InterpolatedStringElement>,
     ) {
         for element in elements {
-            if let ruff_python_ast::InterpolatedStringElement::Interpolation(interp) = element {
+            if let ast::InterpolatedStringElement::Interpolation(interp) = element {
                 self.visit_expr(&interp.expression);
+                if let Some(spec) = &interp.format_spec {
+                    self.visit_interpolated(spec.elements.iter());
+                }
             }
         }
     }
 
+    // Parameter defaults, decorators and class bases are evaluated in the ENCLOSING
+    // scope when the `def`/`class` statement runs, unlike the body.
+    fn visit_parameter_defaults(&mut self, parameters: &ast::Parameters) {
+        for param in parameters
+            .posonlyargs
+            .iter()
+            .chain(parameters.args.iter())
+            .chain(parameters.kwonlyargs.iter())
+        {
+            if let Some(default) = &param.default {
+                self.visit_expr(default);
+            }
+        }
+    }
+
+    // The target of an assignment, `for`, `with` or `except`. `forwards` is `Some` for
+    // an assignment (whether its value is, or forwards, the tracked frame) and `None`
+    // for a loop/`with`/`except` target, which rebinds a name without our being able
+    // to say what to.
+    fn visit_store_target(&mut self, target: &Expr, forwards: Option<bool>) {
+        let at = target.range().start();
+        match target {
+            Expr::Name(name) => match forwards {
+                Some(forwards) => self.rebind_name(at, name.id.as_str(), forwards),
+                None => {
+                    if self.tainted.contains(name.id.as_str()) {
+                        self.record_other(
+                            at,
+                            format!("`{}` rebound by a loop, `with` or `except` target", name.id),
+                            Consumption::Unknown,
+                        );
+                    }
+                }
+            },
+            Expr::Tuple(t) => {
+                for el in &t.elts {
+                    self.visit_store_target(el, forwards.map(|_| false));
+                }
+            }
+            Expr::List(l) => {
+                for el in &l.elts {
+                    self.visit_store_target(el, forwards.map(|_| false));
+                }
+            }
+            Expr::Starred(s) => self.visit_store_target(&s.value, forwards.map(|_| false)),
+            Expr::Subscript(sub) => {
+                if let Some(receiver) = self.tainted_name(&sub.value) {
+                    // Writing into the frame: `df["new"] = ...` is not a read, so a
+                    // literal column here is NOT recorded as an access (doing so would
+                    // make a column that may not exist yet look required). Anything
+                    // else -- a mask, a computed key -- can touch columns we can't
+                    // enumerate.
+                    match crate::ast_extract::extract_string_list_or_single(&sub.slice) {
+                        None => self.record_other(
+                            at,
+                            "assignment through this subscript",
+                            Consumption::Unknown,
+                        ),
+                        Some(columns) => {
+                            self.usage.wrote_columns = true;
+                            // Only an unconditional write guarantees the column exists
+                            // afterwards.
+                            if self.depth == 0 {
+                                self.written.extend(columns);
+                            }
+                        }
+                    }
+                    let previous = self.suppressed_self_reference.replace(receiver.to_string());
+                    self.visit_expr(&sub.slice);
+                    self.suppressed_self_reference = previous;
+                } else {
+                    self.visit_expr(&sub.value);
+                    self.visit_expr(&sub.slice);
+                }
+            }
+            Expr::Attribute(attr) => {
+                if self.tainted_name(&attr.value).is_some() {
+                    self.record_other(
+                        at,
+                        format!("`.{}` assigned", attr.attr.as_str()),
+                        Consumption::Unknown,
+                    );
+                } else {
+                    self.visit_expr(&attr.value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn visit_stmt(&mut self, stmt: &Stmt) {
+        let at = stmt.range().start();
         match stmt {
             // A nested scope has its own bindings; the taint set built up so far
             // doesn't carry into it (matches `frame_ops::PassthroughScan`'s own
-            // treatment of a nested def/class).
-            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            // treatment of a nested def/class). What the statement itself evaluates in
+            // THIS scope -- decorators, defaults, class bases -- is still visited, and
+            // `first_nested_scope_mention` covers the body.
+            Stmt::FunctionDef(f) => {
+                for decorator in &f.decorator_list {
+                    self.visit_expr(&decorator.expression);
+                }
+                self.visit_parameter_defaults(&f.parameters);
+            }
+            Stmt::ClassDef(c) => {
+                for decorator in &c.decorator_list {
+                    self.visit_expr(&decorator.expression);
+                }
+                if let Some(arguments) = &c.arguments {
+                    for arg in &arguments.args {
+                        self.visit_expr(arg);
+                    }
+                    for keyword in &arguments.keywords {
+                        self.visit_expr(&keyword.value);
+                    }
+                }
+            }
             Stmt::Return(ret) => match &ret.value {
                 Some(value) if self.is_tainted(value) => {
-                    self.record_other("returned", Consumption::Unknown)
+                    self.record_other(at, "returned", Consumption::Unknown)
                 }
                 Some(value) => self.visit_expr(value),
                 None => {}
@@ -212,26 +699,49 @@ impl UsageScan {
             Stmt::Expr(expr_stmt) => self.visit_expr(&expr_stmt.value),
             Stmt::Assign(assign) => {
                 // A bare `out = df` is pure aliasing, already fully captured by
-                // `retaint` below -- must NOT also fall through to `visit_expr`'s
+                // `rebind_name` below -- must NOT also fall through to `visit_expr`'s
                 // generic `Expr::Name` fallback, or a plain rename would wrongly
-                // register as an "unrecognized use" alongside becoming tainted.
-                self.visit_unless_tainted(&assign.value);
-                let forwards = expr_forwards_tainted(&self.tainted, &assign.value);
+                // register as an "unrecognized use" alongside becoming tainted. But
+                // stored into an attribute or container (`self.df = df`,
+                // `cache["k"] = df`) the frame escapes this scan's view entirely.
+                let escapes = self.is_tainted(&assign.value)
+                    && assign.targets.iter().any(|t| !matches!(t, Expr::Name(_)));
+                if escapes {
+                    self.record_other(
+                        at,
+                        "stored in an attribute or container",
+                        Consumption::Unknown,
+                    );
+                } else {
+                    self.visit_unless_tainted(&assign.value);
+                }
+                let forwards = self.forwards(&assign.value);
                 for target in &assign.targets {
-                    if let Expr::Name(t) = target {
-                        self.retaint(t.id.as_str(), forwards);
-                    }
+                    self.visit_store_target(target, Some(forwards));
                 }
             }
             Stmt::AnnAssign(ann) => {
                 if let Some(value) = &ann.value {
-                    self.visit_unless_tainted(value);
-                    if let Expr::Name(t) = &*ann.target {
-                        self.retaint(t.id.as_str(), expr_forwards_tainted(&self.tainted, value));
+                    let escapes = self.is_tainted(value) && !matches!(&*ann.target, Expr::Name(_));
+                    if escapes {
+                        self.record_other(
+                            at,
+                            "stored in an attribute or container",
+                            Consumption::Unknown,
+                        );
+                    } else {
+                        self.visit_unless_tainted(value);
                     }
+                    let forwards = self.forwards(value);
+                    self.visit_store_target(&ann.target, Some(forwards));
                 }
             }
-            Stmt::AugAssign(aug) => self.visit_expr(&aug.value),
+            // `df["b"] += 1` READS `b` before writing it, so the target is visited as
+            // a load -- unlike a plain assignment's.
+            Stmt::AugAssign(aug) => {
+                self.visit_expr(&aug.value);
+                self.visit_expr(&aug.target);
+            }
             Stmt::Delete(del) => {
                 for target in &del.targets {
                     self.visit_expr(target);
@@ -249,26 +759,48 @@ impl UsageScan {
             }
             Stmt::For(for_stmt) => {
                 if self.is_tainted(&for_stmt.iter) {
-                    self.record_other("iterated over directly", Consumption::Unknown);
+                    self.record_other(
+                        for_stmt.iter.range().start(),
+                        "iterated over directly",
+                        Consumption::Unknown,
+                    );
                 } else {
                     self.visit_expr(&for_stmt.iter);
                 }
+                self.visit_store_target(&for_stmt.target, None);
                 self.visit_conditional_body(&for_stmt.body);
+                self.visit_conditional_body(&for_stmt.orelse);
             }
             Stmt::While(while_stmt) => {
                 self.visit_expr(&while_stmt.test);
                 self.visit_conditional_body(&while_stmt.body);
+                self.visit_conditional_body(&while_stmt.orelse);
             }
             Stmt::With(with_stmt) => {
                 for item in &with_stmt.items {
                     self.visit_expr(&item.context_expr);
+                    if let Some(vars) = &item.optional_vars {
+                        self.visit_store_target(vars, None);
+                    }
                 }
                 self.visit_conditional_body(&with_stmt.body);
             }
             Stmt::Try(try_stmt) => {
                 self.visit_conditional_body(&try_stmt.body);
                 for handler in &try_stmt.handlers {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    if let Some(type_) = &h.type_ {
+                        self.visit_expr(type_);
+                    }
+                    if let Some(name) = &h.name {
+                        if self.tainted.contains(name.as_str()) {
+                            self.record_other(
+                                h.range().start(),
+                                format!("`{name}` rebound by a loop, `with` or `except` target"),
+                                Consumption::Unknown,
+                            );
+                        }
+                    }
                     self.visit_conditional_body(&h.body);
                 }
                 self.visit_conditional_body(&try_stmt.orelse);
@@ -306,16 +838,17 @@ impl UsageScan {
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
+        let at = expr.range().start();
         match expr {
             Expr::Subscript(sub) => {
                 if let Some(receiver) = self.tainted_name(&sub.value) {
                     match crate::ast_extract::extract_string_list_or_single(&sub.slice) {
                         Some(cols) => {
                             for col in cols {
-                                self.record_column(col);
+                                self.record_column(at, col);
                             }
                         }
-                        None => self.record_other("this subscript", Consumption::Unknown),
+                        None => self.record_other(at, "this subscript", Consumption::Unknown),
                     }
                     // The whole subscript is already summarized by the observation
                     // just recorded above (specific columns, or "this subscript" for
@@ -337,13 +870,27 @@ impl UsageScan {
                 if let Some(receiver) = self.tainted_name(&attr.value) {
                     if !self.is_suppressed(receiver) {
                         let name = attr.attr.as_str();
-                        self.record_other(format!("`.{name}`"), classify_name(name));
+                        self.record_other(at, format!("`.{name}`"), classify_name(name));
                     }
                 } else {
                     self.visit_expr(&attr.value);
                 }
             }
             Expr::Call(call) => {
+                // These can read or rebind ANY variable by name, so nothing about the
+                // frame can be ruled out once one is called in this scope.
+                if let Expr::Name(f) = &*call.func {
+                    if matches!(
+                        f.id.as_str(),
+                        "eval" | "exec" | "locals" | "globals" | "vars"
+                    ) {
+                        self.record_other(
+                            at,
+                            format!("`{}()` can reach any variable", f.id),
+                            Consumption::Unknown,
+                        );
+                    }
+                }
                 match &*call.func {
                     // A method call ON the tainted var: `var.method(...)` -- one
                     // "other use" for the whole call, not also the generic
@@ -351,23 +898,47 @@ impl UsageScan {
                     Expr::Attribute(attr) => match self.tainted_name(&attr.value) {
                         Some(receiver) if !self.is_suppressed(receiver) => {
                             let name = attr.attr.as_str();
-                            self.record_other(format!("`.{name}()`"), classify_name(name));
+                            self.record_other(at, format!("`.{name}()`"), classify_name(name));
                         }
                         Some(_) => {}
                         None => self.visit_expr(&call.func),
                     },
                     _ => self.visit_expr(&call.func),
                 }
-                for arg in &call.arguments.args {
+                let callee = match &*call.func {
+                    Expr::Name(f) => Some(f),
+                    _ => None,
+                };
+                let builtin = callee.filter(|f| self.helpers.is_unshadowed_builtin(f));
+                let passed = match (builtin, &*call.func) {
+                    (Some(f), _) if matches!(f.id.as_str(), "print" | "display") => {
+                        format!("{OUTPUT_USE_PREFIX}`{}()`", f.id)
+                    }
+                    // Something else named `len` could do anything with the frame.
+                    (None, Expr::Name(f)) if f.id.as_str() == "len" => {
+                        "passed to a function named `len()` that isn't the builtin".to_string()
+                    }
+                    _ => passed_to(&call.func),
+                };
+                let summaries = callee.and_then(|f| self.helpers.usage_of(f));
+                for (position, arg) in call.arguments.args.iter().enumerate() {
                     if self.is_tainted(arg) {
-                        self.record_other("passed to a call", Consumption::Unknown);
+                        let summary = summaries
+                            .as_ref()
+                            .and_then(|all| all.iter().find(|p| p.position == position));
+                        self.passed_argument(at, &passed, callee, summary);
                     } else {
                         self.visit_expr(arg);
                     }
                 }
                 for kw in &call.arguments.keywords {
                     if self.is_tainted(&kw.value) {
-                        self.record_other("passed to a call", Consumption::Unknown);
+                        let summary = kw.arg.as_ref().and_then(|name| {
+                            summaries
+                                .as_ref()
+                                .and_then(|all| all.iter().find(|p| p.name == name.as_str()))
+                        });
+                        self.passed_argument(at, &passed, callee, summary);
                     } else {
                         self.visit_expr(&kw.value);
                     }
@@ -383,22 +954,24 @@ impl UsageScan {
                 if self.tainted.contains(name.id.as_str())
                     && !self.is_suppressed(name.id.as_str()) =>
             {
-                self.record_other("referenced", Consumption::Unknown);
+                self.record_other(at, "referenced", Consumption::Unknown);
             }
             Expr::Name(_) => {}
             // Same treatment as `FunctionDef`/`ClassDef` in `visit_stmt`: a lambda
-            // body is its own scope, not walked.
-            Expr::Lambda(_) => {}
+            // body is its own scope, not walked (its parameter defaults are not).
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameter_defaults(parameters);
+                }
+            }
             Expr::Named(named) => {
                 // A walrus target (`y := df`) binds a real name in the ENCLOSING
                 // scope -- unlike `Lambda`, this isn't a nested scope, so it needs
                 // the same alias-vs-use handling `Stmt::Assign` gets, not a skip.
                 self.visit_unless_tainted(&named.value);
                 if let Expr::Name(t) = &*named.target {
-                    self.retaint(
-                        t.id.as_str(),
-                        expr_forwards_tainted(&self.tainted, &named.value),
-                    );
+                    let forwards = self.forwards(&named.value);
+                    self.rebind_name(t.range().start(), t.id.as_str(), forwards);
                 }
             }
             Expr::Dict(dict) => {
@@ -489,7 +1062,7 @@ mod tests {
 
     fn usage(source: &str) -> ColumnUsage {
         let module = parse_module(source).unwrap().into_syntax();
-        scan_usage("df", &module.body)
+        scan_usage("df", &module.body, &|_| 0)
     }
 
     fn cols(usage: &ColumnUsage) -> Vec<(&str, bool)> {
@@ -584,7 +1157,7 @@ mod tests {
         let u = usage("helper(df)\n");
         assert_eq!(
             others(&u),
-            vec![("passed to a call", false, Consumption::Unknown)]
+            vec![("passed to `helper()`", false, Consumption::Unknown)]
         );
     }
 
@@ -737,7 +1310,7 @@ mod tests {
         let u = usage("raise ValueError(df)\n");
         assert_eq!(
             others(&u),
-            vec![("passed to a call", false, Consumption::Unknown)]
+            vec![("passed to `ValueError()`", false, Consumption::Unknown)]
         );
     }
 
@@ -902,6 +1475,324 @@ mod tests {
         assert_eq!(
             others(&u),
             vec![("this subscript", false, Consumption::Unknown)]
+        );
+    }
+
+    // --- soundness: what a suggestion that edits code depends on ---
+
+    fn has_other(u: &ColumnUsage, description: &str) -> bool {
+        u.other_uses.iter().any(|o| o.description == description)
+    }
+
+    #[test]
+    fn test_should_not_record_a_column_write_as_an_access() {
+        // arrange / act: `df["new"] = ...` creates/overwrites a column; recording it
+        // as a read would make a column that may not exist in the source look required.
+        let u = usage("df[\"new\"] = 1\n");
+
+        // assert
+        assert!(u.accesses.is_empty());
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_still_record_the_reads_on_the_right_of_a_column_write() {
+        let u = usage("df[\"b\"] = df[\"a\"] * 2\n");
+        assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_not_record_a_read_of_a_column_the_scope_wrote_first() {
+        let u = usage("df[\"t\"] = df[\"a\"] * 2\nprint(df[\"t\"], df[\"b\"])\n");
+        assert_eq!(cols(&u), vec![("a", false), ("b", false)]);
+        assert!(u.wrote_columns);
+    }
+
+    #[test]
+    fn test_should_not_treat_a_conditional_write_as_creating_the_column() {
+        let u = usage("if flag:\n    df[\"c\"] = 1\nprint(df[\"c\"])\n");
+        assert_eq!(cols(&u), vec![("c", false)]);
+        assert!(u.wrote_columns);
+    }
+
+    #[test]
+    fn test_should_read_a_column_before_it_is_written_as_a_source_read() {
+        let u = usage("print(df[\"x\"])\ndf[\"x\"] = 1\nprint(df[\"x\"])\n");
+        assert_eq!(cols(&u), vec![("x", false)]);
+    }
+
+    #[test]
+    fn test_should_count_a_list_assignment_as_writing_each_column() {
+        let u = usage("df[[\"p\", \"q\"]] = f()\nprint(df[\"p\"], df[\"q\"])\n");
+        assert!(cols(&u).is_empty());
+    }
+
+    #[test]
+    fn test_should_record_an_augmented_assignment_on_a_column_as_a_read() {
+        // `df["b"] += 1` reads `b` before it writes it.
+        let u = usage("df[\"b\"] += 1\n");
+        assert_eq!(cols(&u), vec![("b", false)]);
+    }
+
+    #[test]
+    fn test_should_record_a_masked_assignment_as_unclassified() {
+        let u = usage("df[df[\"a\"] > 1] = 0\n");
+        assert!(has_other(&u, "assignment through this subscript"));
+        assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_record_an_attribute_assignment_on_the_frame() {
+        // `df.columns = [...]` renames every column.
+        let u = usage("df.columns = [\"x\", \"y\"]\n");
+        assert!(has_other(&u, "`.columns` assigned"));
+    }
+
+    #[test]
+    fn test_should_record_the_frame_escaping_into_an_attribute() {
+        let u = usage("self.df = df\n");
+        assert_eq!(
+            others(&u),
+            vec![(
+                "stored in an attribute or container",
+                false,
+                Consumption::Unknown
+            )]
+        );
+    }
+
+    #[test]
+    fn test_should_record_the_frame_escaping_into_a_container() {
+        let u = usage("cache[\"k\"] = df\n");
+        assert!(has_other(&u, "stored in an attribute or container"));
+    }
+
+    #[test]
+    fn test_should_visit_a_for_else_body() {
+        let u = usage("for x in xs:\n    pass\nelse:\n    print(df[\"a\"])\n");
+        assert_eq!(cols(&u), vec![("a", true)]);
+    }
+
+    #[test]
+    fn test_should_visit_a_while_else_body() {
+        let u = usage("while flag:\n    pass\nelse:\n    print(df[\"a\"])\n");
+        assert_eq!(cols(&u), vec![("a", true)]);
+    }
+
+    #[test]
+    fn test_should_keep_the_taint_when_a_conditional_reassignment_may_not_run() {
+        // arrange / act: after the `if`, `df` may still be the ORIGINAL frame, so the
+        // later read must still count -- and the reassignment must be flagged.
+        let u = usage("if flag:\n    df = other()\nprint(df[\"a\"])\n");
+
+        // assert
+        assert_eq!(cols(&u), vec![("a", false)]);
+        assert!(has_other(&u, "`df` conditionally reassigned"));
+    }
+
+    #[test]
+    fn test_should_flag_a_loop_variable_that_rebinds_the_frame() {
+        let u = usage("for df in frames:\n    pass\n");
+        assert!(has_other(
+            &u,
+            "`df` rebound by a loop, `with` or `except` target"
+        ));
+    }
+
+    #[test]
+    fn test_should_flag_a_with_target_that_rebinds_the_frame() {
+        let u = usage("with open(p) as df:\n    pass\n");
+        assert!(has_other(
+            &u,
+            "`df` rebound by a loop, `with` or `except` target"
+        ));
+    }
+
+    #[test]
+    fn test_should_flag_an_except_target_that_rebinds_the_frame() {
+        let u = usage("try:\n    pass\nexcept ValueError as df:\n    pass\n");
+        assert!(has_other(
+            &u,
+            "`df` rebound by a loop, `with` or `except` target"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_flag_a_loop_variable_unrelated_to_the_frame() {
+        let u = usage("for row in rows:\n    pass\n");
+        assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_visit_decorators_and_parameter_defaults_of_a_nested_def() {
+        // arrange / act: both are evaluated in THIS scope when the `def` runs.
+        let u = usage("@cache(df[\"a\"])\ndef f(x=df[\"b\"]):\n    pass\n");
+
+        // assert
+        assert_eq!(cols(&u), vec![("a", false), ("b", false)]);
+    }
+
+    #[test]
+    fn test_should_visit_class_bases() {
+        let u = usage("class C(make(df)):\n    pass\n");
+        assert!(has_other(&u, "passed to `make()`"));
+    }
+
+    #[test]
+    fn test_should_visit_a_lambda_default() {
+        let u = usage("f = lambda x=df[\"a\"]: x\n");
+        assert_eq!(cols(&u), vec![("a", false)]);
+    }
+
+    #[test]
+    fn test_should_flag_dynamic_name_lookups() {
+        for call in ["eval(s)", "exec(s)", "locals()", "globals()", "vars()"] {
+            let u = usage(&format!("{call}\n"));
+            assert!(
+                u.other_uses
+                    .iter()
+                    .any(|o| o.description.ends_with("can reach any variable")),
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_visit_a_nested_fstring_format_spec() {
+        let u = usage("msg = f\"{x:{df}}\"\n");
+        assert!(has_other(&u, "referenced"));
+    }
+
+    #[test]
+    fn test_should_record_the_line_of_each_observation() {
+        // arrange
+        let source = "x = 1\nprint(df[\"a\"])\n\ndf.to_dict()\n";
+        let module = parse_module(source).unwrap().into_syntax();
+        let line_of = |offset: TextSize| source[..offset.to_usize()].matches('\n').count() + 1;
+
+        // act
+        let u = scan_usage("df", &module.body, &line_of);
+
+        // assert
+        assert_eq!(u.accesses[0].line, 2);
+        assert_eq!(u.other_uses[0].line, 4);
+    }
+
+    #[test]
+    fn test_should_track_every_alias_in_ever_tainted() {
+        let u = usage("out = df\nout = other()\nalias = out\n");
+        assert!(u.ever_tainted.contains("df"));
+        assert!(u.ever_tainted.contains("out"));
+        assert!(!u.ever_tainted.contains("alias"));
+    }
+
+    // --- first_nested_scope_mention / declares_global_or_nonlocal ---
+
+    fn mention(source: &str) -> bool {
+        let module = parse_module(source).unwrap().into_syntax();
+        first_nested_scope_mention(&module.body, &HashSet::from(["df".to_string()])).is_some()
+    }
+
+    #[test]
+    fn test_should_find_a_mention_inside_a_nested_function() {
+        assert!(mention("def f():\n    return df[\"a\"]\n"));
+    }
+
+    #[test]
+    fn test_should_find_a_mention_in_a_function_defined_before_the_origin() {
+        // `body` is the whole scope: a function above the origin still runs later.
+        assert!(mention("def f():\n    return df\ndf = load()\n"));
+    }
+
+    #[test]
+    fn test_should_find_a_mention_inside_a_lambda_body() {
+        assert!(mention("f = lambda: df\n"));
+    }
+
+    #[test]
+    fn test_should_find_a_mention_inside_a_comprehension_body() {
+        assert!(mention("out = [df[\"a\"] for x in xs]\n"));
+    }
+
+    #[test]
+    fn test_should_find_a_mention_in_a_later_generator_clause() {
+        assert!(mention("out = [y for x in xs for y in df]\n"));
+    }
+
+    #[test]
+    fn test_should_find_a_mention_inside_a_class_body() {
+        assert!(mention("class C:\n    x = df\n"));
+    }
+
+    #[test]
+    fn test_should_not_count_the_outermost_comprehension_iterable() {
+        // evaluated in the enclosing scope -- `scan_usage` already records it.
+        assert!(!mention("out = sum(x for x in df[\"a\"])\n"));
+    }
+
+    #[test]
+    fn test_should_not_count_decorators_defaults_or_class_bases() {
+        assert!(!mention("@cache(df)\ndef f(x=df):\n    pass\n"));
+        assert!(!mention("class C(make(df)):\n    pass\n"));
+        assert!(!mention("f = lambda x=df: x\n"));
+    }
+
+    #[test]
+    fn test_should_not_find_a_mention_of_an_unrelated_name() {
+        assert!(!mention("def f():\n    return other\n"));
+    }
+
+    #[test]
+    fn test_should_not_count_top_level_code() {
+        assert!(!mention("print(df)\n"));
+    }
+
+    fn declares(source: &str) -> bool {
+        let module = parse_module(source).unwrap().into_syntax();
+        declares_global_or_nonlocal(&module.body, "df")
+    }
+
+    #[test]
+    fn test_should_find_a_global_or_nonlocal_declaration() {
+        assert!(declares("global df\n"));
+        assert!(declares("if flag:\n    nonlocal df\n"));
+    }
+
+    #[test]
+    fn test_should_ignore_a_declaration_of_another_name_or_in_a_nested_def() {
+        assert!(!declares("global other\n"));
+        assert!(!declares("def f():\n    global df\n"));
+    }
+
+    #[test]
+    fn test_should_name_a_module_attribute_callee() {
+        let u = usage("np.log(df)\n");
+        assert_eq!(
+            others(&u),
+            vec![("passed to `np.log()`", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_name_a_keyword_argument_callee_too() {
+        let u = usage("fit(data=df)\n");
+        assert_eq!(
+            others(&u),
+            vec![("passed to `fit()`", false, Consumption::Unknown)]
+        );
+    }
+
+    #[test]
+    fn test_should_fall_back_to_a_generic_label_for_an_unnameable_callee() {
+        let u = usage("registry[\"k\"](df)\n");
+        assert_eq!(
+            others(&u),
+            vec![("passed to a call", false, Consumption::Unknown)]
+        );
+        let u = usage("a.b.c(df)\n");
+        assert_eq!(
+            others(&u),
+            vec![("passed to a call", false, Consumption::Unknown)]
         );
     }
 }

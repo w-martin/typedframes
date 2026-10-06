@@ -51,7 +51,7 @@ GE_REPO_URL = "https://github.com/great-expectations/great_expectations.git"
 # that produced the committed README numbers -- part of why the v0.2.1->v0.2.2
 # README jump (285ms -> 1.79s) turned out not to correspond to any code change
 # at all. Bump deliberately when GE ships a new release, not silently.
-GE_COMMIT = "1.20.0"
+GE_COMMIT = "1.23.2"
 
 
 @dataclass
@@ -513,7 +513,10 @@ def build_tools() -> list[ToolInfo]:
     # and directories are handled correctly.  The old approach invoked the raw
     # Rust binary, which only accepts a single file, and the benchmark had to
     # special-case a hardcoded example file — invalidating multi-file results.
-    tools.append(ToolInfo("typedframes", ["uv", "run", "typedframes", "check"], "DataFrame column checker"))
+    # --no-cache skips the on-disk index cache, so every run is cold like the other tools.
+    tools.append(
+        ToolInfo("typedframes", ["uv", "run", "typedframes", "check", "--no-cache"], "DataFrame column checker")
+    )
     tools.extend(
         [
             # --no-cache bypasses ruff's cache (~/.cache/ruff/) so every run is cold;
@@ -599,6 +602,20 @@ def ensure_release_build(project_root: Path) -> None:
         print("Release build OK.")
 
 
+def ensure_extension_loads(project_root: Path) -> None:
+    """Exit if the typedframes extension can't be imported, which would time an error exit."""
+    result = subprocess.run(
+        ["uv", "run", "python", "-c", "import typedframes._rust_checker"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(f"typedframes extension does not load; fix the build first:\n{result.stderr.strip()}")
+
+
 def main() -> None:
     """Run all benchmarks and print results."""
     parser = argparse.ArgumentParser(description="Benchmark type checkers")
@@ -616,6 +633,7 @@ def main() -> None:
 
     if not args.skip_build:
         ensure_release_build(project_root)
+    ensure_extension_loads(project_root)
 
     tools = build_tools()
 

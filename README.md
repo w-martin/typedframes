@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.9.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.10.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -470,7 +470,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.9.0"]
+        additional_dependencies: ["typedframes==0.10.0"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -519,7 +519,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.9.0"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.10.0"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
@@ -633,17 +633,17 @@ plus the requested features, so both halves get checked normally. See
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-09-30 · Darwin 27.0.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.20.0*
+*2026-10-06 · Darwin 27.0.0 · arm · CPython 3.14.4 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
 
-| Tool | Version | What it does | typedframes (13 files) | great_expectations (485 files) |
+| Tool | Version | What it does | typedframes (14 files) | great_expectations (494 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.9.0 | DataFrame column checker | 51ms ±613µs (IQR 997µs) | 268ms ±4ms (IQR 5ms) |
-| ruff | 0.16.3 | Linter (no type checking) | 31ms ±735µs (IQR 882µs) | 237ms ±4ms (IQR 6ms) |
-| ty | 0.0.72 | Type checker | 74ms ±2ms (IQR 3ms) | 782ms ±12ms (IQR 17ms) |
-| pyrefly | 1.2.0 | Type checker | 98ms ±1ms (IQR 2ms) | 276ms ±8ms (IQR 14ms) |
-| mypy | 2.3.1 | Type checker (no plugin) | 2.73s ±37ms (IQR 43ms) | 4.30s ±72ms (IQR 106ms) |
-| mypy + typedframes | 2.3.1 | Type checker + column checker | 2.72s ±19ms (IQR 23ms) | 4.61s ±22ms (IQR 23ms) |
-| pyright | 1.1.411 | Type checker | 826ms ±11ms (IQR 11ms) | 3.34s ±26ms (IQR 40ms) |
+| typedframes | 0.10.0 | DataFrame column checker | 49ms ±618µs (IQR 609µs) | 134ms ±1ms (IQR 2ms) |
+| ruff | 0.16.10 | Linter (no type checking) | 22ms ±940µs (IQR 2ms) | 225ms ±3ms (IQR 5ms) |
+| ty | 0.0.84 | Type checker | 70ms ±1ms (IQR 2ms) | 788ms ±9ms (IQR 9ms) |
+| pyrefly | 1.3.2 | Type checker | 91ms ±863µs (IQR 1ms) | 261ms ±7ms (IQR 11ms) |
+| mypy | 2.4.0 | Type checker (no plugin) | 1.96s ±10ms (IQR 13ms) | 3.27s ±19ms (IQR 20ms) |
+| mypy + typedframes | 2.4.0 | Type checker + column checker | 1.99s ±29ms (IQR 31ms) | 3.67s ±15ms (IQR 15ms) |
+| pyright | 1.1.414 | Type checker | 940ms ±4ms (IQR 6ms) | 4.21s ±35ms (IQR 52ms) |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -659,6 +659,35 @@ The standalone checker is built with [`ruff_python_parser`](https://github.com/a
 parsing.
 
 **Note:** ty (Astral) does not currently support mypy plugins, so use the standalone binary for column checking with ty.
+
+### Index Cache and Parallelism
+
+Files are indexed and checked in parallel, one worker per core (up to 16). Set `TYPEDFRAMES_JOBS=1` to run on a single thread, or
+a number to cap the workers.
+
+What the checker learns about each file is also cached on disk and reused for every file whose contents have not
+changed, so repeat runs only re-index what you edited. A cached run reports exactly what an uncached run would. The cache
+lives in your per-user cache directory by default (`~/Library/Caches/typedframes` on macOS, `~/.cache/typedframes` on
+Linux), so nothing is added to your repository.
+
+```shell
+typedframes cache path         # where is it?
+typedframes cache clear        # delete it
+typedframes check src/ --no-cache                        # skip it for one run
+typedframes check src/ --cache-dir .typedframes_cache    # keep it in the project instead
+typedframes cache gitignore    # add a project-local cache directory to .gitignore
+```
+
+To set it permanently, use the `TYPEDFRAMES_CACHE_DIR` environment variable or `pyproject.toml`; a relative path is
+relative to the project:
+
+```toml
+[tool.typedframes]
+cache_dir = ".typedframes_cache"
+```
+
+The order of precedence is `--no-cache`, `--cache-dir`, `TYPEDFRAMES_CACHE_DIR`, `cache_dir`, then the default. See
+`typedframes cache --help`.
 
 ---
 
@@ -859,7 +888,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.4.1                  | 0.32.1      | 1.20.0             | 0.3.7                 | 3.0.5        | 0.1.2       | 1.1.3              | 5.1.1            | 2.24.0   | 3.0.0            | 0.8.6            |
+| **Version tested**              | 0.10.0                 | 0.34.1      | 1.23.2             | 0.3.7                 | 3.0.5.260914 | 0.1.2       | 1.1.3              | 5.1.1            | 2.26.0   | 3.1.2            | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |
@@ -879,22 +908,23 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 | Pandas                          | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ✅ Yes                 | ✅ Yes        | ✅ Yes       | ✅ Yes              | ❌ Own            | ✅ Yes    | ❌ No             | ⚠️ Limited        |
 | Polars                          | ✅ Yes                  | ✅ Yes       | ❌ No               | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ Own            | ✅ Yes    | ✅ Yes (only)     | ✅ Yes            |
 | DuckDB, cuDF, etc.              | ❌ No                   | ❌ No        | ✅ Spark, SQL       | ❌ No                  | ❌ No         | ❌ No        | ❌ No               | ❌ No             | ✅ Yes    | ❌ No             | ❌ No             |
-| **Project Status (Aug 2026)**   |
+| **Project Status (Oct 2026)**   |
 | Active development              | ✅ Yes                  | ✅ Yes       | ✅ Yes              | ⚠️ Low                | ✅ Yes        | ❌ Inactive  | ⚠️ Low             | ✅ Yes            | ✅ Yes    | ✅ Yes            | ✅ Yes            |
 
 **Legend:** ✅ Full support | ⚠️ Limited/Partial | ❌ Not supported
 
 ### Tool Descriptions
 
-- **[Pandera](https://pandera.readthedocs.io/)** (v0.32.1): Excellent runtime validation. Static analysis support exists
+- **[Pandera](https://pandera.readthedocs.io/)** (v0.34.1): Excellent runtime validation. Static analysis support exists
   but has limitations—column access via `df["column"]` is not validated, and schema mismatches between functions may not
   be caught.
 
 - **[strictly_typed_pandas](https://strictly-typed-pandas.readthedocs.io/)** (v0.3.7): Provides `DataSet[Schema]` type
   hints for runtime validation via typeguard. Despite documentation implying mypy support, there is no mypy plugin —
-  column access errors are not caught statically. No standalone checker. No polars support.
+  column access errors are not caught statically. No standalone checker. No polars support. Pinned to
+  `pandas<=2.2.3` and `pandas-stubs<=2.2.3.250308`, so it can't be used with pandas 3.
 
-- **[pandas-stubs](https://github.com/pandas-dev/pandas-stubs)** (v3.0.5): Official pandas type stubs. Provides
+- **[pandas-stubs](https://github.com/pandas-dev/pandas-stubs)** (v3.0.5.260914): Official pandas type stubs. Provides
   API-level types but no column-level checking.
 
 - **[dataenforce](https://github.com/CedricFR/dataenforce)** (v0.1.2, the only release ever published): Runtime
@@ -909,17 +939,17 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
   Not compatible with pandas/polars — requires a full rewrite to StaticFrame's own API. Column access is still
   string-based; mypy does not catch column name typos. Type safety comes from immutability guarantees, not schema checking.
 
-- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.24.0): Compatibility layer that provides a unified API
+- **[narwhals](https://narwhals-dev.github.io/narwhals/)** (v2.26.0): Compatibility layer that provides a unified API
   across pandas, polars, DuckDB, cuDF, and more. Solves a different problem—write-once-run-anywhere portability, not
   type safety. See [Why Abstraction Layers Don't Solve Type Safety](#why-abstraction-layers-dont-solve-type-safety)
   below.
 
-- **[Great Expectations](https://greatexpectations.io/)** (v1.20.0): Comprehensive data quality framework. Defines
+- **[Great Expectations](https://greatexpectations.io/)** (v1.23.2): Comprehensive data quality framework. Defines
   "expectations" (assertions) about data values, distributions, and schema properties. Excellent for runtime
   validation, data documentation, and data quality monitoring. No static analysis or column-level type checking in
   code. Supports pandas, Spark, and SQL backends.
 
-- **[dataframely](https://github.com/Quantco/dataframely)** (v3.0.0): Polars-only runtime validation library from Quantco.
+- **[dataframely](https://github.com/Quantco/dataframely)** (v3.1.2): Polars-only runtime validation library from Quantco.
   Schemas are defined as classes inheriting `dy.Schema` with typed descriptor fields (`dy.String()`, `dy.Float64()`)
   and `@dy.rule()` decorators for cross-column and group-level constraints. Returns `dy.DataFrame[Schema]` generic
   types that give call-site narrowing to type checkers, but does not validate column subscript access inside function
@@ -937,16 +967,16 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 These are general Python type checkers. They don't validate DataFrame column names, but they can be used alongside
 typedframes for comprehensive type checking:
 
-- **[mypy](https://mypy-lang.org/)** (v2.3.1): The original Python type checker. typedframes provides a mypy plugin for
+- **[mypy](https://mypy-lang.org/)** (v2.4.0): The original Python type checker. typedframes provides a mypy plugin for
   column checking. See [performance benchmarks](#static-analysis-performance).
 
-- **[ty](https://github.com/astral-sh/ty)** (v0.0.72, Astral): New Rust-based type checker, faster than mypy on
+- **[ty](https://github.com/astral-sh/ty)** (v0.0.84, Astral): New Rust-based type checker, faster than mypy on
   large codebases. Does not support mypy plugins—use typedframes standalone checker.
 
-- **[pyrefly](https://pyrefly.org/)** (v1.2.0, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,
+- **[pyrefly](https://pyrefly.org/)** (v1.3.2, Meta): Rust-based type checker from Meta, replacement for Pyre. Fast,
   but no DataFrame column checking.
 
-- **[pyright](https://github.com/microsoft/pyright)** (v1.1.411, Microsoft): Type checker powering Pylance/VSCode. No
+- **[pyright](https://github.com/microsoft/pyright)** (v1.1.414, Microsoft): Type checker powering Pylance/VSCode. No
   mypy plugin support—use typedframes standalone checker.
 
 ### Not Directly Comparable

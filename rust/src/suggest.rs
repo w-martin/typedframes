@@ -1,0 +1,1061 @@
+//! Suggestions for an untyped DataFrame origin, built from how the rest of its scope
+//! uses it (see `column_usage`).
+//!
+//! The one suggestion is a column selection on its own line after the load:
+//! `df = df[["a", "b"]]` (pandas) or `df = df.select("a", "b")` (polars), which gives the
+//! checker an exact schema. It rewrites real code, so it is made only when every use of
+//! the frame is visible and is a read of a named column; anything else is withheld with a
+//! reason, since dropping a column the program still reads breaks it at runtime.
+//!
+//! Output is byte-range edits plus a rendered diff; `apply` is what writes them.
+
+use crate::column_usage::{ColumnUsage, OtherUse};
+use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
+use serde::Serialize;
+use std::collections::HashMap;
+
+/// One byte-range replacement against the ORIGINAL source (`start == end` inserts).
+#[derive(Debug, Clone, Serialize)]
+pub struct Edit {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Suggestion {
+    pub kind: &'static str,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    /// `"safe"` when nothing about the change needs a human's judgement, `"review"`
+    /// when it is probably right but depends on something this scan can't see (see
+    /// `notes`).
+    pub tier: &'static str,
+    pub columns: Vec<String>,
+    pub reason: String,
+    pub notes: Vec<String>,
+    pub edits: Vec<Edit>,
+    pub diff: String,
+}
+
+/// A site that got no suggestion, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct Withheld {
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub reason: String,
+}
+
+pub(crate) struct Origin<'a> {
+    pub(crate) libraries: &'a LibraryContext,
+    /// The variable's own annotation, when it has one (`df: pd.DataFrame = ...`).
+    pub(crate) annotation: Option<&'a Expr>,
+    pub(crate) source: &'a str,
+    pub(crate) display_path: &'a str,
+    /// The expression assigned to the variable (`None` for a bare annotation).
+    pub(crate) value: Option<&'a Expr>,
+    pub(crate) var: &'a str,
+    pub(crate) line: usize,
+    pub(crate) col: usize,
+    /// Byte range of the whole assignment statement.
+    pub(crate) stmt_start: usize,
+    pub(crate) stmt_end: usize,
+    /// A local of a function rather than a module-level name. A module-level frame can
+    /// be imported by other modules, which this scan can't see.
+    pub(crate) function_local: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Library {
+    Pandas,
+    Polars,
+}
+
+impl Library {
+    /// The name stored in the index.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Library::Pandas => "pandas",
+            Library::Polars => "polars",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Library> {
+        match name {
+            "pandas" => Some(Library::Pandas),
+            "polars" => Some(Library::Polars),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ModuleKind {
+    Library(Library),
+    Connectorx,
+}
+
+/// What a file's own imports and function signatures say about which library a frame
+/// belongs to. Built once per file.
+#[derive(Default, Debug)]
+pub(crate) struct LibraryContext {
+    // Local name of an imported module: `import pandas as pd` -> pd.
+    modules: HashMap<String, ModuleKind>,
+    // Local name of something imported from pandas/polars: `from pandas import read_csv`.
+    names: HashMap<String, Library>,
+    // Functions whose return annotation says pandas or polars, by bare name: this file's
+    // own, plus those imported from other project files (from the index).
+    functions: HashMap<String, Library>,
+}
+
+impl LibraryContext {
+    /// `imported_functions`: libraries of functions this file imports from other files.
+    pub(crate) fn new(
+        body: &[Stmt],
+        imported_functions: &HashMap<String, Library>,
+    ) -> LibraryContext {
+        let mut context = LibraryContext {
+            functions: imported_functions.clone(),
+            ..LibraryContext::default()
+        };
+        context.collect_imports(body);
+        // A name defined twice with different libraries can't be trusted either way.
+        let mut own: HashMap<String, Option<Library>> = HashMap::new();
+        collect_function_returns(body, &context, &mut own);
+        for (name, library) in own {
+            match library {
+                Some(library) => context.functions.insert(name, library),
+                None => context.functions.remove(&name),
+            };
+        }
+        context
+    }
+
+    #[cfg(test)]
+    fn extend(&mut self, body: &[Stmt]) {
+        self.collect_imports(body);
+        let mut own: HashMap<String, Option<Library>> = HashMap::new();
+        collect_function_returns(body, self, &mut own);
+        for (name, library) in own {
+            match library {
+                Some(library) => self.functions.insert(name, library),
+                None => self.functions.remove(&name),
+            };
+        }
+    }
+
+    fn collect_imports(&mut self, body: &[Stmt]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Import(import) => {
+                    for alias in &import.names {
+                        let local = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+                        let kind = match alias.name.as_str() {
+                            "pandas" => Some(ModuleKind::Library(Library::Pandas)),
+                            "polars" => Some(ModuleKind::Library(Library::Polars)),
+                            "connectorx" => Some(ModuleKind::Connectorx),
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            self.modules.insert(local.to_string(), kind);
+                        }
+                    }
+                }
+                Stmt::ImportFrom(import) if import.level == 0 => {
+                    let library = match import.module.as_ref().map(|m| m.as_str()) {
+                        Some("pandas") => Some(Library::Pandas),
+                        Some("polars") => Some(Library::Polars),
+                        _ => None,
+                    };
+                    if let Some(library) = library {
+                        for alias in &import.names {
+                            let local = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+                            self.names.insert(local.to_string(), library);
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => self.collect_imports(&f.body),
+                Stmt::ClassDef(c) => self.collect_imports(&c.body),
+                Stmt::If(i) => {
+                    self.collect_imports(&i.body);
+                    for clause in &i.elif_else_clauses {
+                        self.collect_imports(&clause.body);
+                    }
+                }
+                Stmt::Try(t) => {
+                    self.collect_imports(&t.body);
+                    self.collect_imports(&t.orelse);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The library an annotation names (`pd.DataFrame`, `pl.LazyFrame`, an imported
+    /// `DataFrame`), unwrapping `Optional`/`Annotated`/`X | None`.
+    fn annotation_library(&self, annotation: &Expr) -> Option<Library> {
+        match annotation {
+            Expr::Attribute(attribute)
+                if matches!(attribute.attr.as_str(), "DataFrame" | "LazyFrame") =>
+            {
+                let Expr::Name(base) = &*attribute.value else {
+                    return None;
+                };
+                match self.modules.get(base.id.as_str())? {
+                    ModuleKind::Library(library) => Some(*library),
+                    ModuleKind::Connectorx => None,
+                }
+            }
+            Expr::Name(name) if matches!(name.id.as_str(), "DataFrame" | "LazyFrame") => {
+                self.names.get(name.id.as_str()).copied()
+            }
+            Expr::Subscript(subscript) => {
+                let wrapper = match &*subscript.value {
+                    Expr::Name(n) => n.id.as_str(),
+                    Expr::Attribute(a) => a.attr.as_str(),
+                    _ => return None,
+                };
+                if !matches!(wrapper, "Annotated" | "Optional") {
+                    return None;
+                }
+                match &*subscript.slice {
+                    Expr::Tuple(items) => self.annotation_library(items.elts.first()?),
+                    single => self.annotation_library(single),
+                }
+            }
+            Expr::BinOp(binop) => self
+                .annotation_library(&binop.left)
+                .or_else(|| self.annotation_library(&binop.right)),
+            _ => None,
+        }
+    }
+}
+
+// Every function (and method) of `body` with a return annotation that names a library,
+// keyed by bare name; `None` once two definitions of the name disagree.
+fn collect_function_returns(
+    body: &[Stmt],
+    context: &LibraryContext,
+    out: &mut HashMap<String, Option<Library>>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(function) => {
+                let library = function
+                    .returns
+                    .as_deref()
+                    .and_then(|r| context.annotation_library(r));
+                out.entry(function.name.to_string())
+                    .and_modify(|existing| {
+                        if *existing != library {
+                            *existing = None;
+                        }
+                    })
+                    .or_insert(library);
+                collect_function_returns(&function.body, context, out);
+            }
+            Stmt::ClassDef(class) => collect_function_returns(&class.body, context, out),
+            _ => {}
+        }
+    }
+}
+
+/// The library each function of `module` returns, by name -- what the index stores so
+/// other files can resolve a call to it.
+pub(crate) fn function_libraries(module: &ModModule) -> HashMap<String, Library> {
+    LibraryContext::new(&module.body, &HashMap::new()).functions
+}
+
+/// `Ok` with a suggestion, or `Err` with the reason none could be made.
+pub(crate) fn suggest_selection(
+    origin: &Origin,
+    usage: &ColumnUsage,
+) -> Result<Suggestion, String> {
+    let library = library_of(origin)?;
+    let insertion = insertion_point(origin)?;
+
+    let blockers: Vec<&OtherUse> = usage
+        .other_uses
+        .iter()
+        .filter(|u| crate::column_usage::blocks_narrowing(u))
+        .collect();
+    if let Some(first) = blockers.first() {
+        let more = match blockers.len() - 1 {
+            0 => String::new(),
+            n => format!(", and {n} more"),
+        };
+        return Err(format!(
+            "can't see everything done with it: {} (line {}){more}",
+            first.description, first.line
+        ));
+    }
+    if usage.accesses.is_empty() {
+        return Err("no column is read from it later in this scope".to_string());
+    }
+
+    let mut columns: Vec<String> = Vec::new();
+    for access in &usage.accesses {
+        if !columns.contains(&access.column) {
+            columns.push(access.column.clone());
+        }
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    for column in &columns {
+        let mut reads = usage.accesses.iter().filter(|a| &a.column == column);
+        if reads.clone().all(|a| a.conditional) {
+            let line = reads.next().map_or(0, |a| a.line);
+            notes.push(format!(
+                "'{column}' is only read conditionally (line {line}); if the data lacks it, \
+                 the selection would now fail"
+            ));
+        }
+    }
+    let outputs: Vec<&OtherUse> = usage
+        .other_uses
+        .iter()
+        .filter(|u| {
+            u.description
+                .starts_with(crate::column_usage::OUTPUT_USE_PREFIX)
+        })
+        .collect();
+    if let Some(first) = outputs.first() {
+        notes.push(format!(
+            "the frame is displayed (line {}); the output will show only the selected columns",
+            first.line
+        ));
+    }
+    if library == Library::Pandas && usage.wrote_columns {
+        notes.push(
+            "columns are assigned into the frame later; on older pandas, assigning into a \
+             column selection can raise SettingWithCopyWarning"
+                .to_string(),
+        );
+    }
+    if !origin.function_local {
+        notes.push(
+            "module-level variable: another module may import it and read columns this scan \
+             can't see"
+                .to_string(),
+        );
+    }
+
+    let quoted: Vec<String> = columns
+        .iter()
+        .map(|c| serde_json::to_string(c).unwrap_or_else(|_| format!("\"{c}\"")))
+        .collect();
+    let expression = match library {
+        Library::Pandas => format!("{}[[{}]]", origin.var, quoted.join(", ")),
+        Library::Polars => format!("{}.select({})", origin.var, quoted.join(", ")),
+    };
+    let replacement = format!(
+        "{}{} = {expression}{}",
+        insertion.indent, origin.var, insertion.newline
+    );
+    let mut new_source = String::with_capacity(origin.source.len() + replacement.len());
+    new_source.push_str(&origin.source[..insertion.offset]);
+    if insertion.leading_newline {
+        new_source.push('\n');
+    }
+    new_source.push_str(&replacement);
+    new_source.push_str(&origin.source[insertion.offset..]);
+    let edit_text = if insertion.leading_newline {
+        format!("\n{replacement}")
+    } else {
+        replacement
+    };
+
+    let mut lines: Vec<usize> = usage.accesses.iter().map(|a| a.line).collect();
+    lines.sort_unstable();
+    lines.dedup();
+    let mut helpers: Vec<&str> = usage
+        .accesses
+        .iter()
+        .filter_map(|a| a.via.as_deref())
+        .collect();
+    helpers.sort_unstable();
+    helpers.dedup();
+    let through = if helpers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; some are read inside {}",
+            helpers
+                .iter()
+                .map(|h| format!("`{h}()`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let reason = format!(
+        "only {} {} read later (line{} {}{through})",
+        columns
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if columns.len() == 1 { "is" } else { "are" },
+        if lines.len() == 1 { "" } else { "s" },
+        lines
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+
+    Ok(Suggestion {
+        kind: "select",
+        line: origin.line,
+        col: origin.col,
+        var: origin.var.to_string(),
+        tier: if notes.is_empty() { "safe" } else { "review" },
+        columns,
+        reason,
+        notes,
+        edits: vec![Edit {
+            start: insertion.offset,
+            end: insertion.offset,
+            replacement: edit_text,
+        }],
+        diff: render_unified_diff(origin.display_path, origin.source, &new_source),
+    })
+}
+
+/// Whether `stmt` already narrows `var` to named columns: `var = var[["a", "b"]]` or
+/// `var = var.select("a", "b")`. Running the suggestion again on code it has already
+/// changed must find nothing to do.
+pub(crate) fn is_column_selection_of(stmt: &Stmt, var: &str) -> bool {
+    let Stmt::Assign(assign) = stmt else {
+        return false;
+    };
+    let [Expr::Name(target)] = assign.targets.as_slice() else {
+        return false;
+    };
+    if target.id.as_str() != var {
+        return false;
+    }
+    let is_var = |expr: &Expr| matches!(expr, Expr::Name(n) if n.id.as_str() == var);
+    match &*assign.value {
+        Expr::Subscript(subscript) => {
+            is_var(&subscript.value)
+                && matches!(&*subscript.slice, Expr::List(_))
+                && crate::ast_extract::extract_string_list(&subscript.slice).is_some()
+        }
+        Expr::Call(call) => {
+            matches!(&*call.func, Expr::Attribute(a) if a.attr.as_str() == "select" && is_var(&a.value))
+                && !call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && call
+                    .arguments
+                    .args
+                    .iter()
+                    .all(|a| matches!(a, Expr::StringLiteral(_)))
+        }
+        _ => false,
+    }
+}
+
+// Pandas or polars. In order of how direct the evidence is: the variable's own annotation;
+// the method that produced the frame (`.to_df()`, `.fetch_pandas_all()`, `.toPandas()` are
+// pandas, `.pl()` polars); the module or imported name the expression starts from
+// (`pd.read_parquet(...)`, `read_csv(...)` imported from pandas, connectorx's
+// `return_type=`); the return annotation of a function it calls.
+fn library_of(origin: &Origin) -> Result<Library, String> {
+    let context = origin.libraries;
+    if let Some(library) = origin
+        .annotation
+        .and_then(|a| context.annotation_library(a))
+    {
+        return Ok(library);
+    }
+    let value = origin
+        .value
+        .ok_or_else(|| "it has no assigned value".to_string())?;
+    if let Expr::Call(call) = value {
+        if let Expr::Attribute(attribute) = &*call.func {
+            match attribute.attr.as_str() {
+                "to_df" | "fetch_pandas_all" | "toPandas" | "to_pandas" | "to_dataframe" | "df" => {
+                    return Ok(Library::Pandas)
+                }
+                "pl" | "to_polars" => return Ok(Library::Polars),
+                _ => {}
+            }
+        }
+    }
+    let mut current = value;
+    let mut innermost_call: Option<&ast::ExprCall> = None;
+    loop {
+        match current {
+            Expr::Call(call) => {
+                innermost_call = Some(call);
+                current = &call.func;
+            }
+            Expr::Attribute(attribute) => current = &attribute.value,
+            Expr::Name(name) => {
+                let id = name.id.as_str();
+                match context.modules.get(id) {
+                    Some(ModuleKind::Library(library)) => return Ok(*library),
+                    Some(ModuleKind::Connectorx) => return Ok(connectorx_library(innermost_call)),
+                    None => {}
+                }
+                if let Some(library) = context.names.get(id).or_else(|| context.functions.get(id)) {
+                    return Ok(*library);
+                }
+                return Err(format!(
+                    "can't tell whether `{id}` is pandas or polars (the origin isn't a direct \
+                     `pd.`/`pl.` call, a call to a function annotated `-> pd.DataFrame` or \
+                     `-> pl.DataFrame`, or a method like `.to_df()`)"
+                ));
+            }
+            _ => return Err("its origin isn't a call the library can be read from".to_string()),
+        }
+    }
+}
+
+// connectorx returns pandas unless `return_type="polars"` is passed.
+fn connectorx_library(call: Option<&ast::ExprCall>) -> Library {
+    let polars =
+        call.is_some_and(|call| {
+            call.arguments.keywords.iter().any(|keyword| {
+            keyword.arg.as_ref().is_some_and(|a| a.as_str() == "return_type")
+                && matches!(&keyword.value, Expr::StringLiteral(s) if s.value.to_str() == "polars")
+        })
+        });
+    if polars {
+        Library::Polars
+    } else {
+        Library::Pandas
+    }
+}
+
+struct InsertionPoint {
+    offset: usize,
+    indent: String,
+    // The statement is the last line of a file with no trailing newline.
+    leading_newline: bool,
+    newline: &'static str,
+}
+
+// The start of the line after the origin statement, indented like it. Refused when other
+// code shares the origin's lines (`a = 1; df = load()`), since a new line after it would
+// not directly follow the load.
+fn insertion_point(origin: &Origin) -> Result<InsertionPoint, String> {
+    let source = origin.source;
+    let line_start = source[..origin.stmt_start].rfind('\n').map_or(0, |i| i + 1);
+    let indent = &source[line_start..origin.stmt_start];
+    if !indent.chars().all(|c| c == ' ' || c == '\t') {
+        return Err("it shares a line with other code".to_string());
+    }
+    let rest = &source[origin.stmt_end..];
+    let line_len = rest.find('\n').unwrap_or(rest.len());
+    let trailing = rest[..line_len].trim_start();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        return Err("it shares a line with other code".to_string());
+    }
+    let (offset, leading_newline) = match rest.find('\n') {
+        Some(i) => (origin.stmt_end + i + 1, false),
+        None => (source.len(), true),
+    };
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    Ok(InsertionPoint {
+        offset,
+        indent: indent.to_string(),
+        leading_newline,
+        newline: if leading_newline { "" } else { newline },
+    })
+}
+
+/// A unified diff of `old` -> `new`, or an empty string when they are equal. Assumes
+/// the change is one contiguous region (true of every edit made here), found by
+/// trimming the common leading and trailing lines.
+pub(crate) fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
+    const CONTEXT: usize = 3;
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    if prefix == old_lines.len() && prefix == new_lines.len() {
+        return String::new();
+    }
+    let mut suffix = 0;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let before = prefix.min(CONTEXT);
+    let after = suffix.min(CONTEXT);
+    let start = prefix - before;
+    let old_changed_end = old_lines.len() - suffix;
+    let new_changed_end = new_lines.len() - suffix;
+    let old_end = old_changed_end + after;
+    let new_end = new_changed_end + after;
+
+    let mut out = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{},{} +{},{} @@\n",
+        start + 1,
+        old_end - start,
+        start + 1,
+        new_end - start
+    );
+    let mut push = |marker: char, line: &str| {
+        out.push(marker);
+        out.push_str(line);
+        out.push('\n');
+    };
+    for line in &old_lines[start..prefix] {
+        push(' ', line);
+    }
+    for line in &old_lines[prefix..old_changed_end] {
+        push('-', line);
+    }
+    for line in &new_lines[prefix..new_changed_end] {
+        push('+', line);
+    }
+    for line in &old_lines[old_changed_end..old_end] {
+        push(' ', line);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::column_usage::scan_usage;
+    use ruff_python_ast::Stmt;
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
+
+    // The imports every test source is assumed to have at the top.
+    fn test_libraries() -> LibraryContext {
+        let imports = parse_module("import pandas as pd\nimport polars as pl\n")
+            .unwrap()
+            .into_syntax();
+        LibraryContext::new(&imports.body, &HashMap::new())
+    }
+
+    // Runs the rule on the first assignment of `source`, scanning the rest of the module.
+    fn run(source: &str, function_local: bool) -> Result<Suggestion, String> {
+        let module = parse_module(source).unwrap().into_syntax();
+        let first = module
+            .body
+            .iter()
+            .position(|stmt| matches!(stmt, Stmt::Assign(_)))
+            .expect("source must contain an assignment");
+        let Stmt::Assign(assign) = &module.body[first] else {
+            unreachable!()
+        };
+        let Expr::Name(target) = &assign.targets[0] else {
+            panic!("target must be a name");
+        };
+        let usage = scan_usage(target.id.as_str(), &module.body[first + 1..], &|offset| {
+            source[..offset.to_usize()].matches('\n').count() + 1
+        });
+        let mut libraries = test_libraries();
+        libraries.extend(&module.body);
+        suggest_selection(
+            &Origin {
+                libraries: &libraries,
+                annotation: None,
+                source,
+                display_path: "f.py",
+                value: Some(&assign.value),
+                var: target.id.as_str(),
+                line: 1,
+                col: 1,
+                stmt_start: assign.range().start().to_usize(),
+                stmt_end: assign.range().end().to_usize(),
+                function_local,
+            },
+            &usage,
+        )
+    }
+
+    fn applied(source: &str, suggestion: &Suggestion) -> String {
+        let edit = &suggestion.edits[0];
+        format!(
+            "{}{}{}",
+            &source[..edit.start],
+            edit.replacement,
+            &source[edit.end..]
+        )
+    }
+
+    #[test]
+    fn test_should_select_columns_with_a_pandas_subscript() {
+        let source = "df = pd.read_parquet(\"x.parquet\")\nprint(df[\"a\"], df[\"b\"])\n";
+        let s = run(source, true).unwrap();
+
+        assert_eq!(s.kind, "select");
+        assert_eq!(s.tier, "safe");
+        assert_eq!(s.columns, vec!["a", "b"]);
+        assert_eq!(
+            applied(source, &s),
+            "df = pd.read_parquet(\"x.parquet\")\ndf = df[[\"a\", \"b\"]]\nprint(df[\"a\"], df[\"b\"])\n"
+        );
+        assert!(s.diff.contains("+df = df[[\"a\", \"b\"]]"));
+    }
+
+    #[test]
+    fn test_should_select_columns_with_a_polars_select() {
+        let source = "df = pl.read_parquet(\"x.parquet\")\nprint(df[\"a\"])\n";
+        let s = run(source, true).unwrap();
+
+        assert!(applied(source, &s).contains("df = df.select(\"a\")\n"));
+    }
+
+    #[test]
+    fn test_should_follow_a_method_chain_back_to_the_module() {
+        let source = "df = pl.scan_csv(\"x.csv\").collect()\nprint(df[\"a\"])\n";
+        assert!(run(source, true).unwrap().diff.contains(".select(\"a\")"));
+        let source = "df = pd.read_csv(\"x.csv\").dropna()\nprint(df[\"a\"])\n";
+        assert!(run(source, true).unwrap().diff.contains("df[[\"a\"]]"));
+    }
+
+    #[test]
+    fn test_should_dedupe_columns_in_first_read_order() {
+        let source = "df = pd.read_parquet(\"x\")\nprint(df[\"b\"], df[\"a\"], df[\"b\"])\n";
+        assert_eq!(run(source, true).unwrap().columns, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_should_keep_the_indentation_of_the_origin() {
+        let source = "def f():\n    df = pd.read_parquet(\"x\")\n    print(df[\"a\"])\n";
+        let module = parse_module(source).unwrap().into_syntax();
+        let Stmt::FunctionDef(f) = &module.body[0] else {
+            panic!()
+        };
+        let Stmt::Assign(assign) = &f.body[0] else {
+            panic!()
+        };
+        let usage = scan_usage("df", &f.body[1..], &|_| 3);
+        let libraries = test_libraries();
+        let s = suggest_selection(
+            &Origin {
+                libraries: &libraries,
+                annotation: None,
+                source,
+                display_path: "f.py",
+                value: Some(&assign.value),
+                var: "df",
+                line: 2,
+                col: 5,
+                stmt_start: assign.range().start().to_usize(),
+                stmt_end: assign.range().end().to_usize(),
+                function_local: true,
+            },
+            &usage,
+        )
+        .unwrap();
+        assert_eq!(
+            applied(source, &s),
+            "def f():\n    df = pd.read_parquet(\"x\")\n    df = df[[\"a\"]]\n    print(df[\"a\"])\n"
+        );
+    }
+
+    #[test]
+    fn test_should_insert_after_a_multiline_origin_and_its_comment() {
+        let source = "df = pd.read_parquet(\n    \"x\",\n)  # load\nprint(df[\"a\"])\n";
+        let s = run(source, true).unwrap();
+        assert_eq!(
+            applied(source, &s),
+            "df = pd.read_parquet(\n    \"x\",\n)  # load\ndf = df[[\"a\"]]\nprint(df[\"a\"])\n"
+        );
+    }
+
+    #[test]
+    fn test_should_add_a_newline_when_the_origin_is_the_last_line() {
+        let source = "df = pd.read_parquet(\"x\")";
+        let module = parse_module(source).unwrap().into_syntax();
+        let Stmt::Assign(assign) = &module.body[0] else {
+            panic!()
+        };
+        let usage = ColumnUsage {
+            accesses: vec![crate::column_usage::ColumnAccess {
+                column: "a".to_string(),
+                conditional: false,
+                line: 1,
+                via: None,
+            }],
+            ..ColumnUsage::default()
+        };
+        let libraries = test_libraries();
+        let s = suggest_selection(
+            &Origin {
+                libraries: &libraries,
+                annotation: None,
+                source,
+                display_path: "f.py",
+                value: Some(&assign.value),
+                var: "df",
+                line: 1,
+                col: 1,
+                stmt_start: 0,
+                stmt_end: source.len(),
+                function_local: true,
+            },
+            &usage,
+        )
+        .unwrap();
+        assert_eq!(
+            applied(source, &s),
+            "df = pd.read_parquet(\"x\")\ndf = df[[\"a\"]]"
+        );
+    }
+
+    #[test]
+    fn test_should_withhold_when_other_code_shares_the_line() {
+        let source = "df = pd.read_parquet(\"x\"); b = 2\nprint(df[\"a\"])\n";
+        let reason = run(source, true).unwrap_err();
+        assert!(reason.contains("shares a line"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_withhold_when_the_library_is_unknown() {
+        for source in [
+            "df = read_csv(\"x\")\nprint(df[\"a\"])\n",
+            "df = load()\nprint(df[\"a\"])\n",
+            "df = [1]\nprint(df[\"a\"])\n",
+        ] {
+            assert!(run(source, true).is_err(), "{source}");
+        }
+        let reason = run("df = load()\nprint(df[\"a\"])\n", true).unwrap_err();
+        assert!(reason.contains("pandas or polars"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_withhold_when_the_frame_is_passed_to_a_call() {
+        let source = "df = pd.read_parquet(\"x\")\nhelper(df)\nprint(df[\"a\"])\n";
+        let reason = run(source, true).unwrap_err();
+        assert!(reason.contains("can't see everything"), "{reason}");
+        assert!(reason.contains("line 2"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_count_additional_blockers() {
+        let source =
+            "df = pd.read_parquet(\"x\")\nhelper(df)\ndf.groupby(\"a\")\nprint(df[\"a\"])\n";
+        assert!(run(source, true).unwrap_err().ends_with("and 1 more"));
+    }
+
+    #[test]
+    fn test_should_not_be_blocked_by_index_empty_or_len() {
+        let source =
+            "df = pd.read_parquet(\"x\")\nprint(df.index, df.empty, len(df))\nprint(df[\"a\"])\n";
+        assert!(run(source, true).is_ok());
+    }
+
+    #[test]
+    fn test_should_block_on_columns_because_narrowing_changes_it() {
+        let source = "df = pd.read_parquet(\"x\")\nprint(df.columns)\nprint(df[\"a\"])\n";
+        assert!(run(source, true).is_err());
+    }
+
+    #[test]
+    fn test_should_withhold_when_nothing_is_read() {
+        let reason = run("df = pd.read_parquet(\"x\")\nprint(1)\n", true).unwrap_err();
+        assert!(reason.contains("no column is read"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_not_count_a_column_created_in_scope_as_a_source_column() {
+        let source = "df = pd.read_parquet(\"x\")\ndf[\"total\"] = df[\"a\"] * 2\nprint(df[\"total\"], df[\"b\"])\n";
+        let s = run(source, true).unwrap();
+        assert_eq!(s.columns, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_should_still_count_a_column_written_only_conditionally() {
+        let source = "df = pd.read_parquet(\"x\")\nif flag:\n    df[\"c\"] = 1\nprint(df[\"c\"], df[\"a\"])\n";
+        assert_eq!(run(source, true).unwrap().columns, vec!["c", "a"]);
+    }
+
+    #[test]
+    fn test_should_note_pandas_assignment_into_a_selection_for_review() {
+        let source = "df = pd.read_parquet(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
+        let s = run(source, true).unwrap();
+        assert_eq!(s.tier, "review");
+        assert!(s.notes[0].contains("SettingWithCopyWarning"));
+        let polars = "df = pl.read_parquet(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
+        assert_eq!(run(polars, true).unwrap().tier, "safe");
+    }
+
+    #[test]
+    fn test_should_mark_a_conditional_only_column_as_review() {
+        let source =
+            "df = pd.read_parquet(\"x\")\nif flag:\n    print(df[\"b\"])\nprint(df[\"a\"])\n";
+        let s = run(source, true).unwrap();
+        assert_eq!(s.tier, "review");
+        assert!(s.notes[0].contains("'b' is only read conditionally"));
+    }
+
+    #[test]
+    fn test_should_not_flag_a_column_also_read_unconditionally() {
+        let source =
+            "df = pd.read_parquet(\"x\")\nif flag:\n    print(df[\"a\"])\nprint(df[\"a\"])\n";
+        assert_eq!(run(source, true).unwrap().tier, "safe");
+    }
+
+    #[test]
+    fn test_should_mark_a_module_level_variable_as_review() {
+        let source = "df = pd.read_parquet(\"x\")\nprint(df[\"a\"])\n";
+        let s = run(source, false).unwrap();
+        assert_eq!(s.tier, "review");
+        assert!(s.notes[0].contains("module-level"));
+    }
+
+    #[test]
+    fn test_should_escape_a_column_name_that_needs_it() {
+        let source = "df = pd.read_parquet(\"x\")\nprint(df[\"a\\\"b\"])\n";
+        assert!(run(source, true).unwrap().diff.contains(r#"df[["a\"b"]]"#));
+    }
+
+    #[test]
+    fn test_should_render_an_empty_diff_when_nothing_changed() {
+        assert_eq!(render_unified_diff("f.py", "a\nb\n", "a\nb\n"), "");
+    }
+
+    #[test]
+    fn test_should_render_a_unified_diff_with_context() {
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        let new = "1\n2\n3\n4\nX\n5\n6\n7\n8\n";
+        let diff = render_unified_diff("f.py", old, new);
+        assert!(diff.starts_with("--- a/f.py\n+++ b/f.py\n@@"), "{diff}");
+        assert!(diff.contains("+X\n"));
+        assert!(diff.contains(" 4\n") && diff.contains(" 7\n"));
+    }
+
+    #[test]
+    fn test_should_render_a_diff_at_the_start_and_end_of_a_file() {
+        let at_start = render_unified_diff("f.py", "a\nb\n", "X\na\nb\n");
+        assert!(
+            at_start.contains("+X\n") && at_start.contains("@@ -1,2 +1,3 @@"),
+            "{at_start}"
+        );
+        let at_end = render_unified_diff("f.py", "a\nb\n", "a\nb\nX\n");
+        assert!(
+            at_end.contains("+X\n") && at_end.contains("@@ -1,2 +1,3 @@"),
+            "{at_end}"
+        );
+    }
+
+    // ── which library a frame belongs to ──
+
+    fn selection_of(source: &str) -> String {
+        run(source, true).unwrap().edits[0].replacement.clone()
+    }
+
+    #[test]
+    fn test_should_follow_an_import_alias_to_the_library() {
+        let source = "import pandas as p\ndf = p.read_parquet(\"x\")\nprint(df[\"a\"])\n";
+        assert_eq!(selection_of(source), "df = df[[\"a\"]]\n");
+    }
+
+    #[test]
+    fn test_should_follow_a_name_imported_from_a_library() {
+        let source =
+            "from polars import read_parquet\ndf = read_parquet(\"x\")\nprint(df[\"a\"])\n";
+        assert_eq!(selection_of(source), "df = df.select(\"a\")\n");
+    }
+
+    #[test]
+    fn test_should_read_the_library_from_the_method_that_produced_the_frame() {
+        for (call, expected) in [
+            (
+                "store.get_historical_features(df).to_df()",
+                "df = df[[\"a\"]]\n",
+            ),
+            ("cursor.fetch_pandas_all()", "df = df[[\"a\"]]\n"),
+            ("spark.sql(q).toPandas()", "df = df[[\"a\"]]\n"),
+            ("duckdb.sql(q).df()", "df = df[[\"a\"]]\n"),
+            ("duckdb.sql(q).pl()", "df = df.select(\"a\")\n"),
+            ("table.to_polars()", "df = df.select(\"a\")\n"),
+        ] {
+            let source = format!("df = {call}\nprint(df[\"a\"])\n");
+            assert_eq!(selection_of(&source), expected, "{call}");
+        }
+    }
+
+    #[test]
+    fn test_should_default_connectorx_to_pandas_and_honour_return_type() {
+        let pandas = "import connectorx as cx\ndf = cx.read_sql(uri, q)\nprint(df[\"a\"])\n";
+        let polars = "import connectorx as cx\ndf = cx.read_sql(uri, q, return_type=\"polars\")\nprint(df[\"a\"])\n";
+        assert_eq!(selection_of(pandas), "df = df[[\"a\"]]\n");
+        assert_eq!(selection_of(polars), "df = df.select(\"a\")\n");
+    }
+
+    #[test]
+    fn test_should_read_the_library_from_a_functions_return_annotation() {
+        for (annotation, expected) in [
+            ("pd.DataFrame", "df = df[[\"a\"]]\n"),
+            ("pl.LazyFrame", "df = df.select(\"a\")\n"),
+            ("pl.DataFrame | None", "df = df.select(\"a\")\n"),
+            ("Optional[pd.DataFrame]", "df = df[[\"a\"]]\n"),
+        ] {
+            let source = format!(
+                "from typing import Optional\ndef load() -> {annotation}:\n    ...\ndf = load()\nprint(df[\"a\"])\n"
+            );
+            assert_eq!(selection_of(&source), expected, "{annotation}");
+        }
+    }
+
+    #[test]
+    fn test_should_withhold_a_function_with_no_or_conflicting_return_annotations() {
+        let unannotated = "def load():\n    ...\ndf = load()\nprint(df[\"a\"])\n";
+        assert!(run(unannotated, true)
+            .unwrap_err()
+            .contains("pandas or polars"));
+        let conflicting = "def load() -> pd.DataFrame:\n    ...\n\n\nclass A:\n    def load(self) -> pl.DataFrame:\n        ...\n\n\ndf = load()\nprint(df[\"a\"])\n";
+        assert!(run(conflicting, true).is_err());
+    }
+
+    #[test]
+    fn test_should_withhold_a_frame_from_an_unknown_system() {
+        let source = "df = spark.sql(q)\nprint(df[\"a\"])\n";
+        let reason = run(source, true).unwrap_err();
+        assert!(reason.contains("`spark`"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_prefer_the_variables_own_annotation() {
+        let source = "df: pl.DataFrame = fetch()\nprint(df[\"a\"])\n";
+        let module = parse_module(source).unwrap().into_syntax();
+        let Stmt::AnnAssign(ann) = &module.body[0] else {
+            panic!()
+        };
+        let usage = scan_usage("df", &module.body[1..], &|_| 2);
+        let libraries = test_libraries();
+        let s = suggest_selection(
+            &Origin {
+                libraries: &libraries,
+                annotation: Some(&ann.annotation),
+                source,
+                display_path: "f.py",
+                value: ann.value.as_deref(),
+                var: "df",
+                line: 1,
+                col: 1,
+                stmt_start: 0,
+                stmt_end: source.lines().next().unwrap().len(),
+                function_local: true,
+            },
+            &usage,
+        )
+        .unwrap();
+        assert!(s.diff.contains(".select(\"a\")"));
+    }
+}

@@ -3,10 +3,13 @@
 ## Setup
 
 - **stp version**: 0.3.7
-- **typedframes version**: 0.3.1
+- **typedframes version**: 0.9.0
 - **pandas**: 2.2.3
-- **polars**: 1.41.2
-- **mypy**: 2.1.0
+- **polars**: 1.43.2
+- **mypy**: 2.4.0
+
+strictly-typed-pandas 0.3.7 declares `pandas<=2.2.3` and `pandas-stubs<=2.2.3.250308`, so it can't be used with
+pandas 3; this example is locked to pandas 2.2.3 for that reason.
 
 ## Key Findings
 

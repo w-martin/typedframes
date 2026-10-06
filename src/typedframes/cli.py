@@ -10,10 +10,21 @@ import re
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+from typedframes._cache import (
+    add_to_gitignore,
+    cache_files,
+    gitignore_entry,
+    locate_cache_dir,
+    project_root_for,
+    resolve_cache_dir,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 # ANSI escape sequences
 _RESET = "\033[0m"
@@ -360,7 +371,10 @@ class _FileCheckResult(NamedTuple):
     untyped_site_usage: list[dict]
 
 
-_CheckFileFn = Callable[[str, bytes | None], str]
+_EXTENSION_MISSING = (
+    "The Rust checker extension was not found. "
+    "Ensure typedframes was installed from a wheel or built with: maturin develop"
+)
 
 
 def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
@@ -389,52 +403,20 @@ def _file_check_result(result: dict, file_path: Path) -> _FileCheckResult:
     )
 
 
-def _check_python_file(file_path: Path, check_file: _CheckFileFn, index_bytes: bytes | None) -> _FileCheckResult | None:
-    """Run the Rust checker on one `.py` file, or return `None` if it had to be skipped."""
-    try:
-        result_json = check_file(str(file_path), index_bytes)
-    except OSError as e:
-        print(f"{file_path}: skipped, {e}", file=sys.stderr)
-        return None
-    except RuntimeError as e:
-        # check_file_internal's only failure path is a parse_module() error (see
-        # rust/src/lib.rs), i.e. this file's source isn't valid Python syntax --
-        # not an internal linter bug -- so it's safe to skip and keep going, same
-        # as the OSError case above.
-        print(f"{file_path}: skipped, {e}", file=sys.stderr)
-        return None
+def _file_outcome(file_path: Path, result_json: str | None, error: str | None) -> _FileCheckResult | None:
+    """Turn one file's `check_files` result into a `_FileCheckResult`, or `None` if it was skipped.
 
-    return _file_check_result(json.loads(result_json), file_path)
-
-
-def _check_notebook_file(
-    file_path: Path, check_notebook: _CheckFileFn, index_bytes: bytes | None
-) -> _FileCheckResult | None:
-    """Run the Rust checker on one `.ipynb` file.
-
-    Mirrors `_check_python_file`, but calls the `check_notebook` entry point: the
-    notebook's code cells are parsed and concatenated entirely in Rust (via
-    `ruff_notebook`, the same crate Ruff and Pyrefly use for their own notebook
-    linting), so every error/site already carries a `cell` field and cell-relative
-    `line` by the time it reaches Python -- no synthetic file, no remapping here.
+    A skip is a file that couldn't be read, isn't valid Python, or is a notebook that
+    isn't Python or is malformed -- not an internal linter bug -- so the run carries on.
     """
-    try:
-        result_json = check_notebook(str(file_path), index_bytes)
-    except OSError as e:
-        print(f"{file_path}: skipped, {e}", file=sys.stderr)
+    if error is not None or result_json is None:
+        print(f"{file_path}: skipped, {error}", file=sys.stderr)
         return None
-    except RuntimeError as e:
-        # Covers a genuine syntax error unrelated to magics, malformed notebook
-        # JSON, and a non-Python-kernel notebook -- see check_notebook in
-        # rust/src/pyapi.rs for exactly which of those map here.
-        print(f"{file_path}: skipped, {e}", file=sys.stderr)
-        return None
-
     return _file_check_result(json.loads(result_json), file_path)
 
 
 def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tuple[list[dict], dict]:
-    """Run the Rust checker on each file, dispatching `.ipynb` notebooks through `_check_notebook_file`.
+    """Run the Rust checker on each file, running `.ipynb` notebooks through the notebook checker.
 
     Returns all errors with file paths attached, plus coverage stats
     (``dataframes_total``/``dataframes_typed``) aggregated across every file
@@ -461,13 +443,9 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     Rust source for exactly what this observes and the scope limit it has.
     """
     try:
-        from typedframes._rust_checker import check_file, check_notebook
+        from typedframes._rust_checker import check_files
     except ImportError:
-        msg = (
-            "The Rust checker extension was not found. "
-            "Ensure typedframes was installed from a wheel or built with: maturin develop"
-        )
-        print(msg, file=sys.stderr)
+        print(_EXTENSION_MISSING, file=sys.stderr)
         sys.exit(1)
 
     all_errors: list[dict] = []
@@ -478,11 +456,10 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
     all_dataframe_calls: list[dict] = []
     leg_events: list[dict] = []
     untyped_site_usage: list[dict] = []
-    for file_path in files:
-        if file_path.suffix == ".ipynb":
-            outcome = _check_notebook_file(file_path, check_notebook, index_bytes)
-        else:
-            outcome = _check_python_file(file_path, check_file, index_bytes)
+    # Checked in parallel inside Rust (with the GIL released); results come back in order.
+    results = check_files([str(f) for f in files], index_bytes)
+    for file_path, (result_json, error) in zip(files, results, strict=True):
+        outcome = _file_outcome(file_path, result_json, error)
         if outcome is None:
             continue
         all_errors.extend(outcome.errors)
@@ -608,6 +585,7 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Disable the cross-file index entirely; check every file in isolation, following no imports.",
     )
+    _add_cache_arguments(check_parser)
     check_parser.add_argument(
         "--no-warnings",
         action="store_true",
@@ -660,13 +638,69 @@ def main(argv: list[str] | None = None) -> None:
             "`detail` key in [tool.typedframes.coverage]."
         ),
     )
+    suggest_parser = subparsers.add_parser(
+        "suggest",
+        help="Suggest fixes for DataFrames the checker could not type (dry run: prints diffs, changes nothing).",
+    )
+    suggest_parser.add_argument("path", type=Path, help="File or directory to suggest fixes for.")
+    suggest_parser.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Disable the cross-file index entirely; look at every file in isolation, following no imports.",
+    )
+    _add_cache_arguments(suggest_parser)
+    mode = suggest_parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply every `safe` suggestion to the files (review-tier ones are never applied this way).",
+    )
+    mode.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Show each suggestion and ask whether to apply it (y/n/a to apply this and the rest/q to quit).",
+    )
+    suggest_parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        dest="allow_dirty",
+        help=(
+            "With --apply or --interactive, edit files even if the git work tree has uncommitted changes "
+            "or there is no git repository."
+        ),
+    )
+    cache_parser = subparsers.add_parser(
+        "cache",
+        help="Find, clear or gitignore the on-disk index cache.",
+        description=_CACHE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cache_parser.add_argument(
+        "action",
+        choices=["path", "clear", "gitignore"],
+        help="path: print the cache directory. clear: delete the cache files. "
+        "gitignore: add the cache directory to the project's .gitignore.",
+    )
+    cache_parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=Path(),
+        help="A file or directory in the project whose cache to act on (default: the current directory).",
+    )
+    cache_parser.add_argument("--cache-dir", type=Path, default=None, dest="cache_dir", help="Use this directory.")
     args = parser.parse_args(argv)
 
-    if args.command != "check":
+    if args.command == "check":
+        _run_check(args)
+    elif args.command == "suggest":
+        _run_suggest(args)
+    elif args.command == "cache":
+        _run_cache(args)
+    else:
         parser.print_help()
         sys.exit(2)
-
-    _run_check(args)
 
 
 @dataclass
@@ -1340,6 +1374,73 @@ def _apply_diagnostic_policy(all_errors: list[dict], args: argparse.Namespace) -
     return all_errors
 
 
+_CACHE_HELP = """\
+The index (what the checker learns about every file, so imports across files resolve) is
+cached on disk, per file, and reused for any file whose contents have not changed. A
+cached run gives exactly the results an uncached run would.
+
+Where it lives, first match wins:
+  --cache-dir PATH                      on the command line
+  TYPEDFRAMES_CACHE_DIR=PATH            in the environment
+  [tool.typedframes] cache_dir = "PATH" in pyproject.toml (relative to the project)
+  the per-user cache directory          the default (see `typedframes cache path`)
+Turn it off for one run with --no-cache.
+
+Examples:
+  typedframes cache path                  where is it?
+  typedframes cache clear                 delete it
+  typedframes cache gitignore             keep a project-local cache out of git
+  typedframes check src/ --cache-dir .typedframes_cache
+"""
+
+
+def _add_cache_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        dest="no_cache",
+        help="Do not read or write the on-disk index cache for this run.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        dest="cache_dir",
+        help="Keep the on-disk index cache here (default: the per-user cache directory; "
+        "see `typedframes cache --help` for every way to set it).",
+    )
+
+
+def _run_cache(args: argparse.Namespace) -> None:
+    """`typedframes cache path|clear|gitignore`."""
+    cache_dir = locate_cache_dir(args.path, cli_value=args.cache_dir)
+    if args.action == "path":
+        print(cache_dir)
+    elif args.action == "clear":
+        files = cache_files(cache_dir)
+        freed = 0
+        for file in files:
+            freed += file.stat().st_size
+            file.unlink()
+        print(f"Removed {_plural(len(files), 'cache file')} ({freed / 1024:.0f} KiB) from {cache_dir}")
+    else:
+        root = project_root_for(args.path)
+        entry = gitignore_entry(cache_dir, root) if root is not None else None
+        if root is not None and cache_dir.resolve() == root.resolve():
+            print(f"The cache directory is the project root ({root}); not gitignoring the whole project.")
+            return
+        if root is None or entry is None:
+            print(
+                f"The cache directory ({cache_dir}) is outside the project, so there is nothing to gitignore.\n"
+                "To keep it inside the project instead, use --cache-dir .typedframes_cache or set\n"
+                '`cache_dir = ".typedframes_cache"` under [tool.typedframes] in pyproject.toml,\n'
+                "then run `typedframes cache gitignore` again."
+            )
+            return
+        added = add_to_gitignore(root, entry)
+        print(f"{'Added' if added else 'Already in'} {root / '.gitignore'}: {entry}")
+
+
 def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
     """Build the cross-file index for this run, unless `--no-index` disabled it.
 
@@ -1365,22 +1466,238 @@ def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
         from typedframes._rust_checker import build_project_index, build_single_file_index
     except ImportError:
         return None
+    cache_dir = resolve_cache_dir(path, cli_value=args.cache_dir, disabled=args.no_cache)
+    cache_arg = str(cache_dir) if cache_dir is not None else None
     if path.is_dir():
-        return build_project_index(str(path))
-    return build_single_file_index(str(path))
+        return build_project_index(str(path), cache_arg)
+    return build_single_file_index(str(path), cache_arg)
 
 
-def _run_check(args: argparse.Namespace) -> None:
-    """Execute the check subcommand."""
-    path: Path = args.path.resolve()
+def _suggest_one_file(
+    file_path: Path, root: Path, suggest_file: Callable[[str, str, bytes | None], str], index_bytes: bytes | None
+) -> dict | None:
+    """Ask the Rust checker for one file's suggestions, or `None` if it had to be skipped."""
+    try:
+        return json.loads(suggest_file(str(file_path), _relative_posix(str(file_path), root), index_bytes))
+    except (OSError, RuntimeError) as e:
+        # Unreadable, or not valid Python.
+        print(f"{file_path}: skipped, {e}", file=sys.stderr)
+        return None
 
+
+def _format_suggestion(display_path: str, suggestion: dict) -> str:
+    """Render one suggestion: where, why, any review notes, then the diff Rust built."""
+    columns = ", ".join(json.dumps(column) for column in suggestion["columns"])
+    where = f"{display_path}:{suggestion['line']}:{suggestion['col']}"
+    lines = [
+        f"{where}  {suggestion['var']}  {suggestion['kind']} [{columns}]  [{suggestion['tier']}]",
+        f"  {suggestion['reason']}",
+        *(f"  note: {note}" for note in suggestion["notes"]),
+        "",
+        suggestion["diff"].rstrip("\n"),
+    ]
+    return "\n".join(lines)
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _print_suggestions(suggestions: list[tuple[str, dict]], withheld: list[tuple[str, dict]], file_count: int) -> None:
+    """Print the `suggest` report: each suggestion, what was withheld and why, then a tally."""
+    if not suggestions and not withheld:
+        print("No untyped DataFrame sites found")
+        return
+    for display_path, suggestion in suggestions:
+        print(_format_suggestion(display_path, suggestion))
+        print()
+    if withheld:
+        print("Not suggested:")
+        for display_path, site in withheld:
+            print(f"  {display_path}:{site['line']}:{site['col']}  {site['var']}  {site['reason']}")
+        print()
+    safe = sum(1 for _, suggestion in suggestions if suggestion["tier"] == "safe")
+    print(
+        f"{_plural(len(suggestions), 'suggestion')} ({safe} safe, {len(suggestions) - safe} review), "
+        f"{len(withheld)} withheld, in {_plural(file_count, 'file')}. Dry run: no files were changed."
+    )
+
+
+def _collect_suggestions(
+    files: list[Path], root: Path, suggest_file: Callable[[str, str, bytes | None], str], index_bytes: bytes | None
+) -> tuple[list[tuple[str, dict]], list[tuple[str, dict]], dict[str, Path], int]:
+    """Suggestions and withheld sites per file, files by display path, and how many files were skipped."""
+    suggestions: list[tuple[str, dict]] = []
+    withheld: list[tuple[str, dict]] = []
+    files_by_display: dict[str, Path] = {}
+    unreadable = 0
+    for file_path in files:
+        result = _suggest_one_file(file_path, root, suggest_file, index_bytes)
+        if result is None:
+            unreadable += 1
+            continue
+        display_path = _relative_posix(str(file_path), root)
+        files_by_display[display_path] = file_path
+        suggestions.extend((display_path, suggestion) for suggestion in result["suggestions"])
+        withheld.extend((display_path, site) for site in result["withheld"])
+    return suggestions, withheld, files_by_display, unreadable
+
+
+def _run_suggest(args: argparse.Namespace) -> None:
+    """Execute the suggest subcommand: print suggestions, or apply them with --apply / --interactive."""
+    path = _resolve_existing_path(args.path)
+    if path.suffix == ".ipynb":
+        print("Error: `suggest` doesn't cover notebooks", file=sys.stderr)
+        sys.exit(2)
+    try:
+        from typedframes._rust_checker import suggest_file
+    except ImportError:
+        print(_EXTENSION_MISSING, file=sys.stderr)
+        sys.exit(1)
+
+    index_bytes = _build_index_bytes(path, args)
+    root = path if path.is_dir() else path.parent
+    files = sorted(_collect_python_files(path, _load_configured_excludes(path)))
+
+    editing = args.apply or args.interactive
+    if editing and not args.allow_dirty:
+        problem = _vcs_problem(root)
+        if problem is not None:
+            print(f"Error: {problem}", file=sys.stderr)
+            sys.exit(1)
+
+    suggestions, withheld, files_by_display, unreadable = _collect_suggestions(files, root, suggest_file, index_bytes)
+
+    if not editing:
+        _print_suggestions(suggestions, withheld, len(files))
+        return
+    requests: list[tuple[str, str, list[tuple[int, int]] | None]]
+    if args.apply:
+        safe_files = sorted({display for display, suggestion in suggestions if suggestion["tier"] == "safe"})
+        requests = [(str(files_by_display[display]), display, None) for display in safe_files]
+    else:
+        chosen = _choose_interactively(suggestions)
+        if chosen is None:
+            return
+        requests = [(str(files_by_display[display]), display, origins) for display, origins in chosen.items()]
+    if requests:
+        failed = _apply_and_report(requests, index_bytes, require_tracked=not args.allow_dirty)
+    else:
+        _report_nothing_to_apply(len(suggestions), len(withheld), review_hint=args.apply and bool(suggestions))
+        failed = 0
+    # Exit non-zero if an edit run left files unprocessed; a dry run just skips them.
+    if unreadable or failed:
+        sys.exit(1)
+
+
+def _vcs_problem(root: Path) -> str | None:
+    """Why it isn't safe to edit files under `root`, or `None` when it is.
+
+    Editing is allowed only in a git work tree with no uncommitted changes to tracked
+    files, so everything the tool does can be reviewed and undone with git. The check
+    itself is done in Rust.
+    """
+    try:
+        from typedframes._rust_checker import vcs_problem
+    except ImportError:
+        print(_EXTENSION_MISSING, file=sys.stderr)
+        sys.exit(1)
+    return vcs_problem(str(root))
+
+
+def _choose_interactively(suggestions: list[tuple[str, dict]]) -> dict[str, list[tuple[int, int]]] | None:
+    """Ask about each suggestion in turn; return the chosen origins' positions by file.
+
+    Answers: `y` apply this one, `n` skip it, `a` apply this and every remaining one,
+    `q` quit and apply nothing, in which case `None` is returned.
+    """
+    chosen: dict[str, list[tuple[int, int]]] = {}
+    apply_rest = False
+    for display_path, suggestion in suggestions:
+        if not apply_rest:
+            print(_format_suggestion(display_path, suggestion))
+            answer = _ask("Apply this? [y/n/a/q] ")
+            if answer == "q":
+                print("Quit: nothing was changed.")
+                return None
+            if answer == "n":
+                print()
+                continue
+            apply_rest = answer == "a"
+            print()
+        chosen.setdefault(display_path, []).append((suggestion["line"], suggestion["col"]))
+    return chosen
+
+
+def _ask(prompt: str) -> str:
+    """Read one of y/n/a/q, asking again on anything else; end of input counts as `q`."""
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            return "q"
+        if answer in {"y", "n", "a", "q"}:
+            return answer
+        print("Please answer y, n, a or q.")
+
+
+def _report_nothing_to_apply(suggested: int, withheld: int, *, review_hint: bool) -> None:
+    """Say that no edit was made; `review_hint` adds that review-tier ones need --interactive."""
+    hint = " Review-tier suggestions are only applied one at a time, with --interactive." if review_hint else ""
+    print(f"Nothing to apply ({_plural(suggested, 'suggestion')}, {withheld} withheld).{hint}")
+
+
+def _apply_and_report(
+    requests: list[tuple[str, str, list[tuple[int, int]] | None]], index_bytes: bytes | None, *, require_tracked: bool
+) -> int:
+    """Have Rust apply `requests`, then print what happened; returns how many files couldn't be processed."""
+    try:
+        from typedframes._rust_checker import apply_suggestions
+    except ImportError:
+        print(_EXTENSION_MISSING, file=sys.stderr)
+        sys.exit(1)
+    result = json.loads(apply_suggestions(requests, index_bytes, require_tracked))
+    applied = skipped = written = failed = 0
+    for outcome in result["files"]:
+        if outcome["error"]:
+            print(f"{outcome['file']}: skipped, {outcome['error']}", file=sys.stderr)
+            failed += 1
+            continue
+        for item in outcome["applied"]:
+            columns = ", ".join(json.dumps(c) for c in item["columns"])
+            print(f"applied  {outcome['file']}:{item['line']}:{item['col']}  {item['var']}  [{columns}]")
+        for item in outcome["skipped"]:
+            print(f"skipped  {outcome['file']}:{item['line']}:{item['col']}  {item['reason']}")
+        applied += len(outcome["applied"])
+        skipped += len(outcome["skipped"])
+        written += 1 if outcome["written"] else 0
+    if result["failed"]:
+        print(f"Error: {result['failed']}", file=sys.stderr)
+        sys.exit(1)
+    before = sum(o["errors_before"] for o in result["files"] if o["written"])
+    after = sum(o["errors_after"] for o in result["files"] if o["written"])
+    print(
+        f"Applied {_plural(applied, 'suggestion')} in {_plural(written, 'file')}, {skipped} skipped. "
+        f"Re-checked the edited files: {_plural(before, 'error')} before, {after} after."
+    )
+    return failed
+
+
+def _resolve_existing_path(original: Path) -> Path:
+    """Resolve a command's path argument, exiting 2 with a message if it doesn't exist."""
+    path = original.resolve()
     if not path.exists():
-        original = args.path
         if original.is_absolute():
             print(f"Error: path does not exist: {path}", file=sys.stderr)
         else:
             print(f"Error: path does not exist: {original!r} (resolved to {path})", file=sys.stderr)
         sys.exit(2)
+    return path
+
+
+def _run_check(args: argparse.Namespace) -> None:
+    """Execute the check subcommand."""
+    path = _resolve_existing_path(args.path)
 
     # Loaded before the run so an unusable config is reported up front rather than
     # after a long check.

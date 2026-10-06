@@ -2,10 +2,10 @@
 
 ## Setup
 
-- **pandas-stubs version**: 3.0.5.260730
+- **pandas-stubs version**: 3.0.5.260914
 - **pandas version**: 3.0.5
-- **mypy version**: 2.3.0
-- **typedframes version**: 0.3.1
+- **mypy version**: 2.4.0
+- **typedframes version**: 0.9.0
 - **Python**: ≥3.11
 
 ## Summary

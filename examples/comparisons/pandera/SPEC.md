@@ -5,7 +5,7 @@
 This package compares **pandera** (Python data validation library) with **typedframes** (schema-based DataFrame type checker) for static analysis of column access errors.
 
 **Package:** `pandera`
-**Version:** 0.32.1
+**Version:** 0.34.1
 **Purpose:** Data validation and schema definition for pandas DataFrames using declarative models
 
 ## What Pandera Does

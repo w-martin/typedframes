@@ -33,6 +33,7 @@
 //! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
 //! after all errors have been collected.
 
+mod apply;
 mod ast_extract;
 mod column_consuming_methods;
 mod column_usage;
@@ -41,11 +42,15 @@ mod constants;
 mod contract;
 mod errors;
 mod frame_ops;
+mod helpers;
 mod index;
 mod linter;
 mod notebook;
+mod parallel;
 mod pyapi;
 mod sql;
+mod static_eval;
+mod suggest;
 mod typo;
 
 pub use config::{find_project_root, is_enabled, LinterConfig};
@@ -58,6 +63,10 @@ use pyo3::prelude::*;
 fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pyapi::check_file, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::check_notebook, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::check_files, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::suggest_file, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::apply_suggestions, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::vcs_problem, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::build_project_index, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::build_single_file_index, m)?)?;
     Ok(())

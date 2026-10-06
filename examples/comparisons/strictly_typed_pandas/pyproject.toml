@@ -4,11 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
-    "mypy>=2.1.0",
+    "mypy>=2.4.0",
     "pandas>=2.2.3",
     "polars>=1.41.2",
     "strictly-typed-pandas>=0.3.7",
-    "typedframes[mypy]>=0.2.1",
+    "typedframes[mypy]>=0.9.0",
 ]
 
 [tool.typedframes]

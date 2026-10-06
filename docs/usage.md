@@ -47,6 +47,92 @@ df = pd.read_parquet("orders.parquet", columns=["order_id", "amount"])
 pl_df = pl.read_parquet("orders.parquet", columns=["order_id", "amount"])
 ```
 
+**Anything the checker can work out without running your code works as well as a
+literal.** A column list, a dict, a column name or a SQL string held in a variable, or
+built from other constants, is evaluated before checking:
+
+```python
+BASE = ["order_id", "amount"]
+COLS = BASE + [f"m{i}" for i in range(3)]
+df = pd.read_csv("orders.csv", usecols=COLS)  # {order_id, amount, m0, m1, m2}
+
+data = {"order_id": [1, 2], "amount": [9.5, 3.0]}
+frame = pd.DataFrame(data)  # {order_id, amount}
+
+KEEP = ["order_id"]
+slim = frame[KEEP]  # narrows to {order_id}
+RENAMES = {"amount": "total"}
+renamed = frame.rename(columns=RENAMES)  # {order_id, total}
+
+TABLE = "orders"
+orders = pd.read_sql(f"SELECT order_id, amount FROM {TABLE}", conn)
+```
+
+Evaluated: string, number, boolean, `None`, list, tuple, set and dict literals (with
+`*`/`**` spreads); f-strings, `str.format`, `+` and `*`, set and dict operators,
+`and`/`or`/`not`, comparisons and `a if c else b`; indexing and slicing; `len`, `list`,
+`tuple`, `set`, `dict`, `sorted`, `reversed`, `range`, `zip`, `enumerate`, `min`, `max`,
+`sum`, `str`, `int`, `bool`, `any`, `all`; the common string methods (`join`, `split`,
+`replace`, `strip`, `lower`, `upper`, `title`, `startswith`, ...) and `dict.keys()`,
+`.values()`, `.items()`, `.get()`; and list, set and dict comprehensions over anything
+that is itself evaluable. Scopes are respected: a name bound once inside a function
+resolves there, and a module-level constant is visible inside functions unless a function
+rebinds it.
+
+Your own simple functions, class attributes and imports from other project files are
+followed too:
+
+```python
+# config.py
+BASE = ["order_id", "amount"]
+
+
+def metric_cols(prefix, n=2):
+    return [f"{prefix}{i}" for i in range(n)] + BASE
+
+
+class Cols:
+    KEEP = ["order_id"]
+
+
+# job.py
+from config import BASE, metric_cols
+import config
+
+a = pd.read_csv("a.csv", usecols=metric_cols("m"))  # {m0, m1, order_id, amount}
+b = pd.read_csv("b.csv", usecols=config.BASE)  # {order_id, amount}
+c = pd.read_csv("c.csv", usecols=config.Cols.KEEP)  # not followed: see below
+```
+
+A function is evaluated only if its body is plain assignments and one `return` (no loops,
+branches, `global`, decorators or `*args`), every call in it evaluates, and the arguments
+are themselves evaluable. A class attribute (`Cols.KEEP`) is read when the class has at
+most one base class, also defined in the same file, no decorator or `metaclass`, and the
+attribute is assigned once and never set, deleted or mutated. Across files, a module's
+constants and functions are read as above; `from config import X`, `import config` and
+relative imports are resolved, but `config.Cols.KEEP` (a class in another file) is not.
+A function from another file can only read that file's own constants and functions, never
+the importing file's names.
+
+**Never evaluated:** anything that depends on IO, randomness, time, the environment or
+runtime values (`open`, `json.load`, `os.environ`, `sys.argv`, `random`, `datetime.now`,
+`input`), function parameters, a loop variable over something unknown, or a call to a
+function the checker doesn't know. A set is never turned into an ordered sequence
+(`list(some_set)`), because Python's order for it varies between runs.
+
+**When a name stops being followed.** The name has to be bound exactly once in its scope,
+to a plain `x = ...` or an annotation that is just a builtin type (`COLS: list[str] =
+[...]`; `df: Annotated[pd.DataFrame, S] = None` is a DataFrame, not a constant). It stops
+being followed if anything could change it: `COLS.append(...)`, `COLS[0] = ...`,
+`COLS += ...`, an alias (`other = COLS`), passing it to a function the checker doesn't
+know, returning it, or storing it in a container or attribute. Reading it is fine:
+`len(COLS)`, `"a" in COLS`, iterating, indexing, `usecols=COLS`, and passing it to any
+DataFrame method (`select`, `drop`, `rename`, `merge`, `groupby`, ...) or to `pd.` /
+`pl.` functions. A string, number or tuple of them can't be changed at all, so it can be
+used any way. A name is also not followed if the file calls `globals()`, `vars()`,
+`exec`, `eval` or `locals()`, or has `from module import *`. Constants defined in other
+files are not followed.
+
 **Jupyter notebooks are checked too.** `typedframes check src/` picks up `.ipynb` files
 alongside `.py` files with no flag and no conversion step, reporting each diagnostic as
 `analysis.ipynb:cell 10:1:1: ...` — see [Jupyter notebooks](api/cli.md#jupyter-notebooks).
@@ -626,9 +712,32 @@ src/train.py
     27:1   df               untracked -- reassigned to a Series or scalar via `.sum()`
 ```
 
+For a DataFrame the checker recognized but could not resolve columns for,
+`explain` also shows how the rest of its function (or module) uses it, under
+`columns used downstream:`. Each named column that is read is listed; any other use is
+labelled by whether it touches every column (`[touches every column]`, e.g.
+`.to_dict()`, `.merge()`, `.head()`), touches none (`[touches no columns]`, e.g.
+`.shape`, `.dtypes`), or isn't classified (no tag, e.g. passing the frame to a function).
+A use inside an `if`/`for`/`while`/`with`/`try` is marked `(conditional)`:
+
+```
+src/train.py
+  30:9   pd.DataFrame   COUNTED, untracked -- no static column info
+  columns used downstream:
+    30:1   df               'amount'
+    30:1   df               'region' (conditional)
+    30:1   df               `.to_dict()` [touches every column]
+    30:1   df               passed to `clean()`
+```
+
+Only a frame assigned at the top level of its function or module is scanned, and the
+scan reads that one scope: a use inside a nested function, class, lambda or
+comprehension is reported as a single unclassified use ("also mentioned inside a nested
+function, class, lambda or comprehension") rather than followed.
+
 `--output-format=json` nests the same information under `coverage.files[].calls[]`
-(and `coverage.files[].tracking_ended[]`), each entry carrying `counted`/`typed`/`schema`
-booleans and strings instead of prose:
+(and `coverage.files[].tracking_ended[]`, `coverage.files[].columns_used[]`), each entry
+carrying `counted`/`typed`/`schema` booleans and strings instead of prose:
 
 ```shell
 typedframes check src/ --output-format=json --coverage-detail=explain
@@ -681,6 +790,140 @@ typedframes check src/ --output-format=json --coverage-detail=explain
 - Percentages in failure messages are shown to one decimal place rather than rounded to
   a whole number, so a 99.6% run against `fail_under = 100.0` doesn't read as
   "100.0% is below the required 100.0%".
+
+## Suggesting fixes (`suggest`)
+
+For a DataFrame the checker can't resolve columns for, `typedframes suggest` works out
+a fix from how the rest of its scope uses it, and shows it as a diff:
+
+```shell
+typedframes suggest src/
+```
+
+```
+etl.py:5:5  sales  select ["amount", "region"]  [review]
+  only 'amount', 'region' are read later (lines 6, 8)
+  note: 'region' is only read conditionally (line 8); if the data lacks it, the selection would now fail
+
+--- a/etl.py
++++ b/etl.py
+@@ -3,6 +3,7 @@
+ 
+ def revenue():
+     sales = pd.read_parquet("sales.parquet")
++    sales = sales[["amount", "region"]]
+     total = sales["amount"].sum()
+     if total > 0:
+         print(sales["region"])
+
+Not suggested:
+  etl.py:12:5  raw  can't see everything done with it: passed to `clean()` (line 14)
+  etl.py:18:5  d  can't see everything done with it: `.groupby()` (line 19)
+
+1 suggestion (0 safe, 1 review), 2 withheld, in 1 file. Dry run: no files were changed.
+```
+
+By default `suggest` is a dry run: it prints diffs and never edits a file. It takes the same
+project index as `check`, so it agrees with `check` about which DataFrames are untyped;
+`--no-index` turns that off.
+
+**Applying.** `--apply` writes every `safe` suggestion; `-i`/`--interactive` shows each one
+(including `review` ones) and asks `y`/`n`/`a` (this and all remaining)/`q` (quit, change
+nothing).
+
+```shell
+typedframes suggest src/ --apply
+typedframes suggest src/ --interactive
+```
+
+Edits are written only if they are safe to undo and verified first:
+
+- the git work tree must have no uncommitted changes to tracked files (`--allow-dirty` skips
+  this, and is needed outside a git repository);
+- each file's edited source is parsed and re-checked in memory before anything is written; a
+  file whose edit would not parse or would add errors is skipped, with the reason;
+- accepted files are written together or not at all: a failed write restores every file, and a
+  file that changed on disk since it was analysed is left alone;
+- applying twice changes nothing the second time.
+
+**What it suggests.** For an untyped frame, a column selection on its own line right after the
+load, listing the columns the rest of its scope reads: `df = df[["a", "b"]]` for pandas,
+`df = df.select("a", "b")` for polars. The checker then knows the frame's exact columns, so later
+typos are caught. The load itself is not changed. A column the scope assigns itself
+(`df["total"] = ...`) is not listed, since it isn't in the source data.
+
+The origin can be anywhere in a function, a method, or a module-level `if`/`with`/`try`/`match`
+block; what runs after it in the enclosing blocks is scanned too, including `except` and
+`finally` handlers. An origin inside a loop is withheld (the frame can be read on a later
+pass before it is reassigned).
+
+*Which library.* The selection is spelled differently for pandas and polars, so the library
+is taken from, in order: the variable's own annotation; the producing method (`.to_df()`,
+`.fetch_pandas_all()`, `.toPandas()` mean pandas, `.pl()` polars); the module or imported
+name the expression starts from (`import pandas as p`, `from polars import read_parquet`;
+connectorx's `return_type=`); the return annotation of a function it calls, in this file or
+another (`def load() -> pl.DataFrame`). Anything else is withheld.
+
+*Helpers.* Passing the frame to a function is not an unknown use when that function's use of
+the parameter is known: every use is a read of a named column, or a further call that is.
+Those columns are counted. Returning the frame, calling a method on it that may use every
+column, storing it, or recursion all leave the call unknown. This works for functions of the
+same file and for functions imported from other project files (summaries are stored in the
+index); `module.func(df)` calls are not followed yet.
+
+Narrowing is only safe when every use of the frame is visible and is a read of a named
+column, so a site is **withheld** (and listed under `Not suggested:` with the reason) when:
+
+- the frame is passed to a function that can't be followed, returned, stored in an attribute or
+  container, iterated over, or used through anything other than `df["col"]` / `df[["a", "b"]]`,
+  including methods like `.groupby("region")`, `.drop(columns=...)` or `.head()`, which can
+  use columns by string argument or use every column (`len(df)`, `.index` and `.empty` are
+  fine, provided `len` is really the builtin);
+- `.columns`, `.shape`, `.dtypes` or `.size` is read, since narrowing changes their value;
+- a nested function, class, lambda or comprehension also mentions the frame;
+- the name, or a name it was assigned to, is declared `global` or `nonlocal`, or
+  `eval`/`exec`/`locals`/`globals`/`vars` is called after the load;
+- the load isn't recognisably pandas or polars, the assignment shares a line with other code,
+  it is a class attribute, or it is already followed by a column selection.
+
+**`safe` and `review`.** A suggestion is `safe` when nothing about it depends on code
+the scan can't see. It is `review` when it is probably right but a person should look:
+a column that is only read under a condition (the selection fails if the data lacks it), a frame
+that is printed with `print()`/`display()` (the output will show only the selected columns), a
+pandas frame that later has columns assigned into it (older pandas can raise
+`SettingWithCopyWarning` on a selection), or a module-level variable (another module may
+import it and read other columns). Each reason is printed as a `note:`.
+
+Only `.py` files are covered; passing a notebook is an error.
+
+## Index cache and parallelism
+
+Files are indexed and checked in parallel, one worker per core (up to 16). Set `TYPEDFRAMES_JOBS=1` to run on a single thread, or
+a number to cap the workers.
+
+What the checker learns about each file is also cached on disk and reused for every file whose contents have not
+changed, so repeat runs only re-index what you edited. A cached run reports exactly what an uncached run would. The cache
+lives in your per-user cache directory by default (`~/Library/Caches/typedframes` on macOS, `~/.cache/typedframes` on
+Linux), so nothing is added to your repository.
+
+```shell
+typedframes cache path         # where is it?
+typedframes cache clear        # delete it
+typedframes check src/ --no-cache                        # skip it for one run
+typedframes check src/ --cache-dir .typedframes_cache    # keep it in the project instead
+typedframes cache gitignore    # add a project-local cache directory to .gitignore
+```
+
+To set it permanently, use the `TYPEDFRAMES_CACHE_DIR` environment variable or `pyproject.toml`; a relative path is
+relative to the project:
+
+```toml
+[tool.typedframes]
+cache_dir = ".typedframes_cache"
+```
+
+The order of precedence is `--no-cache`, `--cache-dir`, `TYPEDFRAMES_CACHE_DIR`, `cache_dir`, then the default. See
+`typedframes cache --help`.
 
 ## Call-site argument tracing (Feast `features=`)
 

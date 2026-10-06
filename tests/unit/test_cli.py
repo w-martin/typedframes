@@ -16,7 +16,6 @@ from typedframes.cli import (
     FileTally,
     RunStats,
     _check_files,
-    _check_notebook_file,
     _collect_notebook_files,
     _collect_python_files,
     _coverage_failure_message,
@@ -27,8 +26,10 @@ from typedframes.cli import (
     _explain_json_entry,
     _explain_json_payload,
     _explain_status,
+    _file_outcome,
     _format_explain,
     _format_github,
+    _format_suggestion,
     _format_term_missing,
     _format_text,
     _glob_to_regex,
@@ -37,7 +38,9 @@ from typedframes.cli import (
     _low_coverage_caveat,
     _override_for,
     _percentage,
+    _plural,
     _relative_posix,
+    _suggest_one_file,
     _usage_lines,
     main,
 )
@@ -3116,51 +3119,300 @@ class TestCli(unittest.TestCase):
         # assert
         self.assertIn("title=unknown-column (notebook cell 2)", result)
 
-    def test_should_skip_notebook_on_runtime_error_from_check_notebook(self) -> None:
-        """Test that a RuntimeError from check_notebook is a skip, not fatal.
-
-        Covers a genuine syntax error, malformed notebook JSON, or a non-Python kernel --
-        see check_notebook in rust/src/pyapi.rs. Uses dependency injection (a fake
-        `check_notebook`) rather than patching the real Rust function.
-        """
-
+    def test_should_skip_a_file_the_checker_reports_an_error_for(self) -> None:
+        """Test that a per-file error from `check_files` (syntax error, bad notebook) is a skip, not fatal."""
         # arrange
-        def _failing_check_notebook(_path: str, _index_bytes: bytes | None) -> str:
-            msg = "boom"
-            raise RuntimeError(msg)
+        nb_file = Path("nb.ipynb")
+        captured = StringIO()
 
+        # act
+        with patch("sys.stderr", captured):
+            result = _file_outcome(nb_file, None, "boom")
+
+        # assert
+        self.assertIsNone(result)
+        self.assertIn("nb.ipynb: skipped, boom", captured.getvalue())
+
+    def test_should_skip_an_unreadable_file_in_a_batch_and_check_the_rest(self) -> None:
+        """Test that one unreadable path doesn't stop the other files in the batch being checked."""
+        # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
-            nb_file = Path(tmpdir) / "nb.ipynb"
-            _write_notebook(nb_file, ["x = 1"])
-
+            good = Path(tmpdir) / "good.py"
+            good.write_text("x = 1\n")
+            missing = Path(tmpdir) / "missing.py"
             captured = StringIO()
 
             # act
             with patch("sys.stderr", captured):
-                result = _check_notebook_file(nb_file, _failing_check_notebook, None)
+                errors, stats = _check_files([missing, good])
 
             # assert
-            self.assertIsNone(result)
-            self.assertIn(f"{nb_file}: skipped, boom", captured.getvalue())
+            self.assertEqual(errors, [])
+            self.assertIn("missing.py: skipped", captured.getvalue())
+            self.assertIn(str(good), stats["per_file"])
+            self.assertNotIn(str(missing), stats["per_file"])
 
-    def test_should_skip_notebook_on_os_error_from_check_notebook(self) -> None:
-        """Test that an OSError from check_notebook (e.g. the file can't be read) is a skip too."""
+    def _suggest_output(self, argv: list[str]) -> str:
+        """Run `typedframes suggest ...` and return what it printed to stdout."""
+        captured = StringIO()
+        with patch("sys.stdout", captured):
+            main(["suggest", *argv])
+        return captured.getvalue()
+
+    def test_should_print_a_selection_suggestion_and_change_nothing(self) -> None:
+        """Test the dry run end to end: a diff is shown and the file is left untouched."""
+        # arrange
+        source = 'import pandas as pd\n\n\ndef load():\n    df = pd.read_csv("x.csv")\n    return df["a"] + df["b"]\n'
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = Path(tmpdir) / "job.py"
+            job.write_text(source)
+
+            # act
+            output = self._suggest_output([tmpdir, "--no-index"])
+
+            # assert
+            self.assertIn('job.py:5:5  df  select ["a", "b"]  [safe]', output)
+            self.assertIn("only 'a', 'b' are read later (line 6)", output)
+            self.assertIn("--- a/job.py", output)
+            self.assertIn('+    df = df[["a", "b"]]', output)
+            self.assertIn(
+                "1 suggestion (1 safe, 0 review), 0 withheld, in 1 file. Dry run: no files were changed.", output
+            )
+            self.assertEqual(source, job.read_text())
+
+    def test_should_list_what_was_withheld_and_why(self) -> None:
+        """Test that a site that can't be suggested for is listed with the reason, not dropped."""
+        # arrange
+        source = (
+            "import pandas as pd\n\n\n"
+            "def load():\n"
+            '    raw = pd.read_csv("raw.csv")\n'
+            '    print(raw["a"])\n'
+            "    return clean(raw)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text(source)
+
+            # act
+            output = self._suggest_output([tmpdir, "--no-index"])
+
+            # assert
+            self.assertIn("Not suggested:", output)
+            self.assertIn("job.py:5:5  raw  can't see everything done with it: passed to `clean()` (line 7)", output)
+            self.assertIn("0 suggestions (0 safe, 0 review), 1 withheld", output)
+
+    def test_should_tag_a_module_level_suggestion_for_review_with_its_note(self) -> None:
+        """Test that a review-tier suggestion prints why it needs a human."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text('import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(df["a"])\n')
+
+            # act
+            output = self._suggest_output([tmpdir, "--no-index"])
+
+            # assert
+            self.assertIn("[review]", output)
+            self.assertIn("note: module-level variable: another module may import it", output)
+
+    def test_should_report_when_there_is_nothing_to_suggest(self) -> None:
+        """Test that a project with no untyped DataFrame sites says so."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text("x = 1\n")
+
+            # act
+            output = self._suggest_output([tmpdir, "--no-index"])
+
+            # assert
+            self.assertEqual("No untyped DataFrame sites found\n", output)
+
+    def test_should_name_a_single_file_relative_to_its_directory(self) -> None:
+        """Test that suggesting for one file labels it by its name, not an absolute path."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job = Path(tmpdir) / "job.py"
+            job.write_text('import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(df["a"])\n')
+
+            # act
+            output = self._suggest_output([str(job), "--no-index"])
+
+            # assert
+            self.assertIn("job.py:2:1  df", output)
+            self.assertNotIn(tmpdir, output)
+
+    def test_should_order_suggestions_by_file_then_line(self) -> None:
+        """Test that several files are reported in a stable, sorted order, notebooks excluded."""
+        # arrange
+        snippet = 'import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(df["a"])\n'
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "b.py").write_text(snippet)
+            (Path(tmpdir) / "a.py").write_text(snippet)
+            (Path(tmpdir) / "n.ipynb").write_text("{}")
+
+            # act
+            output = self._suggest_output([tmpdir])
+
+            # assert: this one builds the project index (no --no-index) as `check` does
+            self.assertLess(output.index("a.py:2:1"), output.index("b.py:2:1"))
+            self.assertNotIn("n.ipynb", output)
+            self.assertIn("2 suggestions (0 safe, 2 review)", output)
+
+    def test_should_skip_a_file_that_is_not_valid_python_and_continue(self) -> None:
+        """Test that one unparseable file doesn't stop suggestions for the rest."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "bad.py").write_text("def (:\n")
+            (Path(tmpdir) / "good.py").write_text('import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(df["a"])\n')
+            captured_err = StringIO()
+
+            # act
+            with patch("sys.stderr", captured_err):
+                output = self._suggest_output([tmpdir, "--no-index"])
+
+            # assert
+            self.assertIn("bad.py: skipped", captured_err.getvalue())
+            self.assertIn("good.py:2:1  df", output)
+
+    def test_should_exit_2_when_the_suggest_path_does_not_exist(self) -> None:
+        """Test that a missing path fails the same way `check` does."""
+        # arrange
+        captured = StringIO()
+
+        # act / assert
+        with patch("sys.stderr", captured), self.assertRaises(SystemExit) as ctx:
+            main(["suggest", "/no/such/dir"])
+        self.assertEqual(2, ctx.exception.code)
+        self.assertIn("path does not exist", captured.getvalue())
+
+    def test_should_refuse_a_notebook_for_suggest(self) -> None:
+        """Test that a notebook path is refused with a clear message rather than ignored."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nb = Path(tmpdir) / "n.ipynb"
+            nb.write_text("{}")
+            captured = StringIO()
+
+            # act / assert
+            with patch("sys.stderr", captured), self.assertRaises(SystemExit) as ctx:
+                main(["suggest", str(nb)])
+            self.assertEqual(2, ctx.exception.code)
+            self.assertIn("doesn't cover notebooks", captured.getvalue())
+
+    def test_should_exit_1_for_suggest_when_the_checker_is_not_installed(self) -> None:
+        """Test that suggest gives the same helpful message `check` does without the extension."""
+        # arrange
+        original_import = builtins.__import__
+
+        def mock_import(name: str, *args: object, **kwargs: object) -> object:
+            if name == "typedframes._rust_checker":
+                raise ImportError(name)
+            return original_import(name, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "job.py").write_text("x = 1\n")
+            captured = StringIO()
+
+            # act / assert
+            with (
+                patch("builtins.__import__", side_effect=mock_import),
+                patch("sys.stderr", captured),
+                self.assertRaises(SystemExit) as ctx,
+            ):
+                main(["suggest", tmpdir])
+            self.assertEqual(1, ctx.exception.code)
+            self.assertIn("Rust checker extension was not found", captured.getvalue())
+
+    def test_should_skip_a_file_whose_suggest_call_raises_oserror(self) -> None:
+        """Test that an unreadable file is skipped with a message, not fatal."""
 
         # arrange
-        def _failing_check_notebook(_path: str, _index_bytes: bytes | None) -> str:
+        def failing(_file_path: str, _display_path: str, _index_bytes: bytes | None) -> str:
             msg = "permission denied"
             raise OSError(msg)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            nb_file = Path(tmpdir) / "nb.ipynb"
-            _write_notebook(nb_file, ["x = 1"])
+        captured = StringIO()
 
-            captured = StringIO()
+        # act
+        with patch("sys.stderr", captured):
+            result = _suggest_one_file(Path("x.py"), Path(), failing, None)
 
-            # act
-            with patch("sys.stderr", captured):
-                result = _check_notebook_file(nb_file, _failing_check_notebook, None)
+        # assert
+        self.assertIsNone(result)
+        self.assertIn("x.py: skipped, permission denied", captured.getvalue())
 
-            # assert
-            self.assertIsNone(result)
-            self.assertIn(f"{nb_file}: skipped, permission denied", captured.getvalue())
+    def test_should_pass_the_display_path_and_index_to_the_suggest_call(self) -> None:
+        """Test that the diff header name is project-relative and the index is forwarded."""
+        # arrange
+        seen: list[tuple[str, str, bytes | None]] = []
+
+        def fake(file_path: str, display_path: str, index_bytes: bytes | None) -> str:
+            seen.append((file_path, display_path, index_bytes))
+            return '{"suggestions": [], "withheld": []}'
+
+        # act
+        result = _suggest_one_file(Path("/proj/src/x.py"), Path("/proj"), fake, b"idx")
+
+        # assert
+        self.assertEqual({"suggestions": [], "withheld": []}, result)
+        self.assertEqual([("/proj/src/x.py", "src/x.py", b"idx")], seen)
+
+    def test_should_format_a_suggestion_with_notes_and_the_rust_diff(self) -> None:
+        """Test the suggestion header, reason, notes and diff layout."""
+        # arrange
+        suggestion = {
+            "kind": "select",
+            "line": 3,
+            "col": 5,
+            "var": "df",
+            "tier": "review",
+            "columns": ["a", "b"],
+            "reason": "only 'a', 'b' are read later (line 4)",
+            "notes": ["first note", "second note"],
+            "diff": "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n",
+        }
+
+        # act
+        text = _format_suggestion("src/x.py", suggestion)
+
+        # assert
+        expected = (
+            'src/x.py:3:5  df  select ["a", "b"]  [review]\n'
+            "  only 'a', 'b' are read later (line 4)\n"
+            "  note: first note\n"
+            "  note: second note\n"
+            "\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new"
+        )
+        self.assertEqual(expected, text)
+
+    def test_should_json_quote_a_column_name_in_the_header(self) -> None:
+        """Test that a column containing a quote is shown as a valid string literal."""
+        # arrange
+        suggestion = {
+            "kind": "select",
+            "line": 1,
+            "col": 1,
+            "var": "df",
+            "tier": "safe",
+            "columns": ['b"c'],
+            "reason": "r",
+            "notes": [],
+            "diff": "d",
+        }
+
+        # act
+        text = _format_suggestion("x.py", suggestion)
+
+        # assert
+        self.assertIn('select ["b\\"c"]', text.splitlines()[0])
+
+    def test_should_pluralise_counts(self) -> None:
+        """Test the singular/plural wording used in the suggest tally."""
+        # act / assert
+        self.assertEqual("1 file", _plural(1, "file"))
+        self.assertEqual("0 files", _plural(0, "file"))
+        self.assertEqual("2 files", _plural(2, "file"))

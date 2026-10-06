@@ -24,10 +24,17 @@ use std::sync::Mutex;
 // ── Index structs ──────────────────────────────────────────────────────────────
 
 // Return-type and parameter-contract information extracted from a function definition.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct IndexFunction {
     pub(crate) returns_schema: String, // BaseSchema subclass name, e.g. "OrderSchema"; empty if none
-    pub(crate) returns_frame: String,  // reserved for future use
+    // "pandas" or "polars" when the return annotation names that library's frame type;
+    // empty otherwise. Lets a caller in another file tell which library a call returns.
+    pub(crate) returns_library: String,
+    // What the function does with each parameter whose every use is a read of a named column,
+    // so a caller passing a frame to it knows which columns it needs. Absent for a function
+    // that does anything else with its parameters.
+    #[serde(default)]
+    pub(crate) param_usage: Vec<crate::column_usage::ParamUsage>,
     // Columns required on the function's first parameter. Starts as the columns
     // accessed *directly* in the function body; resolve_transitive_requires (run once,
     // project-wide, in build_index_internal) folds in the requirements of every
@@ -74,7 +81,7 @@ pub(crate) struct IndexFunction {
 }
 
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct IndexEntry {
     pub(crate) schemas: HashMap<String, Vec<String>>, // schema name -> column list
     // Named schema name -> (file it's defined in, definition line) -- see Linter's
@@ -115,6 +122,9 @@ pub(crate) struct IndexEntry {
     // `functions[_].helper_summary`'s plain-function resolution.
     #[serde(default)]
     pub(crate) class_helper_summaries: HashMap<String, HashMap<String, HelperSummary>>,
+    // Statically known constants and evaluable functions, for importing files to fold.
+    #[serde(default)]
+    pub(crate) eval: crate::static_eval::ModuleExports,
 }
 
 // In-memory cross-file symbol index.
@@ -196,7 +206,10 @@ pub(crate) fn compute_all_schemas(
     files: &HashMap<String, IndexEntry>,
 ) -> HashMap<String, Vec<String>> {
     let mut all_schemas: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in files.values() {
+    // Sorted by path so a schema name defined in two files always resolves the same way.
+    let mut ordered: Vec<(&String, &IndexEntry)> = files.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, entry) in ordered {
         for (name, cols) in &entry.schemas {
             all_schemas
                 .entry(name.clone())
@@ -214,7 +227,9 @@ pub(crate) fn compute_all_schema_locations(
     files: &HashMap<String, IndexEntry>,
 ) -> HashMap<String, (String, usize)> {
     let mut all_schema_locations: HashMap<String, (String, usize)> = HashMap::new();
-    for entry in files.values() {
+    let mut ordered: Vec<(&String, &IndexEntry)> = files.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, entry) in ordered {
         for (name, loc) in &entry.schema_locations {
             all_schema_locations
                 .entry(name.clone())
@@ -222,6 +237,226 @@ pub(crate) fn compute_all_schema_locations(
         }
     }
     all_schema_locations
+}
+
+// ── Index cache ────────────────────────────────────────────────────────────────
+
+// Bump when the cached representation changes shape.
+const INDEX_CACHE_FORMAT: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct CachedFile {
+    // Hash of the file's source: the entry is reused only while this still matches.
+    hash: u64,
+    entry: IndexEntry,
+    candidates: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CacheFileIn {
+    format: u32,
+    version: String,
+    fingerprint: u64,
+    entries: HashMap<String, CachedFile>,
+}
+
+#[derive(Serialize)]
+struct CacheFileOut<'a> {
+    format: u32,
+    version: &'a str,
+    fingerprint: u64,
+    entries: HashMap<&'a str, &'a CachedFile>,
+}
+
+// FNV-1a: `DefaultHasher`'s algorithm can change between Rust versions, and cache file
+// names and fingerprints should stay reproducible.
+struct Fnv(u64);
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+fn hash_of(value: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = Fnv(0xcbf2_9ce4_8422_2325);
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What an entry in the cache is worth to this run: still valid as it was loaded, or
+/// freshly computed.
+enum Slot {
+    Kept,
+    Fresh(Box<CachedFile>),
+}
+
+/// Indexes files, reusing the stored result for any file whose source is unchanged. A
+/// missing, unreadable or mismatched cache is ignored, so the index is the same with or
+/// without one.
+pub(crate) struct FileIndexer<'a> {
+    project_root: &'a Path,
+    config: &'a LinterConfig,
+    cache_path: Option<PathBuf>,
+    loaded: HashMap<String, CachedFile>,
+    fingerprint: u64,
+    slots: Mutex<HashMap<String, Slot>>,
+}
+
+impl<'a> FileIndexer<'a> {
+    pub(crate) fn new(
+        project_root: &'a Path,
+        config: &'a LinterConfig,
+        cache_dir: Option<&Path>,
+    ) -> Self {
+        // Configuration comes only from pyproject.toml, so its text stands for it. The build
+        // id covers indexing changes made without a version bump.
+        let pyproject = fs::read_to_string(project_root.join("pyproject.toml")).unwrap_or_default();
+        let fingerprint = hash_of((
+            INDEX_CACHE_FORMAT,
+            env!("CARGO_PKG_VERSION"),
+            env!("TYPEDFRAMES_BUILD_ID"),
+            project_root.to_string_lossy().as_ref(),
+            pyproject,
+        ));
+        let cache_path = cache_dir.map(|dir| {
+            let name = format!(
+                "index-{:016x}.bin",
+                hash_of(project_root.to_string_lossy().as_ref())
+            );
+            dir.join(name)
+        });
+        let loaded = cache_path
+            .as_deref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| rmp_serde::from_slice::<CacheFileIn>(&bytes).ok())
+            .filter(|file| {
+                file.format == INDEX_CACHE_FORMAT
+                    && file.version == env!("CARGO_PKG_VERSION")
+                    && file.fingerprint == fingerprint
+            })
+            .map(|file| file.entries)
+            .unwrap_or_default();
+        FileIndexer {
+            project_root,
+            config,
+            cache_path,
+            loaded,
+            fingerprint,
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn index(&self, path: &Path) -> Option<(IndexEntry, Vec<String>)> {
+        let source = fs::read_to_string(path).ok()?;
+        let key = path.to_str()?;
+        if self.cache_path.is_none() {
+            return index_source(path, &source, self.project_root, self.config)
+                .map(|(entry, candidates, _)| (entry, candidates));
+        }
+        let hash = hash_of(&source);
+        if let Some(cached) = self.loaded.get(key).filter(|c| c.hash == hash) {
+            if let Ok(mut slots) = self.slots.lock() {
+                slots.insert(key.to_string(), Slot::Kept);
+            }
+            return Some((cached.entry.clone(), cached.candidates.clone()));
+        }
+        let (entry, candidates, cacheable) =
+            index_source(path, &source, self.project_root, self.config)?;
+        if cacheable {
+            let fresh = CachedFile {
+                hash,
+                entry: entry.clone(),
+                candidates: candidates.clone(),
+            };
+            if let Ok(mut slots) = self.slots.lock() {
+                slots.insert(key.to_string(), Slot::Fresh(Box::new(fresh)));
+            }
+        }
+        Some((entry, candidates))
+    }
+
+    /// Every path indexed in parallel; results in input order, `None` for a file that
+    /// couldn't be read.
+    pub(crate) fn index_all(&self, paths: &[PathBuf]) -> Vec<Option<(IndexEntry, Vec<String>)>> {
+        crate::parallel::parallel_map(paths, |path| self.index(path))
+    }
+
+    /// Writes the cache back if it changed; best effort. A whole-project run passes `prune`
+    /// to drop entries for files it didn't find, a partial run keeps what it didn't visit.
+    pub(crate) fn save(&self, prune: bool) {
+        let (Some(cache_path), Ok(slots)) = (&self.cache_path, self.slots.lock()) else {
+            return;
+        };
+        let fresh = slots
+            .values()
+            .filter(|s| matches!(s, Slot::Fresh(_)))
+            .count();
+        let kept = slots.len() - fresh;
+        let dropped = prune && kept != self.loaded.len();
+        if fresh == 0 && !dropped {
+            return;
+        }
+        let mut entries: HashMap<&str, &CachedFile> = HashMap::with_capacity(slots.len());
+        if !prune {
+            for (key, file) in &self.loaded {
+                entries.insert(key, file);
+            }
+        }
+        for (key, slot) in slots.iter() {
+            match slot {
+                Slot::Fresh(file) => entries.insert(key, file),
+                Slot::Kept => self
+                    .loaded
+                    .get(key)
+                    .and_then(|file| entries.insert(key, file)),
+            };
+        }
+        let out = CacheFileOut {
+            format: INDEX_CACHE_FORMAT,
+            version: env!("CARGO_PKG_VERSION"),
+            fingerprint: self.fingerprint,
+            entries,
+        };
+        let Ok(bytes) = rmp_serde::to_vec(&out) else {
+            return;
+        };
+        let Some(dir) = cache_path.parent() else {
+            return;
+        };
+        if create_private_dir(dir).is_err() {
+            return;
+        }
+        // Renamed into place so a reader or a crash never sees a half-written file.
+        let temporary = cache_path.with_extension(format!("tmp{}", std::process::id()));
+        if fs::write(&temporary, bytes).is_err() || fs::rename(&temporary, cache_path).is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+}
+
+// A directory made for the cache is private to the user; an existing one is left alone.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
@@ -388,17 +623,27 @@ pub(crate) fn collect_external_package_files(
 // `build_index_internal`. This file's own imports/module_aliases are exactly what's
 // needed to resolve each candidate's raw call-site name to a module, so it's done
 // here rather than requiring a second pass over the same file.
-pub(crate) fn index_file(
+/// The index entry for `source` (the contents of `path`), the external-package candidates
+/// it names, and whether the result depends on nothing but `source` -- `false` when
+/// indexing read another file (a `.sql` file), so a cached copy could go stale without
+/// this file changing.
+pub(crate) fn index_source(
     path: &Path,
+    source: &str,
     project_root: &Path,
     config: &LinterConfig,
-) -> Option<(IndexEntry, Vec<String>)> {
-    let source = fs::read_to_string(path).ok()?;
-
+) -> Option<(IndexEntry, Vec<String>, bool)> {
     let mut linter = Linter::new();
     linter.with_context(project_root.to_path_buf(), config);
     linter.preserve_unresolved_delegates = true;
-    let _ = linter.check_file_internal(&source, path);
+    let _ = linter.check_file_internal(source, path);
+    let depends_on_other_files = linter.read_external_file.get();
+
+    let parsed_module = ruff_python_parser::parse_module(source).ok();
+    let eval = parsed_module
+        .as_ref()
+        .map(|parsed| crate::static_eval::export_module(parsed.syntax(), source))
+        .unwrap_or_default();
 
     let schemas = linter.schemas;
     let schema_locations = linter.schema_locations;
@@ -411,7 +656,7 @@ pub(crate) fn index_file(
     func_names.extend(linter.param_schema_names.keys().cloned());
     func_names.extend(linter.param_governed_templates.keys().cloned());
     func_names.extend(linter.all_function_names.iter().cloned());
-    let functions: HashMap<String, IndexFunction> = func_names
+    let mut functions: HashMap<String, IndexFunction> = func_names
         .into_iter()
         .map(|name| {
             let returns_schema = linter.functions.get(&name).cloned().unwrap_or_default();
@@ -439,7 +684,8 @@ pub(crate) fn index_file(
                 name,
                 IndexFunction {
                     returns_schema,
-                    returns_frame: String::new(),
+                    returns_library: String::new(),
+                    param_usage: Vec::new(),
                     requires,
                     def_line,
                     delegates,
@@ -450,11 +696,23 @@ pub(crate) fn index_file(
             )
         })
         .collect();
+    if let Some(parsed) = &parsed_module {
+        for (name, library) in crate::suggest::function_libraries(parsed.syntax()) {
+            if let Some(function) = functions.get_mut(&name) {
+                function.returns_library = library.as_str().to_string();
+            }
+        }
+        for (name, usage) in crate::helpers::module_param_usages(parsed.syntax()) {
+            if let Some(function) = functions.get_mut(&name) {
+                function.param_usage = usage;
+            }
+        }
+    }
 
     let mut exports = Vec::new();
     let mut imports: HashMap<String, String> = HashMap::new();
     let mut module_aliases: HashMap<String, String> = HashMap::new();
-    if let Ok(parsed) = parse_module(&source) {
+    if let Ok(parsed) = parse_module(source) {
         let module = parsed.into_syntax();
         for stmt in &module.body {
             match stmt {
@@ -567,8 +825,10 @@ pub(crate) fn index_file(
             class_methods: linter.class_methods,
             class_bases: linter.class_bases,
             class_helper_summaries,
+            eval,
         },
         external_package_candidates,
+        !depends_on_other_files,
     ))
 }
 
@@ -630,7 +890,13 @@ pub(crate) fn resolve_traced_external_packages(
 // and merged in — see `resolve_traced_external_packages`. This ordering is required,
 // not just convenient: deciding which external packages are worth tracing depends on
 // having already seen every first-party file's own imports and DataFrame-shaped usage.
+#[cfg(test)]
 pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
+    build_index_cached(project_root, None)
+}
+
+// Builds the project index, using the per-file cache in `cache_dir` when given.
+pub(crate) fn build_index_cached(project_root: &Path, cache_dir: Option<&Path>) -> ProjectIndex {
     // Loaded once and threaded into every per-file `Linter`, so index-time inference
     // (this function) and check-time inference (`check_file`) agree on `sql_dialect` —
     // a mismatch here would make a SQL-derived schema's columns differ depending on
@@ -641,8 +907,9 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
     let mut files = HashMap::new();
     let mut discovered_candidates: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for file_path in &py_files {
-        if let Some((entry, candidates)) = index_file(file_path, project_root, &config) {
+    let indexer = FileIndexer::new(project_root, &config, cache_dir);
+    for (file_path, indexed) in py_files.iter().zip(indexer.index_all(&py_files)) {
+        if let Some((entry, candidates)) = indexed {
             discovered_candidates.extend(candidates);
             if let Some(path_str) = file_path.to_str() {
                 files.insert(path_str.to_string(), entry);
@@ -650,7 +917,14 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
         }
     }
 
-    index_traced_external_packages(project_root, &config, discovered_candidates, &mut files);
+    index_traced_external_packages(
+        project_root,
+        &config,
+        discovered_candidates,
+        &mut files,
+        &indexer,
+    );
+    indexer.save(true);
     finalise_index(project_root, files)
 }
 
@@ -677,11 +951,16 @@ pub(crate) fn index_traced_external_packages(
     config: &LinterConfig,
     discovered_candidates: std::collections::HashSet<String>,
     files: &mut HashMap<String, IndexEntry>,
+    indexer: &FileIndexer,
 ) {
     let traced_packages =
         resolve_traced_external_packages(config, discovered_candidates, project_root, files);
-    for file_path in collect_external_package_files(project_root, &traced_packages) {
-        if let Some((entry, _candidates)) = index_file(&file_path, project_root, config) {
+    let external_files = collect_external_package_files(project_root, &traced_packages);
+    for (file_path, indexed) in external_files
+        .iter()
+        .zip(indexer.index_all(&external_files))
+    {
+        if let Some((entry, _candidates)) = indexed {
             if let Some(path_str) = file_path.to_str() {
                 files.insert(path_str.to_string(), entry);
             }
@@ -799,9 +1078,19 @@ pub(crate) fn resolve_first_party_module_path(
 // project-local import against and no `.venv` to find installed packages in, so the
 // caller falls back to the same no-index behaviour it had before, having genuinely
 // tried first.
+#[cfg(test)]
 pub(crate) fn build_single_file_index_internal(file_path: &Path) -> Option<ProjectIndex> {
+    build_single_file_index_cached(file_path, None)
+}
+
+// Builds the index for one file and its imports, using the per-file cache in `cache_dir` when given.
+pub(crate) fn build_single_file_index_cached(
+    file_path: &Path,
+    cache_dir: Option<&Path>,
+) -> Option<ProjectIndex> {
     let project_root = find_project_root_opt(file_path)?;
     let config = load_linter_config(&project_root);
+    let indexer = FileIndexer::new(&project_root, &config, cache_dir);
     let excluded_dirs = resolve_excluded_dirs(&config);
 
     let mut files: HashMap<String, IndexEntry> = HashMap::new();
@@ -818,7 +1107,7 @@ pub(crate) fn build_single_file_index_internal(file_path: &Path) -> Option<Proje
         if files.len() >= MAX_SINGLE_FILE_INDEXED_FILES {
             break;
         }
-        let Some((entry, candidates)) = index_file(&current, &project_root, &config) else {
+        let Some((entry, candidates)) = indexer.index(&current) else {
             continue;
         };
         discovered_candidates.extend(candidates);
@@ -844,7 +1133,14 @@ pub(crate) fn build_single_file_index_internal(file_path: &Path) -> Option<Proje
         }
     }
 
-    index_traced_external_packages(&project_root, &config, discovered_candidates, &mut files);
+    index_traced_external_packages(
+        &project_root,
+        &config,
+        discovered_candidates,
+        &mut files,
+        &indexer,
+    );
+    indexer.save(false);
     Some(finalise_index(&project_root, files))
 }
 
@@ -2252,6 +2548,7 @@ mod tests {
                 class_methods: HashMap::new(),
                 class_bases: HashMap::new(),
                 class_helper_summaries: HashMap::new(),
+                eval: Default::default(),
             },
         );
         let candidates: std::collections::HashSet<String> =
@@ -3280,5 +3577,200 @@ def load_{i}(path: str) -> pd.DataFrame:
             elapsed,
             elapsed / iterations
         );
+    }
+
+    // ── per-file index cache ──
+
+    const LOADER: &str = "import pandas as pd\n\n\ndef load(path):\n    df = pd.read_csv(path, usecols=[\"a\", \"b\"])\n    return df\n";
+
+    fn project_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        for (name, source) in files {
+            fs::write(dir.path().join(name), source).unwrap();
+        }
+        dir
+    }
+
+    fn as_json(index: &ProjectIndex) -> serde_json::Value {
+        serde_json::to_value(index).unwrap()
+    }
+
+    #[test]
+    fn test_should_build_the_same_index_with_a_warm_cache_as_without_one() {
+        let project = project_with(&[("a.py", LOADER), ("b.py", "x = 1\n")]);
+        let cache = tempfile::tempdir().unwrap();
+
+        let uncached = build_index_cached(project.path(), None);
+        let cold = build_index_cached(project.path(), Some(cache.path()));
+        let warm = build_index_cached(project.path(), Some(cache.path()));
+
+        assert_eq!(as_json(&uncached), as_json(&cold));
+        assert_eq!(as_json(&uncached), as_json(&warm));
+    }
+
+    #[test]
+    fn test_should_reuse_the_entry_of_an_unchanged_file() {
+        let project = project_with(&[("a.py", LOADER), ("b.py", "x = 1\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        let config = LinterConfig::EMPTY;
+        let first = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        let paths = [project.path().join("a.py"), project.path().join("b.py")];
+        first.index_all(&paths);
+        first.save(true);
+
+        let second = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        second.index_all(&paths);
+
+        assert_eq!(second.loaded.len(), 2);
+        let slots = second.slots.lock().unwrap();
+        assert!(slots.values().all(|s| matches!(s, Slot::Kept)));
+    }
+
+    #[test]
+    fn test_should_reindex_only_the_file_that_changed() {
+        let project = project_with(&[("a.py", LOADER), ("b.py", "x = 1\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        build_index_cached(project.path(), Some(cache.path()));
+        fs::write(
+            project.path().join("a.py"),
+            LOADER.replace("[\"a\", \"b\"]", "[\"x\", \"y\"]"),
+        )
+        .unwrap();
+
+        let rebuilt = build_index_cached(project.path(), Some(cache.path()));
+
+        let entry = rebuilt
+            .files
+            .get(project.path().join("a.py").to_str().unwrap())
+            .unwrap();
+        let schema = entry.functions["load"].returns_schema.clone();
+        assert_eq!(entry.schemas[&schema], vec!["x", "y"]);
+        let uncached = build_index_cached(project.path(), None);
+        assert_eq!(as_json(&rebuilt), as_json(&uncached));
+    }
+
+    #[test]
+    fn test_should_drop_a_deleted_file_from_the_cache() {
+        let project = project_with(&[("a.py", LOADER), ("b.py", "x = 1\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        build_index_cached(project.path(), Some(cache.path()));
+        fs::remove_file(project.path().join("b.py")).unwrap();
+
+        let rebuilt = build_index_cached(project.path(), Some(cache.path()));
+
+        assert_eq!(rebuilt.files.len(), 1);
+        let config = LinterConfig::EMPTY;
+        let after = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        assert_eq!(after.loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_should_ignore_a_cache_made_under_a_different_configuration() {
+        let project = project_with(&[("a.py", LOADER)]);
+        let cache = tempfile::tempdir().unwrap();
+        build_index_cached(project.path(), Some(cache.path()));
+        fs::write(
+            project.path().join("pyproject.toml"),
+            "[tool.typedframes]\nwarnings = false\n",
+        )
+        .unwrap();
+
+        let config = load_linter_config(project.path());
+        let indexer = FileIndexer::new(project.path(), &config, Some(cache.path()));
+
+        assert!(indexer.loaded.is_empty());
+    }
+
+    #[test]
+    fn test_should_ignore_an_unreadable_cache_and_replace_it() {
+        let project = project_with(&[("a.py", LOADER)]);
+        let cache = tempfile::tempdir().unwrap();
+        build_index_cached(project.path(), Some(cache.path()));
+        let cache_file = fs::read_dir(cache.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(&cache_file, b"not a cache").unwrap();
+
+        let rebuilt = build_index_cached(project.path(), Some(cache.path()));
+
+        assert_eq!(rebuilt.files.len(), 1);
+        let config = LinterConfig::EMPTY;
+        let again = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        assert_eq!(again.loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_should_not_cache_a_file_whose_index_depends_on_a_sql_file() {
+        let source = "import pandas as pd\nfrom pathlib import Path\n\nsql = Path(\"orders.sql\").read_text()\ndf = pd.read_sql(sql, conn)\n";
+        let project = project_with(&[("etl.py", source)]);
+        fs::write(project.path().join("orders.sql"), "SELECT a FROM t").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        build_index_cached(project.path(), Some(cache.path()));
+
+        let config = LinterConfig::EMPTY;
+        let after = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        assert!(after.loaded.is_empty());
+    }
+
+    #[test]
+    fn test_should_keep_the_rest_of_the_cache_after_a_single_file_run() {
+        let project = project_with(&[("a.py", LOADER), ("b.py", "x = 1\n"), ("c.py", "y = 2\n")]);
+        let cache = tempfile::tempdir().unwrap();
+        build_index_cached(project.path(), Some(cache.path()));
+
+        build_single_file_index_cached(&project.path().join("b.py"), Some(cache.path())).unwrap();
+
+        let config = LinterConfig::EMPTY;
+        let after = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        assert_eq!(after.loaded.len(), 3);
+    }
+
+    #[test]
+    fn test_should_leave_no_temporary_file_behind_when_the_write_fails() {
+        let project = project_with(&[("a.py", LOADER)]);
+        let cache = tempfile::tempdir().unwrap();
+        let config = LinterConfig::EMPTY;
+        let indexer = FileIndexer::new(project.path(), &config, Some(cache.path()));
+        indexer.index(&project.path().join("a.py"));
+        let target = indexer.cache_path.clone().unwrap();
+        fs::create_dir(&target).unwrap();
+
+        indexer.save(true);
+
+        let leftovers: Vec<_> = fs::read_dir(cache.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![target.file_name().unwrap().to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_create_the_cache_directory_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = project_with(&[("a.py", LOADER)]);
+        let parent = tempfile::tempdir().unwrap();
+        let cache = parent.path().join("typedframes");
+
+        build_index_cached(project.path(), Some(&cache));
+
+        let mode = fs::metadata(&cache).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn test_should_survive_a_cache_dir_that_cannot_be_created() {
+        let project = project_with(&[("a.py", LOADER)]);
+        let blocker = project.path().join("blocker");
+        fs::write(&blocker, "a file, not a directory").unwrap();
+
+        let index = build_index_cached(project.path(), Some(&blocker.join("cache")));
+
+        assert_eq!(index.files.len(), 1);
     }
 }

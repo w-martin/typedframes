@@ -19,10 +19,10 @@ This directory contains comparison examples showing the differences between **da
 
 ## Environment
 
-- **dataframely**: 3.0.0
+- **dataframely**: 3.1.2
 - **polars**: 1.43.2
-- **mypy**: 2.3.0
-- **typedframes**: 0.3.1 (published; see repo root for unreleased fixes)
+- **mypy**: 2.4.0
+- **typedframes**: 0.9.0 (published; see repo root for unreleased fixes)
 
 ## Files
 

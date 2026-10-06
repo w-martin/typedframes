@@ -8,15 +8,15 @@ version = "0.1.0"
 description = "Great Expectations examples and comparison with typedframes"
 requires-python = ">=3.11"
 dependencies = [
-    "great-expectations>=1.20.0",
+    "great-expectations>=1.23.2",
     "pandas>=2.0.0",
-    "mypy>=1.0.0",
+    "mypy>=2.4.0",
 ]
 
 [dependency-groups]
 dev = [
-    "typedframes[mypy]>=0.2.1",
-    "pandas-stubs>=3.0.0",
+    "typedframes[mypy]>=0.9.0",
+    "pandas-stubs>=3.0.5.260914",
 ]
 
 [tool.setuptools]

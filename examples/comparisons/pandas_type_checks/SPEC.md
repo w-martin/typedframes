@@ -139,9 +139,9 @@ uv add --dev "typedframes[mypy]>=0.2.1"
 ### Installed Version
 
 - **pandas-type-checks**: 1.1.3
-- **typedframes**: 0.3.1
+- **typedframes**: 0.9.0
 - **pandas**: 3.0.5
-- **mypy**: 2.3.0
+- **mypy**: 2.4.0
 
 ---
 
@@ -178,7 +178,7 @@ uv add --dev "typedframes[mypy]>=0.2.1"
 
 ⚠️ **pandas-type-checks**: Low activity. Latest release (1.1.3) was 2024-08-23, per PyPI. No pandas 3.x compatibility work visible — this comparison's own `a_working_example.py` needed a dtype spec fix (`"object"` → `"str"`) to work under pandas 3.0's new default string dtype.
 
-✓ **typedframes**: Active development. Latest release (0.3.1) was 2026-07-13.
+✓ **typedframes**: Active development. Latest release (0.9.0) was 2026-09-30.
 
 ---
 

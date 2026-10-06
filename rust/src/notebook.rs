@@ -389,6 +389,8 @@ mod tests {
                 accesses: vec![crate::column_usage::ColumnAccess {
                     column: "a".to_string(),
                     conditional: false,
+                    line: 0,
+                    via: None,
                 }],
                 other_uses: vec![],
             }],

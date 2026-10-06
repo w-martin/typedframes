@@ -29,6 +29,23 @@ pub(crate) fn decorator_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+// Column names for a dict literal used as column data -- `{"a": [...], "b": [...]}`.
+// Every item must have a string-literal key: a `**spread` or a computed key means the
+// literal doesn't name every column, so claiming an exact set would be wrong.
+pub(crate) fn extract_dict_literal_keys(dict: &ast::ExprDict) -> Option<Vec<String>> {
+    if dict.items.is_empty() {
+        return None;
+    }
+    let mut columns: Vec<String> = Vec::new();
+    for item in &dict.items {
+        let key = item.key.as_ref().and_then(|k| extract_string_literal(k))?;
+        if !columns.iter().any(|c| c == key) {
+            columns.push(key.to_string());
+        }
+    }
+    Some(columns)
+}
+
 // Column names for `pd.DataFrame([{...}, {...}])` -- a literal list of per-row dict
 // literals (pandas' "records" orientation). Every element must be a dict literal with
 // only string-literal keys; the result is the union of every row's keys, in
@@ -828,6 +845,43 @@ mod tests {
         assert!(!extract_bare_dataframe_type(&annotation_of(
             "def f() -> None: ..."
         )));
+    }
+
+    fn dict_of(source: &str) -> ast::ExprDict {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Expr(expr_stmt) = &parsed.into_syntax().body[0] else {
+            panic!("Expected an expression statement");
+        };
+        let Expr::Dict(dict) = (*expr_stmt.value).clone() else {
+            panic!("Expected a dict literal");
+        };
+        dict
+    }
+
+    #[test]
+    fn test_should_extract_the_keys_of_a_dict_literal_in_order_without_duplicates() {
+        let dict = dict_of("{\"b\": 1, \"a\": 2, \"b\": 3}");
+        assert_eq!(
+            extract_dict_literal_keys(&dict),
+            Some(vec!["b".to_string(), "a".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_should_not_extract_keys_from_an_empty_dict_a_spread_or_a_computed_key() {
+        assert_eq!(extract_dict_literal_keys(&dict_of("{}")), None);
+        assert_eq!(
+            extract_dict_literal_keys(&dict_of("{\"a\": 1, **extra}")),
+            None
+        );
+        assert_eq!(
+            extract_dict_literal_keys(&dict_of("{\"a\": 1, k: 2}")),
+            None
+        );
+        assert_eq!(
+            extract_dict_literal_keys(&dict_of("{\"a\": 1, 2: 2}")),
+            None
+        );
     }
 
     fn filter_call_of(source: &str) -> ast::ExprCall {

@@ -5,8 +5,10 @@ import builtins
 import json
 import tempfile
 import unittest
+from contextlib import chdir
 from io import StringIO
 from pathlib import Path
+from re import sub
 from unittest.mock import patch
 
 from typedframes.cli import (
@@ -27,6 +29,7 @@ from typedframes.cli import (
     _explain_json_payload,
     _explain_status,
     _file_outcome,
+    _format_duration,
     _format_explain,
     _format_github,
     _format_suggestion,
@@ -40,6 +43,7 @@ from typedframes.cli import (
     _percentage,
     _plural,
     _relative_posix,
+    _select_named_sites,
     _suggest_one_file,
     _usage_lines,
     main,
@@ -1581,8 +1585,11 @@ class TestCli(unittest.TestCase):
             with patch("sys.stdout", with_config):
                 main(["check", tmpdir])
 
-            # assert
-            self.assertEqual(without_config.getvalue(), with_config.getvalue())
+            # assert: the elapsed time is the only thing allowed to differ
+            def untimed(text: str) -> str:
+                return sub(r"\(\d+(?:\.\d+)?(?:\u00b5s|ms|s)\)", "(<time>)", text)
+
+            self.assertEqual(untimed(without_config.getvalue()), untimed(with_config.getvalue()))
             self.assertNotIn("below the required", without_config.getvalue())
 
     def test_should_not_enforce_threshold_when_coverage_is_disabled(self) -> None:
@@ -2169,6 +2176,52 @@ class TestCli(unittest.TestCase):
         self.assertIn("cell 3:5:2", report)
         self.assertIn("\n\n", report)
 
+    def test_should_show_an_untyped_sites_name_in_the_explain_report(self) -> None:
+        """Test that a counted-but-untracked site carries its two-word name."""
+        # arrange
+        calls = [{"file": "/proj/a.py", "line": 4, "col": 5, "label": "pd.read_csv", "context": "x"}]
+        untyped = [{"file": "/proj/a.py", "line": 4, "col": 1, "var": "df", "phrase": "quiet-amber"}]
+
+        # act
+        report = _format_explain(ExplainSources(calls, [], untyped), Path("/proj"))
+
+        # assert
+        self.assertIn("COUNTED, untracked -- no static column info  [quiet-amber]", report)
+
+    def test_should_not_name_a_line_that_holds_two_untyped_sites_in_the_explain_report(self) -> None:
+        """Test that an ambiguous line is left untagged rather than given one site's name."""
+        # arrange
+        calls = [{"file": "/proj/a.py", "line": 4, "col": 5, "label": "pd.read_csv", "context": "x"}]
+        untyped = [
+            {"file": "/proj/a.py", "line": 4, "col": 1, "var": "a", "phrase": "quiet-amber"},
+            {"file": "/proj/a.py", "line": 4, "col": 20, "var": "b", "phrase": "solid-triton"},
+        ]
+
+        # act
+        report = _format_explain(ExplainSources(calls, [], untyped), Path("/proj"))
+
+        # assert
+        self.assertIn("COUNTED, untracked -- no static column info", report)
+        self.assertNotIn("quiet-amber", report)
+        self.assertNotIn("solid-triton", report)
+
+    def test_should_list_the_candidates_when_a_name_matches_several_sites(self) -> None:
+        """Test the error for a name two sites share, which a hash collision can still cause."""
+        # arrange
+        site = {"phrase": "quiet-amber", "line": 5, "col": 5, "var": "df"}
+        suggestions = [("/proj/a.py", {**site, "tier": "safe"}), ("/proj/b.py", {**site, "tier": "safe"})]
+        captured = StringIO()
+
+        # act
+        with patch("sys.stderr", captured), self.assertRaises(SystemExit) as ctx:
+            _select_named_sites(["Quiet-Amber"], suggestions, [], editing=False)
+
+        # assert
+        self.assertEqual(2, ctx.exception.code)
+        self.assertIn("names 2 sites", captured.getvalue())
+        self.assertIn("/proj/a.py:5:5", captured.getvalue())
+        self.assertIn("/proj/b.py:5:5", captured.getvalue())
+
     def test_should_report_no_calls_found_for_explain(self) -> None:
         """Test that an entirely call-free run says so rather than printing an empty report."""
         # arrange / act / assert
@@ -2367,6 +2420,49 @@ class TestCli(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn("tracking ended:", output)
             self.assertIn("`.some_unknown()` is not modelled", output)
+
+    def test_should_collapse_repeated_usage_lines_into_a_count(self) -> None:
+        """Test that identical downstream-use lines print once, with how many there were."""
+        # arrange
+        use = {"description": "assignment through this subscript", "conditional": False}
+        usage = {"line": 3, "col": 1, "var": "result", "accesses": [], "other_uses": [use, use, use]}
+
+        # act
+        lines = _usage_lines(usage)
+
+        # assert
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].endswith("assignment through this subscript (x3)"))
+
+    def test_should_format_durations_in_a_fitting_unit(self) -> None:
+        """Test microseconds, milliseconds and seconds."""
+        # arrange / act / assert
+        for seconds, expected in [
+            (0.0000042, "4\u00b5s"),
+            (0.0009996, "1ms"),
+            (0.0123, "12ms"),
+            (0.5, "500ms"),
+            (0.9996, "1.00s"),
+            (1.234, "1.23s"),
+            (75.0, "75.00s"),
+        ]:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(expected, _format_duration(seconds))
+
+    def test_should_not_print_a_zero_second_duration_in_the_summary(self) -> None:
+        """Test that a fast run reports ms or µs rather than `0.0s`."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "ok.py").write_text("x = 1\n")
+            captured = StringIO()
+
+            # act
+            with patch("sys.stdout", captured):
+                main(["check", tmpdir, "--no-index"])
+
+            # assert
+            self.assertRegex(captured.getvalue(), r"Checked 1 file in \d+(\u00b5s|ms)|Checked 1 file in \d+\.\d\ds")
+            self.assertNotIn("0.0s", captured.getvalue())
 
     def test_should_render_usage_lines_for_accesses_and_other_uses(self) -> None:
         """Test _usage_lines' text rendering, including the conditional marker."""
@@ -3171,10 +3267,10 @@ class TestCli(unittest.TestCase):
             output = self._suggest_output([tmpdir, "--no-index"])
 
             # assert
-            self.assertIn('job.py:5:5  df  select ["a", "b"]  [safe]', output)
+            self.assertIn(f'{job}:5:5  df  usecols ["a", "b"]  [safe]', output)
             self.assertIn("only 'a', 'b' are read later (line 6)", output)
             self.assertIn("--- a/job.py", output)
-            self.assertIn('+    df = df[["a", "b"]]', output)
+            self.assertIn('+    df = pd.read_csv("x.csv", usecols=["a", "b"])', output)
             self.assertIn(
                 "1 suggestion (1 safe, 0 review), 0 withheld, in 1 file. Dry run: no files were changed.", output
             )
@@ -3226,19 +3322,40 @@ class TestCli(unittest.TestCase):
             # assert
             self.assertEqual("No untyped DataFrame sites found\n", output)
 
-    def test_should_name_a_single_file_relative_to_its_directory(self) -> None:
-        """Test that suggesting for one file labels it by its name, not an absolute path."""
+    def test_should_print_full_locations_and_a_diff_header_relative_to_the_working_directory(self) -> None:
+        """Test that locations match `check`'s full paths while the diff stays usable with `git apply`."""
         # arrange
         with tempfile.TemporaryDirectory() as tmpdir:
-            job = Path(tmpdir) / "job.py"
+            root = Path(tmpdir).resolve()
+            (root / "src").mkdir()
+            job = root / "src" / "job.py"
             job.write_text('import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(df["a"])\n')
 
             # act
-            output = self._suggest_output([str(job), "--no-index"])
+            with chdir(root):
+                output = self._suggest_output(["src", "--no-index"])
 
             # assert
-            self.assertIn("job.py:2:1  df", output)
-            self.assertNotIn(tmpdir, output)
+            self.assertIn(f"{job}:2:1  df", output)
+            self.assertIn("--- a/src/job.py", output)
+
+    def test_should_use_the_working_directory_when_no_path_is_given(self) -> None:
+        """Test that `check` and `suggest` both default to `.`."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "job.py").write_text('import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(df["a"])\n')
+            captured = StringIO()
+
+            # act
+            with chdir(root):
+                suggested = self._suggest_output(["--no-index"])
+                with patch("sys.stdout", captured):
+                    main(["check", "--no-index"])
+
+            # assert
+            self.assertIn(f"{root / 'job.py'}:2:1  df", suggested)
+            self.assertIn(" in 1 file", captured.getvalue())
 
     def test_should_order_suggestions_by_file_then_line(self) -> None:
         """Test that several files are reported in a stable, sorted order, notebooks excluded."""
@@ -3360,6 +3477,7 @@ class TestCli(unittest.TestCase):
         """Test the suggestion header, reason, notes and diff layout."""
         # arrange
         suggestion = {
+            "phrase": "quiet-amber",
             "kind": "select",
             "line": 3,
             "col": 5,
@@ -3376,7 +3494,7 @@ class TestCli(unittest.TestCase):
 
         # assert
         expected = (
-            'src/x.py:3:5  df  select ["a", "b"]  [review]\n'
+            'quiet-amber  src/x.py:3:5  df  select ["a", "b"]  [review]\n'
             "  only 'a', 'b' are read later (line 4)\n"
             "  note: first note\n"
             "  note: second note\n"
@@ -3393,6 +3511,7 @@ class TestCli(unittest.TestCase):
         """Test that a column containing a quote is shown as a valid string literal."""
         # arrange
         suggestion = {
+            "phrase": "quiet-amber",
             "kind": "select",
             "line": 1,
             "col": 1,

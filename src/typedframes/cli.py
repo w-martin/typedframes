@@ -10,10 +10,13 @@ import re
 import sys
 import time
 import tomllib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from platform import platform, python_version
 from typing import TYPE_CHECKING, NamedTuple
 
+from typedframes import __version__
 from typedframes._cache import (
     add_to_gitignore,
     cache_files,
@@ -21,6 +24,7 @@ from typedframes._cache import (
     locate_cache_dir,
     project_root_for,
     resolve_cache_dir,
+    tighten_cache_permissions,
 )
 
 if TYPE_CHECKING:
@@ -115,6 +119,10 @@ def _load_configured_excludes(path: Path) -> frozenset[str] | None:
 # threshold applied to unconfigured projects.
 _COVERAGE_DEFAULT_FAIL_UNDER = 100.0
 _COVERAGE_PCT_MAX = 100.0
+_ONE_MILLISECOND = 1e-3
+_ONE_MICROSECOND = 1e-6
+_MICROS_PER_MILLI = 1000
+_MILLIS_PER_SECOND = 1000
 
 # Coverage detail levels: how much DataFrame schema coverage detail to print, as text
 # (or nested as structured JSON under --output-format=json). "summary" is the
@@ -563,7 +571,9 @@ def main(argv: list[str] | None = None) -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     check_parser = subparsers.add_parser("check", help="Check Python files for column errors.")
-    check_parser.add_argument("path", type=Path, help="File or directory to check.")
+    check_parser.add_argument(
+        "path", type=Path, nargs="?", default=Path(), help="File or directory to check (default: current directory)."
+    )
     check_parser.add_argument("--strict", action="store_true", help="Exit with code 1 if any errors are found.")
     check_parser.add_argument(
         "--output-format",
@@ -642,7 +652,13 @@ def main(argv: list[str] | None = None) -> None:
         "suggest",
         help="Suggest fixes for DataFrames the checker could not type (dry run: prints diffs, changes nothing).",
     )
-    suggest_parser.add_argument("path", type=Path, help="File or directory to suggest fixes for.")
+    suggest_parser.add_argument(
+        "path",
+        type=Path,
+        nargs="?",
+        default=Path(),
+        help="File or directory to suggest fixes for (default: current directory).",
+    )
     suggest_parser.add_argument(
         "--no-index",
         action="store_true",
@@ -662,6 +678,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Show each suggestion and ask whether to apply it (y/n/a to apply this and the rest/q to quit).",
     )
     suggest_parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Act on just the site with this two-word name (shown next to each site; repeat for several). "
+            "With --apply it is applied even if review-tier, since naming it is the choice."
+        ),
+    )
+    suggest_parser.add_argument(
         "--allow-dirty",
         action="store_true",
         dest="allow_dirty",
@@ -670,6 +696,20 @@ def main(argv: list[str] | None = None) -> None:
             "or there is no git repository."
         ),
     )
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Print a bug-report body for one untyped site, with a redacted copy of its code (review before posting).",
+    )
+    report_parser.add_argument("name", help="The site's two-word name, as shown by `suggest`.")
+    report_parser.add_argument(
+        "path",
+        type=Path,
+        nargs="?",
+        default=Path(),
+        help="File or directory to look in (default: current directory).",
+    )
+    report_parser.add_argument("--no-index", action="store_true", help="Look at every file in isolation.")
+    _add_cache_arguments(report_parser)
     cache_parser = subparsers.add_parser(
         "cache",
         help="Find, clear or gitignore the on-disk index cache.",
@@ -696,6 +736,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_check(args)
     elif args.command == "suggest":
         _run_suggest(args)
+    elif args.command == "report":
+        _run_report(args)
     elif args.command == "cache":
         _run_cache(args)
     else:
@@ -707,7 +749,7 @@ def main(argv: list[str] | None = None) -> None:
 class RunStats:
     """Timing plus DataFrame schema coverage stats for a single `check` invocation."""
 
-    elapsed: float
+    elapsed: float  # seconds
     dataframes_total: int
     dataframes_typed: int
 
@@ -821,6 +863,17 @@ class CoverageBucket:
         if self.total == 0:
             return _COVERAGE_PCT_MAX
         return _COVERAGE_PCT_MAX * self.typed / self.total
+
+
+def _format_duration(seconds: float) -> str:
+    """Duration in whichever of µs, ms or s keeps it readable, switching units after rounding."""
+    micros = round(seconds / _ONE_MICROSECOND)
+    if micros < _MICROS_PER_MILLI:
+        return f"{micros}\u00b5s"
+    millis = round(seconds / _ONE_MILLISECOND)
+    if millis < _MILLIS_PER_SECOND:
+        return f"{millis}ms"
+    return f"{seconds:.2f}s"
 
 
 def _relative_posix(file_str: str, root: Path) -> str:
@@ -1017,7 +1070,13 @@ def _usage_lines(usage: dict) -> list[str]:
         suffix = " (conditional)" if use["conditional"] else ""
         suffix += _CONSUMPTION_TAGS.get(use.get("consumes", ""), "")
         lines.append(f"{location}{use['description']}{suffix}")
-    return lines
+    return _collapse_repeats(lines)
+
+
+def _collapse_repeats(lines: list[str]) -> list[str]:
+    """Merge identical lines into the first occurrence with a `(xN)` count."""
+    counts = Counter(lines)
+    return [f"{line} (x{counts[line]})" if counts[line] > 1 else line for line in dict.fromkeys(lines)]
 
 
 @dataclass(frozen=True)
@@ -1080,11 +1139,19 @@ def _format_explain(sources: ExplainSources, root: Path) -> str:
     for name in sorted(calls_by_file.keys() | events_by_file.keys() | usage_by_file.keys()):
         typed_by_line = {s["line"]: s for s in typed_by_file.get(name, [])}
         untyped_lines = {s["line"] for s in untyped_by_file.get(name, [])}
+        sites_per_line = Counter(s["line"] for s in untyped_by_file.get(name, []))
+        phrase_by_line = {
+            s["line"]: s["phrase"]
+            for s in untyped_by_file.get(name, [])
+            if s.get("phrase") and sites_per_line[s["line"]] == 1
+        }
         if lines:
             lines.append("")
         lines.append(_relative_posix(name, root))
         for site in sorted(calls_by_file.get(name, []), key=_position_key):
             status = _explain_status(site, typed_by_line, untyped_lines)
+            if site["line"] in phrase_by_line and status.startswith("COUNTED, untracked"):
+                status = f"{status}  [{phrase_by_line[site['line']]}]"
             lines.append(f"  {_event_location(site):<12} {site['label']:<16} {status}")
         file_events = sorted(events_by_file.get(name, []), key=_position_key)
         if file_events:
@@ -1342,10 +1409,10 @@ def _print_results(
     file_label = "file" if len(files) == 1 else "files"
     if errors_only or warnings:
         summary = ", ".join(_error_summary_parts(errors_only, warnings))
-        msg = f"\u2717 Found {summary} in {len(files)} {file_label} ({stats.elapsed:.1f}s)"
+        msg = f"\u2717 Found {summary} in {len(files)} {file_label} ({_format_duration(stats.elapsed)})"
         print(f"{_BOLD_RED}{msg}{_RESET}" if use_color else msg)
     else:
-        msg = f"\u2713 Checked {len(files)} {file_label} in {stats.elapsed:.1f}s"
+        msg = f"\u2713 Checked {len(files)} {file_label} in {_format_duration(stats.elapsed)}"
         print(f"{_BOLD_GREEN}{msg}{_RESET}" if use_color else msg)
 
     if show_info and not caveat:
@@ -1468,9 +1535,19 @@ def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
         return None
     cache_dir = resolve_cache_dir(path, cli_value=args.cache_dir, disabled=args.no_cache)
     cache_arg = str(cache_dir) if cache_dir is not None else None
+    if cache_dir is not None:
+        tighten_cache_permissions(cache_dir)
     if path.is_dir():
         return build_project_index(str(path), cache_arg)
     return build_single_file_index(str(path), cache_arg)
+
+
+def _diff_name(file_path: Path, root: Path) -> str:
+    """Name for a diff header: relative to the working directory so `git apply` accepts it, else to `root`."""
+    try:
+        return file_path.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return _relative_posix(str(file_path), root)
 
 
 def _suggest_one_file(
@@ -1478,7 +1555,7 @@ def _suggest_one_file(
 ) -> dict | None:
     """Ask the Rust checker for one file's suggestions, or `None` if it had to be skipped."""
     try:
-        return json.loads(suggest_file(str(file_path), _relative_posix(str(file_path), root), index_bytes))
+        return json.loads(suggest_file(str(file_path), _diff_name(file_path, root), index_bytes))
     except (OSError, RuntimeError) as e:
         # Unreadable, or not valid Python.
         print(f"{file_path}: skipped, {e}", file=sys.stderr)
@@ -1488,7 +1565,7 @@ def _suggest_one_file(
 def _format_suggestion(display_path: str, suggestion: dict) -> str:
     """Render one suggestion: where, why, any review notes, then the diff Rust built."""
     columns = ", ".join(json.dumps(column) for column in suggestion["columns"])
-    where = f"{display_path}:{suggestion['line']}:{suggestion['col']}"
+    where = f"{suggestion['phrase']}  {display_path}:{suggestion['line']}:{suggestion['col']}"
     lines = [
         f"{where}  {suggestion['var']}  {suggestion['kind']} [{columns}]  [{suggestion['tier']}]",
         f"  {suggestion['reason']}",
@@ -1514,13 +1591,15 @@ def _print_suggestions(suggestions: list[tuple[str, dict]], withheld: list[tuple
     if withheld:
         print("Not suggested:")
         for display_path, site in withheld:
-            print(f"  {display_path}:{site['line']}:{site['col']}  {site['var']}  {site['reason']}")
+            where = f"{display_path}:{site['line']}:{site['col']}"
+            print(f"  {site['phrase']}  {where}  {site['var']}  {site['reason']}")
         print()
     safe = sum(1 for _, suggestion in suggestions if suggestion["tier"] == "safe")
     print(
         f"{_plural(len(suggestions), 'suggestion')} ({safe} safe, {len(suggestions) - safe} review), "
         f"{len(withheld)} withheld, in {_plural(file_count, 'file')}. Dry run: no files were changed."
     )
+    print("Each site has a name: use --only NAME to act on one, or `typedframes report NAME` to report a problem.")
 
 
 def _collect_suggestions(
@@ -1536,11 +1615,64 @@ def _collect_suggestions(
         if result is None:
             unreadable += 1
             continue
-        display_path = _relative_posix(str(file_path), root)
+        display_path = str(file_path)
         files_by_display[display_path] = file_path
         suggestions.extend((display_path, suggestion) for suggestion in result["suggestions"])
         withheld.extend((display_path, site) for site in result["withheld"])
     return suggestions, withheld, files_by_display, unreadable
+
+
+def _select_named_sites(
+    names: list[str], suggestions: list[tuple[str, dict]], withheld: list[tuple[str, dict]], *, editing: bool
+) -> tuple[list[tuple[str, dict]], list[tuple[str, dict]]]:
+    """Keep only the sites called `names`.
+
+    Exits 2 if a name matches nothing or more than one site, and 1 if `editing` and a name is a
+    site that has no suggestion.
+    """
+    chosen_suggestions: list[tuple[str, dict]] = []
+    chosen_withheld: list[tuple[str, dict]] = []
+    for raw in dict.fromkeys(names):
+        name = raw.strip().lower()
+        found_suggestions = [(d, s) for d, s in suggestions if s["phrase"] == name]
+        found_withheld = [(d, w) for d, w in withheld if w["phrase"] == name]
+        total = len(found_suggestions) + len(found_withheld)
+        if total == 0:
+            print(f"Error: no untyped site is named {raw!r}", file=sys.stderr)
+            sys.exit(2)
+        if total > 1:
+            print(f"Error: {raw!r} names {total} sites; narrow the path to one of them:", file=sys.stderr)
+            for display_path, site in [*found_suggestions, *found_withheld]:
+                print(f"  {display_path}:{site['line']}:{site['col']}  {site['var']}", file=sys.stderr)
+            sys.exit(2)
+        if editing and found_withheld:
+            site = found_withheld[0][1]
+            print(f"Error: {site['phrase']} can't be edited: {site['reason']}", file=sys.stderr)
+            sys.exit(1)
+        chosen_suggestions.extend(found_suggestions)
+        chosen_withheld.extend(found_withheld)
+    return chosen_suggestions, chosen_withheld
+
+
+def _edit_requests(
+    args: argparse.Namespace, suggestions: list[tuple[str, dict]], files_by_display: dict[str, Path]
+) -> list[tuple[str, str, list[tuple[int, int]] | None]] | None:
+    """What to hand to the apply step for --apply / --apply --only / --interactive; `None` if the user quit."""
+    if args.apply and not args.only:
+        safe_files = sorted({display for display, suggestion in suggestions if suggestion["tier"] == "safe"})
+        return [(str(files_by_display[display]), display, None) for display in safe_files]
+    if args.apply:
+        # Naming a site is the choice, so its tier doesn't matter, but its notes are shown first.
+        chosen: dict[str, list[tuple[int, int]]] | None = {}
+        for display, suggestion in suggestions:
+            for note in suggestion["notes"]:
+                print(f"{suggestion['phrase']}: note: {note}")
+            chosen.setdefault(display, []).append((suggestion["line"], suggestion["col"]))
+    else:
+        chosen = _choose_interactively(suggestions)
+    if chosen is None:
+        return None
+    return [(str(files_by_display[display]), display, origins) for display, origins in chosen.items()]
 
 
 def _run_suggest(args: argparse.Namespace) -> None:
@@ -1567,19 +1699,15 @@ def _run_suggest(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     suggestions, withheld, files_by_display, unreadable = _collect_suggestions(files, root, suggest_file, index_bytes)
+    if args.only:
+        suggestions, withheld = _select_named_sites(args.only, suggestions, withheld, editing=bool(editing))
 
     if not editing:
         _print_suggestions(suggestions, withheld, len(files))
         return
-    requests: list[tuple[str, str, list[tuple[int, int]] | None]]
-    if args.apply:
-        safe_files = sorted({display for display, suggestion in suggestions if suggestion["tier"] == "safe"})
-        requests = [(str(files_by_display[display]), display, None) for display in safe_files]
-    else:
-        chosen = _choose_interactively(suggestions)
-        if chosen is None:
-            return
-        requests = [(str(files_by_display[display]), display, origins) for display, origins in chosen.items()]
+    requests = _edit_requests(args, suggestions, files_by_display)
+    if requests is None:
+        return
     if requests:
         failed = _apply_and_report(requests, index_bytes, require_tracked=not args.allow_dirty)
     else:
@@ -1588,6 +1716,81 @@ def _run_suggest(args: argparse.Namespace) -> None:
     # Exit non-zero if an edit run left files unprocessed; a dry run just skips them.
     if unreadable or failed:
         sys.exit(1)
+
+
+_REPORT_REVIEW_NOTICE = (
+    "<!-- Review before posting, then delete this line. Names, comments and most strings are replaced, "
+    "but numbers 0 and 1, library and option names and the shape of the code are kept as written. -->"
+)
+
+
+def _format_report(report: dict) -> str:
+    """The Markdown issue body for one site's `report_file` result."""
+    verdict = report["verdict"]
+    outcome = verdict["outcome"]
+    if verdict["kind"]:
+        outcome = f"{outcome} (`{verdict['kind']}`, {verdict['tier']})"
+    lines = [
+        _REPORT_REVIEW_NOTICE,
+        f"## typedframes report: {report['name']}",
+        "",
+        f"- typedframes {__version__}",
+        f"- Python {python_version()} on {platform()}",
+        "",
+        "### What the checker did",
+        "",
+        f"- Outcome: {outcome}",
+        f"- Reason: {verdict['reason']}",
+        *(f"- Note: {note}" for note in verdict["notes"]),
+        "",
+        "### Code",
+        "",
+    ]
+    if report["snippet"]:
+        lines += ["```python", report["snippet"].rstrip("\n"), "```"]
+    else:
+        lines.append(f"No snippet: {report['refusal']}.")
+    lines += ["", "### What you expected", "", "<!-- Describe what you expected instead. -->"]
+    return "\n".join(lines)
+
+
+def _run_report(args: argparse.Namespace) -> None:
+    """Execute the report subcommand: find the named site and print its bug-report body."""
+    path = _resolve_existing_path(args.path)
+    if path.suffix == ".ipynb":
+        print("Error: `report` doesn't cover notebooks", file=sys.stderr)
+        sys.exit(2)
+    try:
+        from typedframes._rust_checker import report_file
+    except ImportError:
+        print(_EXTENSION_MISSING, file=sys.stderr)
+        sys.exit(1)
+
+    index_bytes = _build_index_bytes(path, args)
+    files = sorted(_collect_python_files(path, _load_configured_excludes(path)))
+    matches: list[tuple[Path, dict]] = []
+    for file_path in files:
+        try:
+            report = json.loads(report_file(str(file_path), args.name.strip().lower(), index_bytes))
+        except (OSError, RuntimeError) as e:
+            print(f"{file_path}: skipped, {e}", file=sys.stderr)
+            continue
+        if report is not None:
+            matches.append((file_path, report))
+    if not matches:
+        print(f"Error: no untyped site is named {args.name!r}", file=sys.stderr)
+        sys.exit(2)
+    if len(matches) > 1:
+        print(f"Error: {args.name!r} names {len(matches)} sites; narrow the path to one of them:", file=sys.stderr)
+        for file_path, report in matches:
+            print(f"  {file_path}:{report['line']}:{report['col']}  {report['var']}", file=sys.stderr)
+        sys.exit(2)
+    print(_format_report(matches[0][1]))
+    print(
+        "Read the report before posting it: names, comments and most strings are replaced, but the shape of the "
+        "code and library or option names are kept.",
+        file=sys.stderr,
+    )
 
 
 def _vcs_problem(root: Path) -> str | None:
@@ -1643,7 +1846,9 @@ def _ask(prompt: str) -> str:
 
 def _report_nothing_to_apply(suggested: int, withheld: int, *, review_hint: bool) -> None:
     """Say that no edit was made; `review_hint` adds that review-tier ones need --interactive."""
-    hint = " Review-tier suggestions are only applied one at a time, with --interactive." if review_hint else ""
+    hint = (
+        " Review-tier suggestions are only applied one at a time, with --interactive or --only." if review_hint else ""
+    )
     print(f"Nothing to apply ({_plural(suggested, 'suggestion')}, {withheld} withheld).{hint}")
 
 
@@ -1665,7 +1870,9 @@ def _apply_and_report(
             continue
         for item in outcome["applied"]:
             columns = ", ".join(json.dumps(c) for c in item["columns"])
-            print(f"applied  {outcome['file']}:{item['line']}:{item['col']}  {item['var']}  [{columns}]")
+            print(
+                f"applied  {item['phrase']}  {outcome['file']}:{item['line']}:{item['col']}  {item['var']}  [{columns}]"
+            )
         for item in outcome["skipped"]:
             print(f"skipped  {outcome['file']}:{item['line']}:{item['col']}  {item['reason']}")
         applied += len(outcome["applied"])
@@ -1680,6 +1887,8 @@ def _apply_and_report(
         f"Applied {_plural(applied, 'suggestion')} in {_plural(written, 'file')}, {skipped} skipped. "
         f"Re-checked the edited files: {_plural(before, 'error')} before, {after} after."
     )
+    if written and require_tracked:
+        print("Review the changes with `git diff`; undo a file with `git restore FILE`.")
     return failed
 
 
@@ -1697,6 +1906,7 @@ def _resolve_existing_path(original: Path) -> Path:
 
 def _run_check(args: argparse.Namespace) -> None:
     """Execute the check subcommand."""
+    start = time.perf_counter()
     path = _resolve_existing_path(args.path)
 
     # Loaded before the run so an unusable config is reported up front rather than
@@ -1709,7 +1919,6 @@ def _run_check(args: argparse.Namespace) -> None:
     files = sorted(
         _collect_python_files(path, configured_excludes) + _collect_notebook_files(path, configured_excludes)
     )
-    start = time.perf_counter()
     all_errors, coverage = _check_files(files, index_bytes=index_bytes)
     elapsed = time.perf_counter() - start
     stats = RunStats(

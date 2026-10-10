@@ -3,6 +3,7 @@
 from io import StringIO
 from os import environ
 from pathlib import Path
+from stat import S_IMODE
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -287,3 +288,111 @@ class TestCacheCommand(TestCase):
             self.assertEqual(skipped, [])
             self.assertEqual(len(written), 1)
             self.assertTrue(written[0].name.startswith("index-"))
+
+
+class TestCachePermissions(TestCase):
+    """Cache files are private to the user; only the default directory is tightened too."""
+
+    @staticmethod
+    def _mode(path: Path) -> int:
+        return S_IMODE(path.stat().st_mode)
+
+    def test_should_make_the_tools_own_cache_files_private_in_any_directory(self) -> None:
+        """Test that a looser cache file is tightened, and unrelated files are left alone."""
+        # arrange
+        with TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            ours = cache / "index-abc.bin"
+            leftover = cache / "index-abc.tmp123"
+            other = cache / "notes.txt"
+            for file in (ours, leftover, other):
+                file.write_text("x")
+                file.chmod(0o644)
+            cache.chmod(0o755)
+
+            # act
+            _cache.tighten_cache_permissions(cache)
+
+            # assert
+            self.assertEqual(0o600, self._mode(ours))
+            self.assertEqual(0o600, self._mode(leftover))
+            self.assertEqual(0o644, self._mode(other))
+            self.assertEqual(0o755, self._mode(cache))
+
+    def test_should_tighten_the_default_cache_directory_itself(self) -> None:
+        """Test that the per-user default directory becomes owner-only."""
+        # arrange
+        with TemporaryDirectory() as tmpdir:
+            default = Path(tmpdir) / "typedframes"
+            default.mkdir()
+            default.chmod(0o755)
+
+            # act
+            with patch("typedframes._cache.default_cache_dir", return_value=default):
+                _cache.tighten_cache_permissions(default)
+
+            # assert
+            self.assertEqual(0o700, self._mode(default))
+
+    def test_should_leave_an_already_private_file_untouched(self) -> None:
+        """Test that a file with no group or other bits is not rewritten."""
+        # arrange
+        with TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            file = cache / "index-abc.bin"
+            file.write_text("x")
+            file.chmod(0o400)
+
+            # act
+            _cache.tighten_cache_permissions(cache)
+
+            # assert
+            self.assertEqual(0o400, self._mode(file))
+
+    def test_should_ignore_a_file_it_cannot_change(self) -> None:
+        """Test that a permissions error is not fatal."""
+        # arrange
+        with TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            file = cache / "index-abc.bin"
+            file.write_text("x")
+            file.chmod(0o644)
+
+            # act
+            with patch("pathlib.Path.chmod", side_effect=PermissionError):
+                _cache.tighten_cache_permissions(cache)
+
+            # assert
+            self.assertEqual(0o644, self._mode(file))
+
+    def test_should_do_nothing_on_windows(self) -> None:
+        """Test that POSIX permission bits are left alone on Windows."""
+        # arrange
+        with TemporaryDirectory() as tmpdir:
+            file = Path(tmpdir) / "index-abc.bin"
+            file.write_text("x")
+            file.chmod(0o644)
+
+            # act
+            with patch("typedframes._cache.platform", "win32"):
+                _cache.tighten_cache_permissions(Path(tmpdir))
+
+            # assert
+            self.assertEqual(0o644, self._mode(file))
+
+    def test_should_tighten_a_loose_cache_before_a_check_uses_it(self) -> None:
+        """Test that `check` makes an existing cache entry private."""
+        # arrange
+        with TemporaryDirectory() as project, TemporaryDirectory() as cache:
+            (Path(project) / "pyproject.toml").write_text("")
+            (Path(project) / "a.py").write_text("x = 1\n")
+            stale = Path(cache) / "index-old.bin"
+            stale.write_text("x")
+            stale.chmod(0o644)
+
+            # act
+            with patch("sys.stdout", StringIO()):
+                main(["check", project, "--cache-dir", cache])
+
+            # assert
+            self.assertEqual(0o600, self._mode(stale))

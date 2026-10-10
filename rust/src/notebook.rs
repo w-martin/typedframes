@@ -36,6 +36,7 @@ pub(crate) struct NotebookUntypedSite {
     pub line: usize,
     pub col: usize,
     pub var: String,
+    pub phrase: String,
 }
 
 /// The [`crate::errors::TypedSite`] counterpart, relocated to notebook coordinates.
@@ -178,6 +179,7 @@ pub(crate) fn translate_result(
                 line,
                 col: s.col,
                 var: s.var,
+                phrase: s.phrase,
             }
         })
         .collect();
@@ -362,6 +364,7 @@ mod tests {
                 line: 1,
                 col: 1,
                 var: "df".to_string(),
+                phrase: String::new(),
             }],
             typed_sites: vec![TypedSite {
                 line: 1,

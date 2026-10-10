@@ -110,6 +110,7 @@ pub(crate) fn analyze(
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AppliedSuggestion {
+    pub phrase: String,
     pub line: usize,
     pub col: usize,
     pub var: String,
@@ -269,6 +270,7 @@ pub(crate) fn plan_file(
     outcome.applied = chosen
         .iter()
         .map(|s| AppliedSuggestion {
+            phrase: s.phrase.clone(),
             line: s.line,
             col: s.col,
             var: s.var.clone(),
@@ -468,9 +470,9 @@ pub(crate) fn apply_all(
 mod tests {
     use super::*;
 
-    const SAFE: &str = "import pandas as pd\n\n\ndef run():\n    df = pd.read_csv(\"x.csv\")\n    return df[\"a\"] + df[\"b\"]\n";
+    const SAFE: &str = "import pandas as pd\n\n\ndef run():\n    df = pd.read_json(\"x.json\")\n    return df[\"a\"] + df[\"b\"]\n";
     // read only on one path, so a review-tier suggestion
-    const REVIEW: &str = "import pandas as pd\n\n\ndef run(flag):\n    df = pd.read_csv(\"x.csv\")\n    if flag:\n        return df[\"b\"]\n    return df[\"a\"]\n";
+    const REVIEW: &str = "import pandas as pd\n\n\ndef run(flag):\n    df = pd.read_json(\"x.json\")\n    if flag:\n        return df[\"b\"]\n    return df[\"a\"]\n";
 
     fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

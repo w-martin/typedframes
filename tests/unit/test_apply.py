@@ -3,6 +3,7 @@
 from io import StringIO
 from json import dumps
 from pathlib import Path
+from re import MULTILINE, findall
 from sys import modules
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -11,13 +12,22 @@ from unittest.mock import patch
 
 from typedframes.cli import _ask, main
 
-_SAFE = 'import pandas as pd\n\n\ndef run():\n    df = pd.read_csv("x.csv")\n    return df["a"] + df["b"]\n'
+_SAFE = 'import pandas as pd\n\n\ndef run():\n    df = pd.read_json("x.json")\n    return df["a"] + df["b"]\n'
 _SELECTED = _SAFE.replace("    return", '    df = df[["a", "b"]]\n    return')
 _REVIEW = _SAFE.replace('    return df["a"] + df["b"]', '    if flag:\n        return df["b"]\n    return df["a"]')
+_BLOCKED = (
+    "import pandas as pd\n\n\n"
+    'def run():\n    raw = pd.read_json("x.json")\n    print(raw["a"])\n    return clean(raw)\n'
+)
+_MIXED = (
+    "import pandas as pd\n\n\n"
+    'def good():\n    df = pd.read_json("x.json")\n    return df["a"]\n\n\n'
+    'def blocked():\n    raw = pd.read_json("y.json")\n    print(raw["a"])\n    return clean(raw)\n'
+)
 _TWO = (
     "import pandas as pd\n\n\n"
-    'def first():\n    df = pd.read_csv("x.csv")\n    return df["a"]\n\n\n'
-    'def second():\n    df = pd.read_csv("y.csv")\n    return df["b"]\n'
+    'def first():\n    df = pd.read_json("x.json")\n    return df["a"]\n\n\n'
+    'def second():\n    df = pd.read_json("y.json")\n    return df["b"]\n'
 )
 
 
@@ -55,7 +65,7 @@ class TestSuggestApply(TestCase):
             # assert
             self.assertIsNone(code)
             self.assertEqual(job.read_text(), _SELECTED)
-            self.assertIn('applied  job.py:5:5  df  ["a", "b"]', out)
+            self.assertRegex(out, rf'applied  [a-z]+-[a-z]+  {job.resolve()}:5:5  df  \["a", "b"\]')
             self.assertIn("Applied 1 suggestion in 1 file, 0 skipped.", out)
 
     def test_should_not_change_the_file_a_second_time(self) -> None:
@@ -113,6 +123,198 @@ class TestSuggestApply(TestCase):
 
                 # assert
                 self.assertEqual(apply.call_args.args[2], expected)
+
+    def test_should_name_each_site_the_same_way_on_every_run(self) -> None:
+        """Test that the two-word names are stable and shown for suggested and withheld sites."""
+        tmp, job = self._project(_MIXED)
+        with tmp:
+            # act
+            first, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            second, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+
+            # assert
+            self.assertEqual(first, second)
+            self.assertEqual(1, len(findall(r"^[a-z]+-[a-z]+  ", first, flags=MULTILINE)))
+            self.assertEqual(1, len(findall(r"^  [a-z]+-[a-z]+  ", first, flags=MULTILINE)))
+
+    def test_should_show_only_the_named_site_in_a_dry_run(self) -> None:
+        """Test that --only filters the report to the site with that name."""
+        tmp, job = self._project(_TWO)
+        with tmp:
+            everything, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            names = findall(r"^([a-z]+-[a-z]+)  ", everything, flags=MULTILINE)
+
+            # act
+            out, _err, code = _run(["suggest", str(job.parent), "--no-index", "--only", names[1]])
+
+            # assert
+            self.assertIsNone(code)
+            self.assertEqual(2, len(names))
+            self.assertIn(f"{names[1]}  ", out)
+            self.assertNotIn(names[0], out)
+            self.assertIn("1 suggestion (", out)
+
+    def test_should_apply_only_the_named_site(self) -> None:
+        """Test that --apply --only edits just that site and leaves the others alone."""
+        tmp, job = self._project(_TWO)
+        with tmp:
+            everything, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            names = findall(r"^([a-z]+-[a-z]+)  ", everything, flags=MULTILINE)
+
+            # act
+            out, _err, code = _run(
+                ["suggest", str(job.parent), "--apply", "--allow-dirty", "--no-index", "--only", names[0]]
+            )
+
+            # assert
+            self.assertIsNone(code)
+            edited = job.read_text()
+            self.assertIn('df = df[["a"]]', edited)
+            self.assertNotIn('df = df[["b"]]', edited)
+            self.assertIn("Applied 1 suggestion in 1 file", out)
+
+    def test_should_apply_a_named_review_suggestion(self) -> None:
+        """Test that naming a review-tier site is enough to apply it."""
+        tmp, job = self._project(_REVIEW)
+        with tmp:
+            everything, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            name = findall(r"^([a-z]+-[a-z]+)  ", everything, flags=MULTILINE)[0]
+
+            # act
+            _out, _err, code = _run(
+                ["suggest", str(job.parent), "--apply", "--allow-dirty", "--no-index", "--only", name]
+            )
+
+            # assert
+            self.assertIsNone(code)
+            self.assertIn('df = df[["b", "a"]]', job.read_text())
+
+    def test_should_exit_2_for_a_name_that_matches_no_site(self) -> None:
+        """Test that an unknown name is a usage error and nothing is changed."""
+        tmp, job = self._project(_SAFE)
+        with tmp:
+            # act
+            _out, err, code = _run(
+                ["suggest", str(job.parent), "--apply", "--allow-dirty", "--no-index", "--only", "no-such"]
+            )
+
+            # assert
+            self.assertEqual(2, code)
+            self.assertIn("no untyped site is named 'no-such'", err)
+            self.assertEqual(_SAFE, job.read_text())
+
+    def test_should_refuse_to_edit_a_named_site_that_has_no_suggestion(self) -> None:
+        """Test that naming a withheld site with --apply explains why and exits 1."""
+        tmp, job = self._project(_BLOCKED)
+        with tmp:
+            listing, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            name = findall(r"^  ([a-z]+-[a-z]+)  ", listing, flags=MULTILINE)[0]
+
+            # act
+            _out, err, code = _run(
+                ["suggest", str(job.parent), "--apply", "--allow-dirty", "--no-index", "--only", name]
+            )
+
+            # assert
+            self.assertEqual(1, code)
+            self.assertIn("can't be edited: can't see everything done with it", err)
+            self.assertEqual(_BLOCKED, job.read_text())
+
+    def test_should_name_identical_statements_in_different_files_differently(self) -> None:
+        """Test that the same load in two files gets two names, so --only picks exactly one."""
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pyproject.toml").write_text("")
+            (root / "a.py").write_text(_SAFE)
+            (root / "b.py").write_text(_SAFE)
+            listing, _err, _code = _run(["suggest", str(root), "--no-index"])
+            names = findall(r"^([a-z]+-[a-z]+)  ", listing, flags=MULTILINE)
+
+            # act
+            only, _err, code = _run(["suggest", str(root), "--no-index", "--only", names[0]])
+
+            # assert
+            self.assertEqual(2, len(set(names)))
+            self.assertIsNone(code)
+            self.assertIn("1 suggestion (", only)
+
+    def test_should_apply_a_site_named_twice_only_once(self) -> None:
+        """Test that repeating a name in --only doesn't duplicate its edit."""
+        tmp, job = self._project(_TWO)
+        with tmp:
+            everything, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            names = findall(r"^([a-z]+-[a-z]+)  ", everything, flags=MULTILINE)
+
+            # act
+            out, _err, code = _run(
+                [
+                    *["suggest", str(job.parent), "--apply", "--allow-dirty", "--no-index"],
+                    *["--only", names[0], "--only", names[0]],
+                ]
+            )
+
+            # assert
+            self.assertIsNone(code)
+            self.assertEqual(1, job.read_text().count('df = df[["a"]]'))
+            self.assertIn("Applied 1 suggestion in 1 file, 0 skipped.", out)
+
+    def test_should_show_a_named_review_suggestions_notes_before_applying_it(self) -> None:
+        """Test that a review-tier site applied by name still shows why it needs a human."""
+        tmp, job = self._project(_REVIEW)
+        with tmp:
+            everything, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+            name = findall(r"^([a-z]+-[a-z]+)  ", everything, flags=MULTILINE)[0]
+
+            # act
+            out, _err, _code = _run(
+                ["suggest", str(job.parent), "--apply", "--allow-dirty", "--no-index", "--only", name]
+            )
+
+            # assert
+            self.assertIn(f"{name}: note: ", out)
+
+    def test_should_end_a_dry_run_by_saying_what_the_names_are_for(self) -> None:
+        """Test the legend after the tally."""
+        tmp, job = self._project(_SAFE)
+        with tmp:
+            # act
+            out, _err, _code = _run(["suggest", str(job.parent), "--no-index"])
+
+            # assert
+            self.assertIn("Each site has a name: use --only NAME to act on one", out)
+            self.assertIn("typedframes report NAME", out)
+
+    def test_should_say_how_to_review_and_undo_after_editing_a_tracked_tree(self) -> None:
+        """Test the hint printed once files were written under the clean-tree guard."""
+        tmp, job = self._project(_SAFE)
+        result = {
+            "files": [
+                {
+                    "file": "a.py",
+                    "applied": [
+                        {"phrase": "quiet-amber", "line": 5, "col": 5, "var": "df", "columns": ["a"]},
+                    ],
+                    "skipped": [],
+                    "errors_before": 0,
+                    "errors_after": 0,
+                    "written": True,
+                    "error": None,
+                }
+            ],
+            "failed": None,
+        }
+        with (
+            tmp,
+            patch("typedframes._rust_checker.vcs_problem", return_value=None),
+            patch("typedframes._rust_checker.apply_suggestions", return_value=dumps(result)),
+        ):
+            # act
+            out, _err, code = _run(["suggest", str(job.parent), "--apply", "--no-index"])
+
+            # assert
+            self.assertIsNone(code)
+            self.assertIn("applied  quiet-amber  a.py:5:5", out)
+            self.assertIn("Review the changes with `git diff`; undo a file with `git restore FILE`.", out)
 
     def test_should_not_apply_a_review_suggestion_with_apply(self) -> None:
         """Test that only the safe tier is applied without being asked about each one."""

@@ -50,6 +50,11 @@ pub(crate) fn classify_name(name: &str) -> Consumption {
     }
 }
 
+/// Every method name this module classifies, for callers that need the set (not a verdict).
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    WHOLE_FRAME_CONSUMERS.iter().chain(NON_CONSUMERS).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

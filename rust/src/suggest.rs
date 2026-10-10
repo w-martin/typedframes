@@ -1,16 +1,18 @@
 //! Suggestions for an untyped DataFrame origin, built from how the rest of its scope
 //! uses it (see `column_usage`).
 //!
-//! The one suggestion is a column selection on its own line after the load:
-//! `df = df[["a", "b"]]` (pandas) or `df = df.select("a", "b")` (polars), which gives the
-//! checker an exact schema. It rewrites real code, so it is made only when every use of
-//! the frame is visible and is a read of a named column; anything else is withheld with a
+//! The one suggestion is a column selection, which gives the checker an exact schema:
+//! `usecols=`/`columns=` added to a plain `read_csv`/`read_parquet` call, or else
+//! `df = df[["a", "b"]]` (pandas) / `df = df.select("a", "b")` (polars) on its own line
+//! after the load. It rewrites real code, so it is made only when every use of the
+//! frame is visible and is a read of a named column; anything else is withheld with a
 //! reason, since dropping a column the program still reads breaks it at runtime.
 //!
 //! Output is byte-range edits plus a rendered diff; `apply` is what writes them.
 
 use crate::column_usage::{ColumnUsage, OtherUse};
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
+use ruff_text_size::Ranged;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -24,6 +26,8 @@ pub struct Edit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Suggestion {
+    /// The site's stable two-word name; filled in once all of a file's sites are known.
+    pub phrase: String,
     pub kind: &'static str,
     pub line: usize,
     pub col: usize,
@@ -42,6 +46,7 @@ pub struct Suggestion {
 /// A site that got no suggestion, and why.
 #[derive(Debug, Clone, Serialize)]
 pub struct Withheld {
+    pub phrase: String,
     pub line: usize,
     pub col: usize,
     pub var: String,
@@ -274,6 +279,7 @@ pub(crate) fn suggest_selection(
     usage: &ColumnUsage,
 ) -> Result<Suggestion, String> {
     let library = library_of(origin)?;
+    let in_call = in_call_selection(origin, library);
     let insertion = insertion_point(origin)?;
 
     let blockers: Vec<&OtherUse> = usage
@@ -327,7 +333,7 @@ pub(crate) fn suggest_selection(
             first.line
         ));
     }
-    if library == Library::Pandas && usage.wrote_columns {
+    if library == Library::Pandas && usage.wrote_columns && in_call.is_none() {
         notes.push(
             "columns are assigned into the frame later; on older pandas, assigning into a \
              column selection can raise SettingWithCopyWarning"
@@ -346,25 +352,48 @@ pub(crate) fn suggest_selection(
         .iter()
         .map(|c| serde_json::to_string(c).unwrap_or_else(|_| format!("\"{c}\"")))
         .collect();
-    let expression = match library {
-        Library::Pandas => format!("{}[[{}]]", origin.var, quoted.join(", ")),
-        Library::Polars => format!("{}.select({})", origin.var, quoted.join(", ")),
-    };
-    let replacement = format!(
-        "{}{} = {expression}{}",
-        insertion.indent, origin.var, insertion.newline
-    );
-    let mut new_source = String::with_capacity(origin.source.len() + replacement.len());
-    new_source.push_str(&origin.source[..insertion.offset]);
-    if insertion.leading_newline {
-        new_source.push('\n');
-    }
-    new_source.push_str(&replacement);
-    new_source.push_str(&origin.source[insertion.offset..]);
-    let edit_text = if insertion.leading_newline {
-        format!("\n{replacement}")
-    } else {
-        replacement
+    let (edit, new_source, kind) = match &in_call {
+        Some(site) => {
+            let text = format!(", {}=[{}]", site.keyword, quoted.join(", "));
+            let mut new_source = String::with_capacity(origin.source.len() + text.len());
+            new_source.push_str(&origin.source[..site.offset]);
+            new_source.push_str(&text);
+            new_source.push_str(&origin.source[site.offset..]);
+            let edit = Edit {
+                start: site.offset,
+                end: site.offset,
+                replacement: text,
+            };
+            (edit, new_source, site.keyword)
+        }
+        None => {
+            let expression = match library {
+                Library::Pandas => format!("{}[[{}]]", origin.var, quoted.join(", ")),
+                Library::Polars => format!("{}.select({})", origin.var, quoted.join(", ")),
+            };
+            let replacement = format!(
+                "{}{} = {expression}{}",
+                insertion.indent, origin.var, insertion.newline
+            );
+            let mut new_source = String::with_capacity(origin.source.len() + replacement.len());
+            new_source.push_str(&origin.source[..insertion.offset]);
+            if insertion.leading_newline {
+                new_source.push('\n');
+            }
+            new_source.push_str(&replacement);
+            new_source.push_str(&origin.source[insertion.offset..]);
+            let edit_text = if insertion.leading_newline {
+                format!("\n{replacement}")
+            } else {
+                replacement
+            };
+            let edit = Edit {
+                start: insertion.offset,
+                end: insertion.offset,
+                replacement: edit_text,
+            };
+            (edit, new_source, "select")
+        }
     };
 
     let mut lines: Vec<usize> = usage.accesses.iter().map(|a| a.line).collect();
@@ -406,7 +435,8 @@ pub(crate) fn suggest_selection(
     );
 
     Ok(Suggestion {
-        kind: "select",
+        phrase: String::new(),
+        kind,
         line: origin.line,
         col: origin.col,
         var: origin.var.to_string(),
@@ -414,13 +444,115 @@ pub(crate) fn suggest_selection(
         columns,
         reason,
         notes,
-        edits: vec![Edit {
-            start: insertion.offset,
-            end: insertion.offset,
-            replacement: edit_text,
-        }],
+        edits: vec![edit],
         diff: render_unified_diff(origin.display_path, origin.source, &new_source),
     })
+}
+
+/// Where to add a column list to the load call itself.
+struct InCall {
+    /// The keyword to add: `usecols` or `columns`.
+    keyword: &'static str,
+    /// Just after the call's last argument.
+    offset: usize,
+}
+
+// `pd.read_csv(path)` and the like can take the column list directly, which avoids
+// reading the other columns at all. Only for a bare `read_csv`/`read_parquet` call whose
+// options can't refer to a column outside the list: one positional path plus keywords
+// from a short list of harmless ones.
+fn in_call_selection(origin: &Origin, library: Library) -> Option<InCall> {
+    let Some(Expr::Call(call)) = origin.value else {
+        return None;
+    };
+    let name = match &*call.func {
+        Expr::Attribute(a) => match &*a.value {
+            Expr::Name(base)
+                if matches!(
+                    origin.libraries.modules.get(base.id.as_str()),
+                    Some(ModuleKind::Library(l)) if *l == library
+                ) =>
+            {
+                a.attr.as_str()
+            }
+            _ => return None,
+        },
+        Expr::Name(n) if origin.libraries.names.get(n.id.as_str()) == Some(&library) => {
+            n.id.as_str()
+        }
+        _ => return None,
+    };
+    let (keyword, harmless): (&'static str, &[&str]) = match (library, name) {
+        (Library::Pandas, "read_csv") => (
+            "usecols",
+            &[
+                "sep",
+                "delimiter",
+                "encoding",
+                "encoding_errors",
+                "nrows",
+                "low_memory",
+                "engine",
+                "compression",
+                "na_values",
+                "keep_default_na",
+                "decimal",
+                "thousands",
+            ],
+        ),
+        (Library::Pandas, "read_parquet") => ("columns", &["engine", "dtype_backend"]),
+        (Library::Polars, "read_csv") => (
+            "columns",
+            &[
+                "separator",
+                "encoding",
+                "n_rows",
+                "infer_schema_length",
+                "null_values",
+                "ignore_errors",
+            ],
+        ),
+        (Library::Polars, "read_parquet") => ("columns", &["n_rows", "parallel", "use_pyarrow"]),
+        _ => return None,
+    };
+    let arguments = &call.arguments;
+    if arguments.args.len() != 1 || matches!(arguments.args[0], Expr::Starred(_)) {
+        return None;
+    }
+    let all_harmless = arguments.keywords.iter().all(|k| {
+        k.arg
+            .as_ref()
+            .is_some_and(|a| harmless.contains(&a.as_str()))
+    });
+    if !all_harmless {
+        return None;
+    }
+    let last_end = arguments
+        .keywords
+        .iter()
+        .map(|k| k.range().end())
+        .chain(arguments.args.iter().map(|a| a.range().end()))
+        .max()?
+        .to_usize();
+    Some(InCall {
+        keyword,
+        offset: after_closing_parens(origin.source, last_end, call.range().end().to_usize()),
+    })
+}
+
+// An argument written as `(path)` ends before its own closing parenthesis, so step over
+// those; the call's own closing parenthesis is the last character before `call_end`.
+fn after_closing_parens(source: &str, from: usize, call_end: usize) -> usize {
+    let mut position = from;
+    loop {
+        let rest = &source[position..call_end.saturating_sub(1).max(position)];
+        let gap = rest.len() - rest.trim_start().len();
+        if rest.trim_start().starts_with(')') {
+            position += gap + 1;
+        } else {
+            return position;
+        }
+    }
 }
 
 /// Whether `stmt` already narrows `var` to named columns: `var = var[["a", "b"]]` or
@@ -504,9 +636,9 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
                     return Ok(*library);
                 }
                 return Err(format!(
-                    "can't tell whether `{id}` is pandas or polars (the origin isn't a direct \
-                     `pd.`/`pl.` call, a call to a function annotated `-> pd.DataFrame` or \
-                     `-> pl.DataFrame`, or a method like `.to_df()`)"
+                    "can't tell whether it is pandas or polars: the value is built from `{id}`, \
+                     not a direct `pd.`/`pl.` call, a call to a function annotated \
+                     `-> pd.DataFrame` or `-> pl.DataFrame`, or a method like `.to_df()`"
                 ));
             }
             _ => return Err("its origin isn't a call the library can be read from".to_string()),
@@ -638,7 +770,6 @@ mod tests {
     use crate::column_usage::scan_usage;
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
-    use ruff_text_size::Ranged;
 
     // The imports every test source is assumed to have at the top.
     fn test_libraries() -> LibraryContext {
@@ -697,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_should_select_columns_with_a_pandas_subscript() {
-        let source = "df = pd.read_parquet(\"x.parquet\")\nprint(df[\"a\"], df[\"b\"])\n";
+        let source = "df = pd.read_json(\"x.parquet\")\nprint(df[\"a\"], df[\"b\"])\n";
         let s = run(source, true).unwrap();
 
         assert_eq!(s.kind, "select");
@@ -705,14 +836,14 @@ mod tests {
         assert_eq!(s.columns, vec!["a", "b"]);
         assert_eq!(
             applied(source, &s),
-            "df = pd.read_parquet(\"x.parquet\")\ndf = df[[\"a\", \"b\"]]\nprint(df[\"a\"], df[\"b\"])\n"
+            "df = pd.read_json(\"x.parquet\")\ndf = df[[\"a\", \"b\"]]\nprint(df[\"a\"], df[\"b\"])\n"
         );
         assert!(s.diff.contains("+df = df[[\"a\", \"b\"]]"));
     }
 
     #[test]
     fn test_should_select_columns_with_a_polars_select() {
-        let source = "df = pl.read_parquet(\"x.parquet\")\nprint(df[\"a\"])\n";
+        let source = "df = pl.read_json(\"x.parquet\")\nprint(df[\"a\"])\n";
         let s = run(source, true).unwrap();
 
         assert!(applied(source, &s).contains("df = df.select(\"a\")\n"));
@@ -728,13 +859,13 @@ mod tests {
 
     #[test]
     fn test_should_dedupe_columns_in_first_read_order() {
-        let source = "df = pd.read_parquet(\"x\")\nprint(df[\"b\"], df[\"a\"], df[\"b\"])\n";
+        let source = "df = pd.read_json(\"x\")\nprint(df[\"b\"], df[\"a\"], df[\"b\"])\n";
         assert_eq!(run(source, true).unwrap().columns, vec!["b", "a"]);
     }
 
     #[test]
     fn test_should_keep_the_indentation_of_the_origin() {
-        let source = "def f():\n    df = pd.read_parquet(\"x\")\n    print(df[\"a\"])\n";
+        let source = "def f():\n    df = pd.read_json(\"x\")\n    print(df[\"a\"])\n";
         let module = parse_module(source).unwrap().into_syntax();
         let Stmt::FunctionDef(f) = &module.body[0] else {
             panic!()
@@ -763,23 +894,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             applied(source, &s),
-            "def f():\n    df = pd.read_parquet(\"x\")\n    df = df[[\"a\"]]\n    print(df[\"a\"])\n"
+            "def f():\n    df = pd.read_json(\"x\")\n    df = df[[\"a\"]]\n    print(df[\"a\"])\n"
         );
     }
 
     #[test]
     fn test_should_insert_after_a_multiline_origin_and_its_comment() {
-        let source = "df = pd.read_parquet(\n    \"x\",\n)  # load\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\n    \"x\",\n)  # load\nprint(df[\"a\"])\n";
         let s = run(source, true).unwrap();
         assert_eq!(
             applied(source, &s),
-            "df = pd.read_parquet(\n    \"x\",\n)  # load\ndf = df[[\"a\"]]\nprint(df[\"a\"])\n"
+            "df = pd.read_json(\n    \"x\",\n)  # load\ndf = df[[\"a\"]]\nprint(df[\"a\"])\n"
         );
     }
 
     #[test]
     fn test_should_add_a_newline_when_the_origin_is_the_last_line() {
-        let source = "df = pd.read_parquet(\"x\")";
+        let source = "df = pd.read_json(\"x\")";
         let module = parse_module(source).unwrap().into_syntax();
         let Stmt::Assign(assign) = &module.body[0] else {
             panic!()
@@ -813,15 +944,113 @@ mod tests {
         .unwrap();
         assert_eq!(
             applied(source, &s),
-            "df = pd.read_parquet(\"x\")\ndf = df[[\"a\"]]"
+            "df = pd.read_json(\"x\")\ndf = df[[\"a\"]]"
         );
     }
 
     #[test]
     fn test_should_withhold_when_other_code_shares_the_line() {
-        let source = "df = pd.read_parquet(\"x\"); b = 2\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\"); b = 2\nprint(df[\"a\"])\n";
         let reason = run(source, true).unwrap_err();
         assert!(reason.contains("shares a line"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_add_usecols_to_a_pandas_read_csv() {
+        let source = "df = pd.read_csv(\"x.csv\", sep=\";\")\nprint(df[\"a\"], df[\"b\"])\n";
+        let suggestion = run(source, true).unwrap();
+        assert_eq!(suggestion.kind, "usecols");
+        assert_eq!(suggestion.tier, "safe");
+        assert_eq!(
+            applied(source, &suggestion),
+            "df = pd.read_csv(\"x.csv\", sep=\";\", usecols=[\"a\", \"b\"])\nprint(df[\"a\"], df[\"b\"])\n"
+        );
+        assert!(suggestion.diff.contains("+df = pd.read_csv"));
+    }
+
+    #[test]
+    fn test_should_add_columns_to_a_read_parquet_and_a_polars_read_csv() {
+        for (source, expected) in [
+            (
+                "df = pd.read_parquet(\"x\")\nprint(df[\"a\"])\n",
+                "df = pd.read_parquet(\"x\", columns=[\"a\"])\nprint(df[\"a\"])\n",
+            ),
+            (
+                "df = pl.read_csv(\"x\")\nprint(df[\"a\"])\n",
+                "df = pl.read_csv(\"x\", columns=[\"a\"])\nprint(df[\"a\"])\n",
+            ),
+            (
+                "df = pl.read_parquet(\"x\")\nprint(df[\"a\"])\n",
+                "df = pl.read_parquet(\"x\", columns=[\"a\"])\nprint(df[\"a\"])\n",
+            ),
+        ] {
+            let suggestion = run(source, true).unwrap();
+            assert_eq!(suggestion.kind, "columns", "{source}");
+            assert_eq!(applied(source, &suggestion), expected);
+        }
+    }
+
+    #[test]
+    fn test_should_add_the_column_list_after_the_last_argument_of_a_multiline_call() {
+        let source = "df = pd.read_csv(\n    \"x\",\n    sep=\";\",\n)\nprint(df[\"a\"])\n";
+        let suggestion = run(source, true).unwrap();
+        assert_eq!(
+            applied(source, &suggestion),
+            "df = pd.read_csv(\n    \"x\",\n    sep=\";\", usecols=[\"a\"],\n)\nprint(df[\"a\"])\n"
+        );
+        parse_module(&applied(source, &suggestion)).expect("the edited source still parses");
+    }
+
+    #[test]
+    fn test_should_add_usecols_to_a_read_csv_imported_by_name() {
+        let source = "from pandas import read_csv\ndf = read_csv(\"x\")\nprint(df[\"a\"])\n";
+        let suggestion = run(source, true).unwrap();
+        assert_eq!(suggestion.kind, "usecols");
+    }
+
+    #[test]
+    fn test_should_select_after_the_load_when_the_call_has_other_options() {
+        for source in [
+            "df = pd.read_csv(\"x\", parse_dates=[\"a\"])\nprint(df[\"a\"])\n",
+            "df = pd.read_csv(\"x\", names=[\"a\", \"b\"])\nprint(df[\"a\"])\n",
+            "df = pd.read_csv(\"x\", usecols=lambda c: True)\nprint(df[\"a\"])\n",
+            "df = pd.read_csv(\"x\", **options)\nprint(df[\"a\"])\n",
+            "df = pd.read_csv(*paths)\nprint(df[\"a\"])\n",
+            "df = pd.read_csv(\"x\", \"y\")\nprint(df[\"a\"])\n",
+            "df = pd.read_csv(\"x\").copy()\nprint(df[\"a\"])\n",
+        ] {
+            let suggestion = run(source, true).unwrap_or_else(|e| panic!("{source}: {e}"));
+            assert_eq!(suggestion.kind, "select", "{source}");
+        }
+    }
+
+    #[test]
+    fn test_should_add_the_column_list_outside_a_parenthesised_argument() {
+        for (source, expected) in [
+            (
+                "df = pd.read_csv((path))\nprint(df[\"a\"])\n",
+                "df = pd.read_csv((path), usecols=[\"a\"])\nprint(df[\"a\"])\n",
+            ),
+            (
+                "df = pd.read_csv(\"x\", sep=(\";\"))\nprint(df[\"a\"])\n",
+                "df = pd.read_csv(\"x\", sep=(\";\"), usecols=[\"a\"])\nprint(df[\"a\"])\n",
+            ),
+            (
+                "df = pd.read_csv(((path)) )\nprint(df[\"a\"])\n",
+                "df = pd.read_csv(((path)), usecols=[\"a\"] )\nprint(df[\"a\"])\n",
+            ),
+        ] {
+            let suggestion = run(source, true).unwrap();
+            let edited = applied(source, &suggestion);
+            assert_eq!(edited, expected);
+            parse_module(&edited).expect("the edited source still parses");
+        }
+    }
+
+    #[test]
+    fn test_should_name_the_root_of_a_value_whose_library_is_unknown() {
+        let reason = run("df = self.build()\nprint(df[\"a\"])\n", true).unwrap_err();
+        assert!(reason.contains("built from `self`"), "{reason}");
     }
 
     #[test]
@@ -839,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_should_withhold_when_the_frame_is_passed_to_a_call() {
-        let source = "df = pd.read_parquet(\"x\")\nhelper(df)\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nhelper(df)\nprint(df[\"a\"])\n";
         let reason = run(source, true).unwrap_err();
         assert!(reason.contains("can't see everything"), "{reason}");
         assert!(reason.contains("line 2"), "{reason}");
@@ -847,57 +1076,56 @@ mod tests {
 
     #[test]
     fn test_should_count_additional_blockers() {
-        let source =
-            "df = pd.read_parquet(\"x\")\nhelper(df)\ndf.groupby(\"a\")\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nhelper(df)\ndf.groupby(\"a\")\nprint(df[\"a\"])\n";
         assert!(run(source, true).unwrap_err().ends_with("and 1 more"));
     }
 
     #[test]
     fn test_should_not_be_blocked_by_index_empty_or_len() {
         let source =
-            "df = pd.read_parquet(\"x\")\nprint(df.index, df.empty, len(df))\nprint(df[\"a\"])\n";
+            "df = pd.read_json(\"x\")\nprint(df.index, df.empty, len(df))\nprint(df[\"a\"])\n";
         assert!(run(source, true).is_ok());
     }
 
     #[test]
     fn test_should_block_on_columns_because_narrowing_changes_it() {
-        let source = "df = pd.read_parquet(\"x\")\nprint(df.columns)\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nprint(df.columns)\nprint(df[\"a\"])\n";
         assert!(run(source, true).is_err());
     }
 
     #[test]
     fn test_should_withhold_when_nothing_is_read() {
-        let reason = run("df = pd.read_parquet(\"x\")\nprint(1)\n", true).unwrap_err();
+        let reason = run("df = pd.read_json(\"x\")\nprint(1)\n", true).unwrap_err();
         assert!(reason.contains("no column is read"), "{reason}");
     }
 
     #[test]
     fn test_should_not_count_a_column_created_in_scope_as_a_source_column() {
-        let source = "df = pd.read_parquet(\"x\")\ndf[\"total\"] = df[\"a\"] * 2\nprint(df[\"total\"], df[\"b\"])\n";
+        let source = "df = pd.read_json(\"x\")\ndf[\"total\"] = df[\"a\"] * 2\nprint(df[\"total\"], df[\"b\"])\n";
         let s = run(source, true).unwrap();
         assert_eq!(s.columns, vec!["a", "b"]);
     }
 
     #[test]
     fn test_should_still_count_a_column_written_only_conditionally() {
-        let source = "df = pd.read_parquet(\"x\")\nif flag:\n    df[\"c\"] = 1\nprint(df[\"c\"], df[\"a\"])\n";
+        let source =
+            "df = pd.read_json(\"x\")\nif flag:\n    df[\"c\"] = 1\nprint(df[\"c\"], df[\"a\"])\n";
         assert_eq!(run(source, true).unwrap().columns, vec!["c", "a"]);
     }
 
     #[test]
     fn test_should_note_pandas_assignment_into_a_selection_for_review() {
-        let source = "df = pd.read_parquet(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
         let s = run(source, true).unwrap();
         assert_eq!(s.tier, "review");
         assert!(s.notes[0].contains("SettingWithCopyWarning"));
-        let polars = "df = pl.read_parquet(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
+        let polars = "df = pl.read_json(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
         assert_eq!(run(polars, true).unwrap().tier, "safe");
     }
 
     #[test]
     fn test_should_mark_a_conditional_only_column_as_review() {
-        let source =
-            "df = pd.read_parquet(\"x\")\nif flag:\n    print(df[\"b\"])\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nif flag:\n    print(df[\"b\"])\nprint(df[\"a\"])\n";
         let s = run(source, true).unwrap();
         assert_eq!(s.tier, "review");
         assert!(s.notes[0].contains("'b' is only read conditionally"));
@@ -905,14 +1133,13 @@ mod tests {
 
     #[test]
     fn test_should_not_flag_a_column_also_read_unconditionally() {
-        let source =
-            "df = pd.read_parquet(\"x\")\nif flag:\n    print(df[\"a\"])\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nif flag:\n    print(df[\"a\"])\nprint(df[\"a\"])\n";
         assert_eq!(run(source, true).unwrap().tier, "safe");
     }
 
     #[test]
     fn test_should_mark_a_module_level_variable_as_review() {
-        let source = "df = pd.read_parquet(\"x\")\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nprint(df[\"a\"])\n";
         let s = run(source, false).unwrap();
         assert_eq!(s.tier, "review");
         assert!(s.notes[0].contains("module-level"));
@@ -920,7 +1147,7 @@ mod tests {
 
     #[test]
     fn test_should_escape_a_column_name_that_needs_it() {
-        let source = "df = pd.read_parquet(\"x\")\nprint(df[\"a\\\"b\"])\n";
+        let source = "df = pd.read_json(\"x\")\nprint(df[\"a\\\"b\"])\n";
         assert!(run(source, true).unwrap().diff.contains(r#"df[["a\"b"]]"#));
     }
 
@@ -961,14 +1188,13 @@ mod tests {
 
     #[test]
     fn test_should_follow_an_import_alias_to_the_library() {
-        let source = "import pandas as p\ndf = p.read_parquet(\"x\")\nprint(df[\"a\"])\n";
+        let source = "import pandas as p\ndf = p.read_json(\"x\")\nprint(df[\"a\"])\n";
         assert_eq!(selection_of(source), "df = df[[\"a\"]]\n");
     }
 
     #[test]
     fn test_should_follow_a_name_imported_from_a_library() {
-        let source =
-            "from polars import read_parquet\ndf = read_parquet(\"x\")\nprint(df[\"a\"])\n";
+        let source = "from polars import read_json\ndf = read_json(\"x\")\nprint(df[\"a\"])\n";
         assert_eq!(selection_of(source), "df = df.select(\"a\")\n");
     }
 

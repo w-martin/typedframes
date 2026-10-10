@@ -99,6 +99,8 @@ pub struct UntypedSite {
     pub col: usize,
     /// The assigned variable name where one was available, else a generic stand-in.
     pub var: String,
+    /// A stable two-word name for the site (see `phrase`); empty until assigned.
+    pub phrase: String,
 }
 
 /// Downstream usage the checker observed for one [`UntypedSite`] -- what a schema for

@@ -14,6 +14,10 @@ def check_files(file_paths: list[str], index_bytes: bytes | None = None) -> list
 # Dry-run suggestions as JSON: `{"suggestions": [...], "withheld": [...]}`. `display_path`
 # only names the file in diff headers; nothing is written.
 def suggest_file(file_path: str, display_path: str, index_bytes: bytes | None = None) -> str: ...
+
+# Bug-report material for the untyped site with this two-word name, as JSON (`"null"` if
+# the file has none): its masked verdict plus a redacted snippet or the reason for none.
+def report_file(file_path: str, name: str, index_bytes: bytes | None = None) -> str: ...
 def apply_suggestions(
     requests: list[tuple[str, str, list[tuple[int, int]] | None]],
     index_bytes: bytes | None = None,

@@ -109,6 +109,39 @@ pub(crate) fn suggest_file(
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
 }
 
+/// Bug-report material for the untyped site called `name` in one file, as JSON: its
+/// masked verdict and a redacted snippet that is classified the same way (or why there
+/// is none). `"null"` when the file has no site of that name.
+#[pyfunction]
+#[pyo3(signature = (file_path, name, index_bytes = None))]
+pub(crate) fn report_file(
+    file_path: String,
+    name: String,
+    index_bytes: Option<&[u8]>,
+) -> PyResult<String> {
+    let path = Path::new(&file_path);
+    let project_root = find_project_root(path);
+    let config = load_linter_config(&project_root);
+    if !config.enabled.unwrap_or(true) {
+        return Ok("null".to_string());
+    }
+    let source = fs::read_to_string(path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
+    let (mut linter, _index) = linter_with_index(
+        path,
+        &project_root,
+        &config,
+        &source,
+        index_bytes.and_then(get_cached_index),
+    );
+    linter.collect_suggestions = true;
+    linter
+        .check_file_internal(&source, path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+    serde_json::to_string(&crate::report::report_for(&source, &linter, &name))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+}
+
 /// Check a single Python file for DataFrame column errors.
 ///
 /// Accepts an optional MessagePack-serialised [`ProjectIndex`] (produced by

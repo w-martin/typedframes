@@ -801,27 +801,37 @@ typedframes suggest src/
 ```
 
 ```
-etl.py:5:5  sales  select ["amount", "region"]  [review]
+quiet-amber  /repo/etl.py:5:5  sales  columns ["amount", "region"]  [review]
   only 'amount', 'region' are read later (lines 6, 8)
   note: 'region' is only read conditionally (line 8); if the data lacks it, the selection would now fail
 
 --- a/etl.py
 +++ b/etl.py
-@@ -3,6 +3,7 @@
+@@ -2,7 +2,7 @@
+ 
  
  def revenue():
-     sales = pd.read_parquet("sales.parquet")
-+    sales = sales[["amount", "region"]]
+-    sales = pd.read_parquet("sales.parquet")
++    sales = pd.read_parquet("sales.parquet", columns=["amount", "region"])
      total = sales["amount"].sum()
      if total > 0:
          print(sales["region"])
 
 Not suggested:
-  etl.py:12:5  raw  can't see everything done with it: passed to `clean()` (line 14)
-  etl.py:18:5  d  can't see everything done with it: `.groupby()` (line 19)
+  tempo-cherry  /repo/etl.py:12:5  raw  can't see everything done with it: passed to `clean()` (line 14)
+  solid-triton  /repo/etl.py:18:5  d  can't see everything done with it: `.groupby()` (line 19)
 
 1 suggestion (0 safe, 1 review), 2 withheld, in 1 file. Dry run: no files were changed.
 ```
+
+Each site has a two-word name (`quiet-amber`). It is derived from the file's path (relative to the
+project root), the site's own statement and a count of identical statements earlier in the same file,
+so it doesn't change when other code moves around it or when comments and spacing change. It does
+change if the statement or the file's path changes, if an identical statement is added above it, and
+once `--apply` has edited the statement (the name then no longer exists). The name also appears in
+`--coverage-detail=explain`. Locations are full paths, as in
+`check`'s output; diff headers are relative to the working
+directory. The path defaults to the current directory.
 
 By default `suggest` is a dry run: it prints diffs and never edits a file. It takes the same
 project index as `check`, so it agrees with `check` about which DataFrames are untyped;
@@ -836,6 +846,16 @@ typedframes suggest src/ --apply
 typedframes suggest src/ --interactive
 ```
 
+`--only NAME` (repeatable) limits any of these to the named site. With `--apply` it applies that
+site even if it is `review`-tier, since naming it is the choice; its notes are printed first. A name
+that matches nothing exits 2; a name that still matches several sites lists them, and narrowing the
+path to one file picks one; naming a site that has no suggestion exits 1 and says why. After editing
+under the clean-tree guard, `suggest` prints how to review (`git diff`) and undo (`git restore`).
+
+```shell
+typedframes suggest src/ --apply --only quiet-amber
+```
+
 Edits are written only if they are safe to undo and verified first:
 
 - the git work tree must have no uncommitted changes to tracked files (`--allow-dirty` skips
@@ -846,11 +866,14 @@ Edits are written only if they are safe to undo and verified first:
   file that changed on disk since it was analysed is left alone;
 - applying twice changes nothing the second time.
 
-**What it suggests.** For an untyped frame, a column selection on its own line right after the
-load, listing the columns the rest of its scope reads: `df = df[["a", "b"]]` for pandas,
-`df = df.select("a", "b")` for polars. The checker then knows the frame's exact columns, so later
-typos are caught. The load itself is not changed. A column the scope assigns itself
-(`df["total"] = ...`) is not listed, since it isn't in the source data.
+**What it suggests.** For an untyped frame, the columns the rest of its scope reads, added where
+the frame is loaded. On a plain `read_csv` or `read_parquet` call that is a `usecols=` (pandas
+`read_csv`) or `columns=` keyword, so the other columns are never read at all; this is only done
+when the call's other options are harmless ones such as `sep` or `encoding` (a `parse_dates`, `names`
+or `dtype` option could name a column outside the list). Any other load gets a column selection on its
+own line right after it: `df = df[["a", "b"]]` for pandas, `df = df.select("a", "b")` for polars. Either
+way the checker then knows the frame's exact columns, so later typos are caught. A column the scope
+assigns itself (`df["total"] = ...`) is not listed, since it isn't in the source data.
 
 The origin can be anywhere in a function, a method, or a module-level `if`/`with`/`try`/`match`
 block; what runs after it in the enclosing blocks is scanned too, including `except` and
@@ -895,6 +918,39 @@ pandas frame that later has columns assigned into it (older pandas can raise
 import it and read other columns). Each reason is printed as a `note:`.
 
 Only `.py` files are covered; passing a notebook is an error.
+
+## Reporting a problem (`report`)
+
+If `check` or `suggest` gets a site wrong and the code can't be shared, `typedframes report` builds
+an issue body from the site's two-word name (the one `suggest` prints next to it):
+
+```shell
+typedframes report quiet-amber src/
+```
+
+It prints Markdown with the typedframes, Python and OS versions, what the checker decided about the
+site (names and numbers masked), and a redacted copy of the code around it. **Redacted is not
+anonymous**: read the whole body before posting it, and don't use it on code you aren't allowed to
+share. The body starts with a reminder to do so.
+
+*Replaced:* variables become `v1`, `v2`, functions `f1`, classes `C1`, attributes `a1`, and string
+literals `c1`, `c2`; every number except 0 and 1 becomes a placeholder; comments and docstrings are
+dropped; imports other than pandas, polars, numpy, typing and typedframes are left out.
+
+*Kept as written:* the names pandas, polars, numpy and Python itself define (listed in
+`rust/src/report_names.rs`, including some ordinary words such as `values`, `first` and `count` when
+used as method or keyword names), option strings such as `how="left"` when they are the value of an
+option keyword, and the structure of the code: its branches, the order of operations and the number
+of columns. Structure alone can say something about what the code does.
+
+The snippet covers the enclosing function or class member, the same-file functions it calls, and,
+for a call to a function imported from another file whose return type the project index knew, a
+signature-only stand-in. Before printing it, `report` runs the checker on the snippet and prints it
+only if the site is classified exactly as the original was; otherwise the report says so and gives
+no code. It does the same when the code around the site is over 150 lines, or contains anything the
+redactor doesn't recognise. `report` only prints: it makes no network connection, and the only thing it writes is the index
+cache, which `--no-cache` skips. A name shared by identical statements in several files lists them; narrow the path to one
+file. Notebooks aren't covered.
 
 ## Index cache and parallelism
 

@@ -1733,6 +1733,7 @@ impl Linter {
             return;
         }
         let body = module.body.as_slice();
+        self.name_untyped_sites();
         let by_position: HashMap<(usize, usize), &str> = self
             .untyped_sites
             .iter()
@@ -1754,6 +1755,40 @@ impl Linter {
         self.untyped_site_usage = results.usage;
         if self.collect_suggestions {
             self.settle_suggestions(results.outcomes);
+        }
+    }
+
+    // Libraries of functions this file imports from other project files, by local name.
+    pub(crate) fn imported_function_libraries(&self) -> &HashMap<String, suggest::Library> {
+        &self.imported_function_libraries
+    }
+
+    // The file's path relative to the project root, with `/` separators, so a site's name
+    // doesn't depend on where the checker was run from. Falls back to the bare file name.
+    fn name_salt(&self) -> String {
+        let path = Path::new(&self.file_display);
+        let relative = self
+            .project_root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .or_else(|| path.file_name().map(Path::new))
+            .unwrap_or(path);
+        relative.to_string_lossy().replace('\\', "/")
+    }
+
+    // Gives every untyped site its stable two-word name; see `phrase`.
+    fn name_untyped_sites(&mut self) {
+        let Some(index) = self.line_index.as_ref() else {
+            return;
+        };
+        let sites: Vec<(usize, usize, &str)> = self
+            .untyped_sites
+            .iter()
+            .map(|s| (s.line, s.col, s.var.as_str()))
+            .collect();
+        let phrases = crate::phrase::site_phrases(&self.source, index, &self.name_salt(), &sites);
+        for (site, phrase) in self.untyped_sites.iter_mut().zip(phrases) {
+            site.phrase = phrase;
         }
     }
 
@@ -2005,12 +2040,21 @@ impl Linter {
             .iter()
             .map(|site| ((site.line, site.col), site.var.clone()))
             .collect();
+        let phrase_at: HashMap<(usize, usize), String> = self
+            .untyped_sites
+            .iter()
+            .map(|site| ((site.line, site.col), site.phrase.clone()))
+            .collect();
         let mut reached = std::collections::HashSet::new();
         for (pos, outcome) in outcomes {
             reached.insert(pos);
             match outcome {
-                Ok(suggestion) => self.suggestions.push(suggestion),
+                Ok(mut suggestion) => {
+                    suggestion.phrase = phrase_at.get(&pos).cloned().unwrap_or_default();
+                    self.suggestions.push(suggestion);
+                }
                 Err(reason) => self.withheld.push(suggest::Withheld {
+                    phrase: phrase_at.get(&pos).cloned().unwrap_or_default(),
                     line: pos.0,
                     col: pos.1,
                     var: var_at.get(&pos).cloned().unwrap_or_default(),
@@ -2021,6 +2065,7 @@ impl Linter {
         for site in &self.untyped_sites {
             if !reached.contains(&(site.line, site.col)) {
                 self.withheld.push(suggest::Withheld {
+                    phrase: site.phrase.clone(),
                     line: site.line,
                     col: site.col,
                     var: site.var.clone(),
@@ -2971,6 +3016,7 @@ impl Linter {
             line: current_line,
             col: current_col,
             var: var_hint.to_string(),
+            phrase: String::new(),
         });
     }
 
@@ -11245,6 +11291,60 @@ df = pd.read_csv("data.csv", usecols=["a", "b"])
     }
 
     #[test]
+    fn test_should_name_suggested_and_withheld_sites_with_their_phrases() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+
+def good():
+    df = pd.read_json("x.json")
+    return df["a"]
+
+
+def blocked():
+    raw = pd.read_json("y.json")
+    print(raw["a"])
+    return clean(raw)
+"#;
+
+        // act
+        let linter = suggest_for(source);
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1);
+        assert_eq!(linter.withheld.len(), 1);
+        let phrase_of = |var: &str| {
+            linter
+                .untyped_sites
+                .iter()
+                .find(|s| s.var == var)
+                .map(|s| s.phrase.clone())
+                .unwrap()
+        };
+        assert_eq!(linter.suggestions[0].phrase, phrase_of("df"));
+        assert_eq!(linter.withheld[0].phrase, phrase_of("raw"));
+        assert_ne!(phrase_of("df"), phrase_of("raw"));
+        assert!(!phrase_of("df").is_empty());
+    }
+
+    #[test]
+    fn test_should_keep_a_sites_phrase_when_unrelated_code_is_added_above_it() {
+        // arrange
+        let load = "    df = pd.read_json(\"x.json\")\n    return df[\"a\"]\n";
+        let before = format!("import pandas as pd\n\n\ndef load():\n{load}");
+        let after = format!(
+            "import pandas as pd\n\nLIMIT = 5\n\n\ndef other():\n    return 1\n\n\ndef load():\n{load}"
+        );
+
+        // act
+        let phrase = |source: &str| suggest_for(source).untyped_sites[0].phrase.clone();
+
+        // assert
+        assert_eq!(phrase(&before), phrase(&after));
+    }
+
+    #[test]
     fn test_should_suggest_a_selection_for_a_function_local_load() {
         // arrange
         let source = r#"
@@ -11252,7 +11352,7 @@ import pandas as pd
 
 
 def load():
-    df = pd.read_csv("x.csv")
+    df = pd.read_json("x.json")
     return df["a"] + df["b"]
 "#;
 
@@ -11562,7 +11662,7 @@ def run():
     #[test]
     fn test_should_suggest_a_select_for_a_polars_load() {
         let linter =
-            suggest_for("import polars as pl\ndf = pl.read_csv(\"x.csv\")\nprint(df[\"a\"])\n");
+            suggest_for("import polars as pl\ndf = pl.read_json(\"x.json\")\nprint(df[\"a\"])\n");
         assert!(linter.withheld.is_empty(), "{:?}", linter.withheld);
         assert!(linter.suggestions[0]
             .diff
@@ -11706,7 +11806,7 @@ import pandas as pd
 
 class Report:
     def build(self):
-        df = pd.read_csv("x.csv")
+        df = pd.read_json("x.json")
         return df["a"] + df["b"]
 "#;
         let linter = suggest_for(source);
@@ -11727,7 +11827,7 @@ import pandas as pd
 
 def run(flag):
     if flag:
-        df = pd.read_csv("x.csv")
+        df = pd.read_json("x.json")
         print(df["a"])
     print(df["b"])
 "#;
@@ -11793,7 +11893,7 @@ import pandas as pd
 
 def run(lock):
     with lock:
-        df = pd.read_csv("x.csv")
+        df = pd.read_json("x.json")
     print(df["a"])
 "#;
         let linter = suggest_for(source);

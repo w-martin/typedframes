@@ -436,10 +436,24 @@ impl<'a> FileIndexer<'a> {
         }
         // Renamed into place so a reader or a crash never sees a half-written file.
         let temporary = cache_path.with_extension(format!("tmp{}", std::process::id()));
-        if fs::write(&temporary, bytes).is_err() || fs::rename(&temporary, cache_path).is_err() {
+        if write_private(&temporary, &bytes).is_err() || fs::rename(&temporary, cache_path).is_err()
+        {
             let _ = fs::remove_file(&temporary);
         }
     }
+}
+
+// Cache files hold source paths and identifiers, so only the user may read them.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
 // A directory made for the cache is private to the user; an existing one is left alone.
@@ -3761,6 +3775,27 @@ def load_{i}(path: str) -> pd.DataFrame:
 
         let mode = fs::metadata(&cache).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_write_cache_files_readable_by_the_user_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = project_with(&[("a.py", LOADER)]);
+        let cache = tempfile::tempdir().unwrap();
+
+        build_index_cached(project.path(), Some(cache.path()));
+
+        let files: Vec<_> = fs::read_dir(cache.path()).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let mode = files[0]
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

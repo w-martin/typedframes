@@ -47,7 +47,10 @@ mod index;
 mod linter;
 mod notebook;
 mod parallel;
+mod phrase;
 mod pyapi;
+mod report;
+mod report_names;
 mod sql;
 mod static_eval;
 mod suggest;
@@ -65,6 +68,7 @@ fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pyapi::check_notebook, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::check_files, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::suggest_file, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::report_file, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::apply_suggestions, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::vcs_problem, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::build_project_index, m)?)?;

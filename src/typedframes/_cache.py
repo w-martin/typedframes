@@ -27,6 +27,31 @@ def default_cache_dir() -> Path:
     return (Path(base) if base else Path.home() / ".cache") / "typedframes"
 
 
+def tighten_cache_permissions(cache_dir: Path) -> None:
+    """Make the cache files this tool wrote readable by the user alone, and the default directory too.
+
+    The cache holds source paths and identifiers. A directory chosen with `--cache-dir`, the
+    environment or pyproject.toml may be shared (it can even be the project root), so there only
+    the tool's own files are touched; the per-user default directory is the tool's alone.
+    """
+    if platform == "win32":
+        return
+    for file in cache_files(cache_dir):
+        _restrict(file, 0o700)
+    if cache_dir.is_dir() and cache_dir.resolve() == default_cache_dir().resolve():
+        _restrict(cache_dir, 0o700)
+
+
+def _restrict(path: Path, keep: int) -> None:
+    """Drop every permission bit outside `keep`, if the file isn't already that private."""
+    try:
+        mode = path.stat().st_mode & 0o777
+        if mode & ~keep:
+            path.chmod(mode & keep)
+    except OSError:
+        return
+
+
 def project_root_for(path: Path) -> Path | None:
     """The nearest directory at or above `path` that holds a `pyproject.toml`."""
     start = path.resolve()

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar
 
 from .column import Column
 from .column_group import ColumnGroup
-from .column_group_error import ColumnGroupError
 from .column_set import ColumnSet
 
 if TYPE_CHECKING:
@@ -72,9 +70,7 @@ class BaseSchema(metaclass=SchemaMeta):
 
     Class Attributes:
         enforce_columns: If True, validate that all defined columns exist.
-        enforce_types: If True, enforce column types during I/O operations.
         allow_extra_columns: If True, allow columns not defined in schema.
-        greedy_column_sets: If True, allow columns to match multiple ColumnSets.
 
     Example:
         class UserData(BaseSchema):
@@ -93,9 +89,7 @@ class BaseSchema(metaclass=SchemaMeta):
     _column_group_map: ClassVar[dict[str, ColumnGroup] | None] = None
 
     enforce_columns: ClassVar[bool] = True
-    enforce_types: ClassVar[bool] = True
     allow_extra_columns: ClassVar[bool] = True
-    greedy_column_sets: ClassVar[bool] = False
 
     @classmethod
     def columns(cls) -> dict[str, Column]:
@@ -128,82 +122,6 @@ class BaseSchema(metaclass=SchemaMeta):
                 names.extend(cs.members)
 
         return names
-
-    @classmethod
-    def _build_key_column_map(cls) -> dict[str, Column]:
-        """Build mapping of column keys to Column objects."""
-        key_column_map: dict[str, Column] = {}
-        for col in cls.columns().values():
-            key_column_map[col.column_name] = col
-        return key_column_map
-
-    @classmethod
-    def _match_column_to_set(
-        cls,
-        col_name: str,
-        cs: ColumnSet,
-        *,
-        consumed: bool,
-        greedy: bool,
-        current_match: Column | ColumnSet | None,
-    ) -> bool:
-        """Check if column matches a ColumnSet. Returns True if matched."""
-        matches = any(re.match(pattern, col_name) for pattern in cs.members) if cs.regex else col_name in cs.members
-
-        if matches and consumed and not greedy:
-            raise ColumnGroupError(col_name, current_match, cs)
-
-        return matches and not consumed
-
-    @classmethod
-    def compute_column_map(
-        cls,
-        dataframe_columns: list[str],
-        *,
-        greedy: bool | None = None,
-    ) -> tuple[dict[str, type], dict[str, list[str]]]:
-        """
-        Compute column type map and ColumnSet consumption from actual DataFrame columns.
-
-        Args:
-            dataframe_columns: List of column names from the DataFrame.
-            greedy: Override greedy_column_sets setting.
-
-        Returns:
-            Tuple of (column_type_map, column_consumed_map) where:
-            - column_type_map: Dict mapping column name to its type
-            - column_consumed_map: Dict mapping ColumnSet name to list of matched columns
-
-        Raises:
-            ColumnGroupError: If a column matches multiple ColumnSets (when not greedy).
-
-        """
-        greedy = greedy if greedy is not None else cls.greedy_column_sets
-        column_consumed_map: dict[str, list[str]] = defaultdict(list)
-        key_column_map = cls._build_key_column_map()
-
-        if not cls.column_sets():
-            return {k: v.type for k, v in key_column_map.items()}, dict(column_consumed_map)
-
-        column_bag: list[Column | ColumnSet | None] = [key_column_map.get(c) for c in dataframe_columns]
-        consumed: list[bool] = [col is not None for col in column_bag]
-
-        column_sets_list = list(cls.column_sets().values())
-        for i, col_name in enumerate(dataframe_columns):
-            for cs in column_sets_list:
-                if cls._match_column_to_set(
-                    col_name, cs, consumed=consumed[i], greedy=greedy, current_match=column_bag[i]
-                ):
-                    consumed[i] = True
-                    column_bag[i] = cs
-                    column_consumed_map[cs.name].append(col_name)
-
-        result: dict[str, type] = {}
-        for i, col_or_set in enumerate(column_bag):
-            if col_or_set is not None:
-                result[dataframe_columns[i]] = col_or_set.type
-
-        return result, dict(column_consumed_map)
 
     @classmethod
     def validate_columns(cls, df_columns: list[str]) -> list[str]:

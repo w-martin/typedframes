@@ -4,7 +4,8 @@
 
 // Directories that should never be descended into when collecting `.py` files by
 // default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
-// trees. Mirrors ruff's default exclude list (and cli.py's own `_EXCLUDED_DIRS`,
+// trees. Mirrors ruff's default exclude list, plus `target` (the Rust/maturin build
+// output), and cli.py's own `_EXCLUDED_DIRS`,
 // which MUST be kept in sync with this) -- including ruff's own override semantics:
 // `[tool.typedframes] exclude` in pyproject.toml REPLACES this set entirely rather
 // than adding to it (see `collect_py_files`).
@@ -35,6 +36,7 @@ pub(crate) const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
     "dist",
     "node_modules",
     "site-packages",
+    "target",
     "venv",
 ];
 

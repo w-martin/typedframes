@@ -69,7 +69,8 @@ def lint(ctx: Context) -> None:
     ctx.run("ruff check .")
     ctx.run("ty check .")
     ctx.run("bandit -r src/ -c pyproject.toml")
-    ctx.run("complexipy src/ --max-complexity-allowed 50")
+    # python315.py uses syntax newer than complexipy's parser accepts (see typedframes/compat.py).
+    ctx.run("complexipy src/ --max-complexity-allowed 50 --exclude '**/python315.py'")
     print("Checking Rust formatting...")
     ctx.run(f"cd {RUST_DIR} && cargo fmt --all -- --check")
     print("Running Rust clippy...")

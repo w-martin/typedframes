@@ -4,9 +4,6 @@ Annotate a plain polars DataFrame with a schema, then use ordinary `pl.col()`
 expressions and string/subscript access exactly as you already do -- the checker
 validates both against the schema at lint time, with zero runtime overhead. `.col`
 gives a refactor-safe expression from the schema descriptor instead of a bare string.
-
-(`PolarsFrame[Schema]` is a deprecated alternate spelling for this same annotation --
-see `docs/api/polars.md` -- so this file sticks to the `Annotated[...]` form directly.)
 """
 
 from typing import Annotated

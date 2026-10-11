@@ -12,10 +12,6 @@ Core Classes:
     ColumnSet: Define a group of columns matching a pattern.
     ColumnGroup: Group multiple Columns/ColumnSets for convenient access.
 
-Frame Classes (separate imports):
-    PandasFrame: ``from typedframes.pandas import PandasFrame``
-    PolarsFrame: ``from typedframes.polars import PolarsFrame``
-
 Usage:
     from typing import Annotated
     import pandas as pd
@@ -37,7 +33,7 @@ Usage:
     df.filter(UserSchema.user_id.col > 10)  # ✓ Refactor-safe polars expression
 """
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 
 from .base_schema import BaseSchema as BaseSchema
 from .column import Column as Column

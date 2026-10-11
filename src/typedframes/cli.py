@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# Python 3.15 (PEP 810) imports `platform` on first use, which only `report` needs; older versions
+# import it as usual.
+__lazy_modules__ = ["platform"]
+
 import argparse
 import functools
 import json
@@ -12,12 +16,14 @@ import time
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
+from os import sep
+from os.path import normcase
+from pathlib import Path, PurePath
 from platform import platform, python_version
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from typedframes import __version__
-from typedframes._cache import (
+from typedframes.cache import (
     add_to_gitignore,
     cache_files,
     gitignore_entry,
@@ -26,6 +32,7 @@ from typedframes._cache import (
     resolve_cache_dir,
     tighten_cache_permissions,
 )
+from typedframes.compat import flatten
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -41,7 +48,8 @@ _DIM = "\033[2m"  # low-key informational text: coverage summary, non-actionable
 # Directories that should never be descended into when collecting .py files by
 # default: VCS metadata, virtualenvs, caches, editor/tool state, and vendored/build
 # trees. Mirrors ruff's default exclude list, a well-established precedent for
-# "directories no linter should scan" -- including ruff's own override semantics:
+# "directories no linter should scan" (plus `target`, the Rust/maturin build output) -- including
+# ruff's own override semantics:
 # [tool.typedframes] exclude in pyproject.toml REPLACES this set entirely rather than
 # adding to it (see _load_configured_excludes/_collect_python_files).
 _EXCLUDED_DIRS = frozenset(
@@ -72,6 +80,7 @@ _EXCLUDED_DIRS = frozenset(
         "dist",
         "node_modules",
         "site-packages",
+        "target",
         "venv",
     }
 )
@@ -327,8 +336,17 @@ def _pattern_specificity(pattern: str) -> tuple[int, int, str]:
     return (len(literal_prefix), len(pattern), pattern)
 
 
-def _collect_files_with_suffix(path: Path, suffix: str, configured_excludes: frozenset[str] | None) -> list[Path]:
-    """Collect all files with the given suffix from a path (file or directory).
+def _path_order(path: str) -> tuple[str, ...]:
+    """Sort key that orders path strings the way `Path` objects compare, without comparing `Path`s.
+
+    Comparing `Path` objects is several times slower, and plain string order differs from it (`a.py`
+    sorts before `a/b.py` as text, after it as paths).
+    """
+    return PurePath(normcase(path)).parts
+
+
+def _collect_files(path: Path, suffixes: tuple[str, ...], configured_excludes: frozenset[str] | None) -> list[Path]:
+    """Collect all files ending in one of `suffixes` from a path (file or directory), in one walk.
 
     Prunes descent into vendored/VCS/cache directories: `configured_excludes` (see
     `_load_configured_excludes`) REPLACES the built-in default set (``_EXCLUDED_DIRS``)
@@ -338,26 +356,25 @@ def _collect_files_with_suffix(path: Path, suffix: str, configured_excludes: fro
     pruning the built-in default set alone.
     """
     if path.is_file():
-        if path.suffix == suffix:
-            return [path]
-        return []
+        return [path] if path.suffix in suffixes else []
 
     excluded_dirs = _EXCLUDED_DIRS if configured_excludes is None else configured_excludes
-    found = []
+    found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(path):
         dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
-        found.extend(Path(dirpath) / filename for filename in filenames if filename.endswith(suffix))
-    return sorted(found)
+        found.extend(f"{dirpath}{sep}{filename}" for filename in filenames if filename.endswith(suffixes))
+    found.sort(key=_path_order)
+    return [Path(file) for file in found]
 
 
 def _collect_python_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
-    """Collect all .py files from a path (file or directory). See `_collect_files_with_suffix`."""
-    return _collect_files_with_suffix(path, ".py", configured_excludes)
+    """Collect all .py files from a path (file or directory). See `_collect_files`."""
+    return _collect_files(path, (".py",), configured_excludes)
 
 
 def _collect_notebook_files(path: Path, configured_excludes: frozenset[str] | None = None) -> list[Path]:
-    """Collect all .ipynb files from a path (file or directory). See `_collect_files_with_suffix`."""
-    return _collect_files_with_suffix(path, ".ipynb", configured_excludes)
+    """Collect all .ipynb files from a path (file or directory). See `_collect_files`."""
+    return _collect_files(path, (".ipynb",), configured_excludes)
 
 
 class FileTally(NamedTuple):
@@ -456,29 +473,24 @@ def _check_files(files: list[Path], *, index_bytes: bytes | None = None) -> tupl
         print(_EXTENSION_MISSING, file=sys.stderr)
         sys.exit(1)
 
-    all_errors: list[dict] = []
-    totals = {"dataframes_total": 0, "dataframes_typed": 0}
-    per_file: dict[str, FileTally] = {}
-    untyped_sites: list[dict] = []
-    typed_sites: list[dict] = []
-    all_dataframe_calls: list[dict] = []
-    leg_events: list[dict] = []
-    untyped_site_usage: list[dict] = []
     # Checked in parallel inside Rust (with the GIL released); results come back in order.
     results = check_files([str(f) for f in files], index_bytes)
-    for file_path, (result_json, error) in zip(files, results, strict=True):
-        outcome = _file_outcome(file_path, result_json, error)
-        if outcome is None:
-            continue
-        all_errors.extend(outcome.errors)
-        per_file[str(file_path)] = outcome.tally
-        totals["dataframes_total"] += outcome.tally.total
-        totals["dataframes_typed"] += outcome.tally.typed
-        untyped_sites.extend(outcome.untyped_sites)
-        typed_sites.extend(outcome.typed_sites)
-        all_dataframe_calls.extend(outcome.all_dataframe_calls)
-        leg_events.extend(outcome.leg_events)
-        untyped_site_usage.extend(outcome.untyped_site_usage)
+    outcomes = [
+        (file_path, outcome)
+        for file_path, (result_json, error) in zip(files, results, strict=True)
+        if (outcome := _file_outcome(file_path, result_json, error)) is not None
+    ]
+    all_errors = flatten(outcome.errors for _, outcome in outcomes)
+    per_file = {str(file_path): outcome.tally for file_path, outcome in outcomes}
+    totals = {
+        "dataframes_total": sum(outcome.tally.total for _, outcome in outcomes),
+        "dataframes_typed": sum(outcome.tally.typed for _, outcome in outcomes),
+    }
+    untyped_sites = flatten(outcome.untyped_sites for _, outcome in outcomes)
+    typed_sites = flatten(outcome.typed_sites for _, outcome in outcomes)
+    all_dataframe_calls = flatten(outcome.all_dataframe_calls for _, outcome in outcomes)
+    leg_events = flatten(outcome.leg_events for _, outcome in outcomes)
+    untyped_site_usage = flatten(outcome.untyped_site_usage for _, outcome in outcomes)
     return all_errors, {
         **totals,
         "per_file": per_file,
@@ -565,10 +577,22 @@ def _percentage(value: str) -> float:
     return pct
 
 
+def _parser_options(version: tuple[int, ...] = sys.version_info[:3]) -> dict[str, Any]:
+    """Typo suggestions for mistyped subcommands and choices: opt-in from Python 3.14, the default from 3.15."""
+    return {"suggest_on_error": True} if version >= (3, 14) else {}
+
+
+class _Parser(argparse.ArgumentParser):
+    """The CLI's argument parser; subcommand parsers use it too."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**{**_parser_options(), **kwargs})
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the typedframes CLI."""
-    parser = argparse.ArgumentParser(prog="typedframes", description="Static analysis for DataFrame column schemas.")
-    subparsers = parser.add_subparsers(dest="command")
+    parser = _Parser(prog="typedframes", description="Static analysis for DataFrame column schemas.")
+    subparsers = parser.add_subparsers(dest="command", parser_class=_Parser)
 
     check_parser = subparsers.add_parser("check", help="Check Python files for column errors.")
     check_parser.add_argument(
@@ -1689,7 +1713,7 @@ def _run_suggest(args: argparse.Namespace) -> None:
 
     index_bytes = _build_index_bytes(path, args)
     root = path if path.is_dir() else path.parent
-    files = sorted(_collect_python_files(path, _load_configured_excludes(path)))
+    files = _collect_python_files(path, _load_configured_excludes(path))
 
     editing = args.apply or args.interactive
     if editing and not args.allow_dirty:
@@ -1767,7 +1791,7 @@ def _run_report(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     index_bytes = _build_index_bytes(path, args)
-    files = sorted(_collect_python_files(path, _load_configured_excludes(path)))
+    files = _collect_python_files(path, _load_configured_excludes(path))
     matches: list[tuple[Path, dict]] = []
     for file_path in files:
         try:
@@ -1916,9 +1940,7 @@ def _run_check(args: argparse.Namespace) -> None:
     index_bytes = _build_index_bytes(path, args)
 
     configured_excludes = _load_configured_excludes(path)
-    files = sorted(
-        _collect_python_files(path, configured_excludes) + _collect_notebook_files(path, configured_excludes)
-    )
+    files = _collect_files(path, (".py", ".ipynb"), configured_excludes)
     all_errors, coverage = _check_files(files, index_bytes=index_bytes)
     elapsed = time.perf_counter() - start
     stats = RunStats(

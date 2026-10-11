@@ -435,8 +435,10 @@ The following are pruned by default — no config needed:
 .bzr  .claude  .direnv  .eggs  .git  .git-rewrite  .hg  .ipynb_checkpoints
 .mypy_cache  .nox  .pants.d  .pytest_cache  .pytype  .ruff_cache  .svn  .tox
 .venv  .vscode  .idea  __pycache__  _build  buck-out  build  dist
-node_modules  site-packages  venv
+node_modules  site-packages  target  venv
 ```
+
+`target` is a Rust/maturin project's build output, which can hold thousands of directories.
 
 `exclude` **replaces this default list entirely** — matching by bare directory name,
 not a path/glob pattern:

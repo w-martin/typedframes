@@ -22,7 +22,6 @@ All targets are copied to /tmp before benchmarking to avoid filesystem effects.
 """
 
 import argparse
-import datetime
 import platform
 import re
 import shutil
@@ -33,12 +32,12 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
-# Number of timed runs per tool. 10 was too few to characterise high-variance
-# tools (pyrefly on the small corpus has been observed at CV > 100%, i.e.
-# statistically meaningless) -- see GH issue #10.
-RUNS = 20
+# Number of timed runs per tool. Each result is the median of these runs, with their
+# sample standard deviation alongside.
+RUNS = 5
 # Number of warmup runs (discarded)
 WARMUP = 3
 
@@ -76,53 +75,19 @@ class BenchmarkResult:
     success: bool = True
     error: str | None = None
 
-    def _filtered_times(self) -> list[int]:
-        """Timed samples with outliers beyond 2 standard deviations discarded.
-
-        `.mean`/`.std`/`.iqr` are computed over this filtered set so a single
-        pathological run (OS scheduling hiccup, background process, etc.) doesn't
-        skew the headline numbers -- see GH issue #10. `.times` itself is left
-        untouched so the raw samples remain available for transparency/debugging.
-        """
-        if len(self.times) <= 1:
-            # Too few points for stdev-based filtering to be meaningful.
-            return list(self.times)
-        mean = statistics.mean(self.times)
-        stdev = statistics.stdev(self.times)
-        if stdev == 0:
-            return list(self.times)
-        filtered = [t for t in self.times if abs(t - mean) <= 2 * stdev]
-        # Should never be empty (a symmetric 2-stdev band around the mean of the
-        # same data always contains the mean-nearest points), but fall back to
-        # the raw times rather than reporting stats over nothing.
-        return filtered or list(self.times)
-
     @property
-    def mean(self) -> float:
-        """Mean execution time in nanoseconds, with outliers beyond 2 stdev discarded."""
-        filtered = self._filtered_times()
-        return statistics.mean(filtered) if filtered else 0.0
+    def median(self) -> float:
+        """Median execution time in nanoseconds over every timed run."""
+        return statistics.median(self.times) if self.times else 0.0
 
     @property
     def std(self) -> float:
-        """Standard deviation in nanoseconds, with outliers beyond 2 stdev discarded."""
-        filtered = self._filtered_times()
-        return statistics.stdev(filtered) if len(filtered) > 1 else 0.0
+        """Sample standard deviation in nanoseconds over every timed run (0.0 below two runs).
 
-    @property
-    def iqr(self) -> float:
-        """Interquartile range (Q3 - Q1) in nanoseconds, with outliers beyond 2 stdev discarded.
-
-        Falls back to 0.0 for fewer than 2 samples, matching the `.std` guard --
-        `statistics.quantiles` technically tolerates a single data point (it just
-        returns that point three times, for an IQR of 0), but there's no
-        meaningful spread to report below 2 samples.
+        Nothing is discarded: a run that was disturbed shows up in the spread, while the
+        median is what keeps it from moving the headline number.
         """
-        filtered = self._filtered_times()
-        if len(filtered) < 2:
-            return 0.0
-        q1, _, q3 = statistics.quantiles(filtered, n=4)
-        return q3 - q1
+        return statistics.stdev(self.times) if len(self.times) > 1 else 0.0
 
 
 def copy_to_tmp(source: Path, label: str) -> Path:
@@ -258,7 +223,7 @@ def get_machine_info() -> str:
     no corresponding code change, and lacking this context made it impossible to
     rule out "different machine" after the fact).
     """
-    date = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
+    date = datetime.now(tz=UTC).date().isoformat()
     cpu = platform.processor() or platform.machine()
     py = f"{platform.python_implementation()} {platform.python_version()}"
     return f"{date} · {platform.system()} {platform.release()} · {cpu} · {py} · {_get_ram_gb()} RAM"
@@ -353,15 +318,19 @@ def run_benchmark(
     )
 
 
-def format_time(ns: float) -> str:
-    """Format time in appropriate units from nanoseconds."""
-    if ns < 1_000:
-        return f"{ns:.0f}ns"
-    if ns < 1_000_000:
-        return f"{ns / 1_000:.0f}\u00b5s"
-    if ns < 1_000_000_000:
-        return f"{ns / 1_000_000:.0f}ms"
-    return f"{ns / 1_000_000_000:.2f}s"
+def format_stat(median_ns: float, std_ns: float) -> str:
+    """Format `median ± std` with both numbers in one unit, chosen from the median.
+
+    Seconds (2 decimals) from one second up, milliseconds (1 decimal) below that, and
+    whole microseconds below a millisecond, so a cell never mixes units.
+    """
+    if median_ns >= 1_000_000_000:
+        scale, unit, places = 1_000_000_000, "s", 2
+    elif median_ns >= 1_000_000:
+        scale, unit, places = 1_000_000, "ms", 1
+    else:
+        scale, unit, places = 1_000, "\u00b5s", 0
+    return f"{median_ns / scale:.{places}f} \u00b1 {std_ns / scale:.{places}f} {unit}"
 
 
 def _format_cell(result: BenchmarkResult | None) -> str:
@@ -370,7 +339,7 @@ def _format_cell(result: BenchmarkResult | None) -> str:
         return "-"
     if not result.success:
         return result.error or "N/A"
-    return f"{format_time(result.mean)} \u00b1{format_time(result.std)} (IQR {format_time(result.iqr)})"
+    return format_stat(result.median, result.std)
 
 
 def generate_markdown_table(
@@ -389,8 +358,12 @@ def generate_markdown_table(
     header = "| Tool | Version | What it does | " + " | ".join(col_headers) + " |"
     sep_parts = "|------|---------|--------------|" + "|".join("-" * (len(h) + 2) for h in col_headers) + "|"
 
+    caption = (
+        f"**Benchmark results** (median of {RUNS} runs \u00b1 one standard deviation, "
+        f"{WARMUP} warmup, caches cleared between runs):"
+    )
     lines = [
-        f"**Benchmark results** ({RUNS} runs, {WARMUP} warmup, caches cleared between runs):",
+        caption,
         f"*{get_machine_info()} · Great Expectations pinned @ {GE_COMMIT}*",
         "",
         header,
@@ -482,10 +455,7 @@ def run_codebase_benchmarks(
         results.append(result)
 
         if result.success:
-            print(
-                f"{format_time(result.mean)} (\u00b1{format_time(result.std)}, "
-                f"IQR {format_time(result.iqr)}) [{result.version}]"
-            )
+            print(f"{format_stat(result.median, result.std)} [{result.version}]")
         else:
             print(f"SKIPPED: {result.error}")
 

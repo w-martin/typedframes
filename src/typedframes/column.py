@@ -70,7 +70,7 @@ class Column:
         """
         Return the column name as a string for native pandas subscript access.
 
-        Provides refactor-safe column name access without requiring ``PandasFrame``.
+        Provides refactor-safe column name access for plain pandas DataFrames.
         Parallel to ``.col`` (polars expression) for pandas string access.
 
         Example:

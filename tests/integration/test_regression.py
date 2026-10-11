@@ -53,23 +53,6 @@ class TestPluginRegression(unittest.TestCase):
         # assert
         self.assertNotIn("Column 'non_existent' does not exist", stdout)
 
-    def test_should_accept_polarsframe_with_type_argument(self) -> None:
-        """Test that mypy accepts PolarsFrame[Schema] without type-arg errors."""
-        # arrange
-        test_file = "tests/fixtures/polarsframe_generic.py"
-
-        # act
-        stdout, _stderr, _exit_code = self._run_mypy(
-            "--ignore-missing-imports",
-            "--no-error-summary",
-            "--config-file",
-            "/dev/null",
-            test_file,
-        )
-
-        # assert - the type-arg error should not appear
-        self.assertNotIn("type-arg", stdout, f"Unexpected type-arg error in mypy output: {stdout}")
-
     def test_should_catch_errors_with_plugin(self) -> None:
         """Test that mypy with the plugin catches column errors."""
         # arrange

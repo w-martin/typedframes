@@ -8,7 +8,18 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-from typedframes import _cache
+from typedframes.cache import (
+    ENV_VAR,
+    add_to_gitignore,
+    cache_files,
+    configured_cache_dir,
+    default_cache_dir,
+    gitignore_entry,
+    locate_cache_dir,
+    project_root_for,
+    resolve_cache_dir,
+    tighten_cache_permissions,
+)
 from typedframes.cli import main
 
 
@@ -18,8 +29,8 @@ class TestCacheLocation(TestCase):
     def test_should_use_the_macos_user_cache_dir_on_darwin(self) -> None:
         """Test the default on macOS."""
         # act
-        with patch("typedframes._cache.platform", "darwin"):
-            result = _cache.default_cache_dir()
+        with patch("typedframes.cache.platform", "darwin"):
+            result = default_cache_dir()
 
         # assert
         self.assertEqual(result, Path.home() / "Library" / "Caches" / "typedframes")
@@ -27,8 +38,8 @@ class TestCacheLocation(TestCase):
     def test_should_honour_xdg_cache_home_on_linux(self) -> None:
         """Test that XDG_CACHE_HOME wins over ~/.cache."""
         # act
-        with patch("typedframes._cache.platform", "linux"), patch.dict(environ, {"XDG_CACHE_HOME": "/xdg"}):
-            result = _cache.default_cache_dir()
+        with patch("typedframes.cache.platform", "linux"), patch.dict(environ, {"XDG_CACHE_HOME": "/xdg"}):
+            result = default_cache_dir()
 
         # assert
         self.assertEqual(result, Path("/xdg/typedframes"))
@@ -36,8 +47,8 @@ class TestCacheLocation(TestCase):
     def test_should_fall_back_to_dot_cache_on_linux(self) -> None:
         """Test the default when XDG_CACHE_HOME is unset."""
         # act
-        with patch("typedframes._cache.platform", "linux"), patch.dict(environ, {}, clear=True):
-            result = _cache.default_cache_dir()
+        with patch("typedframes.cache.platform", "linux"), patch.dict(environ, {}, clear=True):
+            result = default_cache_dir()
 
         # assert
         self.assertEqual(result, Path.home() / ".cache" / "typedframes")
@@ -45,10 +56,10 @@ class TestCacheLocation(TestCase):
     def test_should_use_local_app_data_on_windows(self) -> None:
         """Test the default on Windows, with and without LOCALAPPDATA."""
         # act
-        with patch("typedframes._cache.platform", "win32"), patch.dict(environ, {"LOCALAPPDATA": "/local"}):
-            with_var = _cache.default_cache_dir()
-        with patch("typedframes._cache.platform", "win32"), patch.dict(environ, {}, clear=True):
-            without_var = _cache.default_cache_dir()
+        with patch("typedframes.cache.platform", "win32"), patch.dict(environ, {"LOCALAPPDATA": "/local"}):
+            with_var = default_cache_dir()
+        with patch("typedframes.cache.platform", "win32"), patch.dict(environ, {}, clear=True):
+            without_var = default_cache_dir()
 
         # assert
         self.assertEqual(with_var, Path("/local/typedframes/Cache"))
@@ -57,8 +68,8 @@ class TestCacheLocation(TestCase):
     def test_should_resolve_nothing_when_caching_is_disabled(self) -> None:
         """Test that --no-cache beats every other setting."""
         # act
-        with patch.dict(environ, {_cache.ENV_VAR: "/from/env"}):
-            result = _cache.resolve_cache_dir(Path(), cli_value=Path("/flag"), disabled=True)
+        with patch.dict(environ, {ENV_VAR: "/from/env"}):
+            result = resolve_cache_dir(Path(), cli_value=Path("/flag"), disabled=True)
 
         # assert
         self.assertIsNone(result)
@@ -71,28 +82,28 @@ class TestCacheLocation(TestCase):
             flag = root / "from-flag"
 
             # act
-            with patch.dict(environ, {_cache.ENV_VAR: str(root / "from-env")}):
-                by_flag = _cache.resolve_cache_dir(root, cli_value=flag)
-                by_env = _cache.resolve_cache_dir(root)
+            with patch.dict(environ, {ENV_VAR: str(root / "from-env")}):
+                by_flag = resolve_cache_dir(root, cli_value=flag)
+                by_env = resolve_cache_dir(root)
             with patch.dict(environ, {}, clear=True):
-                by_config = _cache.resolve_cache_dir(root)
+                by_config = resolve_cache_dir(root)
                 (root / "pyproject.toml").write_text("")
-                by_default = _cache.resolve_cache_dir(root)
+                by_default = resolve_cache_dir(root)
 
             # assert
             self.assertEqual(by_flag, flag)
             self.assertEqual(by_env, root / "from-env")
             self.assertEqual(by_config, root / "from-config")
-            self.assertEqual(by_default, _cache.default_cache_dir())
+            self.assertEqual(by_default, default_cache_dir())
 
     def test_should_use_the_default_when_there_is_no_project_to_read_config_from(self) -> None:
         """Test the per-user default for a path outside any project, with nothing else set."""
         # act
-        with patch.dict(environ, {}, clear=True), patch("typedframes._cache.project_root_for", return_value=None):
-            result = _cache.locate_cache_dir(Path("/no/project"))
+        with patch.dict(environ, {}, clear=True), patch("typedframes.cache.project_root_for", return_value=None):
+            result = locate_cache_dir(Path("/no/project"))
 
         # assert
-        self.assertEqual(result, _cache.default_cache_dir())
+        self.assertEqual(result, default_cache_dir())
 
     def test_should_read_an_absolute_config_value_and_ignore_a_bad_one(self) -> None:
         """Test an absolute `cache_dir`, a non-string one, an empty one and unreadable TOML."""
@@ -102,12 +113,12 @@ class TestCacheLocation(TestCase):
 
             # act / assert
             pyproject.write_text('[tool.typedframes]\ncache_dir = "/abs/cache"\n')
-            self.assertEqual(_cache.configured_cache_dir(root), Path("/abs/cache"))
+            self.assertEqual(configured_cache_dir(root), Path("/abs/cache"))
             for text in ("[tool.typedframes]\ncache_dir = 3\n", '[tool.typedframes]\ncache_dir = ""\n', "= not toml"):
                 pyproject.write_text(text)
-                self.assertIsNone(_cache.configured_cache_dir(root))
+                self.assertIsNone(configured_cache_dir(root))
             pyproject.unlink()
-            self.assertIsNone(_cache.configured_cache_dir(root))
+            self.assertIsNone(configured_cache_dir(root))
 
     def test_should_find_the_project_root_above_a_file(self) -> None:
         """Test walking up to the nearest pyproject.toml, and finding none."""
@@ -118,10 +129,10 @@ class TestCacheLocation(TestCase):
             nested.mkdir(parents=True)
 
             # act / assert
-            self.assertEqual(_cache.project_root_for(nested), root)
-            self.assertEqual(_cache.project_root_for(nested / "mod.py"), root)
+            self.assertEqual(project_root_for(nested), root)
+            self.assertEqual(project_root_for(nested / "mod.py"), root)
         with patch("pathlib.Path.is_file", return_value=False):
-            self.assertIsNone(_cache.project_root_for(Path("/nowhere")))
+            self.assertIsNone(project_root_for(Path("/nowhere")))
 
 
 class TestCacheHousekeeping(TestCase):
@@ -136,11 +147,11 @@ class TestCacheHousekeeping(TestCase):
             (cache / "notes.txt").write_text("mine")
 
             # act
-            files = _cache.cache_files(cache)
+            files = cache_files(cache)
 
             # assert
             self.assertEqual([f.name for f in files], ["index-abc.bin", "index-abc.tmp123"])
-            self.assertEqual(_cache.cache_files(cache / "missing"), [])
+            self.assertEqual(cache_files(cache / "missing"), [])
 
     def test_should_give_a_gitignore_entry_only_for_a_directory_inside_the_project(self) -> None:
         """Test the entry for an in-project cache and none for one outside."""
@@ -148,16 +159,16 @@ class TestCacheHousekeeping(TestCase):
             root = Path(tmpdir)
 
             # act / assert
-            self.assertEqual(_cache.gitignore_entry(root / ".typedframes_cache", root), "/.typedframes_cache/")
-            self.assertIsNone(_cache.gitignore_entry(Path("/elsewhere/cache"), root))
+            self.assertEqual(gitignore_entry(root / ".typedframes_cache", root), "/.typedframes_cache/")
+            self.assertIsNone(gitignore_entry(Path("/elsewhere/cache"), root))
 
     def test_should_not_ignore_the_whole_project_when_the_cache_is_the_project_root(self) -> None:
         """Test that a cache directory equal to the root yields no gitignore entry."""
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
 
-            self.assertIsNone(_cache.gitignore_entry(root, root))
-            self.assertIsNone(_cache.gitignore_entry(root / ".", root))
+            self.assertIsNone(gitignore_entry(root, root))
+            self.assertIsNone(gitignore_entry(root / ".", root))
 
     def test_should_keep_bytes_that_are_not_utf8_when_appending_to_gitignore(self) -> None:
         """Test that a gitignore with Latin-1 text is extended, not rejected or rewritten."""
@@ -165,7 +176,7 @@ class TestCacheHousekeeping(TestCase):
             root = Path(tmpdir)
             (root / ".gitignore").write_bytes(b"# caf\xe9\nbuild\n")
 
-            self.assertTrue(_cache.add_to_gitignore(root, "/c/"))
+            self.assertTrue(add_to_gitignore(root, "/c/"))
 
             self.assertEqual((root / ".gitignore").read_bytes(), b"# caf\xe9\nbuild\n/c/\n")
 
@@ -175,14 +186,14 @@ class TestCacheHousekeeping(TestCase):
             root = Path(tmpdir)
 
             # act / assert
-            self.assertTrue(_cache.add_to_gitignore(root, "/c/"))
+            self.assertTrue(add_to_gitignore(root, "/c/"))
             self.assertEqual((root / ".gitignore").read_text(), "/c/\n")
-            self.assertFalse(_cache.add_to_gitignore(root, "/c/"))
+            self.assertFalse(add_to_gitignore(root, "/c/"))
             (root / ".gitignore").write_text("build")
-            self.assertTrue(_cache.add_to_gitignore(root, "/c/"))
+            self.assertTrue(add_to_gitignore(root, "/c/"))
             self.assertEqual((root / ".gitignore").read_text(), "build\n/c/\n")
             (root / ".gitignore").write_text("c\n")
-            self.assertFalse(_cache.add_to_gitignore(root, "/c/"))
+            self.assertFalse(add_to_gitignore(root, "/c/"))
 
 
 class TestCacheCommand(TestCase):
@@ -311,7 +322,7 @@ class TestCachePermissions(TestCase):
             cache.chmod(0o755)
 
             # act
-            _cache.tighten_cache_permissions(cache)
+            tighten_cache_permissions(cache)
 
             # assert
             self.assertEqual(0o600, self._mode(ours))
@@ -328,8 +339,8 @@ class TestCachePermissions(TestCase):
             default.chmod(0o755)
 
             # act
-            with patch("typedframes._cache.default_cache_dir", return_value=default):
-                _cache.tighten_cache_permissions(default)
+            with patch("typedframes.cache.default_cache_dir", return_value=default):
+                tighten_cache_permissions(default)
 
             # assert
             self.assertEqual(0o700, self._mode(default))
@@ -344,7 +355,7 @@ class TestCachePermissions(TestCase):
             file.chmod(0o400)
 
             # act
-            _cache.tighten_cache_permissions(cache)
+            tighten_cache_permissions(cache)
 
             # assert
             self.assertEqual(0o400, self._mode(file))
@@ -360,7 +371,7 @@ class TestCachePermissions(TestCase):
 
             # act
             with patch("pathlib.Path.chmod", side_effect=PermissionError):
-                _cache.tighten_cache_permissions(cache)
+                tighten_cache_permissions(cache)
 
             # assert
             self.assertEqual(0o644, self._mode(file))
@@ -374,8 +385,8 @@ class TestCachePermissions(TestCase):
             file.chmod(0o644)
 
             # act
-            with patch("typedframes._cache.platform", "win32"):
-                _cache.tighten_cache_permissions(Path(tmpdir))
+            with patch("typedframes.cache.platform", "win32"):
+                tighten_cache_permissions(Path(tmpdir))
 
             # assert
             self.assertEqual(0o644, self._mode(file))

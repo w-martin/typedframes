@@ -52,11 +52,7 @@ uv run typedframes check inference_example.py
 
 `Annotated[pd.DataFrame, Schema]` basics: string column access, descriptor
 `.s` for refactor-safe names, and intentional errors to show what the checker
-catches. Plain `pd.DataFrame` throughout — no `PandasFrame` subclass involved,
-despite the similar-sounding older filename this replaces
-(`pandasframe_example.py`). `PandasFrame`/`PolarsFrame` are deprecated — see
-`docs/api/pandas.md`/`polars.md` for why — so this `Annotated[...]` form is the
-only pattern demonstrated going forward.
+catches. Plain `pd.DataFrame` throughout.
 
 ```shell
 uv run mypy --config-file mypy_empty.ini --strict annotated_pandas_example.py

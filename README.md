@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.11.1) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.12.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -470,7 +470,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.11.1"]
+        additional_dependencies: ["typedframes==0.12.0"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -519,12 +519,37 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.11.1"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.12.0"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
 | `no-warnings` | `false` | Suppress warning-level diagnostics |
 | `args` | *(empty)* | Escape hatch for `--no-index`, `--lenient-ingest`, `--no-info` |
+
+### Fixing Untyped DataFrames (`suggest`)
+
+For a DataFrame the checker can't resolve columns for, `typedframes suggest` works out a fix from the columns the rest
+of its scope reads: a `usecols=`/`columns=` added to a plain `read_csv` or `read_parquet`, or else a column selection on
+the line after the load. It is a dry run that prints diffs. Each site has a two-word name (`quiet-amber`) shown next to it.
+
+```shell
+typedframes suggest src/                              # dry run: prints diffs, changes nothing
+typedframes suggest src/ --apply                      # write the safe suggestions
+typedframes suggest src/ --apply --only quiet-amber   # act on just that site
+typedframes suggest src/ --interactive                # ask about each suggestion
+```
+
+Edits need a clean git work tree and tracked files, each edited file is re-checked in memory before anything is written,
+and the files are written together or not at all. See the
+[full guide](docs/usage.md#suggesting-fixes-suggest).
+
+### Reporting a Problem (`report`)
+
+If `check` or `suggest` gets a site wrong and the code can't be shared, `typedframes report quiet-amber src/` prints a
+bug-report body with a redacted copy of the code around that site, checked against the checker so it reproduces the same
+result. Redacted is not anonymous: read it before posting, and don't use it on code you aren't allowed to share. See
+[Reporting a problem](docs/usage.md#reporting-a-problem-report), and
+[Security and data handling](docs/security.md) for what the tool reads, writes and connects to.
 
 ---
 
@@ -632,18 +657,18 @@ plus the requested features, so both halves get checked normally. See
 
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
-**Benchmark results** (20 runs, 3 warmup, caches cleared between runs):
-*2026-10-10 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
+**Benchmark results** (median of 5 runs ± one standard deviation, 3 warmup, caches cleared between runs):
+*2026-10-11 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
 
 | Tool | Version | What it does | typedframes (14 files) | great_expectations (494 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.11.1 | DataFrame column checker | 45ms ±407µs (IQR 721µs) | 127ms ±1ms (IQR 1ms) |
-| ruff | 0.16.10 | Linter (no type checking) | 21ms ±670µs (IQR 1ms) | 196ms ±2ms (IQR 3ms) |
-| ty | 0.0.84 | Type checker | 70ms ±2ms (IQR 1ms) | 765ms ±9ms (IQR 12ms) |
-| pyrefly | 1.3.2 | Type checker | 91ms ±2ms (IQR 3ms) | 269ms ±8ms (IQR 13ms) |
-| mypy | 2.4.0 | Type checker (no plugin) | 1.96s ±43ms (IQR 72ms) | 3.12s ±37ms (IQR 59ms) |
-| mypy + typedframes | 2.4.0 | Type checker + column checker | 1.89s ±10ms (IQR 15ms) | 3.53s ±39ms (IQR 67ms) |
-| pyright | 1.1.414 | Type checker | 917ms ±10ms (IQR 13ms) | 4.03s ±36ms (IQR 61ms) |
+| typedframes | 0.12.0 | DataFrame column checker | 41.1 ± 0.7 ms | 122.1 ± 0.6 ms |
+| ruff | 0.17.0 | Linter (no type checking) | 21.5 ± 0.6 ms | 212.9 ± 1.5 ms |
+| ty | 0.0.84 | Type checker | 50.2 ± 0.3 ms | 751.7 ± 7.6 ms |
+| pyrefly | 1.3.2 | Type checker | 91.5 ± 2.5 ms | 268.9 ± 3.8 ms |
+| mypy | 2.4.0 | Type checker (no plugin) | 1.82 ± 0.03 s | 3.04 ± 0.02 s |
+| mypy + typedframes | 2.4.0 | Type checker + column checker | 1.84 ± 0.02 s | 3.46 ± 0.02 s |
+| pyright | 1.1.414 | Type checker | 794.2 ± 13.8 ms | 3.90 ± 0.03 s |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -888,7 +913,7 @@ Comprehensive comparison of pandas/DataFrame typing and validation tools. **type
 
 | Feature                         | typedframes            | Pandera     | Great Expectations | strictly_typed_pandas | pandas-stubs | dataenforce | pandas-type-checks | StaticFrame      | narwhals | dataframely      | patito           |
 |---------------------------------|------------------------|-------------|--------------------|-----------------------|--------------|-------------|--------------------|------------------|----------|------------------|------------------|
-| **Version tested**              | 0.11.1                 | 0.34.1      | 1.23.2             | 0.3.7                 | 3.0.5.260914 | 0.1.2       | 1.1.3              | 5.1.1            | 2.26.0   | 3.1.2            | 0.8.6            |
+| **Version tested**              | 0.12.0                 | 0.34.1      | 1.23.2             | 0.3.7                 | 3.0.5.260914 | 0.1.2       | 1.1.3              | 5.1.1            | 2.26.0   | 3.1.2            | 0.8.6            |
 | **Analysis Type**               |
 | When errors are caught          | **Static (lint-time)** | Runtime     | Runtime            | Runtime               | Static       | Runtime     | Runtime            | Runtime          | Runtime  | Runtime          | Runtime          |
 | **Static Analysis (our focus)** |

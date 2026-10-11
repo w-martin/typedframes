@@ -36,8 +36,6 @@ nav:
   - API Reference:
     - Overview: api/index.md
     - Core: api/core.md
-    - pandas: api/pandas.md
-    - polars: api/polars.md
     - Schema Algebra: api/schema_algebra.md
     - Pandera Integration: api/pandera.md
     - Exceptions: api/exceptions.md

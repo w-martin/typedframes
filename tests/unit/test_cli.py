@@ -4,13 +4,18 @@ import argparse
 import builtins
 import json
 import tempfile
-import unittest
 from contextlib import chdir
+from importlib import import_module
 from io import StringIO
+from os import walk
 from pathlib import Path
 from re import sub
+from subprocess import run
+from sys import executable, version_info
+from unittest import TestCase, skipUnless
 from unittest.mock import patch
 
+from typedframes import cli
 from typedframes.cli import (
     CoverageBucket,
     CoverageConfig,
@@ -18,6 +23,7 @@ from typedframes.cli import (
     FileTally,
     RunStats,
     _check_files,
+    _collect_files,
     _collect_notebook_files,
     _collect_python_files,
     _coverage_failure_message,
@@ -40,6 +46,7 @@ from typedframes.cli import (
     _load_coverage_config,
     _low_coverage_caveat,
     _override_for,
+    _parser_options,
     _percentage,
     _plural,
     _relative_posix,
@@ -82,7 +89,7 @@ def _write_notebook(path: Path, cells: list[str]) -> None:
     path.write_text(json.dumps(notebook))
 
 
-class TestCli(unittest.TestCase):
+class TestCli(TestCase):
     """Unit tests for the CLI entry point."""
 
     def test_should_print_help_when_no_command(self) -> None:
@@ -168,6 +175,70 @@ class TestCli(unittest.TestCase):
 
             # assert
             self.assertEqual(result, [])
+
+    def _tricky_tree(self, root: Path) -> None:
+        """Names whose order depends on comparing path components rather than text."""
+        for name in ["a.py", "a-x.py", "a/b.py", "a/c/d.py", "B.py", "m.ipynb", "a/n.ipynb", "z.py.bak", "a/notes.txt"]:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("")
+
+    def test_should_order_collected_files_exactly_like_sorted_paths(self) -> None:
+        """Test that the faster string sort gives the order sorting `Path` objects did."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._tricky_tree(root)
+            expected = sorted(p for p in root.rglob("*") if p.suffix in {".py", ".ipynb"})
+
+            # act
+            result = _collect_files(root, (".py", ".ipynb"), None)
+
+            # assert
+            self.assertEqual(expected, result)
+            self.assertEqual(7, len(result))
+
+    def test_should_order_files_found_from_a_relative_root_like_sorted_paths(self) -> None:
+        """Test the `./` prefix an os.walk of `.` adds doesn't change the order."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._tricky_tree(root)
+
+            # act
+            with chdir(root):
+                result = _collect_files(Path(), (".py", ".ipynb"), None)
+                expected = sorted(p for p in Path().rglob("*") if p.suffix in {".py", ".ipynb"})
+
+            # assert
+            self.assertEqual(expected, result)
+
+    def test_should_walk_the_tree_once_for_python_files_and_notebooks(self) -> None:
+        """Test that `check` collects both kinds of file in a single directory walk."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._tricky_tree(root)
+
+            # act
+            with patch("typedframes.cli.os.walk", wraps=walk) as walker, patch("sys.stdout", StringIO()):
+                main(["check", tmpdir, "--no-index", "--no-cache"])
+
+            # assert
+            self.assertEqual(1, walker.call_count)
+
+    def test_should_return_a_single_file_only_when_its_suffix_is_wanted(self) -> None:
+        """Test the single-file shortcut with several suffixes."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wanted = Path(tmpdir) / "n.ipynb"
+            other = Path(tmpdir) / "x.txt"
+            wanted.write_text("")
+            other.write_text("")
+
+            # act / assert
+            self.assertEqual([wanted], _collect_files(wanted, (".py", ".ipynb"), None))
+            self.assertEqual([], _collect_files(other, (".py", ".ipynb"), None))
 
     def test_should_collect_python_files_from_directory(self) -> None:
         """Test recursive collection of .py files from a directory."""
@@ -1037,6 +1108,22 @@ class TestCli(unittest.TestCase):
             # assert
             names = [f.name for f in result]
             self.assertEqual(names, ["app.py"])
+
+    def test_should_skip_a_rust_target_directory_by_default(self) -> None:
+        """Test that a Rust/maturin `target` build directory is never descended into."""
+        # arrange
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target_dir = root / "rust" / "target" / "debug" / "build"
+            target_dir.mkdir(parents=True)
+            (target_dir / "generated.py").write_text("x = 1\n")
+            (root / "app.py").write_text("x = 1\n")
+
+            # act
+            result = _collect_python_files(root)
+
+            # assert
+            self.assertEqual(["app.py"], [f.name for f in result])
 
     def test_should_prune_dot_claude_by_default_with_no_excludes_given(self) -> None:
         """Test that .claude is pruned by the built-in default set with no config at all."""
@@ -2221,6 +2308,49 @@ class TestCli(unittest.TestCase):
         self.assertIn("names 2 sites", captured.getvalue())
         self.assertIn("/proj/a.py:5:5", captured.getvalue())
         self.assertIn("/proj/b.py:5:5", captured.getvalue())
+
+    def test_should_ask_for_typo_suggestions_only_where_argparse_supports_them(self) -> None:
+        """Test the version gate: `suggest_on_error` exists from Python 3.14."""
+        # arrange / act / assert
+        self.assertEqual({}, _parser_options((3, 11, 0)))
+        self.assertEqual({}, _parser_options((3, 13, 9)))
+        self.assertEqual({"suggest_on_error": True}, _parser_options((3, 14, 0)))
+        self.assertEqual({"suggest_on_error": True}, _parser_options((3, 15, 0)))
+
+    @skipUnless(version_info >= (3, 14), "argparse suggest_on_error needs Python 3.14")
+    def test_should_suggest_the_subcommand_for_a_typo(self) -> None:
+        """Test that a mistyped subcommand names the one that was probably meant."""
+        # arrange
+        captured = StringIO()
+
+        # act
+        with patch("sys.stderr", captured), self.assertRaises(SystemExit) as ctx:
+            main(["chek", "."])
+
+        # assert
+        self.assertEqual(2, ctx.exception.code)
+        self.assertIn("maybe you meant 'check'", captured.getvalue())
+
+    def test_should_only_name_importable_modules_as_lazy(self) -> None:
+        """Test that every entry of `__lazy_modules__` is a real module."""
+        # arrange / act / assert
+        for name in cli.__lazy_modules__:
+            with self.subTest(module=name):
+                self.assertIsNotNone(import_module(name))
+
+    @skipUnless(version_info >= (3, 15), "lazy imports need Python 3.15")
+    def test_should_not_import_platform_until_it_is_used(self) -> None:
+        """Test that importing the CLI leaves `platform` for `report` to load."""
+        # arrange / act
+        result = run(
+            [executable, "-c", "import sys, typedframes.cli; print('platform' in sys.modules)"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # assert
+        self.assertEqual("False", result.stdout.strip())
 
     def test_should_report_no_calls_found_for_explain(self) -> None:
         """Test that an entirely call-free run says so rather than printing an empty report."""

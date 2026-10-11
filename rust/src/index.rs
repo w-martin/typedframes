@@ -2654,6 +2654,36 @@ class VendoredSchema(BaseSchema):
     }
 
     #[test]
+    fn test_should_prune_a_rust_target_directory_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("rust").join("target").join("debug")).unwrap();
+        fs::write(
+            root.join("rust")
+                .join("target")
+                .join("debug")
+                .join("generated.py"),
+            "x = 1\n",
+        )
+        .unwrap();
+        fs::write(root.join("app.py"), "x = 1\n").unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        let indexed: Vec<&String> = index.files.keys().collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("app.py")),
+            "{indexed:#?}"
+        );
+        assert!(
+            !indexed.iter().any(|p| p.ends_with("generated.py")),
+            "{indexed:#?}"
+        );
+    }
+
+    #[test]
     fn test_should_prune_dot_claude_by_default_with_no_config_at_all() {
         // .claude is in DEFAULT_EXCLUDED_DIRS -- pruned automatically with no
         // [tool.typedframes] exclude configured at all, same as .venv/.git/etc.

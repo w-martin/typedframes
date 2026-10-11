@@ -43,45 +43,13 @@ class ColumnGroup:
         """Set the name attribute from the class attribute name."""
         self.name = name
 
-    def get_column_names(self, consumed_map: dict[str, list[str]] | None = None) -> list[str]:
-        """
-        Get all column names in this group.
-
-        Args:
-            consumed_map: Mapping of ColumnSet names to matched column names.
-                Required for ColumnSets with regex patterns.
-
-        Returns:
-            List of column names.
-
-        """
-        consumed_map = consumed_map or {}
-        result: list[str] = []
-
-        for member in self.members:
-            if isinstance(member, Column):
-                effective_name = member.alias if isinstance(member.alias, str) else member.name
-                result.append(effective_name)
-            elif isinstance(member, ColumnSet):
-                if member.name in consumed_map:
-                    result.extend(consumed_map[member.name])
-                else:
-                    result.extend(member.members)
-            elif isinstance(member, ColumnGroup):
-                result.extend(member.get_column_names(consumed_map))
-
-        return result
-
     @property
     def s(self) -> list[str]:
         """
         Return all column names in this group as a list of strings.
 
         Groups containing regex ``ColumnSet`` members raise ``ValueError`` because
-        matched column names are only known at runtime (the deprecated
-        ``PandasFrame.from_schema()`` resolves these; there is currently no
-        ``Annotated[...]``-based equivalent since that path has no runtime component
-        to introspect actual columns against).
+        matched column names are only known at runtime.
 
         Returns:
             Flat list of column name strings for all non-regex members.
@@ -96,24 +64,18 @@ class ColumnGroup:
                 result.append(member.alias if isinstance(member.alias, str) else member.name)
             elif isinstance(member, ColumnSet):
                 if member.regex:
-                    msg = (
-                        f"Cannot resolve regex ColumnSet '{member.name}' without consumed_map. "
-                        "Use the deprecated PandasFrame.from_schema() to resolve regex "
-                        "patterns at runtime."
-                    )
+                    msg = f"Cannot resolve regex ColumnSet '{member.name}': its matches are only known at runtime."
                     raise ValueError(msg)
                 result.extend(member.members)
             elif isinstance(member, ColumnGroup):
                 result.extend(member.s)
         return result
 
-    def cols(self, consumed_map: dict[str, list[str]] | None = None) -> list[pl.Expr]:
+    def cols(self) -> list[pl.Expr]:
         """
         Return polars column expressions for all columns in this group.
 
-        Args:
-            consumed_map: Mapping of ColumnSet names to matched column names.
-                Required for ColumnSets with regex patterns.
+        Groups containing regex ``ColumnSet`` members raise ``ValueError``, as for ``.s``.
 
         Returns:
             List of polars column expressions.
@@ -130,5 +92,4 @@ class ColumnGroup:
             package = "polars"
             raise MissingDependencyError(package, "ColumnGroup.cols") from None
 
-        names = self.get_column_names(consumed_map)
-        return [pl.col(n) for n in names]
+        return [pl.col(n) for n in self.s]

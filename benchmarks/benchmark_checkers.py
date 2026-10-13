@@ -479,10 +479,7 @@ def build_tools() -> list[ToolInfo]:
     plugin_cfg = _create_mypy_config(with_plugin=True)
 
     tools: list[ToolInfo] = []
-    # Use the Python CLI (uv run typedframes check <target>) so that both files
-    # and directories are handled correctly.  The old approach invoked the raw
-    # Rust binary, which only accepts a single file, and the benchmark had to
-    # special-case a hardcoded example file — invalidating multi-file results.
+    # `uv run typedframes check <target>` handles both files and directories.
     # --no-cache skips the on-disk index cache, so every run is cold like the other tools.
     tools.append(
         ToolInfo("typedframes", ["uv", "run", "typedframes", "check", "--no-cache"], "DataFrame column checker")
@@ -545,7 +542,7 @@ def print_summary(
 
 
 def ensure_release_build(project_root: Path) -> None:
-    """Rebuild the typedframes Rust extension in release mode before benchmarking.
+    """Rebuild the typedframes executable in release mode before benchmarking.
 
     `maturin develop` (the documented dev workflow in DEVELOPING.md, also what
     `inv build` runs) builds a DEBUG binary by default -- unoptimized, no LTO, no
@@ -556,7 +553,7 @@ def ensure_release_build(project_root: Path) -> None:
     from a real regression when comparing against a prior README table. Always
     rebuild in release mode here unless explicitly skipped.
     """
-    print("Building typedframes Rust extension in release mode...", flush=True)
+    print("Building the typedframes executable in release mode...", flush=True)
     result = subprocess.run(
         ["uv", "run", "maturin", "develop", "--release", "--manifest-path", str(project_root / "rust" / "Cargo.toml")],
         cwd=project_root,
@@ -572,10 +569,10 @@ def ensure_release_build(project_root: Path) -> None:
         print("Release build OK.")
 
 
-def ensure_extension_loads(project_root: Path) -> None:
-    """Exit if the typedframes extension can't be imported, which would time an error exit."""
+def ensure_binary_runs(project_root: Path) -> None:
+    """Exit if the typedframes executable can't run, which would time an error exit."""
     result = subprocess.run(
-        ["uv", "run", "python", "-c", "import typedframes._rust_checker"],
+        ["uv", "run", "typedframes", "--help"],
         cwd=project_root,
         capture_output=True,
         text=True,
@@ -583,7 +580,7 @@ def ensure_extension_loads(project_root: Path) -> None:
         check=False,
     )
     if result.returncode != 0:
-        sys.exit(f"typedframes extension does not load; fix the build first:\n{result.stderr.strip()}")
+        sys.exit(f"the typedframes executable does not run; fix the build first:\n{result.stderr.strip()}")
 
 
 def main() -> None:
@@ -595,7 +592,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-build",
         action="store_true",
-        help="Skip rebuilding the typedframes extension in release mode; benchmark whatever is installed as-is.",
+        help="Skip rebuilding the typedframes executable in release mode; benchmark whatever is installed as-is.",
     )
     args = parser.parse_args()
 
@@ -603,7 +600,7 @@ def main() -> None:
 
     if not args.skip_build:
         ensure_release_build(project_root)
-    ensure_extension_loads(project_root)
+    ensure_binary_runs(project_root)
 
     tools = build_tools()
 

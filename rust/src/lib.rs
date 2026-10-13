@@ -1,23 +1,24 @@
-//! Rust-based static analyser for typedframes, exposed to Python via PyO3.
+//! Rust-based static analyser for typedframes, and the `typedframes` command line built on it.
 //!
 //! # Architecture
 //!
 //! The checker operates in two phases:
 //!
-//! 1. **Index phase** (`build_project_index`) — walks all `.py` files in the project,
+//! 1. **Index phase** (`index::build_index_cached`) — walks all `.py` files in the project,
 //!    parses each one with `ruff_python_parser`, and extracts a lightweight symbol table
 //!    (`ProjectIndex`) containing schema definitions and annotated function return types.
-//!    The index is serialised to MessagePack bytes (via `rmp_serde`) and passed back to
-//!    the Python caller in memory — no files are written to disk.
-//!    Checking a single file instead uses `build_single_file_index`, which produces the
-//!    same `ProjectIndex` from a much narrower file set: just the checked file plus the
-//!    project-local modules and external packages its own imports actually reach.
+//!    Checking a single file instead uses `index::build_single_file_index_cached`, which
+//!    produces the same `ProjectIndex` from a much narrower file set: just the checked file
+//!    plus the project-local modules and external packages its own imports actually reach.
+//!    Per-file results are cached on disk and reused while a file's source is unchanged.
 //!
-//! 2. **Check phase** (`check_file`) — parses a single file, optionally deserialises the
-//!    project index, resolves cross-file imports, and runs the [`Linter`] AST visitor.
-//!    The visitor walks statements with [`Linter::visit_stmt`] (schema/variable tracking)
-//!    and validates column access expressions with [`Linter::visit_expr`].  Diagnostics
-//!    are returned as a JSON array of [`LintError`] objects.
+//! 2. **Check phase** ([`engine`]) — parses each file, resolves cross-file imports against the
+//!    index, and runs the [`Linter`] AST visitor in parallel. The visitor walks statements
+//!    with [`Linter::visit_stmt`] (schema/variable tracking) and validates column access
+//!    expressions with [`Linter::visit_expr`]. Diagnostics come back as [`LintError`] values.
+//!
+//! The [`cli`] module is the command line: argument parsing, file collection, output formats,
+//! the coverage gate, and the `check`, `suggest`, `report` and `cache` commands.
 //!
 //! # Typo suggestions
 //!
@@ -59,11 +60,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod apply;
 mod ast_extract;
 mod call_usage;
+pub mod cli;
 mod column_consuming_methods;
 mod column_usage;
 mod config;
 mod constants;
 mod contract;
+pub mod engine;
 mod errors;
 mod fast_hash;
 mod frame_ops;
@@ -73,7 +76,6 @@ mod linter;
 mod notebook;
 mod parallel;
 mod phrase;
-mod pyapi;
 mod report;
 mod report_minimize;
 mod report_names;
@@ -85,20 +87,3 @@ mod typo;
 pub use config::{find_project_root, is_enabled, LinterConfig};
 pub use errors::{FileStats, LintError, UntypedSite};
 pub use linter::Linter;
-
-use pyo3::prelude::*;
-
-#[pymodule]
-fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(pyapi::check_file, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::check_notebook, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::check_files, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::report_files, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::suggest_files, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::report_all_files, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::apply_suggestions, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::vcs_problem, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::build_project_index, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::build_single_file_index, m)?)?;
-    Ok(())
-}

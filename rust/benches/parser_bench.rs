@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::path::Path;
 
-use _rust_checker::Linter;
+use typedframes_checker::Linter;
 
 fn bench_check_file(c: &mut Criterion) {
     let source = include_str!("../../examples/features/typedframes_example.py");

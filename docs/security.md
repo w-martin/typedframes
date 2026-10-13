@@ -14,10 +14,11 @@ on your code and check each claim yourself.
   `trace_external_packages`, those packages' source in the project's `.venv`.
 - **It makes no network connection.** There is no networking code in the checker or the CLI and no
   telemetry. The Python package has no runtime dependencies (optional extras aside); the Rust
-  extension is statically linked from the crates in `rust/Cargo.lock`, which include none of the
+  executable is statically linked from the crates in `rust/Cargo.lock`, which include none of the
   common HTTP or TLS crates, and the ruff parser crates are pinned to a release tag.
 - **It starts one kind of subprocess: `git`,** and only for `suggest --apply` and `--interactive`,
-  to check that the work tree is clean and the files are tracked.
+  to check that the work tree is clean and the files are tracked. The Python package starts the
+  `typedframes` executable (from the mypy plugin and `python -m typedframes`) and nothing else.
 - **Environment variables read:** `TYPEDFRAMES_JOBS` (worker count) and `TYPEDFRAMES_CACHE_DIR`
   (cache location), plus `XDG_CACHE_HOME` or `LOCALAPPDATA` to find the default cache directory.
 

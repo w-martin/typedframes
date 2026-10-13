@@ -1,6 +1,6 @@
 [package]
 name = "typedframes_checker"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "A high-performance Rust-based checker for typedframes DataFrame column schemas"
 license = "MIT"
@@ -8,12 +8,8 @@ repository = "https://github.com/w-martin/typedframes"
 homepage = "https://github.com/w-martin/typedframes"
 documentation = "https://github.com/w-martin/typedframes"
 
-[lib]
-name = "_rust_checker"
-crate-type = ["cdylib", "rlib"]
-
 [[bin]]
-name = "typedframes_checker"
+name = "typedframes"
 path = "src/main.rs"
 
 [profile.release]
@@ -36,26 +32,18 @@ ruff_source_file = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
 ruff_notebook = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 rmp-serde = "1"
 anyhow = "1.0"
-toml = "1.1"
+toml = { version = "1.1", features = ["preserve_order"] }
 sqlparser = "0.62"
-# `extension-module` is deliberately NOT enabled here. maturin turns it on for the
-# builds that need it (`features = ["pyo3/extension-module"]` in pyproject.toml), and
-# enabling it unconditionally breaks `cargo test` on macOS: the feature tells pyo3 not
-# to link libpython, leaving the CPython symbols to be resolved by the interpreter that
-# loads the extension. `cargo test` also builds the cdylib, and macOS's linker rejects
-# a dylib with undefined symbols, so the whole test run failed with
-# "Undefined symbols ... _PyByteArray_AsString". Linux tolerates it, which is why CI
-# stayed green while local macOS runs did not.
-pyo3 = { version = "0.29", features = ["abi3-py311"] }
-
+clap = { version = "4.6.7", features = ["derive"] }
+regex = "1.13.1"
 # The allocator split ruff and ty use: jemalloc where it builds, mimalloc on Windows (jemalloc
 # has no MSVC support), the platform allocator elsewhere. Keep the `cfg`s in `src/lib.rs` in
-# step with these. `disable_initial_exec_tls` lets the library be loaded with `dlopen`.
+# step with these. jemalloc is tuned for a short run on many threads in `../.cargo/config.toml`.
 [target.'cfg(all(not(target_os = "windows"), not(target_os = "openbsd"), not(target_os = "aix"), not(target_os = "android"), any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64", target_arch = "riscv64")))'.dependencies]
-tikv-jemallocator = { version = "0.7", features = ["disable_initial_exec_tls"] }
+tikv-jemallocator = "0.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }

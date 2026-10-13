@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typedframes"
-version = "0.13.0"
+version = "0.14.0"
 description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
 keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"
@@ -35,9 +35,6 @@ Documentation = "https://typedframes.readthedocs.io/en/latest/"
 Repository = "https://github.com/w-martin/typedframes"
 "Issue Tracker" = "https://github.com/w-martin/typedframes/issues"
 
-[project.scripts]
-typedframes = "typedframes.cli:main"
-
 [project.optional-dependencies]
 pandas = ["pandas>=2.0"]
 pandera = ["pandera>=0.20.0"]
@@ -47,9 +44,14 @@ mypy = ["mypy"]
 [tool.maturin]
 manifest-path = "rust/Cargo.toml"
 python-source = "src"
-module-name = "typedframes._rust_checker"
-features = ["pyo3/extension-module"]
-include = [{ path = "LICENSE", format = "sdist" }]
+# The wheel carries the Rust `typedframes` executable (installed as a script) next to the Python package.
+bindings = "bin"
+module-name = "typedframes"
+# The cargo config carries the allocator tuning, so a build from the sdist is tuned too.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = ".cargo/config.toml", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 addopts = "--cov=. --cov-report=term-missing --cov-report=json --cov-report=lcov --cov-branch -n auto"
@@ -58,7 +60,6 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 omit = [
-    "src/typedframes/python315.py",  # needs 3.15; tests/unit/test_compat.py covers it there
     "benchmarks/*",
     "examples/*",
     "tests/*",
@@ -74,8 +75,6 @@ ignore_missing_imports = true
 line-length = 120
 target-version = "py311"
 fix = true
-# Files that use syntax newer than the oldest supported Python (see typedframes/compat.py).
-per-file-target-version = { "src/typedframes/python315.py" = "py315" }
 
 [tool.ruff.format]
 # Ensure the formatter respects the limit
@@ -112,7 +111,9 @@ ignore = [
 # join raises a tz-naive/tz-aware mismatch against that fixture.
 "examples/sql_connectors/feast/*" = ["DTZ005"]
 "tasks.py" = ["T201"]
-"src/typedframes/cli.py" = ["T201"]
+# The one module that starts the Rust executable (the mypy plugin and `python -m typedframes` use it).
+# Its command is always the installed `typedframes` executable, never user-supplied text.
+"src/typedframes/_binary.py" = ["S603", "S606"]
 "benchmarks/*" = ["T201", "S603", "S607", "PLR2004", "PLR0912", "PLR0913", "TRY300"]
 
 [tool.ruff.lint.mccabe]
@@ -154,7 +155,9 @@ dev = [
 ]
 
 [tool.bandit]
-exclude_dirs = ["tests", "examples"]
+# bandit cannot skip one rule for one file, so the module that starts the Rust executable (B404, B603, B606;
+# see `_binary.py`) is excluded whole. It does nothing else.
+exclude_dirs = ["tests", "examples", "src/typedframes/_binary.py"]
 
 [tool.trustedlicenses]
 allowed-categories = ["Permissive", "Public Domain", "Copyleft Limited"]
@@ -171,10 +174,6 @@ line_coverage_min = 100
 branch_coverage_min = 100
 file_line_coverage_min = 100
 file_branch_coverage_min = 100
-
-[tool.ty.src]
-# Uses syntax newer than requires-python (see typedframes/compat.py); ruff still checks it.
-exclude = ["src/typedframes/python315.py"]
 
 [tool.ty.terminal]
 output-format = "concise"

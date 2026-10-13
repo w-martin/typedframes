@@ -992,10 +992,9 @@ Files are indexed and checked in parallel, one worker per core (up to 16). Set `
 a number to cap the workers.
 
 The checker allocates a lot of small objects, so it uses jemalloc (mimalloc on Windows, the platform allocator on targets
-jemalloc does not build for), the same split ruff uses. The command line sets `_RJEM_MALLOC_CONF` to
-`narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0` before the extension loads, which keeps memory close to the platform
-allocator's at nearly the same speed; set `_RJEM_MALLOC_CONF` yourself to use other jemalloc settings. Peak memory on a
-494-file project is about 40 MB, of which roughly 18 MB is the Python interpreter.
+jemalloc does not build for), the same split ruff uses. jemalloc is built with few arenas and no lingering free memory
+(`narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0`), which keeps peak memory about 11 MB lower than jemalloc's defaults at the
+same speed. Peak memory on a 494-file project is about 36 MB.
 
 What the checker learns about each file is also cached on disk and reused for every file whose contents have not
 changed, so repeat runs only re-index what you edited. A cached run reports exactly what an uncached run would. The cache

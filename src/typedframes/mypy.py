@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from mypy.plugin import MethodContext, Plugin
 
+from typedframes._binary import BinaryNotFoundError, run_binary
+
 if TYPE_CHECKING:
     from mypy.types import Type
 
@@ -33,12 +35,16 @@ def is_enabled(project_root: Path) -> bool:
             config = tomllib.load(f)
             enabled = config.get("tool", {}).get("typedframes", {}).get("enabled", True)
             return bool(enabled)
-    except Exception:  # noqa: BLE001
+    except (OSError, tomllib.TOMLDecodeError):
         return True
 
 
 class CheckerNotFoundError(Exception):
     """Raised when the typedframes checker cannot be found or executed."""
+
+
+class CheckerFailedError(Exception):
+    """Raised when the typedframes checker ran but did not produce a result."""
 
 
 class TypedFramesPlugin(Plugin):
@@ -47,54 +53,52 @@ class TypedFramesPlugin(Plugin):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the plugin."""
         super().__init__(*args, **kwargs)
-        self._checker_results: dict[str, list[dict[str, Any]]] = {}
-        self._index_bytes_by_root: dict[str, bytes | None] = {}
+        self._errors_by_root: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        # The hook runs for every subscript in a file, so a file's answer is worked out once.
+        self._errors_by_file: dict[str, list[dict[str, Any]]] = {}
 
-    def _get_index_bytes(self, project_root: Path) -> bytes | None:
-        """Build and cache the project index as MessagePack bytes, keyed by project root."""
+    def _project_errors(self, project_root: Path) -> dict[str, list[dict[str, Any]]]:
+        """Every file's diagnostics for a project, by file path: the checker runs once per project root.
+
+        Without a `pyproject.toml` a file's own directory is its root, so a root inside one that was
+        already checked is served from that run.
+        """
         key = str(project_root)
-        if key not in self._index_bytes_by_root:
-            try:
-                from typedframes._rust_checker import build_project_index
-
-                self._index_bytes_by_root[key] = build_project_index(str(project_root))
-            except ImportError:
-                self._index_bytes_by_root[key] = None
-        return self._index_bytes_by_root[key]
-
-    def _run_via_extension(self, file_path: str, index_bytes: bytes | None) -> list[dict[str, Any]]:
-        """Run the checker via the Rust extension module."""
-        from typedframes._rust_checker import check_file
-
-        result_json = str(check_file(file_path, index_bytes))
-        result: dict[str, Any] = json.loads(result_json)
-        return result["errors"]
+        for checked, errors in self._errors_by_root.items():
+            if project_root.is_relative_to(checked):
+                return errors
+        try:
+            completed = run_binary(["check", key, "--output-format", "json"], capture=True)
+        except BinaryNotFoundError as e:
+            msg = (
+                "typedframes checker executable not found. "
+                "Ensure the package is properly installed with 'uv add typedframes' "
+                "or build from source with 'uv run inv build'."
+            )
+            raise CheckerNotFoundError(msg) from e
+        if completed.returncode != 0:
+            msg = f"typedframes check exited with status {completed.returncode}: {completed.stderr.strip()}"
+            raise CheckerFailedError(msg)
+        by_file: dict[str, list[dict[str, Any]]] = {}
+        for error in json.loads(completed.stdout)["errors"]:
+            by_file.setdefault(error["file"], []).append(error)
+        self._errors_by_root[key] = by_file
+        return by_file
 
     def _run_checker(self, file_path: str) -> list[dict[str, Any]]:
-        """Run the Rust checker on the given file."""
-        if file_path in self._checker_results:
-            return self._checker_results[file_path]
+        """The checker's diagnostics for the given file."""
+        if file_path in self._errors_by_file:
+            return self._errors_by_file[file_path]
 
         if not file_path or "site-packages" in file_path or file_path.endswith(".pyi"):
             return []
 
         project_root = get_project_root(Path(file_path))
-        if not is_enabled(project_root):
-            return []
-
-        index_bytes = self._get_index_bytes(project_root)
-
-        try:
-            errors = self._run_via_extension(file_path, index_bytes)
-        except ImportError as e:
-            msg = (
-                "typedframes checker extension not found. "
-                "Ensure the package is properly installed with 'uv add typedframes' "
-                "or build from source with 'uv run maturin develop'."
-            )
-            raise CheckerNotFoundError(msg) from e
-
-        self._checker_results[file_path] = errors
+        if is_enabled(project_root):
+            errors = self._project_errors(project_root).get(str(Path(file_path).resolve()), [])
+        else:
+            errors = []
+        self._errors_by_file[file_path] = errors
         return errors
 
     def get_method_hook(
@@ -131,6 +135,6 @@ class TypedFramesPlugin(Plugin):
         return context.default_return_type
 
 
-def plugin(version: str) -> type[TypedFramesPlugin]:  # noqa: ARG001
+def plugin(_version: str) -> type[TypedFramesPlugin]:
     """Entry point for the mypy plugin."""
     return TypedFramesPlugin

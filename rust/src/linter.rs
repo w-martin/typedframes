@@ -7344,7 +7344,6 @@ fn inferred_schema_line(name: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::index::build_index_internal;
-    use crate::pyapi::get_cached_index;
 
     #[test]
     fn test_should_lint_base_schema_column_access() {
@@ -7494,8 +7493,6 @@ print(df["name"])
 
         // act
         let index = build_index_internal(root);
-        let index_bytes = crate::pyapi::encode_index(&index).unwrap();
-        let index = get_cached_index(&index_bytes).unwrap();
         let mut linter = Linter::new();
         linter.load_cross_file_symbols_notebook(&index, notebook_source, root);
         let errors = linter
@@ -7583,8 +7580,6 @@ print(df["name"])
 
         // act
         let index = build_index_internal(root);
-        let index_bytes = crate::pyapi::encode_index(&index).unwrap();
-        let index = get_cached_index(&index_bytes).unwrap();
         let mut linter = Linter::new();
         linter.load_cross_file_symbols(&index, pipeline_source, &pipeline_path, root);
         let errors = linter

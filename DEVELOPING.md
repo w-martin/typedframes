@@ -4,7 +4,7 @@
 
 - Python 3.11 or higher
 - [uv](https://github.com/astral-sh/uv) - Python package manager
-- Rust toolchain (for building the linter extension)
+- Rust toolchain (for building the `typedframes` executable)
 
 > **macOS note:** If you installed Rust via `brew install rustup` and `rustc`/`cargo`
 > are not found even after `rustup toolchain install stable`, it's because Homebrew's
@@ -27,12 +27,14 @@ git clone https://github.com/w-martin/typedframes.git
 cd typedframes
 ```
 
-2. Install dependencies and build the Rust extension:
+2. Install dependencies. This builds the Rust `typedframes` executable and installs it into the
+   project environment next to the Python package (the mypy plugin and `python -m typedframes` run it):
 
 ```shell
 uv sync
-uv run maturin develop
 ```
+
+   After editing Rust code, rebuild and reinstall it with `uv run inv build`.
 
 3. Install pre-commit hooks:
 
@@ -89,28 +91,8 @@ The Rust tests can also be run on their own:
 cd rust && cargo test
 ```
 
-This needs the project virtualenv to exist, because pyo3 links against a real
-interpreter and the `abi3-py311` floor requires Python 3.11 or newer. Run `uv sync`
-first (see [Setup](#setup)) and `cargo test` picks it up automatically, via
-`PYO3_PYTHON` in `rust/.cargo/config.toml`.
-
-Without it you'll see one of:
-
-```
-error: failed to run the Python interpreter at .../rust/../.venv/bin/python: No such file or directory
-error: cannot set a minimum Python version 3.11 higher than the interpreter version 3.9
-```
-
-The first means the venv isn't there yet — run `uv sync`. The second means something
-else already set `PYO3_PYTHON`, or an older interpreter is being used; note that macOS
-ships Python 3.9 as its system `python3`.
-
-If your interpreter lives somewhere other than `.venv/`, set `PYO3_PYTHON` yourself and
-it takes precedence over the checked-in default:
-
-```shell
-PYO3_PYTHON=/path/to/python3.11 cargo test
-```
+The Rust tests need no Python. They include end-to-end tests of the `typedframes` command
+(`rust/tests/cli.rs`).
 
 ### Verify Licenses
 
@@ -163,16 +145,20 @@ This project requires 100% branch coverage. The coverage configuration excludes:
 - `raise NotImplementedError` statements
 - Lines marked with `# pragma: no cover`
 
-## Building the Rust Linter
+## Building the `typedframes` executable
 
-The Rust linter extension is built with maturin:
+The command line is a Rust program, `typedframes`. It is shipped in the wheel next to the Python
+package (the schema classes and the mypy plugin) and built with maturin:
 
 ```shell
 uv run maturin develop
 ```
 
-For release builds:
+builds it in debug mode and installs it into the environment (`uv run inv build` does the same
+when the Rust sources changed). For a release build of the wheel:
 
 ```shell
 uv run maturin build --release
 ```
+
+To run the executable without installing it, `cargo run --manifest-path rust/Cargo.toml -- check .`.

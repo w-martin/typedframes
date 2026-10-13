@@ -3,9 +3,9 @@
 //! before writing and left alone if it changed.
 
 use crate::config::{find_project_root, load_linter_config};
+use crate::engine::{linter_with_index, CheckError};
 use crate::errors::LintError;
 use crate::index::ProjectIndex;
-use crate::pyapi::{linter_with_index, CheckError};
 use crate::suggest::{Edit, Suggestion};
 use ruff_python_parser::parse_module;
 use serde::Serialize;

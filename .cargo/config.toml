@@ -1,0 +1,6 @@
+# jemalloc's defaults suit a long-lived server. A check runs for tens of milliseconds on many
+# threads, so it does better with few arenas and no lingering free memory. The setting is compiled
+# in, which is why it lives here and not in the program: the allocator is running before any code
+# could change it, and the program may not use `unsafe`.
+[env]
+JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0"

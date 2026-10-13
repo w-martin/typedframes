@@ -80,10 +80,19 @@ class TestUtilsUnit(unittest.TestCase):
             # act/assert
             self.assertFalse(is_enabled(test_path))
 
-        # Test exception
+        # Test an unreadable file
         with (
             patch("pathlib.Path.exists") as mock_exists,
-            patch.object(Path, "open", side_effect=Exception()),
+            patch.object(Path, "open", side_effect=OSError()),
+        ):
+            mock_exists.return_value = True
+            # act/assert
+            self.assertTrue(is_enabled(test_path))
+
+        # Test a file that is not valid TOML
+        with (
+            patch("pathlib.Path.exists") as mock_exists,
+            patch.object(Path, "open", return_value=io.BytesIO(b"[tool.typedframes\nenabled =")),
         ):
             mock_exists.return_value = True
             # act/assert

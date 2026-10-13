@@ -1,28 +1,22 @@
-//! The PyO3-facing entry points Python calls into.
-//!
-//! Module registration is in `lib.rs`; this module holds the `#[pyfunction]`s and the
-//! process-wide deserialised-index cache.
+//! The Python-free core the extension and the command line both call: per-file checks,
+//! suggestions and reports, the project contexts they share, and the process-wide
+//! deserialised-index cache.
 
-use crate::apply::{apply_all, Selection};
 use crate::config::{find_project_root, find_project_root_opt, load_linter_config, LinterConfig};
 use crate::errors::{
     CheckFileResult, FileStats, LintError, UntypedSiteUsage, CODE_UNTRACKED_DATAFRAME,
 };
-use crate::index::{
-    build_index_cached, build_index_with_callers, build_single_file_index_cached, ProjectIndex,
-};
+use crate::index::ProjectIndex;
 use crate::notebook::{self, NotebookCheckResult, NotebookFileStats};
 use crate::parallel::{file_cost, parallel_map_largest_first};
 use crate::suggest::{Suggestion, Withheld};
 use crate::Linter;
-use pyo3::prelude::*;
 use ruff_notebook::{Notebook, NotebookError};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 // Joins `linter.untyped_sites` (which has var/line/col) with `linter.untyped_site_usage`
 // (keyed by position only) into the flat, self-contained list `FileStats` exposes --
@@ -71,73 +65,7 @@ struct SuggestFileResult {
     withheld: Vec<Withheld>,
 }
 
-/// Dry-run suggestions for many `(file, display name)` pairs, in parallel, as `(json, error)`
-/// per file in input order. For each untyped DataFrame origin the JSON has either an edit (as
-/// byte ranges plus a rendered diff) or the reason none could be made. Nothing is written. It
-/// takes the same optional project index as [`check_files`] so it agrees with `check` about
-/// which sites are untyped; the display name is only how the diff headers name the file.
-#[pyfunction]
-#[pyo3(signature = (requests, index_bytes = None))]
-pub(crate) fn suggest_files(
-    py: Python<'_>,
-    requests: Vec<(String, String)>,
-    index_bytes: Option<&[u8]>,
-) -> Vec<(Option<String>, Option<String>)> {
-    let index = index_bytes.and_then(get_cached_index);
-    let contexts = ProjectContexts::default();
-    py.detach(|| {
-        run_batch(
-            &requests,
-            |(file, _)| file,
-            |(file, display)| suggest_file_impl(file, display, index.clone(), &contexts),
-        )
-    })
-}
-
-/// Bug-report material for the untyped site called `name` in each file, in parallel, as
-/// `(json, error)` per file in input order: its masked verdict and a redacted snippet that is
-/// classified the same way (or why there is none). The JSON is `null` when the file has no
-/// site of that name.
-#[pyfunction]
-#[pyo3(signature = (file_paths, name, index_bytes = None))]
-pub(crate) fn report_files(
-    py: Python<'_>,
-    file_paths: Vec<String>,
-    name: String,
-    index_bytes: Option<&[u8]>,
-) -> Vec<(Option<String>, Option<String>)> {
-    let index = index_bytes.and_then(get_cached_index);
-    let contexts = ProjectContexts::default();
-    py.detach(|| {
-        run_batch(
-            &file_paths,
-            |file| file,
-            |file| report_file_impl(file, &name, index.clone(), &contexts),
-        )
-    })
-}
-
-/// Every untyped site's report in each file, in parallel, as `(json, error)` per file in input
-/// order; the JSON is an array in file order.
-#[pyfunction]
-#[pyo3(signature = (file_paths, index_bytes = None))]
-pub(crate) fn report_all_files(
-    py: Python<'_>,
-    file_paths: Vec<String>,
-    index_bytes: Option<&[u8]>,
-) -> Vec<(Option<String>, Option<String>)> {
-    let index = index_bytes.and_then(get_cached_index);
-    let contexts = ProjectContexts::default();
-    py.detach(|| {
-        run_batch(
-            &file_paths,
-            |file| file,
-            |file| report_all_file_impl(file, index.clone(), &contexts),
-        )
-    })
-}
-
-fn suggest_file_impl(
+pub(crate) fn suggest_file_impl(
     file_path: &str,
     display_path: &str,
     index: Option<Arc<ProjectIndex>>,
@@ -166,7 +94,7 @@ fn suggest_file_impl(
 
 // Runs `f` over `items` in parallel, largest file first, as `(json, error)` pairs in input
 // order. `path_of` names the file an item is about, for ordering by size.
-fn run_batch<T: Sync>(
+pub(crate) fn run_batch<T: Sync>(
     items: &[T],
     path_of: impl Fn(&T) -> &String,
     f: impl Fn(&T) -> Result<String, CheckError> + Sync,
@@ -183,7 +111,7 @@ fn run_batch<T: Sync>(
 
 // Checks `file_path` as `report` and `report_all` need it: with suggestions collected.
 // `None` when the linter is disabled in the project's `pyproject.toml`.
-fn checked_for_report(
+pub(crate) fn checked_for_report(
     file_path: &str,
     index: Option<Arc<ProjectIndex>>,
     contexts: &ProjectContexts,
@@ -201,7 +129,7 @@ fn checked_for_report(
     Ok(Some((source, linter)))
 }
 
-fn report_file_impl(
+pub(crate) fn report_file_impl(
     file_path: &str,
     name: &str,
     index: Option<Arc<ProjectIndex>>,
@@ -212,7 +140,7 @@ fn report_file_impl(
     serde_json::to_string(&report).map_err(runtime)
 }
 
-fn report_all_file_impl(
+pub(crate) fn report_all_file_impl(
     file_path: &str,
     index: Option<Arc<ProjectIndex>>,
     contexts: &ProjectContexts,
@@ -221,23 +149,6 @@ fn report_all_file_impl(
         .map(|(source, linter)| crate::report::report_all(&source, &linter))
         .unwrap_or_default();
     serde_json::to_string(&reports).map_err(runtime)
-}
-
-/// Check a single Python file for DataFrame column errors.
-///
-/// Accepts an optional MessagePack-serialised [`ProjectIndex`] (produced by
-/// [`build_project_index`]) so the linter can resolve cross-file imports, e.g. a schema
-/// defined in `schemas.py` and used in `pipeline.py`.  Returns a JSON array of
-/// [`LintError`] objects, or `"[]"` when the linter is disabled in `pyproject.toml`.
-#[pyfunction]
-#[pyo3(signature = (file_path, index_bytes = None))]
-pub(crate) fn check_file(file_path: String, index_bytes: Option<&[u8]>) -> PyResult<String> {
-    check_file_impl(
-        &file_path,
-        index_bytes.and_then(get_cached_index),
-        &ProjectContexts::default(),
-    )
-    .map_err(PyErr::from)
 }
 
 /// Why checking one file produced no result. Kept free of Python types so it can be
@@ -251,96 +162,86 @@ pub(crate) enum CheckError {
 }
 
 impl CheckError {
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             CheckError::Io(m) | CheckError::Runtime(m) => m,
         }
     }
 }
 
-impl From<CheckError> for PyErr {
-    fn from(error: CheckError) -> PyErr {
-        match error {
-            CheckError::Io(m) => PyErr::new::<pyo3::exceptions::PyOSError, _>(m),
-            CheckError::Runtime(m) => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(m),
-        }
-    }
-}
-
-fn runtime(e: impl std::fmt::Display) -> CheckError {
+pub(crate) fn runtime(e: impl std::fmt::Display) -> CheckError {
     CheckError::Runtime(e.to_string())
 }
 
-/// Why files under `root` shouldn't be edited (not a git work tree, or it has uncommitted
-/// changes), or `None` when it is safe to.
-#[pyfunction]
-pub(crate) fn vcs_problem(root: String) -> Option<String> {
-    crate::apply::vcs_problem(Path::new(&root))
-}
+/// A file's check result as JSON, or the message of why it was skipped: exactly one is set.
+pub(crate) type FileOutcome = (Option<String>, Option<String>);
 
-/// `(file_path, display_path, origins)`: the origins to apply, or `None` for the safe tier.
-type ApplyRequest = (String, String, Option<Vec<(usize, usize)>>);
-
-/// Apply suggestions to files. `requests` is a list of `(file_path, display_path, origins)`
-/// where `origins` is `None` for "every safe suggestion" or a list of `(line, col)` origin
-/// positions the user chose. Each file's edits are checked in memory first and only
-/// accepted if they add no errors; accepted files are then written together or not at all.
-/// Returns JSON describing what happened to every file.
-#[pyfunction]
-#[pyo3(signature = (requests, index_bytes = None, require_tracked = false))]
-pub(crate) fn apply_suggestions(
-    py: Python<'_>,
-    requests: Vec<ApplyRequest>,
-    index_bytes: Option<&[u8]>,
-    require_tracked: bool,
-) -> PyResult<String> {
-    let index = index_bytes.and_then(get_cached_index);
-    let requests: Vec<(String, String, Selection)> = requests
-        .into_iter()
-        .map(|(file, display, origins)| {
-            let selection = origins.map_or(Selection::SafeTier, Selection::Origins);
-            (file, display, selection)
-        })
-        .collect();
-    let result = py.detach(|| apply_all(&requests, index, require_tracked));
-    serde_json::to_string(&result)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-}
-
-/// Check many files at once, in parallel, returning for each `(result_json, error)`
-/// exactly one of which is set: the same JSON [`check_file`]/[`check_notebook`] return
-/// (chosen by the `.ipynb` extension), or the message of the error they would raise.
-/// Results are in input order. The GIL is released while the files are checked.
-#[pyfunction]
-#[pyo3(signature = (file_paths, index_bytes = None))]
-pub(crate) fn check_files(
-    py: Python<'_>,
-    file_paths: Vec<String>,
-    index_bytes: Option<&[u8]>,
-) -> Vec<(Option<String>, Option<String>)> {
-    let index = index_bytes.and_then(get_cached_index);
+/// Checks `files` in parallel, largest first, as one outcome per file in input order. A path
+/// ending in `.ipynb` is checked as a notebook.
+pub(crate) fn check_batch(files: &[String], index: Option<Arc<ProjectIndex>>) -> Vec<FileOutcome> {
     let contexts = ProjectContexts::default();
-    py.detach(|| {
-        parallel_map_largest_first(
-            &file_paths,
-            |file_path| file_cost(Path::new(file_path)),
-            |file_path| {
-                let result = if file_path.ends_with(".ipynb") {
-                    check_notebook_impl(file_path, index.clone())
-                } else {
-                    check_file_impl(file_path, index.clone(), &contexts)
-                };
-                match result {
-                    Ok(json) => (Some(json), None),
-                    Err(error) => (None, Some(error.message().to_string())),
-                }
-            },
-        )
-    })
+    parallel_map_largest_first(
+        files,
+        |file_path| file_cost(Path::new(file_path)),
+        |file_path| {
+            let result = if file_path.ends_with(".ipynb") {
+                check_notebook_impl(file_path, index.clone())
+            } else {
+                check_file_impl(file_path, index.clone(), &contexts)
+            };
+            match result {
+                Ok(json) => (Some(json), None),
+                Err(error) => (None, Some(error.message().to_string())),
+            }
+        },
+    )
+}
+
+/// Dry-run suggestions for each `(file, display name)` request, in parallel, as one outcome per
+/// request in input order. The display name only names the file in diff headers.
+pub(crate) fn suggest_batch(
+    requests: &[(String, String)],
+    index: Option<Arc<ProjectIndex>>,
+) -> Vec<FileOutcome> {
+    let contexts = ProjectContexts::default();
+    run_batch(
+        requests,
+        |(file, _)| file,
+        |(file, display)| suggest_file_impl(file, display, index.clone(), &contexts),
+    )
+}
+
+/// The report for the untyped site called `name` in each file (JSON `null` where a file has none),
+/// in parallel, as one outcome per file in input order.
+pub(crate) fn report_batch(
+    files: &[String],
+    name: &str,
+    index: Option<Arc<ProjectIndex>>,
+) -> Vec<FileOutcome> {
+    let contexts = ProjectContexts::default();
+    run_batch(
+        files,
+        |file| file,
+        |file| report_file_impl(file, name, index.clone(), &contexts),
+    )
+}
+
+/// Every untyped site's report in each file (a JSON array), in parallel, as one outcome per file in
+/// input order.
+pub(crate) fn report_all_batch(
+    files: &[String],
+    index: Option<Arc<ProjectIndex>>,
+) -> Vec<FileOutcome> {
+    let contexts = ProjectContexts::default();
+    run_batch(
+        files,
+        |file| file,
+        |file| report_all_file_impl(file, index.clone(), &contexts),
+    )
 }
 
 // A project's root and `[tool.typedframes]` settings.
-struct ProjectContext {
+pub(crate) struct ProjectContext {
     root: PathBuf,
     config: LinterConfig,
 }
@@ -351,7 +252,7 @@ struct ProjectContext {
 // `pyproject.toml` above it has no shared root -- each file there is its own root, as
 // `find_project_root` falls back to -- so only the fact that none exists is remembered.
 #[derive(Default)]
-struct ProjectContexts {
+pub(crate) struct ProjectContexts {
     by_dir: RwLock<HashMap<PathBuf, Option<Arc<ProjectContext>>>>,
     by_root: RwLock<HashMap<PathBuf, Arc<ProjectContext>>>,
 }
@@ -391,7 +292,7 @@ impl ProjectContexts {
     }
 }
 
-fn check_file_impl(
+pub(crate) fn check_file_impl(
     file_path: &str,
     index: Option<Arc<ProjectIndex>>,
     contexts: &ProjectContexts,
@@ -487,23 +388,7 @@ fn check_file_impl(
     serde_json::to_string(&result).map_err(runtime)
 }
 
-/// Check a single Jupyter notebook (`.ipynb`) for DataFrame column errors.
-///
-/// Mirrors [`check_file`], but the source comes from `ruff_notebook::Notebook` --
-/// the same crate Ruff and Pyrefly use for their own notebook linting -- instead of
-/// reading the path directly: the notebook's code cells are parsed as JSON and
-/// concatenated in memory, then checked exactly like a regular file's contents
-/// (`Linter::check_notebook_internal` parses in Jupyter/IPython mode so magics don't
-/// break the parse). Every diagnostic's line/col and any "(defined at ...)" message
-/// reference are translated back from that concatenated source to the notebook
-/// cell/line they actually came from before returning.
-#[pyfunction]
-#[pyo3(signature = (file_path, index_bytes = None))]
-pub(crate) fn check_notebook(file_path: String, index_bytes: Option<&[u8]>) -> PyResult<String> {
-    check_notebook_impl(&file_path, index_bytes.and_then(get_cached_index)).map_err(PyErr::from)
-}
-
-fn check_notebook_impl(
+pub(crate) fn check_notebook_impl(
     file_path: &str,
     index: Option<Arc<ProjectIndex>>,
 ) -> Result<String, CheckError> {
@@ -587,136 +472,9 @@ fn check_notebook_impl(
     serde_json::to_string(&result).map_err(runtime)
 }
 
-// Every file in a run is checked against the same serialised index. Deserialising it per
-// file would make a whole-project check O(files^2), so the last one is kept, keyed by the
-// id stamped on its bytes (see `INDEX_ID_LEN`); a different index replaces the entry.
-pub(crate) static INDEX_CACHE: Mutex<Option<(u128, Arc<ProjectIndex>)>> = Mutex::new(None);
-
-// A unique id leads each serialized index, so telling indexes apart is a 16-byte compare
-// rather than a pass over a payload that can be tens of MB.
-const INDEX_ID_LEN: usize = 16;
-
-fn new_index_id() -> u128 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (
-        nanos,
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    )
-        .hash(&mut hasher);
-    (u128::from(hasher.finish()) << 64) | (nanos & u128::from(u64::MAX))
-}
-
-fn serialize_with_id(index: &ProjectIndex) -> Result<(u128, Vec<u8>), rmp_serde::encode::Error> {
-    let id = new_index_id();
-    let mut bytes = id.to_le_bytes().to_vec();
-    index.serialize(&mut rmp_serde::Serializer::new(&mut bytes))?;
-    Ok((id, bytes))
-}
-
-#[cfg(test)]
-pub(crate) fn encode_index(index: &ProjectIndex) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    serialize_with_id(index).map(|(_, bytes)| bytes)
-}
-
-// `encode_index` for an index just built, which is kept as the cached one under the id on the
-// bytes: the run that follows checks every file against it, and has no need to decode it again.
-pub(crate) fn encode_and_cache_index(
-    index: ProjectIndex,
-) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let (id, bytes) = serialize_with_id(&index)?;
-    if let Ok(mut cache) = INDEX_CACHE.lock() {
-        *cache = Some((id, Arc::new(index)));
-    }
-    Ok(bytes)
-}
-
-pub(crate) fn get_cached_index(bytes: &[u8]) -> Option<Arc<ProjectIndex>> {
-    let (id, body) = bytes.split_at_checked(INDEX_ID_LEN)?;
-    let id = u128::from_le_bytes(id.try_into().ok()?);
-
-    let mut cache = INDEX_CACHE.lock().ok()?;
-    if let Some((cached_id, index)) = cache.as_ref() {
-        if *cached_id == id {
-            return Some(index.clone());
-        }
-    }
-    let index = Arc::new(rmp_serde::from_slice::<ProjectIndex>(body).ok()?);
-    *cache = Some((id, index.clone()));
-    Some(index)
-}
-
-/// Build a cross-file symbol index for an entire project.
-///
-/// Walks all `.py` files under `project_root`, parses each one, and extracts
-/// schema definitions and annotated function return types into a [`ProjectIndex`].
-/// The index is serialised with MessagePack and returned as raw bytes so it can be
-/// held in Python memory and passed to subsequent [`check_file`] calls without any
-/// intermediate disk I/O.
-#[pyfunction]
-#[pyo3(signature = (project_root, cache_dir = None, with_callers = false))]
-pub(crate) fn build_project_index(
-    py: Python<'_>,
-    project_root: String,
-    cache_dir: Option<String>,
-    with_callers: bool,
-) -> PyResult<Vec<u8>> {
-    let root = Path::new(&project_root);
-    let build = if with_callers {
-        build_index_with_callers
-    } else {
-        build_index_cached
-    };
-    let index = py.detach(|| build(root, cache_dir.as_deref().map(Path::new)));
-    encode_and_cache_index(index)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
-}
-
-/// Build a cross-file symbol index scoped to a SINGLE file's own references.
-///
-/// The counterpart to [`build_project_index`] for `typedframes check some_file.py`.
-/// Rather than walking the whole project, it locates the project root by walking up
-/// from `file_path` to the nearest `pyproject.toml` and indexes only that file, the
-/// project-local modules its own imports reach (bounded — see
-/// `MAX_SINGLE_FILE_IMPORT_DEPTH`), and any external installed package that closure
-/// calls in a DataFrame-shaped way. Same MessagePack-serialised [`ProjectIndex`] shape,
-/// so [`check_file`] consumes it identically.
-///
-/// Returns `None` when no `pyproject.toml` exists anywhere above the file — there is
-/// then no root to resolve imports against, so the caller checks the file in isolation
-/// exactly as it did before.
-#[pyfunction]
-#[pyo3(signature = (file_path, cache_dir = None))]
-pub(crate) fn build_single_file_index(
-    py: Python<'_>,
-    file_path: String,
-    cache_dir: Option<String>,
-) -> PyResult<Option<Vec<u8>>> {
-    let path = Path::new(&file_path);
-    let Some(index) =
-        py.detach(|| build_single_file_index_cached(path, cache_dir.as_deref().map(Path::new)))
-    else {
-        return Ok(None);
-    };
-    encode_and_cache_index(index)
-        .map(Some)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn empty_index() -> ProjectIndex {
-        let dir = tempfile::tempdir().unwrap();
-        build_index_cached(dir.path(), None)
-    }
 
     #[test]
     fn test_should_give_each_file_its_own_root_when_no_project_file_is_above_it() {
@@ -752,64 +510,5 @@ mod tests {
         // assert
         assert_eq!(first.root, dir.path());
         assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn test_should_serve_an_index_just_built_from_the_cache_without_decoding_it() {
-        // arrange: a body that could not be decoded, behind the id of the cached index.
-        let mut bytes = encode_and_cache_index(empty_index()).unwrap();
-        bytes.truncate(INDEX_ID_LEN + 3);
-
-        // act
-        let served = get_cached_index(&bytes);
-
-        // assert
-        assert!(served.is_some());
-    }
-
-    #[test]
-    fn test_should_still_decode_an_index_whose_id_is_not_the_cached_one() {
-        // arrange
-        let bytes = encode_index(&empty_index()).unwrap();
-        let _ = encode_and_cache_index(empty_index()).unwrap();
-
-        // act
-        let decoded = get_cached_index(&bytes);
-
-        // assert
-        assert!(decoded.is_some());
-    }
-
-    #[test]
-    fn test_should_stamp_each_encoded_index_with_a_distinct_id() {
-        let index = empty_index();
-
-        let first = encode_index(&index).unwrap();
-        let second = encode_index(&index).unwrap();
-
-        assert_ne!(first[..INDEX_ID_LEN], second[..INDEX_ID_LEN]);
-        assert_eq!(first[INDEX_ID_LEN..], second[INDEX_ID_LEN..]);
-    }
-
-    #[test]
-    fn test_should_decode_what_it_encoded() {
-        let bytes = encode_index(&empty_index()).unwrap();
-
-        assert!(get_cached_index(&bytes).is_some());
-    }
-
-    #[test]
-    fn test_should_reject_bytes_too_short_to_hold_an_id() {
-        assert!(get_cached_index(&[1, 2, 3]).is_none());
-        assert!(get_cached_index(&[]).is_none());
-    }
-
-    #[test]
-    fn test_should_reject_a_payload_that_is_not_an_index() {
-        // a fresh id, so the cache can't answer for it
-        let mut bytes = new_index_id().to_le_bytes().to_vec();
-        bytes.extend_from_slice(b"not messagepack");
-
-        assert!(get_cached_index(&bytes).is_none());
     }
 }

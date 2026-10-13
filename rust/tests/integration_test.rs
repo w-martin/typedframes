@@ -1,6 +1,6 @@
-use _rust_checker::Linter;
 use std::fs;
 use tempfile::tempdir;
+use typedframes_checker::Linter;
 
 #[test]
 fn test_should_detect_missing_column_with_base_schema() {

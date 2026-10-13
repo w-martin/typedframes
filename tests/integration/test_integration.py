@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from typedframes._rust_checker import build_project_index, check_file  # ty: ignore[unresolved-import]
+from tests.integration.helpers import build_project_index, check_file
 
 
 class TestTypedFramesCheckerIntegration(unittest.TestCase):
@@ -100,8 +100,8 @@ class BadSchema(BaseSchema):
         # cleanup
         Path(temp_file).unlink()
 
-    def test_should_build_project_index_with_schema_entries(self) -> None:
-        """Test that build_project_index returns MessagePack bytes and the index is usable."""
+    def test_should_check_a_schema_file_inside_its_project_without_errors(self) -> None:
+        """Test that a project holding a schema definition checks clean."""
         # arrange
         schema_source = """
 from typedframes import BaseSchema, Column
@@ -116,13 +116,9 @@ class ProductSchema(BaseSchema):
             schema_path.write_text(schema_source)
 
             # act
-            index_bytes = build_project_index(tmpdir)
+            result = check_file(str(schema_path), build_project_index(tmpdir))
 
-            # assert — bytes sanity check
-            self.assertIsInstance(index_bytes, bytes)
-            self.assertGreater(len(index_bytes), 0)
-            # functional check: schema file itself has no column-access errors
-            result = check_file(str(schema_path), index_bytes)
+            # assert
             self.assertEqual(json.loads(result)["errors"], [])
 
     def test_should_catch_cross_file_column_error(self) -> None:

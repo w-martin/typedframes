@@ -1,10 +1,10 @@
 """Invoke tasks for typedframes development."""
 
-import importlib.machinery
 import sys
 from importlib.metadata import version
 from inspect import Parameter, isroutine, signature
 from pathlib import Path
+from sysconfig import get_config_var, get_path
 from types import ModuleType
 from typing import Any
 from warnings import catch_warnings, simplefilter
@@ -12,45 +12,35 @@ from warnings import catch_warnings, simplefilter
 from invoke import Context, task
 
 RUST_DIR = Path("rust")
-EXTENSION_DIR = Path("src") / "typedframes"
 LIBRARY_NAMES = RUST_DIR / "src" / "library_names.txt"
 
 
-def _compiled_extension() -> Path | None:
-    """Find the compiled Python extension module actually loaded by `import typedframes`."""
-    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
-        matches = list(EXTENSION_DIR.glob(f"_rust_checker{suffix}"))
-        if matches:
-            return matches[0]
-    return None
+def _installed_binary() -> Path | None:
+    """The `typedframes` executable `maturin develop` installed into this environment, if any."""
+    candidate = Path(get_path("scripts")) / f"typedframes{get_config_var('EXE') or ''}"
+    return candidate if candidate.is_file() else None
 
 
 def _needs_build() -> bool:
-    """Check if the compiled Python extension needs rebuilding.
+    """Check if the installed `typedframes` executable needs rebuilding.
 
-    Must check the extension `maturin develop` installs into `src/typedframes/`, not
-    `rust/target/debug/typedframes_checker` (the standalone CLI binary `cargo build`/`cargo
-    test` produces) -- the two are built independently, so a bare `cargo test` can leave this
-    check thinking the extension is fresh when it's actually stale.
+    Must check the executable `maturin develop` installs into the environment, not the one
+    `cargo build`/`cargo test` leave in `rust/target/debug`: the two are built independently, so
+    a bare `cargo test` can leave this check thinking the installed one is fresh when it is stale.
     """
-    extension = _compiled_extension()
-    if extension is None:
+    binary = _installed_binary()
+    if binary is None:
         return True
 
-    extension_mtime = extension.stat().st_mtime
+    built = binary.stat().st_mtime
     src_dir = RUST_DIR / "src"
-
-    for src_file in [*src_dir.rglob("*.rs"), *src_dir.rglob("*.txt")]:
-        if src_file.stat().st_mtime > extension_mtime:
-            return True
-
-    cargo_toml = RUST_DIR / "Cargo.toml"
-    return cargo_toml.exists() and cargo_toml.stat().st_mtime > extension_mtime
+    sources = [*src_dir.rglob("*.rs"), *src_dir.rglob("*.txt"), RUST_DIR / "Cargo.toml", RUST_DIR / "Cargo.lock"]
+    return any(source.exists() and source.stat().st_mtime > built for source in sources)
 
 
 @task
 def build(ctx: Context, *, force: bool = False) -> None:
-    """Build the Rust checker extension (maturin develop) if needed."""
+    """Build the `typedframes` executable and install it with the package (maturin develop) if needed."""
     if force or _needs_build():
         print("Building Rust checker...")
         ctx.run("maturin develop --manifest-path rust/Cargo.toml")
@@ -224,8 +214,7 @@ def lint(ctx: Context) -> None:
     ctx.run("ruff check .")
     ctx.run("ty check .")
     ctx.run("bandit -r src/ -c pyproject.toml")
-    # python315.py uses syntax newer than complexipy's parser accepts (see typedframes/compat.py).
-    ctx.run("complexipy src/ --max-complexity-allowed 50 --exclude '**/python315.py'")
+    ctx.run("complexipy src/ --max-complexity-allowed 50")
     print("Checking Rust formatting...")
     ctx.run(f"cd {RUST_DIR} && cargo fmt --all -- --check")
     print("Running Rust clippy...")
@@ -241,7 +230,7 @@ def lint_fix(ctx: Context) -> None:
 
 @task(pre=[build])
 def test(ctx: Context) -> None:
-    """Run pytest with branch coverage and Rust tests. Builds Rust checker if needed."""
+    """Run pytest with branch coverage and Rust tests. Builds the executable if needed."""
     print("Running Python tests...")
     ctx.run("python -m pytest tests/")
     ctx.run("coverage-threshold")

@@ -15,7 +15,6 @@ import sys
 import time
 import tomllib
 from collections import Counter
-from dataclasses import dataclass
 from os import sep
 from os.path import normcase
 from pathlib import Path, PurePath
@@ -36,6 +35,11 @@ from typedframes.compat import flatten
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+# The extension's jemalloc reads this when it loads. A short run on many threads does better with
+# few arenas and no lingering free memory (about 10 MB less at the same speed); a value the user
+# already set wins.
+os.environ.setdefault("_RJEM_MALLOC_CONF", "narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0")
 
 # ANSI escape sequences
 _RESET = "\033[0m"
@@ -153,8 +157,7 @@ def _coverage_warn(message: str) -> None:
     print(f"typedframes: {message}", file=sys.stderr)
 
 
-@dataclass(frozen=True)
-class CoverageConfig:
+class CoverageConfig(NamedTuple):
     """Resolved DataFrame schema coverage threshold settings for one `check` invocation.
 
     The default instance is the "nothing configured" state -- disabled, so no
@@ -724,13 +727,35 @@ def main(argv: list[str] | None = None) -> None:
         "report",
         help="Print a bug-report body for one untyped site, with a redacted copy of its code (review before posting).",
     )
-    report_parser.add_argument("name", help="The site's two-word name, as shown by `suggest`.")
+    report_parser.add_argument("name", nargs="?", help="The site's two-word name, as shown by `suggest`.")
     report_parser.add_argument(
         "path",
         type=Path,
         nargs="?",
         default=Path(),
         help="File or directory to look in (default: current directory).",
+    )
+    report_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Report every untyped site, grouped by why the checker decided as it did. Takes PATH, not NAME.",
+    )
+    report_parser.add_argument(
+        "--outcome",
+        choices=("suggested", "withheld"),
+        help="With --all, only the sites the checker decided this way about.",
+    )
+    report_parser.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default="markdown",
+        dest="report_format",
+        help="With --all, how to print the groups (default: markdown).",
+    )
+    report_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="With --all, write one bug-report body per group into this directory instead of printing.",
     )
     report_parser.add_argument("--no-index", action="store_true", help="Look at every file in isolation.")
     _add_cache_arguments(report_parser)
@@ -769,8 +794,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
 
 
-@dataclass
-class RunStats:
+class RunStats(NamedTuple):
     """Timing plus DataFrame schema coverage stats for a single `check` invocation."""
 
     elapsed: float  # seconds
@@ -870,8 +894,7 @@ def _coverage_message(stats: RunStats) -> str:
     )
 
 
-@dataclass(frozen=True)
-class CoverageBucket:
+class CoverageBucket(NamedTuple):
     """One threshold and the aggregate DataFrame tally it is judged against."""
 
     label: str | None
@@ -1103,8 +1126,7 @@ def _collapse_repeats(lines: list[str]) -> list[str]:
     return [f"{line} (x{counts[line]})" if counts[line] > 1 else line for line in dict.fromkeys(lines)]
 
 
-@dataclass(frozen=True)
-class ExplainSources:
+class ExplainSources(NamedTuple):
     """The raw per-file lists `--coverage-detail=explain` draws its report from.
 
     Bundled into one object (rather than a handful of separate parameters) since
@@ -1532,7 +1554,7 @@ def _run_cache(args: argparse.Namespace) -> None:
         print(f"{'Added' if added else 'Already in'} {root / '.gitignore'}: {entry}")
 
 
-def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
+def _build_index_bytes(path: Path, args: argparse.Namespace, *, callers: bool = False) -> bytes | None:
     """Build the cross-file index for this run, unless `--no-index` disabled it.
 
     Two shapes, picked by what `path` is:
@@ -1550,6 +1572,9 @@ def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
 
     `--no-index` remains the explicit opt-out from both: truly no index, every file
     checked in isolation, no import following of any kind.
+
+    `callers` also records what every call to a function does with its result, which costs
+    one more read of every file, so only the commands that narrow a returned frame ask.
     """
     if args.no_index:
         return None
@@ -1562,7 +1587,7 @@ def _build_index_bytes(path: Path, args: argparse.Namespace) -> bytes | None:
     if cache_dir is not None:
         tighten_cache_permissions(cache_dir)
     if path.is_dir():
-        return build_project_index(str(path), cache_arg)
+        return build_project_index(str(path), cache_arg, callers)
     return build_single_file_index(str(path), cache_arg)
 
 
@@ -1574,16 +1599,17 @@ def _diff_name(file_path: Path, root: Path) -> str:
         return _relative_posix(str(file_path), root)
 
 
-def _suggest_one_file(
-    file_path: Path, root: Path, suggest_file: Callable[[str, str, bytes | None], str], index_bytes: bytes | None
-) -> dict | None:
-    """Ask the Rust checker for one file's suggestions, or `None` if it had to be skipped."""
-    try:
-        return json.loads(suggest_file(str(file_path), _diff_name(file_path, root), index_bytes))
-    except (OSError, RuntimeError) as e:
-        # Unreadable, or not valid Python.
-        print(f"{file_path}: skipped, {e}", file=sys.stderr)
-        return None
+def _batch_results(files: list[Path], outcomes: list[tuple[str | None, str | None]]) -> list[Any | None]:
+    """Each file's decoded JSON result, or `None` (after naming it on stderr) if the checker skipped it."""
+    results: list[object | None] = []
+    for file_path, (payload, error) in zip(files, outcomes, strict=True):
+        if payload is None:
+            # Unreadable, or not valid Python.
+            print(f"{file_path}: skipped, {error}", file=sys.stderr)
+            results.append(None)
+        else:
+            results.append(json.loads(payload))
+    return results
 
 
 def _format_suggestion(display_path: str, suggestion: dict) -> str:
@@ -1627,15 +1653,19 @@ def _print_suggestions(suggestions: list[tuple[str, dict]], withheld: list[tuple
 
 
 def _collect_suggestions(
-    files: list[Path], root: Path, suggest_file: Callable[[str, str, bytes | None], str], index_bytes: bytes | None
+    files: list[Path],
+    root: Path,
+    suggest_files: Callable[[list[tuple[str, str]], bytes | None], list[tuple[str | None, str | None]]],
+    index_bytes: bytes | None,
 ) -> tuple[list[tuple[str, dict]], list[tuple[str, dict]], dict[str, Path], int]:
     """Suggestions and withheld sites per file, files by display path, and how many files were skipped."""
     suggestions: list[tuple[str, dict]] = []
     withheld: list[tuple[str, dict]] = []
     files_by_display: dict[str, Path] = {}
     unreadable = 0
-    for file_path in files:
-        result = _suggest_one_file(file_path, root, suggest_file, index_bytes)
+    requests = [(str(file_path), _diff_name(file_path, root)) for file_path in files]
+    results = _batch_results(files, suggest_files(requests, index_bytes))
+    for file_path, result in zip(files, results, strict=True):
         if result is None:
             unreadable += 1
             continue
@@ -1706,12 +1736,12 @@ def _run_suggest(args: argparse.Namespace) -> None:
         print("Error: `suggest` doesn't cover notebooks", file=sys.stderr)
         sys.exit(2)
     try:
-        from typedframes._rust_checker import suggest_file
+        from typedframes._rust_checker import suggest_files
     except ImportError:
         print(_EXTENSION_MISSING, file=sys.stderr)
         sys.exit(1)
 
-    index_bytes = _build_index_bytes(path, args)
+    index_bytes = _build_index_bytes(path, args, callers=True)
     root = path if path.is_dir() else path.parent
     files = _collect_python_files(path, _load_configured_excludes(path))
 
@@ -1722,7 +1752,7 @@ def _run_suggest(args: argparse.Namespace) -> None:
             print(f"Error: {problem}", file=sys.stderr)
             sys.exit(1)
 
-    suggestions, withheld, files_by_display, unreadable = _collect_suggestions(files, root, suggest_file, index_bytes)
+    suggestions, withheld, files_by_display, unreadable = _collect_suggestions(files, root, suggest_files, index_bytes)
     if args.only:
         suggestions, withheld = _select_named_sites(args.only, suggestions, withheld, editing=bool(editing))
 
@@ -1749,7 +1779,7 @@ _REPORT_REVIEW_NOTICE = (
 
 
 def _format_report(report: dict) -> str:
-    """The Markdown issue body for one site's `report_file` result."""
+    """The Markdown issue body for one site's report."""
     verdict = report["verdict"]
     outcome = verdict["outcome"]
     if verdict["kind"]:
@@ -1778,34 +1808,170 @@ def _format_report(report: dict) -> str:
     return "\n".join(lines)
 
 
-def _run_report(args: argparse.Namespace) -> None:
-    """Execute the report subcommand: find the named site and print its bug-report body."""
-    path = _resolve_existing_path(args.path)
-    if path.suffix == ".ipynb":
-        print("Error: `report` doesn't cover notebooks", file=sys.stderr)
+# How many more uses a reason mentions; sites differing only in that are one problem.
+_MORE_USES_SUFFIX = re.compile(r", and N more$")
+
+
+def _group_reports(reports: list[dict]) -> list[list[dict]]:
+    """Group site reports by what the checker decided and why, largest group first."""
+    groups: dict[tuple, list[dict]] = {}
+    for report in reports:
+        verdict = report["verdict"]
+        reason = _MORE_USES_SUFFIX.sub("", verdict["reason"])
+        groups.setdefault((verdict["outcome"], verdict["kind"], verdict["tier"], reason), []).append(report)
+    return sorted(groups.values(), key=lambda group: (-len(group), group[0]["name"]))
+
+
+def _representative(group: list[dict]) -> dict:
+    """The report in a group that is easiest to read: one with a snippet, the shortest."""
+    return min(group, key=lambda r: (r["snippet"] is None, len(r["snippet"] or "")))
+
+
+def _group_title(group: list[dict]) -> str:
+    verdict = group[0]["verdict"]
+    reason = _MORE_USES_SUFFIX.sub("", verdict["reason"])
+    return f"{verdict['outcome']}: {reason}"
+
+
+def _format_report_groups(groups: list[list[dict]]) -> str:
+    """The Markdown body for `report --all`: a tally, then each group with its clearest snippet."""
+    total = sum(len(group) for group in groups)
+    sites = f"{total} untyped {'site' if total == 1 else 'sites'}"
+    group_count = f"{len(groups)} {'group' if len(groups) == 1 else 'groups'}"
+    lines = [
+        _REPORT_REVIEW_NOTICE,
+        f"## typedframes report: {sites} in {group_count}",
+        "",
+        f"- typedframes {__version__}",
+        f"- Python {python_version()} on {platform()}",
+        "",
+        "| Sites | What the checker did |",
+        "| ---: | --- |",
+        *(f"| {len(group)} | {_group_title(group)} |" for group in groups),
+    ]
+    for number, group in enumerate(groups, start=1):
+        representative = _representative(group)
+        lines += ["", f"### {number}. {_group_title(group)}", "", f"Sites: {', '.join(r['name'] for r in group)}", ""]
+        if representative["snippet"]:
+            lines += [f"Smallest example, `{representative['name']}`:", "", "```python"]
+            lines += [representative["snippet"].rstrip("\n"), "```"]
+        else:
+            lines.append(f"No snippet: {representative['refusal']}.")
+    return "\n".join(lines)
+
+
+def _report_groups_json(groups: list[list[dict]]) -> str:
+    """`report --all` as JSON: one object per group, with the clearest example."""
+    payload = {
+        "typedframes": __version__,
+        "sites": sum(len(group) for group in groups),
+        "groups": [
+            {
+                "count": len(group),
+                "outcome": group[0]["verdict"]["outcome"],
+                "kind": group[0]["verdict"]["kind"],
+                "tier": group[0]["verdict"]["tier"],
+                "reason": _MORE_USES_SUFFIX.sub("", group[0]["verdict"]["reason"]),
+                "names": [r["name"] for r in group],
+                "snippet": _representative(group)["snippet"],
+                "refusal": _representative(group)["refusal"],
+            }
+            for group in groups
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def _write_report_groups(groups: list[list[dict]], directory: Path) -> list[Path]:
+    """Write one bug-report body per group; returns the files written."""
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    for number, group in enumerate(groups, start=1):
+        representative = _representative(group)
+        body = _format_report(representative)
+        others = [r["name"] for r in group if r is not representative]
+        if others:
+            body += f"\n\nThe checker decided the same way at {len(others)} other sites: {', '.join(others)}."
+        file = directory / f"{number:02d}-{representative['name']}.md"
+        file.write_text(body + "\n")
+        written.append(file)
+    return written
+
+
+def _report_target(args: argparse.Namespace) -> tuple[str | None, Path]:
+    """The site name (None with --all) and path a `report` call names, exiting 2 on a bad combination."""
+    if args.all:
+        if args.name is not None and args.path != Path():
+            print("Error: `report --all` takes a path, not a site name", file=sys.stderr)
+            sys.exit(2)
+        return None, Path(args.name) if args.name is not None else args.path
+    if args.name is None:
+        print("Error: `report` needs a site name, or --all", file=sys.stderr)
         sys.exit(2)
+    return args.name, args.path
+
+
+def _run_report_all(args: argparse.Namespace, path: Path) -> None:
+    """Execute `report --all`: report every untyped site under `path`, grouped by cause."""
     try:
-        from typedframes._rust_checker import report_file
+        from typedframes._rust_checker import report_all_files
     except ImportError:
         print(_EXTENSION_MISSING, file=sys.stderr)
         sys.exit(1)
 
-    index_bytes = _build_index_bytes(path, args)
+    index_bytes = _build_index_bytes(path, args, callers=True)
     files = _collect_python_files(path, _load_configured_excludes(path))
-    matches: list[tuple[Path, dict]] = []
-    for file_path in files:
-        try:
-            report = json.loads(report_file(str(file_path), args.name.strip().lower(), index_bytes))
-        except (OSError, RuntimeError) as e:
-            print(f"{file_path}: skipped, {e}", file=sys.stderr)
-            continue
-        if report is not None:
-            matches.append((file_path, report))
+    reports: list[dict] = []
+    for found in _batch_results(files, report_all_files([str(file_path) for file_path in files], index_bytes)):
+        if found is not None:
+            reports.extend(found)
+    if args.outcome:
+        reports = [r for r in reports if r["verdict"]["outcome"] == args.outcome]
+    if not reports:
+        print("No untyped sites.")
+        return
+    groups = _group_reports(reports)
+    if args.output_dir:
+        for file in _write_report_groups(groups, args.output_dir):
+            print(file)
+    elif args.report_format == "json":
+        print(_report_groups_json(groups))
+    else:
+        print(_format_report_groups(groups))
+    print(
+        "Read the report before posting it: names, comments and most strings are replaced, but the shape of the "
+        "code and library or option names are kept.",
+        file=sys.stderr,
+    )
+
+
+def _run_report(args: argparse.Namespace) -> None:
+    """Execute the report subcommand: find the named site and print its bug-report body."""
+    name, target = _report_target(args)
+    path = _resolve_existing_path(target)
+    if path.suffix == ".ipynb":
+        print("Error: `report` doesn't cover notebooks", file=sys.stderr)
+        sys.exit(2)
+    if name is None:
+        _run_report_all(args, path)
+        return
+    try:
+        from typedframes._rust_checker import report_files
+    except ImportError:
+        print(_EXTENSION_MISSING, file=sys.stderr)
+        sys.exit(1)
+
+    index_bytes = _build_index_bytes(path, args, callers=True)
+    files = _collect_python_files(path, _load_configured_excludes(path))
+    reports = _batch_results(
+        files, report_files([str(file_path) for file_path in files], name.strip().lower(), index_bytes)
+    )
+    matches = [(file_path, report) for file_path, report in zip(files, reports, strict=True) if report is not None]
     if not matches:
-        print(f"Error: no untyped site is named {args.name!r}", file=sys.stderr)
+        print(f"Error: no untyped site is named {name!r}", file=sys.stderr)
         sys.exit(2)
     if len(matches) > 1:
-        print(f"Error: {args.name!r} names {len(matches)} sites; narrow the path to one of them:", file=sys.stderr)
+        print(f"Error: {name!r} names {len(matches)} sites; narrow the path to one of them:", file=sys.stderr)
         for file_path, report in matches:
             print(f"  {file_path}:{report['line']}:{report['col']}  {report['var']}", file=sys.stderr)
         sys.exit(2)

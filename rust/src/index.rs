@@ -80,6 +80,22 @@ pub(crate) struct IndexFunction {
     pub(crate) helper_summary: Option<HelperSummary>,
 }
 
+// The statement-level calls a file makes, recorded while the file is parsed so that finding
+// which functions are called does not parse every file a second time: the callee names, and
+// the `self.<attr>.<method>()` calls with what `<attr>` was assigned. Only needed until
+// `resolve_called_functions` has run; it is then dropped, so the index sent on does not carry it.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CallSites {
+    pub(crate) names: Vec<String>,
+    pub(crate) self_calls: Vec<(SelfAttrOrigin, String)>,
+}
+
+impl CallSites {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.self_calls.is_empty()
+    }
+}
+
 // Symbol table for a single `.py` file, stored inside ProjectIndex.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct IndexEntry {
@@ -125,6 +141,9 @@ pub(crate) struct IndexEntry {
     // Statically known constants and evaluable functions, for importing files to fold.
     #[serde(default)]
     pub(crate) eval: crate::static_eval::ModuleExports,
+    // See `CallSites`. Empty in a finished index.
+    #[serde(default, skip_serializing_if = "CallSites::is_empty")]
+    pub(crate) call_sites: CallSites,
 }
 
 // In-memory cross-file symbol index.
@@ -197,6 +216,20 @@ pub(crate) struct ProjectIndex {
     // SAME-FILE confirmation is unaffected and already works.
     #[serde(default)]
     pub(crate) called_functions: HashMap<String, std::collections::HashSet<String>>,
+    // Function or method name -> what every call to it in the project does with the frame it
+    // returns, for the names where every call is seen and only reads named columns of the
+    // result. Absent means unknown, never "no columns". Empty unless the index covers the
+    // whole project: an index built around one file's imports never sees its callers.
+    #[serde(default)]
+    pub(crate) call_usage: HashMap<String, CallUsage>,
+}
+
+/// The columns read from the result of every call to a function, across the project.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CallUsage {
+    pub(crate) columns: Vec<String>,
+    /// Calls seen, counting the defining file's own.
+    pub(crate) calls: usize,
 }
 
 // Union schema name -> column list across every file's `schemas` map. First
@@ -242,7 +275,7 @@ pub(crate) fn compute_all_schema_locations(
 // ── Index cache ────────────────────────────────────────────────────────────────
 
 // Bump when the cached representation changes shape.
-const INDEX_CACHE_FORMAT: u32 = 2;
+const INDEX_CACHE_FORMAT: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct CachedFile {
@@ -386,7 +419,11 @@ impl<'a> FileIndexer<'a> {
     /// Every path indexed in parallel; results in input order, `None` for a file that
     /// couldn't be read.
     pub(crate) fn index_all(&self, paths: &[PathBuf]) -> Vec<Option<(IndexEntry, Vec<String>)>> {
-        crate::parallel::parallel_map(paths, |path| self.index(path))
+        crate::parallel::parallel_map_largest_first(
+            paths,
+            |path| crate::parallel::file_cost(path),
+            |path| self.index(path),
+        )
     }
 
     /// Writes the cache back if it changed; best effort. A whole-project run passes `prune`
@@ -498,7 +535,13 @@ pub(crate) fn collect_py_files(
             if resolved_excludes.contains(name_str.as_ref()) {
                 continue;
             }
-            if path.is_dir() {
+            // The directory read already says what an entry is; only a symlink needs a `stat`
+            // to see what it points at.
+            let is_dir = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                _ => path.is_dir(),
+            };
+            if is_dir {
                 stack.push(path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
                 result.push(path);
@@ -516,27 +559,26 @@ pub(crate) fn collect_py_files(
 // convention this project's own examples use (a `uv`-managed `.venv`); a project using
 // a differently-named or externally-managed environment simply won't resolve anything,
 // same as any other candidate path that doesn't exist.
-// Memoized because `resolve_module_file` — which calls this — runs once per import
-// statement across an entire project check, and the answer can never change within a
-// single process's lifetime (see INDEX_CACHE above for the same reasoning). Without
-// this, a large project with a real `.venv` would re-`read_dir` the same `lib/`
-// directory on every single import resolution, turning one cheap directory listing
-// into one per import statement in the whole project.
-pub(crate) static SITE_PACKAGES_CACHE: Mutex<Option<(PathBuf, Option<PathBuf>)>> = Mutex::new(None);
+//
+// Found once per thread and root, for the thread's lifetime: every import resolution asks, and
+// a large project would otherwise `read_dir` the same `lib/` directory once per import
+// statement. Per thread rather than shared, because a lock that every worker reads still makes
+// them queue on one cache line.
+thread_local! {
+    static SITE_PACKAGES_MEMO: std::cell::RefCell<HashMap<PathBuf, Option<PathBuf>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
 
 pub(crate) fn find_site_packages_dir(project_root: &Path) -> Option<PathBuf> {
-    if let Ok(cache) = SITE_PACKAGES_CACHE.lock() {
-        if let Some((cached_root, result)) = cache.as_ref() {
-            if cached_root == project_root {
-                return result.clone();
-            }
+    SITE_PACKAGES_MEMO.with(|memo| {
+        if let Some(found) = memo.borrow().get(project_root) {
+            return found.clone();
         }
-    }
-    let result = find_site_packages_dir_uncached(project_root);
-    if let Ok(mut cache) = SITE_PACKAGES_CACHE.lock() {
-        *cache = Some((project_root.to_path_buf(), result.clone()));
-    }
-    result
+        let found = find_site_packages_dir_uncached(project_root);
+        memo.borrow_mut()
+            .insert(project_root.to_path_buf(), found.clone());
+        found
+    })
 }
 
 pub(crate) fn find_site_packages_dir_uncached(project_root: &Path) -> Option<PathBuf> {
@@ -637,6 +679,69 @@ pub(crate) fn collect_external_package_files(
 // `build_index_internal`. This file's own imports/module_aliases are exactly what's
 // needed to resolve each candidate's raw call-site name to a module, so it's done
 // here rather than requiring a second pass over the same file.
+// The names a module exports through `__all__`, the names it imports with `from X import Y`
+// (each to the module it came from), and its plain `import module [as alias]` aliases.
+fn module_exports_and_imports(
+    module: &ruff_python_ast::ModModule,
+) -> (
+    Vec<String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) {
+    let mut exports = Vec::new();
+    let mut imports: HashMap<String, String> = HashMap::new();
+    let mut module_aliases: HashMap<String, String> = HashMap::new();
+    for stmt in &module.body {
+        match stmt {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    let Expr::Name(name) = target else {
+                        continue;
+                    };
+                    if name.id.as_str() != "__all__" {
+                        continue;
+                    }
+                    let Expr::List(list) = &*assign.value else {
+                        continue;
+                    };
+                    for el in &list.elts {
+                        if let Expr::StringLiteral(s) = el {
+                            exports.push(s.value.to_str().to_string());
+                        }
+                    }
+                }
+            }
+            Stmt::ImportFrom(import_from) if import_from.level == 0 => {
+                if let Some(module_ident) = &import_from.module {
+                    let module_name = module_ident.id.to_string();
+                    for alias in &import_from.names {
+                        imports.insert(alias.name.id.to_string(), module_name.clone());
+                    }
+                }
+            }
+            // Plain `import module [as alias]` / `import a.b.c [as alias]`. Without
+            // an alias, Python binds the FIRST segment of a dotted import (`import
+            // a.b.c` binds `a`), so a dotted single-segment module (the common case
+            // for a flat project: `import transforms`) binds cleanly; a genuinely
+            // nested `a.b.c` accessed as `a.b.c.func()` without an alias is not
+            // tracked here (`a.func()` wouldn't resolve to `a.b.c` anyway) — same
+            // conservative-not-exhaustive trade-off as the rest of this heuristic.
+            Stmt::Import(import_stmt) => {
+                for alias in &import_stmt.names {
+                    let dotted = alias.name.id.to_string();
+                    let local_name = match &alias.asname {
+                        Some(asname) => asname.id.to_string(),
+                        None => dotted.split('.').next().unwrap_or(&dotted).to_string(),
+                    };
+                    module_aliases.insert(local_name, dotted);
+                }
+            }
+            _ => {}
+        }
+    }
+    (exports, imports, module_aliases)
+}
+
 /// The index entry for `source` (the contents of `path`), the external-package candidates
 /// it names, and whether the result depends on nothing but `source` -- `false` when
 /// indexing read another file (a `.sql` file), so a cached copy could go stale without
@@ -650,14 +755,51 @@ pub(crate) fn index_source(
     let mut linter = Linter::new();
     linter.with_context(project_root.to_path_buf(), config);
     linter.preserve_unresolved_delegates = true;
-    let _ = linter.check_file_internal(source, path);
-    let depends_on_other_files = linter.read_external_file.get();
-
+    // Parsed and analysed once. Everything that reads the module as written -- its exports,
+    // helper summaries, return libraries and imports -- is read first, because constant
+    // folding then rewrites the module in place for the lint. Nothing here has imports to
+    // resolve.
     let parsed_module = ruff_python_parser::parse_module(source).ok();
-    let eval = parsed_module
-        .as_ref()
-        .map(|parsed| crate::static_eval::export_module(parsed.syntax(), source))
-        .unwrap_or_default();
+    let no_imports = crate::static_eval::ImportedModules::new();
+    let mut as_written = None;
+    if let Some(parsed) = &parsed_module {
+        let module = parsed.syntax();
+        let analysis = crate::static_eval::Analysis::build(module, &no_imports);
+        let eval = crate::static_eval::export_module(&analysis, source);
+        analysis.reset();
+        let usages = crate::helpers::module_param_usages_in(&analysis, module);
+        analysis.reset();
+        let folds = crate::static_eval::plan_folds(module, &analysis);
+        let libraries = crate::suggest::function_libraries(module);
+        let names = module_exports_and_imports(module);
+        let call_sites = module_call_sites(module);
+        as_written = Some((eval, usages, libraries, names, call_sites, folds));
+    }
+    let mut folded_and_checked = false;
+    let (eval, usages, libraries, (exports, imports, module_aliases), call_sites, folds) =
+        match as_written {
+            Some((eval, usages, libraries, names, call_sites, folds)) => {
+                (eval, usages, libraries, names, call_sites, Some(folds))
+            }
+            None => (
+                Default::default(),
+                HashMap::new(),
+                HashMap::new(),
+                (Vec::new(), HashMap::new(), HashMap::new()),
+                CallSites::default(),
+                None,
+            ),
+        };
+    if let (Some(parsed), Some((folds, reads))) = (parsed_module, folds) {
+        let mut module = parsed.into_syntax();
+        crate::static_eval::apply_folds(&mut module, &folds);
+        let _ = linter.lint_folded(&module, reads, source, path);
+        folded_and_checked = true;
+    }
+    if !folded_and_checked {
+        let _ = linter.check_file_internal(source, path);
+    }
+    let depends_on_other_files = linter.read_external_file.get();
 
     let schemas = linter.schemas;
     let schema_locations = linter.schema_locations;
@@ -710,71 +852,14 @@ pub(crate) fn index_source(
             )
         })
         .collect();
-    if let Some(parsed) = &parsed_module {
-        for (name, library) in crate::suggest::function_libraries(parsed.syntax()) {
-            if let Some(function) = functions.get_mut(&name) {
-                function.returns_library = library.as_str().to_string();
-            }
-        }
-        for (name, usage) in crate::helpers::module_param_usages(parsed.syntax()) {
-            if let Some(function) = functions.get_mut(&name) {
-                function.param_usage = usage;
-            }
+    for (name, library) in libraries {
+        if let Some(function) = functions.get_mut(&name) {
+            function.returns_library = library.as_str().to_string();
         }
     }
-
-    let mut exports = Vec::new();
-    let mut imports: HashMap<String, String> = HashMap::new();
-    let mut module_aliases: HashMap<String, String> = HashMap::new();
-    if let Ok(parsed) = parse_module(source) {
-        let module = parsed.into_syntax();
-        for stmt in &module.body {
-            match stmt {
-                Stmt::Assign(assign) => {
-                    for target in &assign.targets {
-                        let Expr::Name(name) = target else {
-                            continue;
-                        };
-                        if name.id.as_str() != "__all__" {
-                            continue;
-                        }
-                        let Expr::List(list) = &*assign.value else {
-                            continue;
-                        };
-                        for el in &list.elts {
-                            if let Expr::StringLiteral(s) = el {
-                                exports.push(s.value.to_str().to_string());
-                            }
-                        }
-                    }
-                }
-                Stmt::ImportFrom(import_from) if import_from.level == 0 => {
-                    if let Some(module_ident) = &import_from.module {
-                        let module_name = module_ident.id.to_string();
-                        for alias in &import_from.names {
-                            imports.insert(alias.name.id.to_string(), module_name.clone());
-                        }
-                    }
-                }
-                // Plain `import module [as alias]` / `import a.b.c [as alias]`. Without
-                // an alias, Python binds the FIRST segment of a dotted import (`import
-                // a.b.c` binds `a`), so a dotted single-segment module (the common case
-                // for a flat project: `import transforms`) binds cleanly; a genuinely
-                // nested `a.b.c` accessed as `a.b.c.func()` without an alias is not
-                // tracked here (`a.func()` wouldn't resolve to `a.b.c` anyway) — same
-                // conservative-not-exhaustive trade-off as the rest of this heuristic.
-                Stmt::Import(import_stmt) => {
-                    for alias in &import_stmt.names {
-                        let dotted = alias.name.id.to_string();
-                        let local_name = match &alias.asname {
-                            Some(asname) => asname.id.to_string(),
-                            None => dotted.split('.').next().unwrap_or(&dotted).to_string(),
-                        };
-                        module_aliases.insert(local_name, dotted);
-                    }
-                }
-                _ => {}
-            }
+    for (name, usage) in usages {
+        if let Some(function) = functions.get_mut(&name) {
+            function.param_usage = usage;
         }
     }
 
@@ -840,6 +925,7 @@ pub(crate) fn index_source(
             class_bases: linter.class_bases,
             class_helper_summaries,
             eval,
+            call_sites,
         },
         external_package_candidates,
         !depends_on_other_files,
@@ -911,6 +997,23 @@ pub(crate) fn build_index_internal(project_root: &Path) -> ProjectIndex {
 
 // Builds the project index, using the per-file cache in `cache_dir` when given.
 pub(crate) fn build_index_cached(project_root: &Path, cache_dir: Option<&Path>) -> ProjectIndex {
+    build_index_inner(project_root, cache_dir, false)
+}
+
+// `build_index_cached` plus `ProjectIndex::call_usage`, which re-reads every file once more
+// and is only worth it for the commands that narrow what a function returns.
+pub(crate) fn build_index_with_callers(
+    project_root: &Path,
+    cache_dir: Option<&Path>,
+) -> ProjectIndex {
+    build_index_inner(project_root, cache_dir, true)
+}
+
+fn build_index_inner(
+    project_root: &Path,
+    cache_dir: Option<&Path>,
+    with_callers: bool,
+) -> ProjectIndex {
     // Loaded once and threaded into every per-file `Linter`, so index-time inference
     // (this function) and check-time inference (`check_file`) agree on `sql_dialect` —
     // a mismatch here would make a SQL-derived schema's columns differ depending on
@@ -939,7 +1042,7 @@ pub(crate) fn build_index_cached(project_root: &Path, cache_dir: Option<&Path>) 
         &indexer,
     );
     indexer.save(true);
-    finalise_index(project_root, files)
+    finalise_index(project_root, files, with_callers)
 }
 
 // A configured `exclude` REPLACES DEFAULT_EXCLUDED_DIRS entirely -- it does not add to
@@ -989,6 +1092,7 @@ pub(crate) fn index_traced_external_packages(
 pub(crate) fn finalise_index(
     project_root: &Path,
     mut files: HashMap<String, IndexEntry>,
+    whole_project: bool,
 ) -> ProjectIndex {
     let all_schemas = compute_all_schemas(&files);
     let all_schema_locations = compute_all_schema_locations(&files);
@@ -997,6 +1101,15 @@ pub(crate) fn finalise_index(
     resolve_transitive_helper_summaries(project_root, &mut files);
     let governed = resolve_param_governed_call_sites(project_root, &files);
     let called_functions = resolve_called_functions(project_root, &files);
+    // Served their purpose: the index that goes on to the checks does not carry them.
+    for entry in files.values_mut() {
+        entry.call_sites = CallSites::default();
+    }
+    let call_usage = if whole_project {
+        resolve_call_usage(&files)
+    } else {
+        HashMap::new()
+    };
     ProjectIndex {
         version: 1,
         files,
@@ -1005,6 +1118,7 @@ pub(crate) fn finalise_index(
         call_site_errors: governed.call_site_errors,
         resolved_governed: governed.resolved_governed,
         called_functions,
+        call_usage,
     }
 }
 
@@ -1155,7 +1269,7 @@ pub(crate) fn build_single_file_index_cached(
         &indexer,
     );
     indexer.save(false);
-    Some(finalise_index(&project_root, files))
+    Some(finalise_index(&project_root, files, false))
 }
 
 // Resolve each function's `param_schema_name` (the schema its first parameter is
@@ -1293,24 +1407,72 @@ pub(crate) fn resolve_called_functions(
         return called;
     }
 
-    for file_path in files.keys() {
-        let Ok(source) = fs::read_to_string(file_path) else {
-            continue;
-        };
-        let Ok(parsed) = parse_module(&source) else {
-            continue;
-        };
-        let module = parsed.into_syntax();
-        scan_stmts_for_called_functions(
-            &module.body,
+    // Each file's recorded call sites only read the shared index, so files are resolved in
+    // parallel and their results merged afterwards.
+    let entries: Vec<(&String, &IndexEntry)> = files.iter().collect();
+    let per_file = crate::parallel::parallel_map(&entries, |(file_path, entry)| {
+        let mut local: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        resolve_call_sites(
             file_path,
             project_root,
             files,
-            None,
-            &mut called,
+            &entry.call_sites,
+            &mut local,
         );
+        local
+    });
+    for local in per_file {
+        for (target, names) in local {
+            called.entry(target).or_default().extend(names);
+        }
     }
     called
+}
+
+// Project-wide merge of what each file shows about the calls to every name (see
+// `call_usage`): a name is kept only when no file hides a use of it, at least one call
+// reads columns, and the project defines a function of that name. A file that can't be read
+// or parsed may hold calls this can't see, so then nothing is kept.
+pub(crate) fn resolve_call_usage(
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, CallUsage> {
+    let mut modules = Vec::with_capacity(files.len());
+    let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for file_path in files.keys() {
+        let Ok(source) = fs::read_to_string(file_path) else {
+            return HashMap::new();
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            return HashMap::new();
+        };
+        let module = parsed.into_syntax();
+        defined.extend(crate::call_usage::defined_names(&module));
+        modules.push(module);
+    }
+    let mut merged: HashMap<String, crate::call_usage::Observation> = HashMap::new();
+    for module in &modules {
+        for (name, seen) in crate::call_usage::module_call_usage(module, &defined).observations {
+            let total = merged.entry(name).or_default();
+            total.calls += seen.calls;
+            total.unknown |= seen.unknown;
+            total.columns.extend(seen.columns);
+        }
+    }
+    merged
+        .into_iter()
+        .filter(|(name, seen)| {
+            !seen.unknown && seen.calls > 0 && !seen.columns.is_empty() && defined.contains(name)
+        })
+        .map(|(name, seen)| {
+            (
+                name,
+                CallUsage {
+                    columns: seen.columns.into_iter().collect(),
+                    calls: seen.calls,
+                },
+            )
+        })
+        .collect()
 }
 
 // Resolve a `self.<attr>` origin (see `collect_self_attr_origins`) to the file that
@@ -1347,26 +1509,15 @@ fn resolve_self_attr_class_file(
     }
 }
 
-// Traversal shape mirrors `scan_stmts_for_governed_calls`'s If/For/While/With
-// recursion, EXTENDED to also descend into function and class bodies (see the
-// FunctionDef/ClassDef arms below for why: unlike the narrower Feast-specific
-// scanner, this one's whole purpose depends on finding real call sites, which
-// overwhelmingly live inside a function or method body, not at module level).
-//
-// `self_attrs` is `Some` while inside a class body (recomputed fresh at each
-// `Stmt::ClassDef` from that class's own `__init__`, matching a real `Linter`'s
-// per-class `current_self_attrs` scoping -- a nested class does NOT inherit an
-// enclosing class's attrs) and `None` everywhere else (module level, a plain
-// function). It's what lets a `self.<attr>.<method>(...)` call site resolve, the
-// shape `resolve_delegate_target` alone can't cover (it only resolves bare names via
-// imports/module_aliases, with no notion of instance attributes).
-pub(crate) fn scan_stmts_for_called_functions(
+// Records the statement-level calls in `stmts`: every callee name, and each
+// `self.<attr>.<method>(...)` whose `<attr>` is one of the enclosing class's `__init__`
+// origins. The traversal is the one `resolve_called_functions` has always used -- function and
+// class bodies are entered, a class's own `__init__` origins replace any enclosing class's.
+fn collect_call_sites(
     stmts: &[Stmt],
-    file_path: &str,
-    project_root: &Path,
-    files: &HashMap<String, IndexEntry>,
     self_attrs: Option<&HashMap<String, SelfAttrOrigin>>,
-    called: &mut HashMap<String, std::collections::HashSet<String>>,
+    names: &mut std::collections::BTreeSet<String>,
+    self_calls: &mut Vec<(SelfAttrOrigin, String)>,
 ) {
     for stmt in stmts {
         let call = match stmt {
@@ -1387,39 +1538,16 @@ pub(crate) fn scan_stmts_for_called_functions(
                 _ => None,
             };
             if let Some(callee_name) = callee_name {
-                if let Some((target_file, target_func)) =
-                    resolve_delegate_target(file_path, callee_name, project_root, files)
-                {
-                    called.entry(target_file).or_default().insert(target_func);
-                }
+                names.insert(callee_name.to_string());
             }
-            // self.<attr>.<method>(...) -- a shape resolve_delegate_target can't
-            // cover (bare-name imports/module_aliases only, no notion of instance
-            // attributes). Resolved via `self_attrs`, this class's own `__init__`
-            // origins (see the ClassDef arm below).
             if let (Expr::Attribute(attr), Some(attrs)) = (&*call.func, self_attrs) {
                 if let Expr::Attribute(recv_attr) = &*attr.value {
                     if let Expr::Name(recv_base) = &*recv_attr.value {
                         if recv_base.id.as_str() == "self" {
                             if let Some(origin) = attrs.get(recv_attr.attr.as_str()) {
-                                if let Some(target_file) = resolve_self_attr_class_file(
-                                    file_path,
-                                    origin,
-                                    project_root,
-                                    files,
-                                ) {
-                                    let method_known = files
-                                        .get(&target_file)
-                                        .and_then(|e| e.class_methods.get(&origin.class_name))
-                                        .is_some_and(|methods| {
-                                            methods.contains_key(attr.attr.as_str())
-                                        });
-                                    if method_known {
-                                        called
-                                            .entry(target_file)
-                                            .or_default()
-                                            .insert(attr.attr.to_string());
-                                    }
+                                let site = (origin.clone(), attr.attr.to_string());
+                                if !self_calls.contains(&site) {
+                                    self_calls.push(site);
                                 }
                             }
                         }
@@ -1429,115 +1557,38 @@ pub(crate) fn scan_stmts_for_called_functions(
         }
         match stmt {
             Stmt::If(if_stmt) => {
-                scan_stmts_for_called_functions(
-                    &if_stmt.body,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&if_stmt.body, self_attrs, names, self_calls);
                 for clause in &if_stmt.elif_else_clauses {
-                    scan_stmts_for_called_functions(
-                        &clause.body,
-                        file_path,
-                        project_root,
-                        files,
-                        self_attrs,
-                        called,
-                    );
+                    collect_call_sites(&clause.body, self_attrs, names, self_calls);
                 }
             }
             Stmt::For(for_stmt) => {
-                scan_stmts_for_called_functions(
-                    &for_stmt.body,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&for_stmt.body, self_attrs, names, self_calls)
             }
             Stmt::While(while_stmt) => {
-                scan_stmts_for_called_functions(
-                    &while_stmt.body,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&while_stmt.body, self_attrs, names, self_calls)
             }
             Stmt::With(with_stmt) => {
-                scan_stmts_for_called_functions(
-                    &with_stmt.body,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&with_stmt.body, self_attrs, names, self_calls)
             }
             Stmt::Try(try_stmt) => {
-                scan_stmts_for_called_functions(
-                    &try_stmt.body,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&try_stmt.body, self_attrs, names, self_calls);
                 for handler in &try_stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    scan_stmts_for_called_functions(
-                        &h.body,
-                        file_path,
-                        project_root,
-                        files,
-                        self_attrs,
-                        called,
-                    );
+                    collect_call_sites(&h.body, self_attrs, names, self_calls);
                 }
-                scan_stmts_for_called_functions(
-                    &try_stmt.orelse,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
-                scan_stmts_for_called_functions(
-                    &try_stmt.finalbody,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&try_stmt.orelse, self_attrs, names, self_calls);
+                collect_call_sites(&try_stmt.finalbody, self_attrs, names, self_calls);
             }
-            // Function and class bodies -- deliberately recursed into, UNLIKE
-            // `scan_stmts_for_governed_calls`'s narrower traversal: almost every real
-            // call site lives inside a function or method body, not at module level,
-            // so skipping these (matching the Feast-specific scanner's scope) would
-            // make cross-file confirmation find close to nothing in practice.
+            // Function and class bodies are entered: almost every real call site lives in a
+            // function or method body. A nested function still sees the enclosing class's
+            // `self.<attr>` origins, as a real Linter's `current_self_attrs` does.
             Stmt::FunctionDef(func_def) => {
-                // `self_attrs` carries through unchanged -- a nested function defined
-                // inside a method still sees the enclosing class's `self.<attr>`
-                // origins, matching a real Linter's `current_self_attrs` staying in
-                // effect for a class's whole body, nested defs included.
-                scan_stmts_for_called_functions(
-                    &func_def.body,
-                    file_path,
-                    project_root,
-                    files,
-                    self_attrs,
-                    called,
-                );
+                collect_call_sites(&func_def.body, self_attrs, names, self_calls)
             }
             Stmt::ClassDef(class_def) => {
-                // Fresh per class, from THIS class's own __init__ only -- a nested
-                // class does NOT inherit an enclosing class's attrs, matching
-                // `collect_self_attr_origins`'s same-class scoping in the real Linter.
+                // Fresh per class, from THIS class's own `__init__` only -- a nested class
+                // does not inherit an enclosing class's attributes.
                 let mut class_self_attrs = HashMap::new();
                 for body_stmt in &class_def.body {
                     if let Stmt::FunctionDef(func_def) = body_stmt {
@@ -1546,16 +1597,58 @@ pub(crate) fn scan_stmts_for_called_functions(
                         }
                     }
                 }
-                scan_stmts_for_called_functions(
-                    &class_def.body,
-                    file_path,
-                    project_root,
-                    files,
-                    Some(&class_self_attrs),
-                    called,
-                );
+                collect_call_sites(&class_def.body, Some(&class_self_attrs), names, self_calls);
             }
             _ => {}
+        }
+    }
+}
+
+/// The call sites of a module as written.
+pub(crate) fn module_call_sites(module: &ruff_python_ast::ModModule) -> CallSites {
+    let mut names = std::collections::BTreeSet::new();
+    let mut self_calls = Vec::new();
+    collect_call_sites(&module.body, None, &mut names, &mut self_calls);
+    CallSites {
+        names: names.into_iter().collect(),
+        self_calls,
+    }
+}
+
+// Resolves a file's recorded call sites to the functions and methods they call, recording
+// each against its defining file.
+fn resolve_call_sites(
+    file_path: &str,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    sites: &CallSites,
+    called: &mut HashMap<String, std::collections::HashSet<String>>,
+) {
+    for name in &sites.names {
+        if let Some((target_file, target_func)) =
+            resolve_delegate_target(file_path, name, project_root, files)
+        {
+            called.entry(target_file).or_default().insert(target_func);
+        }
+    }
+    // `self.<attr>.<method>(...)` is a shape `resolve_delegate_target` can't cover (it only
+    // resolves bare names through imports and module aliases): it goes through the class the
+    // attribute was assigned.
+    for (origin, method) in &sites.self_calls {
+        let Some(target_file) =
+            resolve_self_attr_class_file(file_path, origin, project_root, files)
+        else {
+            continue;
+        };
+        let method_known = files
+            .get(&target_file)
+            .and_then(|e| e.class_methods.get(&origin.class_name))
+            .is_some_and(|methods| methods.contains_key(method.as_str()));
+        if method_known {
+            called
+                .entry(target_file)
+                .or_default()
+                .insert(method.clone());
         }
     }
 }
@@ -2563,6 +2656,7 @@ mod tests {
                 class_bases: HashMap::new(),
                 class_helper_summaries: HashMap::new(),
                 eval: Default::default(),
+                call_sites: CallSites::default(),
             },
         );
         let candidates: std::collections::HashSet<String> =
@@ -3638,6 +3732,225 @@ def load_{i}(path: str) -> pd.DataFrame:
 
     fn as_json(index: &ProjectIndex) -> serde_json::Value {
         serde_json::to_value(index).unwrap()
+    }
+
+    #[test]
+    fn test_should_only_record_what_callers_read_when_asked_to() {
+        // arrange
+        let project = project_with(&[
+            ("lib.py", "import pandas as pd\n\n\ndef load():\n    df = pd.read_csv(\"x.csv\")\n    return df\n"),
+            ("use.py", "from lib import load\n\n\ndef f():\n    d = load()\n    return d[\"a\"]\n"),
+        ]);
+
+        // act
+        let without = build_index_cached(project.path(), None);
+        let with = build_index_with_callers(project.path(), None);
+
+        // assert
+        assert!(without.call_usage.is_empty());
+        assert_eq!(with.call_usage["load"].columns, vec!["a".to_string()]);
+        assert_eq!(with.call_usage["load"].calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_should_still_follow_a_symlink_to_a_directory_when_collecting_python_files() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        fs::write(dir.path().join("real").join("a.py"), "x = 1\n").unwrap();
+        fs::write(dir.path().join("b.py"), "y = 2\n").unwrap();
+        fs::write(dir.path().join("notes.txt"), "not python\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+
+        // act
+        let mut found = collect_py_files(dir.path(), &std::collections::HashSet::new());
+        found.sort();
+
+        // assert
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.strip_prefix(dir.path()).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, vec!["b.py", "link/a.py", "real/a.py"]);
+    }
+
+    #[test]
+    fn test_should_not_carry_call_sites_in_the_finished_index() {
+        // arrange
+        let project = project_with(&[
+            ("a.py", LOADER),
+            (
+                "b.py",
+                "from a import load\n\n\ndef f():\n    d = load(\"x\")\n    return d\n",
+            ),
+        ]);
+
+        // act
+        let index = build_index_cached(project.path(), None);
+
+        // assert: they were used (`load` is known to be called) and then dropped.
+        let a_path = project.path().join("a.py").to_str().unwrap().to_string();
+        assert!(index.called_functions[&a_path].contains("load"));
+        assert!(index
+            .files
+            .values()
+            .all(|entry| entry.call_sites.is_empty()));
+    }
+
+    #[test]
+    fn test_should_find_a_method_called_through_a_self_attribute_in_another_file() {
+        // arrange
+        let project = project_with(&[
+            (
+                "svc.py",
+                "import pandas as pd\n\n\nclass Backtester:\n    def run(self) -> pd.DataFrame:\n        return pd.DataFrame({\"a\": [1]})\n",
+            ),
+            (
+                "use.py",
+                "from svc import Backtester\n\n\nclass Report:\n    def __init__(self):\n        self.bt = Backtester()\n\n    def go(self):\n        out = self.bt.run()\n        return out\n",
+            ),
+        ]);
+
+        // act
+        let index = build_index_cached(project.path(), None);
+
+        // assert
+        let svc = project.path().join("svc.py").to_str().unwrap().to_string();
+        assert!(index.called_functions[&svc].contains("run"));
+    }
+
+    fn call_sites_of(source: &str) -> CallSites {
+        let module = ruff_python_parser::parse_module(source)
+            .unwrap()
+            .into_syntax();
+        module_call_sites(&module)
+    }
+
+    #[test]
+    fn test_should_record_calls_in_every_statement_block() {
+        // arrange
+        let source = "\
+if a:\n    in_if()\nelse:\n    in_else()\n\
+for _ in b:\n    in_for()\n\
+while c:\n    in_while()\n\
+with d:\n    in_with()\n\
+try:\n    in_try()\nexcept E:\n    in_except()\nelse:\n    in_orelse()\nfinally:\n    in_finally()\n";
+
+        // act
+        let sites = call_sites_of(source);
+
+        // assert
+        let expected = [
+            "in_else",
+            "in_except",
+            "in_finally",
+            "in_for",
+            "in_if",
+            "in_orelse",
+            "in_try",
+            "in_while",
+            "in_with",
+        ];
+        assert_eq!(sites.names, expected);
+    }
+
+    #[test]
+    fn test_should_record_assigned_calls_attribute_callees_and_nested_function_calls() {
+        // arrange
+        let source =
+            "x = make()\nmod.helper(x)\n\n\ndef outer():\n    def inner():\n        deep()\n";
+
+        // act
+        let sites = call_sites_of(source);
+
+        // assert
+        assert_eq!(sites.names, ["deep", "helper", "make"]);
+    }
+
+    #[test]
+    fn test_should_not_record_calls_that_are_not_statement_level() {
+        // arrange
+        let source = "y = [make() for _ in z]\nprint(other())\nvalue = (lambda: hidden())()\n";
+
+        // act
+        let sites = call_sites_of(source);
+
+        // assert: only the outer `print(...)` call is a statement; `other` is an argument.
+        assert_eq!(sites.names, ["print"]);
+    }
+
+    #[test]
+    fn test_should_give_a_nested_class_its_own_self_attribute_origins() {
+        // arrange
+        let source = "\
+class Outer:\n    def __init__(self):\n        self.a = Alpha()\n\n    def run(self):\n        self.a.go()\n\
+\n    class Inner:\n        def run(self):\n            self.a.nested()\n";
+
+        // act
+        let sites = call_sites_of(source);
+
+        // assert: `Inner` has no `__init__`, so `self.a` is not an origin there.
+        let methods: Vec<&str> = sites.self_calls.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(methods, ["go"]);
+    }
+
+    #[test]
+    fn test_should_record_a_repeated_self_call_once() {
+        // arrange
+        let source = "\
+class C:\n    def __init__(self):\n        self.a = Alpha()\n\n    def run(self):\n        self.a.go()\n        self.a.go()\n";
+
+        // act
+        let sites = call_sites_of(source);
+
+        // assert
+        assert_eq!(sites.self_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_should_leave_no_call_sites_for_a_file_that_does_not_parse() {
+        // arrange
+        let project = project_with(&[("a.py", LOADER), ("broken.py", "def f(:\n    pass\n")]);
+        let config = LinterConfig::EMPTY;
+        let indexer = FileIndexer::new(project.path(), &config, None);
+
+        // act
+        indexer.index_all(&[
+            project.path().join("a.py"),
+            project.path().join("broken.py"),
+        ]);
+
+        // assert
+        let slots = indexer.slots.lock().unwrap();
+        let broken = project.path().join("broken.py");
+        let has_sites = slots.iter().any(|(path, slot)| {
+            path == &broken
+                && matches!(slot, Slot::Fresh(file) if !file.entry.call_sites.is_empty())
+        });
+        assert!(!has_sites);
+    }
+
+    #[test]
+    fn test_should_find_the_same_called_functions_with_a_warm_cache_as_without_one() {
+        // arrange
+        let project = project_with(&[
+            ("a.py", LOADER),
+            (
+                "b.py",
+                "from a import load\n\n\ndef f():\n    d = load(\"x\")\n    return d\n",
+            ),
+        ]);
+        let cache = tempfile::tempdir().unwrap();
+
+        // act
+        let uncached = build_index_cached(project.path(), None);
+        build_index_cached(project.path(), Some(cache.path()));
+        let warm = build_index_cached(project.path(), Some(cache.path()));
+
+        // assert
+        assert!(!uncached.called_functions.is_empty());
+        assert_eq!(uncached.called_functions, warm.called_functions);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::constants::{
     SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
-    is_line_ignored, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN, CODE_RESERVED_NAME,
-    CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
+    is_line_ignored, CODE_ASSUMED_CONSTANT, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN,
+    CODE_RESERVED_NAME, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
 };
 use crate::errors::{DataFrameCallSite, LegEvent, LintError, TypedSite, UntypedSite};
 use crate::frame_ops::{
@@ -86,6 +86,8 @@ struct UsageScope<'a> {
     body: &'a [Stmt],
     by_position: &'a HashMap<(usize, usize), &'a str>,
     in_function: bool,
+    // The function the body belongs to, for finding its callers.
+    function_name: Option<&'a str>,
 }
 
 // What one pass over a file's scopes learns about its untyped sites: their downstream
@@ -154,7 +156,7 @@ pub(crate) struct UnresolvedDataframeShapedCall {
 
 // What `self.<attr> = <value>(...)` in `__init__` resolved `<attr>` to -- see
 // `Linter::current_self_attrs`'s doc comment for why this exists at all.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SelfAttrOrigin {
     // Class name exactly as spelled at the assignment site (`ClassName` or
     // `module.ClassName`'s trailing segment) -- looked up in `Linter::class_methods`
@@ -335,6 +337,9 @@ pub struct Linter {
     // What functions imported from other project files do with their parameters, by local
     // name, from the index.
     imported_param_usage: HashMap<String, Vec<column_usage::ParamUsage>>,
+    // The project index this file is checked against, for what every caller of a function
+    // does with the frame it returns (`ProjectIndex::call_usage`).
+    pub(crate) project_index: Option<Arc<ProjectIndex>>,
     // Names bound to a plain string literal (or a resolvable `.sql`/text file read —
     // see `resolve_literal_rhs`) exactly once anywhere in the module. Populated by a
     // `StringBindingCollector` pre-pass in `check_file_internal`, before the main
@@ -491,6 +496,14 @@ pub struct Linter {
 // variable a reader of the report would actually recognize. Falls back to `fallback`
 // for a target with no single name of its own (tuple unpacking, `obj.attr = ...`,
 // `d["k"] = ...`), matching what the existing untyped-site call sites already do.
+// Whether the call passes any of `names` as a keyword argument.
+fn has_keyword(call: &ast::ExprCall, names: &[&str]) -> bool {
+    call.arguments
+        .keywords
+        .iter()
+        .any(|k| k.arg.as_ref().is_some_and(|a| names.contains(&a.as_str())))
+}
+
 fn assign_var_hint(assign: &ast::StmtAssign, fallback: &str) -> String {
     assign
         .targets
@@ -503,6 +516,51 @@ fn assign_var_hint(assign: &ast::StmtAssign, fallback: &str) -> String {
             }
         })
         .unwrap_or_else(|| fallback.to_string())
+}
+
+// The call a function returns, when `return <call>` is the only value-return in its body
+// (nested functions and classes aside): a second return may hand back something else, so no
+// one return describes what callers get.
+fn only_returned_call(stmts: &[Stmt]) -> Option<&ast::ExprCall> {
+    fn collect<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Return(ret) => out.extend(ret.value.as_deref()),
+                Stmt::If(s) => {
+                    collect(&s.body, out);
+                    for clause in &s.elif_else_clauses {
+                        collect(&clause.body, out);
+                    }
+                }
+                Stmt::For(s) => {
+                    collect(&s.body, out);
+                    collect(&s.orelse, out);
+                }
+                Stmt::While(s) => {
+                    collect(&s.body, out);
+                    collect(&s.orelse, out);
+                }
+                Stmt::With(s) => collect(&s.body, out),
+                Stmt::Try(s) => {
+                    collect(&s.body, out);
+                    for handler in &s.handlers {
+                        let ast::ExceptHandler::ExceptHandler(h) = handler;
+                        collect(&h.body, out);
+                    }
+                    collect(&s.orelse, out);
+                    collect(&s.finalbody, out);
+                }
+                Stmt::Match(s) => s.cases.iter().for_each(|c| collect(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    let mut returned = Vec::new();
+    collect(stmts, &mut returned);
+    match returned.as_slice() {
+        [Expr::Call(call)] => Some(call),
+        _ => None,
+    }
 }
 
 // Walk `stmts` looking for the first `return <Name>` — handles top-level returns
@@ -1505,6 +1563,7 @@ impl Linter {
             read_external_file: std::cell::Cell::new(false),
             imported_function_libraries: HashMap::new(),
             imported_param_usage: HashMap::new(),
+            project_index: None,
             string_var_candidates: HashMap::new(),
             dict_list_var_candidates: HashMap::new(),
             bool_var_candidates: HashMap::new(),
@@ -1592,7 +1651,7 @@ impl Linter {
         path: &Path,
     ) -> Result<Vec<LintError>, anyhow::Error> {
         let parsed = parse_module(source).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(self.check_parsed_module(&parsed.into_syntax(), source, path))
+        Ok(self.check_parsed_module(parsed.into_syntax(), source, path))
     }
 
     // Same as `check_file_internal`, but parses in Jupyter/IPython mode so magics
@@ -1612,27 +1671,42 @@ impl Linter {
             .try_into_module()
             .expect("Mode::Ipython always parses to a ModModule")
             .into_syntax();
-        Ok(self.check_parsed_module(&module, source, path))
+        Ok(self.check_parsed_module(module, source, path))
     }
 
     // Shared by `check_file_internal` and `check_notebook_internal`: everything
     // after parsing succeeds -- schema/variable tracking via the AST walk, then
     // filtering out any diagnostic whose line carries a `# typedframes: ignore`
     // comment.
-    fn check_parsed_module(
+    pub(crate) fn check_parsed_module(
+        &mut self,
+        mut module: ModModule,
+        source: &str,
+        path: &Path,
+    ) -> Vec<LintError> {
+        // Every name or expression that can be evaluated without running the program is
+        // replaced by the literal it equals (source ranges kept), so everything below sees
+        // a literal where there was a variable -- see `static_eval`.
+        let (folds, reads) = {
+            let analysis = static_eval::Analysis::build(&module, &self.imported_modules);
+            static_eval::plan_folds(&module, &analysis)
+        };
+        static_eval::apply_folds(&mut module, &folds);
+        self.lint_folded(&module, reads, source, path)
+    }
+
+    // Everything after folding: `module` already has its constants replaced, and `reads` are
+    // the class constants read through `self`/`cls` that went into that.
+    pub(crate) fn lint_folded(
         &mut self,
         module: &ModModule,
+        self_constant_reads: Vec<static_eval::SelfConstantRead>,
         source: &str,
         path: &Path,
     ) -> Vec<LintError> {
         self.source = source.to_string();
         self.file_display = path.display().to_string();
         self.line_index = Some(LineIndex::from_source_text(source));
-        // Every name or expression that can be evaluated without running the program is
-        // replaced by the literal it equals (source ranges kept), so everything below sees
-        // a literal where there was a variable -- see `static_eval`.
-        let folded = static_eval::fold_constants(module, &self.imported_modules);
-        let module = folded.as_ref().unwrap_or(module);
         (self.string_var_candidates, self.bool_var_candidates) =
             self.collect_literal_var_candidates(&module.body, path);
         self.dict_list_var_candidates = collect_row_var_candidates(&module.body);
@@ -1689,6 +1763,27 @@ impl Linter {
             self.visit_stmt(stmt, &mut errors);
         }
 
+        // A class constant read through `self` is trusted unless a subclass elsewhere
+        // rebinds it, which can't be seen from here; `Final` rules that out.
+        let mut advised: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for read in self_constant_reads.iter().filter(|r| !r.is_final) {
+            if advised.insert((read.class.clone(), read.attr.clone())) {
+                let (line, col) = self.source_location(read.range.start());
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_ASSUMED_CONSTANT.to_string(),
+                    message: format!(
+                        "`self.{attr}` is read as a constant, assuming no subclass in another \
+                         file overrides it; declare `{attr}: Final = ...` to make that certain",
+                        attr = read.attr
+                    ),
+                    severity: "info".to_string(),
+                });
+            }
+        }
+
         // Resolve every pending pass-through-count reversal now that the whole file
         // has been walked and `functions_called` is complete -- see
         // `pending_passthrough_reversals`'s doc comment for why this can't happen
@@ -1743,13 +1838,14 @@ impl Linter {
         let libraries = suggest::LibraryContext::new(body, &self.imported_function_libraries);
         let no_imports = static_eval::ImportedModules::new();
         let analysis = static_eval::Analysis::build(module, &no_imports);
-        let helpers = helpers::FileHelpers::new(&analysis, &self.imported_param_usage);
+        let helpers =
+            helpers::FileHelpers::new(&analysis, &self.imported_param_usage).with_methods(module);
         self.scan_scope_for_untyped_usage(
             &libraries,
             &helpers,
             body,
             &by_position,
-            false,
+            None,
             &mut results,
         );
         self.untyped_site_usage = results.usage;
@@ -1801,7 +1897,7 @@ impl Linter {
         helpers: &dyn column_usage::HelperResolver,
         scope_body: &[Stmt],
         by_position: &HashMap<(usize, usize), &str>,
-        in_function: bool,
+        function_name: Option<&str>,
         results: &mut SiteScanResults,
     ) {
         let scope = UsageScope {
@@ -1809,7 +1905,8 @@ impl Linter {
             helpers,
             body: scope_body,
             by_position,
-            in_function,
+            in_function: function_name.is_some(),
+            function_name,
         };
         self.scan_block(&scope, scope_body, &[], false, results);
     }
@@ -1837,7 +1934,7 @@ impl Linter {
                         scope.helpers,
                         &func_def.body,
                         scope.by_position,
-                        true,
+                        Some(func_def.name.as_str()),
                         results,
                     );
                 }
@@ -1916,13 +2013,45 @@ impl Linter {
                         scope.helpers,
                         &func_def.body,
                         scope.by_position,
-                        true,
+                        Some(func_def.name.as_str()),
                         results,
                     );
                 }
                 Stmt::ClassDef(inner) => self.scan_class_body(scope, &inner.body, results),
                 _ => {}
             }
+        }
+    }
+
+    // A function that returns the frame is as wide as its callers need. When every call to
+    // it in the project is seen and each only reads named columns of the result, the
+    // `returned` uses stand for those reads. Callers outside the project, or reaching the
+    // function dynamically, can't be seen, so the suggestion carries a note.
+    fn see_through_returns(&self, scope: &UsageScope, usage: &mut column_usage::ColumnUsage) {
+        let (Some(name), Some(index)) = (scope.function_name, self.project_index.as_ref()) else {
+            return;
+        };
+        let Some(callers) = index.call_usage.get(name) else {
+            return;
+        };
+        let blockers: Vec<&column_usage::OtherUse> = usage
+            .other_uses
+            .iter()
+            .filter(|u| column_usage::blocks_narrowing(u))
+            .collect();
+        if blockers.is_empty() || !blockers.iter().all(|u| u.description == "returned") {
+            return;
+        }
+        let line = blockers[0].line;
+        usage.other_uses.retain(|u| u.description != "returned");
+        let via = format!("callers of `{name}` ({} calls)", callers.calls);
+        for column in &callers.columns {
+            usage.accesses.push(column_usage::ColumnAccess {
+                column: column.clone(),
+                conditional: false,
+                line,
+                via: Some(via.clone()),
+            });
         }
     }
 
@@ -1988,6 +2117,7 @@ impl Linter {
                 line: line_of(offset),
             });
         }
+        self.see_through_returns(scope, &mut usage);
         if self.collect_suggestions {
             let next = rest
                 .first()
@@ -2120,7 +2250,7 @@ impl Linter {
         self.load_cross_file_symbols_from_module(index, &module.into_syntax(), project_root, None);
     }
 
-    fn load_cross_file_symbols_from_module(
+    pub(crate) fn load_cross_file_symbols_from_module(
         &mut self,
         index: &ProjectIndex,
         module: &ModModule,
@@ -4885,6 +5015,47 @@ impl Linter {
                         }
                     }
                 }
+                // `return pd.DataFrame({...})` / `return pd.read_csv(..., usecols=[...])`:
+                // the frame is never named, so the `return <var>` inference above can't
+                // see it, but its columns are as known as if it had been.
+                if !self.functions.contains_key(func_def.name.as_str()) {
+                    if let Some(call) = only_returned_call(&func_def.body) {
+                        if let Expr::Attribute(attr) = &*call.func {
+                            if let Expr::Name(module) = &*attr.value {
+                                if LOAD_MODULES.contains(&module.id.as_str())
+                                    && LOAD_FUNCTIONS.contains(&attr.attr.as_str())
+                                {
+                                    // A column list that isn't literal says nothing about
+                                    // the columns, whatever else the call passes.
+                                    let literal_lists = call
+                                        .arguments
+                                        .keywords
+                                        .iter()
+                                        .filter(|k| {
+                                            k.arg.as_ref().is_some_and(|a| {
+                                                matches!(a.as_str(), "columns" | "usecols")
+                                            })
+                                        })
+                                        .all(|k| {
+                                            ast_extract::extract_string_list(&k.value).is_some()
+                                        });
+                                    if let (Some(cols), true) = (
+                                        self.extract_load_columns(attr.attr.as_str(), call).0,
+                                        literal_lists,
+                                    ) {
+                                        let line = self.source_location(call.range().start()).0;
+                                        let schema = self.make_inferred_schema(
+                                            cols,
+                                            func_def.name.as_str(),
+                                            line,
+                                        );
+                                        self.functions.insert(func_def.name.to_string(), schema);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Lowest-priority fallback: a bare `-> pd.DataFrame`/`-> pl.DataFrame`
                 // return annotation with nothing more specific found above (no named
                 // Schema, no body-inferred one either -- e.g. the function's real
@@ -5469,6 +5640,21 @@ impl Linter {
                                                          exist, or annotate the variable's \
                                                          type, e.g. `df: Annotated[pd.DataFrame, \
                                                          MySchema] = pd.read_sql(...)`"
+                                                    }
+                                                    LoadKind::File
+                                                        if has_keyword(
+                                                            call,
+                                                            &["columns", "usecols"],
+                                                        ) =>
+                                                    {
+                                                        "the column list given isn't made of \
+                                                         string literals or constants the \
+                                                         checker can resolve (an attribute like \
+                                                         `self.x` can't be); use literals or \
+                                                         module-level constants, or annotate the \
+                                                         variable's type, e.g. `df: \
+                                                         Annotated[pd.DataFrame, MySchema] = \
+                                                         pd.DataFrame(...)`"
                                                     }
                                                     LoadKind::File if func_name == "DataFrame" => {
                                                         "pass a dict literal, or specify \
@@ -9724,6 +9910,335 @@ print(df["a"])
                 .all(|e| e.code != CODE_UNKNOWN_COLUMN && e.code != CODE_UNVERIFIABLE_COLUMN),
             "errors: {errors:?}"
         );
+    }
+
+    #[test]
+    fn test_should_not_tell_a_call_that_already_passes_columns_to_specify_columns() {
+        // arrange: `columns=` is given, but its elements can't be resolved statically.
+        let source = r#"
+import pandas as pd
+
+
+class C:
+    def f(self):
+        df = pd.DataFrame(columns=[self.a, self.b])
+        return df["a"]
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        let hint = errors
+            .iter()
+            .find(|e| e.code == CODE_UNTRACKED_DATAFRAME)
+            .expect("an untracked warning");
+        assert!(
+            hint.message.contains("isn't made of string literals"),
+            "{}",
+            hint.message
+        );
+        assert!(
+            !hint.message.contains("or specify `columns=`"),
+            "{}",
+            hint.message
+        );
+    }
+
+    #[test]
+    fn test_should_still_suggest_columns_when_a_dataframe_is_built_without_any() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef f(rows):\n    df = pd.DataFrame(rows)\n    return df[\"a\"]\n";
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        let hint = errors
+            .iter()
+            .find(|e| e.code == CODE_UNTRACKED_DATAFRAME)
+            .expect("an untracked warning");
+        assert!(
+            hint.message.contains("specify `columns=`"),
+            "{}",
+            hint.message
+        );
+    }
+
+    fn untyped_site_outcome(source: &str) -> (usize, Vec<String>) {
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+        (
+            linter.suggestions.len(),
+            linter.withheld.iter().map(|w| w.reason.clone()).collect(),
+        )
+    }
+
+    #[test]
+    fn test_should_resolve_the_library_of_a_frame_returned_by_an_annotated_self_method() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass S:\n    def make(self) -> pd.DataFrame:\n        return pd.DataFrame({\"a\": [1]})\n\n    def use(self):\n        df = self.make()\n        return df[\"a\"]\n";
+
+        // act
+        let (_suggested, withheld) = untyped_site_outcome(source);
+
+        // assert
+        assert!(
+            withheld.iter().all(|r| !r.contains("can't tell whether")),
+            "{withheld:?}"
+        );
+    }
+
+    const SELF_ATTRIBUTE_COLUMNS: &str = "import pandas as pd\n\n\nclass C:\n    A = \"a\"\n\n    def f(self):\n        out = pd.DataFrame(columns=[self.A])\n        return out[\"zz\"]\n";
+
+    #[test]
+    fn test_should_track_columns_named_by_a_class_constant_read_through_self() {
+        // act
+        let (typed, errors) = typed_count(SELF_ATTRIBUTE_COLUMNS);
+
+        // assert
+        assert_eq!(typed, 1);
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_track_columns_named_by_a_class_constant_read_through_cls() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass C:\n    A = \"a\"\n\n    @classmethod\n    def f(cls):\n        out = pd.DataFrame(columns=[cls.A])\n        return out[\"zz\"]\n";
+
+        // act
+        let (typed, _errors) = typed_count(source);
+
+        // assert
+        assert_eq!(typed, 1);
+    }
+
+    #[test]
+    fn test_should_not_track_a_class_constant_a_subclass_in_the_file_rebinds() {
+        // arrange: `self` in `f` may be a `Sub`, whose `A` is different.
+        let source = format!("{SELF_ATTRIBUTE_COLUMNS}\n\nclass Sub(C):\n    A = \"b\"\n");
+
+        // act
+        let (typed, _errors) = typed_count(&source);
+
+        // assert
+        assert_eq!(typed, 0);
+    }
+
+    #[test]
+    fn test_should_not_track_a_class_constant_an_instance_assignment_may_replace() {
+        // arrange
+        let source = SELF_ATTRIBUTE_COLUMNS.replace(
+            "    def f(self):",
+            "    def reset(self):\n        self.A = \"q\"\n\n    def f(self):",
+        );
+
+        // act
+        let (typed, _errors) = typed_count(&source);
+
+        // assert
+        assert_eq!(typed, 0);
+    }
+
+    #[test]
+    fn test_should_give_callers_the_columns_of_a_frame_a_function_returns_directly() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef make():\n    return pd.DataFrame({\"a\": [1], \"b\": [2]})\n\n\ndef use():\n    df = make()\n    return df[\"zz\"]\n";
+
+        // act
+        let (typed, errors) = typed_count(source);
+
+        // assert: counted once, at the call site that resolves through `make`.
+        assert_eq!(typed, 1);
+        let error = errors
+            .iter()
+            .find(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .expect("an unknown-column error");
+        assert!(error.message.contains("{a, b}"), "{}", error.message);
+    }
+
+    #[test]
+    fn test_should_give_callers_the_usecols_of_a_loader_a_function_returns_directly() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef load():\n    return pd.read_csv(\"x.csv\", usecols=[\"a\", \"b\"])\n\n\ndef use():\n    df = load()\n    return df[\"zz\"]\n";
+
+        // act
+        let (typed, errors) = typed_count(source);
+
+        // assert
+        assert_eq!(typed, 1);
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_infer_columns_when_a_function_returns_in_more_than_one_place() {
+        // arrange: either frame may come back.
+        let source = "import pandas as pd\n\n\ndef make(flag):\n    if flag:\n        return pd.DataFrame({\"a\": [1]})\n    return pd.DataFrame({\"b\": [1]})\n\n\ndef use():\n    df = make(True)\n    return df[\"a\"]\n";
+
+        // act
+        let (typed, errors) = typed_count(source);
+
+        // assert
+        assert_eq!(typed, 0);
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_prefer_columns_read_from_the_body_to_a_bare_frame_annotation() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef make() -> pd.DataFrame:\n    return pd.DataFrame({\"a\": [1]})\n\n\ndef use():\n    df = make()\n    return df[\"zz\"]\n";
+
+        // act
+        let (typed, errors) = typed_count(source);
+
+        // assert
+        assert_eq!(typed, 1);
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_advise_declaring_final_for_a_class_constant_read_through_self() {
+        // arrange: read twice, advised once.
+        let source = format!(
+            "{}        again = pd.DataFrame(columns=[self.A])\n",
+            SELF_ATTRIBUTE_COLUMNS.replace("        return out[\"zz\"]\n", "")
+        );
+
+        // act
+        let (_typed, errors) = typed_count(&source);
+
+        // assert
+        let advice: Vec<&LintError> = errors
+            .iter()
+            .filter(|e| e.code == CODE_ASSUMED_CONSTANT)
+            .collect();
+        assert_eq!(advice.len(), 1, "{errors:?}");
+        assert_eq!(advice[0].severity, "info");
+        assert!(
+            advice[0].message.contains("`A: Final = ...`"),
+            "{}",
+            advice[0].message
+        );
+    }
+
+    #[test]
+    fn test_should_not_advise_declaring_final_for_a_constant_already_final() {
+        // arrange
+        let source = SELF_ATTRIBUTE_COLUMNS
+            .replace("    A = \"a\"", "    A: Final = \"a\"")
+            .replace(
+                "import pandas as pd",
+                "from typing import Final\n\nimport pandas as pd",
+            );
+
+        // act
+        let (typed, errors) = typed_count(&source);
+
+        // assert: still resolved, and nothing to advise.
+        assert_eq!(typed, 1);
+        assert!(
+            errors.iter().all(|e| e.code != CODE_ASSUMED_CONSTANT),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_note_that_a_suggestion_through_a_self_method_assumes_it_is_not_overridden() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass S:\n    def reads(self, frame):\n        return frame[\"b\"]\n\n    def use(self):\n        df = pd.read_csv(\"x.csv\")\n        return self.reads(df)\n";
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        let suggestion = linter.suggestions.first().expect("a suggestion");
+        assert_eq!(suggestion.tier, "review");
+        assert!(
+            suggestion
+                .notes
+                .iter()
+                .any(|n| n.contains("`self.reads()`")),
+            "{:?}",
+            suggestion.notes
+        );
+    }
+
+    #[test]
+    fn test_should_not_infer_a_returned_frames_columns_from_a_non_literal_columns_argument() {
+        // arrange: the data names `a` but `columns=` decides what the frame has.
+        let source = "import pandas as pd\n\n\ndef make(cols):\n    return pd.DataFrame({\"a\": [1]}, columns=cols)\n\n\ndef use():\n    df = make([\"a\", \"b\"])\n    return df[\"b\"]\n";
+
+        // act
+        let (typed, errors) = typed_count(source);
+
+        // assert
+        assert_eq!(typed, 0);
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_track_an_empty_placeholder_constant_read_through_self() {
+        // arrange: a subclass elsewhere is expected to fill it in.
+        let source = SELF_ATTRIBUTE_COLUMNS
+            .replace("A = \"a\"", "A: list = []")
+            .replace("columns=[self.A]", "columns=self.A");
+
+        // act
+        let (typed, errors) = typed_count(&source);
+
+        // assert
+        assert_eq!(typed, 0);
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_track_a_class_constant_when_the_class_sets_attributes_dynamically() {
+        // arrange
+        for dynamic in [
+            "    def set(self, name):\n        setattr(self, name, 1)\n\n",
+            "    def load(self, values):\n        self.__dict__.update(values)\n\n",
+            "    def __setattr__(self, name, value):\n        pass\n\n",
+        ] {
+            let source = SELF_ATTRIBUTE_COLUMNS
+                .replace("    def f(self):", &format!("{dynamic}    def f(self):"));
+
+            // act
+            let (typed, _errors) = typed_count(&source);
+
+            // assert
+            assert_eq!(typed, 0, "{dynamic}");
+        }
     }
 
     // Lints `source` and returns (typed DataFrames, errors).

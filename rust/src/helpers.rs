@@ -11,7 +11,7 @@ use crate::column_usage::{
     blocks_narrowing, declares_global_or_nonlocal, first_nested_scope_mention, scan_usage_with,
     HelperResolver, ParamUsage,
 };
-use crate::static_eval::{Analysis, CalleeBinding, ImportedModules};
+use crate::static_eval::{Analysis, CalleeBinding};
 use ruff_python_ast::{self as ast, ModModule, Stmt};
 use ruff_text_size::{Ranged, TextSize};
 use std::cell::RefCell;
@@ -25,8 +25,30 @@ const MAX_DEPTH: usize = 8;
 pub(crate) struct FileHelpers<'a> {
     analysis: &'a Analysis<'a>,
     imported: &'a HashMap<String, Vec<ParamUsage>>,
+    // Every method of the file's classes by bare name; `None` once two classes define the
+    // name, since `self` could then be an instance of either (or of a subclass).
+    methods: HashMap<String, Option<&'a ast::StmtFunctionDef>>,
     memo: RefCell<HashMap<TextSize, Option<Vec<ParamUsage>>>>,
     active: RefCell<HashSet<TextSize>>,
+}
+
+fn collect_methods<'a>(
+    body: &'a [Stmt],
+    out: &mut HashMap<String, Option<&'a ast::StmtFunctionDef>>,
+) {
+    for stmt in body {
+        let Stmt::ClassDef(class) = stmt else {
+            continue;
+        };
+        for member in &class.body {
+            if let Stmt::FunctionDef(def) = member {
+                out.entry(def.name.to_string())
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(def));
+            }
+        }
+        collect_methods(&class.body, out);
+    }
 }
 
 impl<'a> FileHelpers<'a> {
@@ -37,9 +59,16 @@ impl<'a> FileHelpers<'a> {
         FileHelpers {
             analysis,
             imported,
+            methods: HashMap::new(),
             memo: RefCell::new(HashMap::new()),
             active: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Also resolves `self.<method>(...)` calls to the methods of `module`'s classes.
+    pub(crate) fn with_methods(mut self, module: &'a ModModule) -> Self {
+        collect_methods(&module.body, &mut self.methods);
+        self
     }
 
     /// The summary of each parameter of `def` that has one.
@@ -103,6 +132,27 @@ impl HelperResolver for FileHelpers<'_> {
         self.analysis.is_unbound_name(callee)
     }
 
+    fn method_usage_of(&self, method: &str) -> Option<Vec<ParamUsage>> {
+        let def = (*self.methods.get(method)?)?;
+        if !def.decorator_list.is_empty() || def.is_async {
+            return None;
+        }
+        let summaries = self.summarize(def)?;
+        // `self` takes the first position, so a caller's arguments are one place earlier.
+        Some(
+            summaries
+                .into_iter()
+                .filter(|p| p.position != 0)
+                .map(|mut p| {
+                    if p.position != usize::MAX {
+                        p.position -= 1;
+                    }
+                    p
+                })
+                .collect(),
+        )
+    }
+
     fn usage_of(&self, callee: &ast::ExprName) -> Option<Vec<ParamUsage>> {
         match self.analysis.callee_binding(callee)? {
             CalleeBinding::Function(def) => self.summarize(def),
@@ -113,11 +163,19 @@ impl HelperResolver for FileHelpers<'_> {
 
 /// Summaries for every module-level function of `module`, by name, for the index. Only
 /// functions with at least one summarized parameter are included.
+#[cfg(test)]
 pub(crate) fn module_param_usages(module: &ModModule) -> HashMap<String, Vec<ParamUsage>> {
-    let none = ImportedModules::new();
-    let analysis = Analysis::build(module, &none);
+    let none = crate::static_eval::ImportedModules::new();
+    module_param_usages_in(&Analysis::build(module, &none), module)
+}
+
+/// `module_param_usages` for an analysis already built from `module` with no imports.
+pub(crate) fn module_param_usages_in(
+    analysis: &Analysis,
+    module: &ModModule,
+) -> HashMap<String, Vec<ParamUsage>> {
     let imported = HashMap::new();
-    let helpers = FileHelpers::new(&analysis, &imported);
+    let helpers = FileHelpers::new(analysis, &imported);
     let mut out = HashMap::new();
     for stmt in &module.body {
         let Stmt::FunctionDef(def) = stmt else {
@@ -137,6 +195,7 @@ pub(crate) fn module_param_usages(module: &ModModule) -> HashMap<String, Vec<Par
 mod tests {
     use super::*;
     use crate::column_usage::scan_usage_with;
+    use crate::static_eval::ImportedModules;
     use ruff_python_parser::parse_module;
 
     // Scans the statements after the first assignment of `df`, with helpers from `source`.
@@ -145,7 +204,7 @@ mod tests {
         let none = ImportedModules::new();
         let analysis = Analysis::build(&module, &none);
         let imported = HashMap::new();
-        let helpers = FileHelpers::new(&analysis, &imported);
+        let helpers = FileHelpers::new(&analysis, &imported).with_methods(&module);
         let origin = module
             .body
             .iter()
@@ -174,6 +233,38 @@ mod tests {
             vec![("a", false), ("b", false), ("c", false)]
         );
         assert_eq!(usage.accesses[0].via.as_deref(), Some("total"));
+    }
+
+    #[test]
+    fn test_should_count_the_columns_a_method_called_on_self_reads() {
+        // `self` is not an argument, so the frame is the call's first.
+        let source = "class S:\n    def total(self, n, frame):\n        return frame[\"a\"]\n\n\ndf = load()\nprint(self.total(1, df))\nprint(self.total(1, frame=df))\n";
+
+        let usage = scan(source);
+
+        assert!(usage.other_uses.is_empty(), "{:?}", usage.other_uses);
+        assert_eq!(columns(&usage), vec![("a", false), ("a", false)]);
+        assert_eq!(usage.accesses[0].via.as_deref(), Some("self.total"));
+    }
+
+    #[test]
+    fn test_should_not_know_a_method_two_classes_define() {
+        let source = "class A:\n    def total(self, frame):\n        return frame[\"a\"]\n\n\nclass B(A):\n    def total(self, frame):\n        return frame[\"b\"]\n\n\ndf = load()\nprint(self.total(df))\n";
+
+        let usage = scan(source);
+
+        assert!(usage.accesses.is_empty());
+        assert_eq!(usage.other_uses.len(), 1);
+    }
+
+    #[test]
+    fn test_should_not_know_a_decorated_method_or_one_that_returns_the_frame() {
+        let source = "class S:\n    @staticmethod\n    def read(frame):\n        return frame[\"a\"]\n\n    def back(self, frame):\n        return frame\n\n\ndf = load()\nprint(self.read(df))\nprint(self.back(df))\n";
+
+        let usage = scan(source);
+
+        assert!(usage.accesses.is_empty());
+        assert_eq!(usage.other_uses.len(), 2);
     }
 
     #[test]

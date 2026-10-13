@@ -4,22 +4,25 @@
 //! process-wide deserialised-index cache.
 
 use crate::apply::{apply_all, Selection};
-use crate::config::{find_project_root, load_linter_config, LinterConfig};
+use crate::config::{find_project_root, find_project_root_opt, load_linter_config, LinterConfig};
 use crate::errors::{
     CheckFileResult, FileStats, LintError, UntypedSiteUsage, CODE_UNTRACKED_DATAFRAME,
 };
-use crate::index::{build_index_cached, build_single_file_index_cached, ProjectIndex};
+use crate::index::{
+    build_index_cached, build_index_with_callers, build_single_file_index_cached, ProjectIndex,
+};
 use crate::notebook::{self, NotebookCheckResult, NotebookFileStats};
-use crate::parallel::parallel_map;
+use crate::parallel::{file_cost, parallel_map_largest_first};
 use crate::suggest::{Suggestion, Withheld};
 use crate::Linter;
 use pyo3::prelude::*;
 use ruff_notebook::{Notebook, NotebookError};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 // Joins `linter.untyped_sites` (which has var/line/col) with `linter.untyped_site_usage`
 // (keyed by position only) into the flat, self-contained list `FileStats` exposes --
@@ -55,8 +58,10 @@ pub(crate) fn linter_with_index(
 ) -> (Linter, Option<Arc<ProjectIndex>>) {
     let mut linter = Linter::new();
     linter.with_context(project_root.to_path_buf(), config);
-    let index =
-        index.inspect(|idx| linter.load_cross_file_symbols(idx, source, path, project_root));
+    let index = index.inspect(|idx| {
+        linter.load_cross_file_symbols(idx, source, path, project_root);
+        linter.project_index = Some(Arc::clone(idx));
+    });
     (linter, index)
 }
 
@@ -66,80 +71,156 @@ struct SuggestFileResult {
     withheld: Vec<Withheld>,
 }
 
-/// Dry-run suggestions for one Python file: for each untyped DataFrame origin, either an
-/// edit (as byte ranges plus a rendered diff) or the reason none could be made. Nothing
-/// is written. Takes the same optional project index as [`check_file`] so it agrees
-/// with `check` about which sites are untyped. `display_path` is only how the diff
-/// headers name the file.
+/// Dry-run suggestions for many `(file, display name)` pairs, in parallel, as `(json, error)`
+/// per file in input order. For each untyped DataFrame origin the JSON has either an edit (as
+/// byte ranges plus a rendered diff) or the reason none could be made. Nothing is written. It
+/// takes the same optional project index as [`check_files`] so it agrees with `check` about
+/// which sites are untyped; the display name is only how the diff headers name the file.
 #[pyfunction]
-#[pyo3(signature = (file_path, display_path, index_bytes = None))]
-pub(crate) fn suggest_file(
-    file_path: String,
-    display_path: String,
+#[pyo3(signature = (requests, index_bytes = None))]
+pub(crate) fn suggest_files(
+    py: Python<'_>,
+    requests: Vec<(String, String)>,
     index_bytes: Option<&[u8]>,
-) -> PyResult<String> {
-    let path = Path::new(&file_path);
-    let project_root = find_project_root(path);
-    let config = load_linter_config(&project_root);
+) -> Vec<(Option<String>, Option<String>)> {
+    let index = index_bytes.and_then(get_cached_index);
+    let contexts = ProjectContexts::default();
+    py.detach(|| {
+        run_batch(
+            &requests,
+            |(file, _)| file,
+            |(file, display)| suggest_file_impl(file, display, index.clone(), &contexts),
+        )
+    })
+}
+
+/// Bug-report material for the untyped site called `name` in each file, in parallel, as
+/// `(json, error)` per file in input order: its masked verdict and a redacted snippet that is
+/// classified the same way (or why there is none). The JSON is `null` when the file has no
+/// site of that name.
+#[pyfunction]
+#[pyo3(signature = (file_paths, name, index_bytes = None))]
+pub(crate) fn report_files(
+    py: Python<'_>,
+    file_paths: Vec<String>,
+    name: String,
+    index_bytes: Option<&[u8]>,
+) -> Vec<(Option<String>, Option<String>)> {
+    let index = index_bytes.and_then(get_cached_index);
+    let contexts = ProjectContexts::default();
+    py.detach(|| {
+        run_batch(
+            &file_paths,
+            |file| file,
+            |file| report_file_impl(file, &name, index.clone(), &contexts),
+        )
+    })
+}
+
+/// Every untyped site's report in each file, in parallel, as `(json, error)` per file in input
+/// order; the JSON is an array in file order.
+#[pyfunction]
+#[pyo3(signature = (file_paths, index_bytes = None))]
+pub(crate) fn report_all_files(
+    py: Python<'_>,
+    file_paths: Vec<String>,
+    index_bytes: Option<&[u8]>,
+) -> Vec<(Option<String>, Option<String>)> {
+    let index = index_bytes.and_then(get_cached_index);
+    let contexts = ProjectContexts::default();
+    py.detach(|| {
+        run_batch(
+            &file_paths,
+            |file| file,
+            |file| report_all_file_impl(file, index.clone(), &contexts),
+        )
+    })
+}
+
+fn suggest_file_impl(
+    file_path: &str,
+    display_path: &str,
+    index: Option<Arc<ProjectIndex>>,
+    contexts: &ProjectContexts,
+) -> Result<String, CheckError> {
+    let path = Path::new(file_path);
+    let context = contexts.of(path);
+    let (project_root, config) = (&context.root, &context.config);
 
     let mut result = SuggestFileResult {
         suggestions: Vec::new(),
         withheld: Vec::new(),
     };
     if config.enabled.unwrap_or(true) {
-        let source = fs::read_to_string(path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
-        let (mut linter, _index) = linter_with_index(
-            path,
-            &project_root,
-            &config,
-            &source,
-            index_bytes.and_then(get_cached_index),
-        );
+        let source = fs::read_to_string(path).map_err(|e| CheckError::Io(e.to_string()))?;
+        let (mut linter, _index) = linter_with_index(path, project_root, config, &source, index);
         linter.collect_suggestions = true;
-        linter.suggest_display_path = display_path;
-        linter
-            .check_file_internal(&source, path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+        linter.suggest_display_path = display_path.to_string();
+        linter.check_file_internal(&source, path).map_err(runtime)?;
         result.suggestions = std::mem::take(&mut linter.suggestions);
         result.withheld = std::mem::take(&mut linter.withheld);
     }
 
-    serde_json::to_string(&result)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+    serde_json::to_string(&result).map_err(runtime)
 }
 
-/// Bug-report material for the untyped site called `name` in one file, as JSON: its
-/// masked verdict and a redacted snippet that is classified the same way (or why there
-/// is none). `"null"` when the file has no site of that name.
-#[pyfunction]
-#[pyo3(signature = (file_path, name, index_bytes = None))]
-pub(crate) fn report_file(
-    file_path: String,
-    name: String,
-    index_bytes: Option<&[u8]>,
-) -> PyResult<String> {
-    let path = Path::new(&file_path);
-    let project_root = find_project_root(path);
-    let config = load_linter_config(&project_root);
+// Runs `f` over `items` in parallel, largest file first, as `(json, error)` pairs in input
+// order. `path_of` names the file an item is about, for ordering by size.
+fn run_batch<T: Sync>(
+    items: &[T],
+    path_of: impl Fn(&T) -> &String,
+    f: impl Fn(&T) -> Result<String, CheckError> + Sync,
+) -> Vec<(Option<String>, Option<String>)> {
+    parallel_map_largest_first(
+        items,
+        |item| file_cost(Path::new(path_of(item))),
+        |item| match f(item) {
+            Ok(json) => (Some(json), None),
+            Err(error) => (None, Some(error.message().to_string())),
+        },
+    )
+}
+
+// Checks `file_path` as `report` and `report_all` need it: with suggestions collected.
+// `None` when the linter is disabled in the project's `pyproject.toml`.
+fn checked_for_report(
+    file_path: &str,
+    index: Option<Arc<ProjectIndex>>,
+    contexts: &ProjectContexts,
+) -> Result<Option<(String, Linter)>, CheckError> {
+    let path = Path::new(file_path);
+    let context = contexts.of(path);
+    let (project_root, config) = (&context.root, &context.config);
     if !config.enabled.unwrap_or(true) {
-        return Ok("null".to_string());
+        return Ok(None);
     }
-    let source = fs::read_to_string(path)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
-    let (mut linter, _index) = linter_with_index(
-        path,
-        &project_root,
-        &config,
-        &source,
-        index_bytes.and_then(get_cached_index),
-    );
+    let source = fs::read_to_string(path).map_err(|e| CheckError::Io(e.to_string()))?;
+    let (mut linter, _index) = linter_with_index(path, project_root, config, &source, index);
     linter.collect_suggestions = true;
-    linter
-        .check_file_internal(&source, path)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
-    serde_json::to_string(&crate::report::report_for(&source, &linter, &name))
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+    linter.check_file_internal(&source, path).map_err(runtime)?;
+    Ok(Some((source, linter)))
+}
+
+fn report_file_impl(
+    file_path: &str,
+    name: &str,
+    index: Option<Arc<ProjectIndex>>,
+    contexts: &ProjectContexts,
+) -> Result<String, CheckError> {
+    let report = checked_for_report(file_path, index, contexts)?
+        .and_then(|(source, linter)| crate::report::report_for(&source, &linter, name));
+    serde_json::to_string(&report).map_err(runtime)
+}
+
+fn report_all_file_impl(
+    file_path: &str,
+    index: Option<Arc<ProjectIndex>>,
+    contexts: &ProjectContexts,
+) -> Result<String, CheckError> {
+    let reports = checked_for_report(file_path, index, contexts)?
+        .map(|(source, linter)| crate::report::report_all(&source, &linter))
+        .unwrap_or_default();
+    serde_json::to_string(&reports).map_err(runtime)
 }
 
 /// Check a single Python file for DataFrame column errors.
@@ -151,7 +232,12 @@ pub(crate) fn report_file(
 #[pyfunction]
 #[pyo3(signature = (file_path, index_bytes = None))]
 pub(crate) fn check_file(file_path: String, index_bytes: Option<&[u8]>) -> PyResult<String> {
-    check_file_impl(&file_path, index_bytes.and_then(get_cached_index)).map_err(PyErr::from)
+    check_file_impl(
+        &file_path,
+        index_bytes.and_then(get_cached_index),
+        &ProjectContexts::default(),
+    )
+    .map_err(PyErr::from)
 }
 
 /// Why checking one file produced no result. Kept free of Python types so it can be
@@ -233,29 +319,87 @@ pub(crate) fn check_files(
     index_bytes: Option<&[u8]>,
 ) -> Vec<(Option<String>, Option<String>)> {
     let index = index_bytes.and_then(get_cached_index);
+    let contexts = ProjectContexts::default();
     py.detach(|| {
-        parallel_map(&file_paths, |file_path| {
-            let result = if file_path.ends_with(".ipynb") {
-                check_notebook_impl(file_path, index.clone())
-            } else {
-                check_file_impl(file_path, index.clone())
-            };
-            match result {
-                Ok(json) => (Some(json), None),
-                Err(error) => (None, Some(error.message().to_string())),
-            }
-        })
+        parallel_map_largest_first(
+            &file_paths,
+            |file_path| file_cost(Path::new(file_path)),
+            |file_path| {
+                let result = if file_path.ends_with(".ipynb") {
+                    check_notebook_impl(file_path, index.clone())
+                } else {
+                    check_file_impl(file_path, index.clone(), &contexts)
+                };
+                match result {
+                    Ok(json) => (Some(json), None),
+                    Err(error) => (None, Some(error.message().to_string())),
+                }
+            },
+        )
     })
+}
+
+// A project's root and `[tool.typedframes]` settings.
+struct ProjectContext {
+    root: PathBuf,
+    config: LinterConfig,
+}
+
+// The root and settings of the project each file belongs to, found once per directory
+// rather than once per file: a batch of files shares a handful of directories, and reading
+// and parsing `pyproject.toml` for every one of them is pure repetition. A directory with no
+// `pyproject.toml` above it has no shared root -- each file there is its own root, as
+// `find_project_root` falls back to -- so only the fact that none exists is remembered.
+#[derive(Default)]
+struct ProjectContexts {
+    by_dir: RwLock<HashMap<PathBuf, Option<Arc<ProjectContext>>>>,
+    by_root: RwLock<HashMap<PathBuf, Arc<ProjectContext>>>,
+}
+
+impl ProjectContexts {
+    fn of(&self, path: &Path) -> Arc<ProjectContext> {
+        let dir = path.parent().unwrap_or(path);
+        let cached = self.by_dir.read().ok().and_then(|m| m.get(dir).cloned());
+        let found = cached.unwrap_or_else(|| {
+            let found = find_project_root_opt(path).map(|root| self.shared(root));
+            if let Ok(mut dirs) = self.by_dir.write() {
+                dirs.insert(dir.to_path_buf(), found.clone());
+            }
+            found
+        });
+        // A file is its own root here, and a file holds no `pyproject.toml`.
+        found.unwrap_or_else(|| {
+            Arc::new(ProjectContext {
+                root: path.to_path_buf(),
+                config: LinterConfig::EMPTY,
+            })
+        })
+    }
+
+    fn shared(&self, root: PathBuf) -> Arc<ProjectContext> {
+        if let Some(known) = self.by_root.read().ok().and_then(|m| m.get(&root).cloned()) {
+            return known;
+        }
+        let context = Arc::new(ProjectContext {
+            config: load_linter_config(&root),
+            root: root.clone(),
+        });
+        if let Ok(mut roots) = self.by_root.write() {
+            roots.insert(root, Arc::clone(&context));
+        }
+        context
+    }
 }
 
 fn check_file_impl(
     file_path: &str,
     index: Option<Arc<ProjectIndex>>,
+    contexts: &ProjectContexts,
 ) -> Result<String, CheckError> {
     let file_path = file_path.to_string();
     let path = Path::new(&file_path);
-    let project_root = find_project_root(path);
-    let config = load_linter_config(&project_root);
+    let context = contexts.of(path);
+    let (project_root, config) = (&context.root, &context.config);
 
     if !config.enabled.unwrap_or(true) {
         let empty = CheckFileResult {
@@ -267,7 +411,17 @@ fn check_file_impl(
 
     let source = fs::read_to_string(path).map_err(|e| CheckError::Io(e.to_string()))?;
 
-    let (mut linter, index) = linter_with_index(path, &project_root, &config, &source, index);
+    // Parsed once, for the cross-file symbol load and for the lint itself.
+    let parsed = ruff_python_parser::parse_module(&source).ok();
+    let module = parsed.as_ref().map(|parsed| parsed.syntax());
+    let mut linter = Linter::new();
+    linter.with_context(project_root.clone(), config);
+    let index = index.inspect(|idx| {
+        if let Some(module) = module {
+            linter.load_cross_file_symbols_from_module(idx, module, project_root, path.to_str());
+        }
+        linter.project_index = Some(Arc::clone(idx));
+    });
 
     // Diagnostics resolved at a call site in THIS file, targeting a function elsewhere
     // whose parameter governs a Feast features= call — see
@@ -281,7 +435,10 @@ fn check_file_impl(
         .and_then(|idx| idx.call_site_errors.get(&file_path).cloned())
         .unwrap_or_default();
 
-    let mut errors = linter.check_file_internal(&source, path).map_err(runtime)?;
+    let mut errors = match parsed {
+        Some(parsed) => linter.check_parsed_module(parsed.into_syntax(), &source, path),
+        None => linter.check_file_internal(&source, path).map_err(runtime)?,
+    };
 
     // Retract THIS file's own intra-function untracked-dataframe warnings for any
     // function that at least one call site anywhere in the project was actually SEEN
@@ -456,9 +613,27 @@ fn new_index_id() -> u128 {
     (u128::from(hasher.finish()) << 64) | (nanos & u128::from(u64::MAX))
 }
 
-pub(crate) fn encode_index(index: &ProjectIndex) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let mut bytes = new_index_id().to_le_bytes().to_vec();
+fn serialize_with_id(index: &ProjectIndex) -> Result<(u128, Vec<u8>), rmp_serde::encode::Error> {
+    let id = new_index_id();
+    let mut bytes = id.to_le_bytes().to_vec();
     index.serialize(&mut rmp_serde::Serializer::new(&mut bytes))?;
+    Ok((id, bytes))
+}
+
+#[cfg(test)]
+pub(crate) fn encode_index(index: &ProjectIndex) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    serialize_with_id(index).map(|(_, bytes)| bytes)
+}
+
+// `encode_index` for an index just built, which is kept as the cached one under the id on the
+// bytes: the run that follows checks every file against it, and has no need to decode it again.
+pub(crate) fn encode_and_cache_index(
+    index: ProjectIndex,
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let (id, bytes) = serialize_with_id(&index)?;
+    if let Ok(mut cache) = INDEX_CACHE.lock() {
+        *cache = Some((id, Arc::new(index)));
+    }
     Ok(bytes)
 }
 
@@ -485,15 +660,21 @@ pub(crate) fn get_cached_index(bytes: &[u8]) -> Option<Arc<ProjectIndex>> {
 /// held in Python memory and passed to subsequent [`check_file`] calls without any
 /// intermediate disk I/O.
 #[pyfunction]
-#[pyo3(signature = (project_root, cache_dir = None))]
+#[pyo3(signature = (project_root, cache_dir = None, with_callers = false))]
 pub(crate) fn build_project_index(
     py: Python<'_>,
     project_root: String,
     cache_dir: Option<String>,
+    with_callers: bool,
 ) -> PyResult<Vec<u8>> {
     let root = Path::new(&project_root);
-    let index = py.detach(|| build_index_cached(root, cache_dir.as_deref().map(Path::new)));
-    encode_index(&index)
+    let build = if with_callers {
+        build_index_with_callers
+    } else {
+        build_index_cached
+    };
+    let index = py.detach(|| build(root, cache_dir.as_deref().map(Path::new)));
+    encode_and_cache_index(index)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
 }
 
@@ -523,7 +704,7 @@ pub(crate) fn build_single_file_index(
     else {
         return Ok(None);
     };
-    encode_index(&index)
+    encode_and_cache_index(index)
         .map(Some)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
 }
@@ -535,6 +716,68 @@ mod tests {
     fn empty_index() -> ProjectIndex {
         let dir = tempfile::tempdir().unwrap();
         build_index_cached(dir.path(), None)
+    }
+
+    #[test]
+    fn test_should_give_each_file_its_own_root_when_no_project_file_is_above_it() {
+        // arrange: with no `pyproject.toml` the file's own path is its root, so one file's
+        // answer must never be handed to its neighbours.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.py"), dir.path().join("b.py"));
+        fs::write(&a, "x = 1\n").unwrap();
+        fs::write(&b, "y = 2\n").unwrap();
+        let contexts = ProjectContexts::default();
+
+        // act
+        let (first, second) = (contexts.of(&a), contexts.of(&b));
+
+        // assert
+        assert_eq!(first.root, a);
+        assert_eq!(second.root, b);
+    }
+
+    #[test]
+    fn test_should_share_one_context_between_files_of_the_same_project() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        let (a, b) = (dir.path().join("a.py"), dir.path().join("b.py"));
+        fs::write(&a, "x = 1\n").unwrap();
+        fs::write(&b, "y = 2\n").unwrap();
+        let contexts = ProjectContexts::default();
+
+        // act
+        let (first, second) = (contexts.of(&a), contexts.of(&b));
+
+        // assert
+        assert_eq!(first.root, dir.path());
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_should_serve_an_index_just_built_from_the_cache_without_decoding_it() {
+        // arrange: a body that could not be decoded, behind the id of the cached index.
+        let mut bytes = encode_and_cache_index(empty_index()).unwrap();
+        bytes.truncate(INDEX_ID_LEN + 3);
+
+        // act
+        let served = get_cached_index(&bytes);
+
+        // assert
+        assert!(served.is_some());
+    }
+
+    #[test]
+    fn test_should_still_decode_an_index_whose_id_is_not_the_cached_one() {
+        // arrange
+        let bytes = encode_index(&empty_index()).unwrap();
+        let _ = encode_and_cache_index(empty_index()).unwrap();
+
+        // act
+        let decoded = get_cached_index(&bytes);
+
+        // assert
+        assert!(decoded.is_some());
     }
 
     #[test]

@@ -340,6 +340,32 @@ pub(crate) fn suggest_selection(
                 .to_string(),
         );
     }
+    let mut methods: Vec<&str> = Vec::new();
+    for via in usage.accesses.iter().filter_map(|a| a.via.as_deref()) {
+        if via.starts_with("self.") && !methods.contains(&via) {
+            methods.push(via);
+        }
+    }
+    if !methods.is_empty() {
+        let names: Vec<String> = methods.iter().map(|m| format!("`{m}()`")).collect();
+        notes.push(format!(
+            "assumes {} is not overridden in a subclass in another file, which this scan \
+             can't see",
+            names.join(", ")
+        ));
+    }
+    if let Some(via) = usage
+        .accesses
+        .iter()
+        .filter_map(|a| a.via.as_deref())
+        .find(|v| v.starts_with("callers of "))
+    {
+        notes.push(format!(
+            "the frame is returned, so these columns are the ones read by the {via} seen \
+             under the scanned path; callers outside it, or reaching the function dynamically, \
+             can't be seen"
+        ));
+    }
     if !origin.function_local {
         notes.push(
             "module-level variable: another module may import it and read columns this scan \
@@ -406,6 +432,9 @@ pub(crate) fn suggest_selection(
         .collect();
     helpers.sort_unstable();
     helpers.dedup();
+    let (callers, helpers): (Vec<&str>, Vec<&str>) = helpers
+        .into_iter()
+        .partition(|v| v.starts_with("callers of "));
     let through = if helpers.is_empty() {
         String::new()
     } else {
@@ -417,6 +446,11 @@ pub(crate) fn suggest_selection(
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    };
+    let through = if callers.is_empty() {
+        through
+    } else {
+        format!("{through}; read by the {}", callers.join(", "))
     };
     let reason = format!(
         "only {} {} read later (line{} {}{through})",
@@ -618,15 +652,25 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
     }
     let mut current = value;
     let mut innermost_call: Option<&ast::ExprCall> = None;
+    // The attribute applied directly to the root name: `make` in `self.make().copy()`.
+    let mut root_attribute: Option<&str> = None;
     loop {
         match current {
             Expr::Call(call) => {
                 innermost_call = Some(call);
                 current = &call.func;
             }
-            Expr::Attribute(attribute) => current = &attribute.value,
+            Expr::Attribute(attribute) => {
+                root_attribute = Some(attribute.attr.as_str());
+                current = &attribute.value;
+            }
             Expr::Name(name) => {
                 let id = name.id.as_str();
+                if matches!(id, "self" | "cls") && innermost_call.is_some() {
+                    if let Some(library) = root_attribute.and_then(|m| context.functions.get(m)) {
+                        return Ok(*library);
+                    }
+                }
                 match context.modules.get(id) {
                     Some(ModuleKind::Library(library)) => return Ok(*library),
                     Some(ModuleKind::Connectorx) => return Ok(connectorx_library(innermost_call)),

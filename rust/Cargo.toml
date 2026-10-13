@@ -1,6 +1,6 @@
 [package]
 name = "typedframes_checker"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "A high-performance Rust-based checker for typedframes DataFrame column schemas"
 license = "MIT"
@@ -50,6 +50,15 @@ sqlparser = "0.62"
 # "Undefined symbols ... _PyByteArray_AsString". Linux tolerates it, which is why CI
 # stayed green while local macOS runs did not.
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
+
+# The allocator split ruff and ty use: jemalloc where it builds, mimalloc on Windows (jemalloc
+# has no MSVC support), the platform allocator elsewhere. Keep the `cfg`s in `src/lib.rs` in
+# step with these. `disable_initial_exec_tls` lets the library be loaded with `dlopen`.
+[target.'cfg(all(not(target_os = "windows"), not(target_os = "openbsd"), not(target_os = "aix"), not(target_os = "android"), any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64", target_arch = "riscv64")))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["disable_initial_exec_tls"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.8"

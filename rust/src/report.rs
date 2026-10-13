@@ -10,7 +10,8 @@
 
 use crate::linter::Linter;
 use crate::phrase;
-use crate::report_names::{keeps_name, keeps_string, KEPT_IMPORT_ROOTS};
+use crate::report_minimize::minimize;
+use crate::report_names::{keeps_library_name, keeps_name, keeps_string, KEPT_IMPORT_ROOTS};
 use crate::suggest::Library;
 use ruff_python_ast::{Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
@@ -20,8 +21,10 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-/// Most lines a snippet may have; a bigger scope is left for the reporter to trim.
+/// Most lines a snippet may have once reduced; a bigger scope is left for the reporter to trim.
 const MAX_SNIPPET_LINES: usize = 150;
+/// Most lines of redacted code worth reducing.
+const MAX_UNREDUCED_LINES: usize = 1500;
 /// Most extra same-file functions pulled in because the site's scope calls them.
 const MAX_HELPERS: usize = 12;
 
@@ -135,6 +138,19 @@ fn analyse(source: &str) -> Result<Linter, String> {
     Ok(linter)
 }
 
+// A reason without how many more uses there were: dropping code can lower that count
+// without changing why the checker decided as it did.
+fn without_count(reason: &str) -> &str {
+    reason.strip_suffix(", and N more").unwrap_or(reason)
+}
+
+fn same_verdict(a: &Verdict, b: &Verdict) -> bool {
+    a.outcome == b.outcome
+        && a.kind == b.kind
+        && a.tier == b.tier
+        && without_count(&a.reason) == without_count(&b.reason)
+}
+
 /// Runs the snippet through the checker and confirms the site at `position` gets the
 /// same verdict the real one did.
 fn verify(snippet: &str, position: (usize, usize), real: &Verdict) -> Result<(), String> {
@@ -146,7 +162,7 @@ fn verify(snippet: &str, position: (usize, usize), real: &Verdict) -> Result<(),
         .ok_or("the snippet has no untyped site where the original was")?;
     let redacted = verdict_of(&linter, &site.phrase)
         .ok_or("the snippet's site was neither suggested nor withheld")?;
-    if &redacted == real {
+    if same_verdict(&redacted, real) {
         Ok(())
     } else {
         Err(format!(
@@ -165,14 +181,21 @@ struct Tok {
 /// Renames as it goes, remembering what it called each original.
 #[derive(Default)]
 struct Namer {
+    // Names a kept import brought in, which stay wherever they are used.
+    imported: std::collections::HashSet<String>,
     names: HashMap<String, String>,
     strings: HashMap<String, String>,
     counts: HashMap<char, usize>,
 }
 
 impl Namer {
-    fn name(&mut self, original: &str, prefix: char) -> String {
-        if keeps_name(original) {
+    // `library`: whether a library name may stay here; false where the code is defining the
+    // name, or a capitalised name is used as a plain value.
+    fn name(&mut self, original: &str, prefix: char, library: bool) -> String {
+        if keeps_name(original)
+            || self.imported.contains(original)
+            || (library && keeps_library_name(original, prefix))
+        {
             return original.to_string();
         }
         if let Some(found) = self.names.get(original) {
@@ -222,6 +245,8 @@ struct Redactor<'a> {
     site_offset: usize,
     site_position: Option<(usize, usize)>,
     refusal: Option<String>,
+    // Redacting a kept import, whose names are the library's own.
+    in_import: bool,
 }
 
 // Token kinds that are syntax rather than data: copied as written.
@@ -429,6 +454,10 @@ impl Redactor<'_> {
                 "Int" | "Float" | "Complex" => masked_number(&kind, text),
                 // `!r`, `!s` and `!a` are syntax, not names.
                 "Name" if self.previous_kind(index, floor) == "Exclamation" => text.to_string(),
+                "Name" if self.in_import => {
+                    self.namer.imported.insert(text.to_string());
+                    text.to_string()
+                }
                 "Name" => {
                     let before = self.previous_kind(index, floor);
                     let after = self.next_kind(index, ceil);
@@ -447,7 +476,9 @@ impl Redactor<'_> {
                     } else {
                         'v'
                     };
-                    self.namer.name(text, prefix)
+                    // A bare name is the library's only if an import said so.
+                    let library = before == "Dot" || prefix == 'k';
+                    self.namer.name(text, prefix, library)
                 }
                 other if copies_verbatim(other) => text.to_string(),
                 other => {
@@ -627,9 +658,11 @@ fn build_snippet(
         site_offset,
         site_position: None,
         refusal: None,
+        in_import: false,
     };
 
     // Library imports.
+    redactor.in_import = true;
     for stmt in body.iter().filter(|s| is_kept_import(s)) {
         redactor.redact(
             stmt.range().start().to_usize(),
@@ -637,6 +670,7 @@ fn build_snippet(
         );
         redactor.out.push('\n');
     }
+    redactor.in_import = false;
 
     // Signature-only stand-ins for imported functions whose library the index knew.
     let defined: BTreeSet<&str> = body
@@ -679,7 +713,7 @@ fn build_snippet(
                 Library::Polars => ("pl", "polars"),
             };
             stub_libraries.insert(module);
-            let renamed = redactor.namer.name(name, 'f');
+            let renamed = redactor.namer.name(name, 'f', false);
             stub_lines.push_str(&format!(
                 "def {renamed}(*args, **kwargs) -> {alias}.DataFrame: ...\n"
             ));
@@ -748,14 +782,23 @@ fn build_snippet(
     let trimmed = text.trim_start_matches('\n');
     let removed_lines = text.len() - trimmed.len();
     let snippet = format!("{trimmed}\n");
-    if snippet.lines().count() > MAX_SNIPPET_LINES {
+    // Leading blank lines were removed, so the recorded line moves up by that many.
+    if snippet.lines().count() > MAX_UNREDUCED_LINES {
         return Err(format!(
-            "the code around the site is {} lines, over the {MAX_SNIPPET_LINES}-line limit; trim it by hand",
+            "the code around the site is {} lines, over the {MAX_UNREDUCED_LINES}-line limit; trim it by hand",
             snippet.lines().count()
         ));
     }
-    // Leading blank lines were removed, so the recorded line moves up by that many.
     Ok((snippet, (position.0 - removed_lines, position.1)))
+}
+
+/// The report for every untyped site in the file the linter has just checked, in file order.
+pub(crate) fn report_all(source: &str, linter: &Linter) -> Vec<SiteReport> {
+    linter
+        .untyped_sites
+        .iter()
+        .filter_map(|site| report_for(source, linter, &site.phrase))
+        .collect()
 }
 
 /// The report for the untyped site called `name`, or `None` if this file has no such site.
@@ -767,7 +810,19 @@ pub(crate) fn report_for(source: &str, linter: &Linter, name: &str) -> Option<Si
     let built = offset
         .ok_or_else(|| "the site's position could not be found".to_string())
         .and_then(|offset| build_snippet(source, offset, linter.imported_function_libraries()))
-        .and_then(|(snippet, position)| verify(&snippet, position, &verdict).map(|()| snippet));
+        .and_then(|(snippet, position)| {
+            verify(&snippet, position, &verdict)?;
+            let (reduced, _) = minimize(&snippet, position, |text, at| {
+                verify(text, at, &verdict).is_ok()
+            });
+            if reduced.lines().count() > MAX_SNIPPET_LINES {
+                return Err(format!(
+                    "the code that decides this is {} lines, over the {MAX_SNIPPET_LINES}-line limit; trim it by hand",
+                    reduced.lines().count()
+                ));
+            }
+            Ok(reduced)
+        });
     let (snippet, refusal) = match built {
         Ok(snippet) => (Some(snippet), None),
         Err(reason) => (None, Some(reason)),
@@ -809,6 +864,21 @@ mod tests {
         report_for(source, &linter, &name).expect("site has a report")
     }
 
+    // The redacted code before it is reduced, for tests of what redaction keeps and hides.
+    fn unreduced(source: &str, var: &str) -> String {
+        let linter = linter_for(source);
+        let site = linter
+            .untyped_sites
+            .iter()
+            .find(|s| s.var == var)
+            .expect("no such site");
+        let index = LineIndex::from_source_text(source);
+        let offset = phrase::offset_of(source, &index, site.line, site.col).expect("offset");
+        build_snippet(source, offset, linter.imported_function_libraries())
+            .expect("a snippet")
+            .0
+    }
+
     const PRIVATE: &str = r#"import pandas as pd
 from acme_internal import secret_loader
 
@@ -828,10 +898,9 @@ class PricingService:
     #[test]
     fn test_should_keep_none_of_the_original_names_or_strings() {
         // act
-        let report = report(PRIVATE, "revenue");
+        let snippet = unreduced(PRIVATE, "revenue");
 
         // assert
-        let snippet = report.snippet.expect("a snippet was produced");
         for secret in [
             "acme",
             "PricingService",
@@ -854,6 +923,59 @@ class PricingService:
         assert!(snippet.contains("pd.read_csv("), "{snippet}");
         assert!(snippet.contains("sep=\"c"), "{snippet}");
         assert!(snippet.contains(".groupby("), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_keep_library_names_where_the_library_uses_them_and_rename_ordinary_variables() {
+        // arrange
+        let source = "import numpy as np\nimport pandas as pd\n\n\ndef run(tenants: np.ndarray, value):\n    raw = pd.read_csv(\"x.csv\")\n    value = np.percentile(tenants, 2, axis=0)\n    return raw.fillna(value=value), raw.shape\n";
+
+        // act
+        let snippet = unreduced(source, "raw");
+
+        // assert
+        assert!(snippet.contains("np.ndarray"), "{snippet}");
+        assert!(snippet.contains("np.percentile("), "{snippet}");
+        assert!(snippet.contains(".fillna(value="), "{snippet}");
+        assert!(snippet.contains(".shape"), "{snippet}");
+        assert!(!snippet.contains("tenants"), "{snippet}");
+        assert!(snippet.contains("v2 = np.percentile("), "{snippet}");
+        assert!(!snippet.contains("value ="), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_rename_user_definitions_and_values_that_share_a_library_name() {
+        // arrange: `load`, `Config` and `Catalog` are numpy or polars names too.
+        let source = "import pandas as pd\n\n\nclass Catalog:\n    pass\n\n\ndef load(path):\n    return pd.read_csv(path)\n\n\ndef run():\n    Config = Catalog\n    raw = pd.read_csv(\"x.csv\")\n    print(load(raw))\n    return raw[\"a\"], Config\n";
+
+        // act
+        let snippet = unreduced(source, "raw");
+
+        // assert
+        for secret in ["Catalog", "Config", "load"] {
+            assert!(
+                !snippet.contains(secret),
+                "{secret} leaked into:\n{snippet}"
+            );
+        }
+        assert!(snippet.contains("pd.read_csv("), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_keep_a_name_imported_from_a_library_wherever_it_is_used() {
+        // arrange
+        let source = "from pandas import DataFrame\nimport pandas as pd\n\n\ndef run(rows) -> DataFrame:\n    raw = pd.read_csv(\"x.csv\")\n    return DataFrame(raw[\"a\"])\n";
+
+        // act
+        let snippet = unreduced(source, "raw");
+
+        // assert
+        assert!(
+            snippet.contains("from pandas import DataFrame"),
+            "{snippet}"
+        );
+        assert!(snippet.contains("-> DataFrame:"), "{snippet}");
+        assert!(snippet.contains("return DataFrame("), "{snippet}");
     }
 
     #[test]
@@ -894,7 +1016,7 @@ class NightlyJob(acme_internal.BaseJob):
     #[test]
     fn test_should_rename_the_same_thing_the_same_way() {
         // act
-        let snippet = report(PRIVATE, "revenue").snippet.unwrap();
+        let snippet = unreduced(PRIVATE, "revenue");
 
         // assert: the frame is renamed once and used under that name
         let first_line = snippet
@@ -927,10 +1049,9 @@ def run(who):
 "#;
 
         // act
-        let report = report(source, "raw");
+        let snippet = unreduced(source, "raw");
 
         // assert
-        let snippet = report.snippet.expect("a snippet was produced");
         for secret in [
             "secret",
             "text_secret",
@@ -1085,7 +1206,7 @@ def run(items, flag):
     #[test]
     fn test_should_keep_the_helper_the_scope_calls_and_the_class_around_it() {
         // act
-        let snippet = report(PRIVATE, "revenue").snippet.unwrap();
+        let snippet = unreduced(PRIVATE, "revenue");
 
         // assert
         assert!(snippet.contains("class C1"), "{snippet}");
@@ -1142,7 +1263,7 @@ def run(items, flag):
     }
 
     #[test]
-    fn test_should_refuse_a_scope_too_large_to_paste() {
+    fn test_should_reduce_a_scope_too_large_to_paste_to_the_code_that_decides_the_verdict() {
         // arrange
         let mut source =
             String::from("import pandas as pd\n\n\ndef run():\n    raw = pd.read_csv(\"x.csv\")\n");
@@ -1155,8 +1276,73 @@ def run(items, flag):
         let report = report(&source, "raw");
 
         // assert
+        let snippet = report.snippet.expect("a snippet once the noise is dropped");
+        assert!(!snippet.contains("print"), "{snippet}");
+        assert!(snippet.contains("read_csv"), "{snippet}");
+        assert!(snippet.lines().count() < 10, "{snippet}");
+    }
+
+    #[test]
+    fn test_should_refuse_a_site_whose_own_statement_is_too_large_to_paste() {
+        // arrange
+        let mut source = String::from(
+            "import pandas as pd\n\n\ndef run():\n    raw = pd.read_csv(\n        \"x.csv\",\n        na_values=[\n",
+        );
+        for i in 0..200 {
+            source.push_str(&format!("            \"n{i}\",\n"));
+        }
+        source.push_str("        ],\n    )\n    return raw[\"a\"]\n");
+
+        // act
+        let report = report(&source, "raw");
+
+        // assert
         assert!(report.snippet.is_none());
         assert!(report.refusal.unwrap().contains("trim it by hand"));
+    }
+
+    #[test]
+    fn test_should_drop_code_that_does_not_decide_the_verdict() {
+        // act
+        let snippet = report(PRIVATE, "revenue").snippet.unwrap();
+
+        // assert: the load and the call it escapes into stay; the arithmetic does not
+        assert!(snippet.contains("read_csv"), "{snippet}");
+        assert!(!snippet.contains('+'), "{snippet}");
+        assert!(!snippet.contains("groupby"), "{snippet}");
+        assert!(!snippet.contains("sum"), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_keep_the_use_that_withholds_a_site_and_drop_the_rest() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef run(a, b):\n    raw = pd.read_csv(\"x.csv\")\n    print(raw[\"a\"])\n    return clean_the_data(raw)\n";
+
+        // act
+        let report = report(source, "raw");
+
+        // assert
+        assert_eq!(report.verdict.outcome, "withheld");
+        let snippet = report.snippet.expect("snippet");
+        assert!(!snippet.contains("print"), "{snippet}");
+        assert_eq!(snippet.matches("(v").count(), 1, "{snippet}");
+        assert!(
+            snippet.contains("def f1():"),
+            "unused parameters go: {snippet}"
+        );
+    }
+
+    #[test]
+    fn test_should_give_a_reduced_snippet_that_is_still_classified_like_the_original() {
+        // act
+        let report = report(PRIVATE, "revenue");
+
+        // assert
+        let snippet = report.snippet.expect("snippet");
+        let redacted = linter_for(&snippet);
+        assert_eq!(redacted.untyped_sites.len(), 1);
+        let again = verdict_of(&redacted, &redacted.untyped_sites[0].phrase).unwrap();
+        assert!(same_verdict(&again, &report.verdict));
     }
 
     #[test]
@@ -1215,6 +1401,35 @@ def run(items, flag):
             "{}",
             &source[offset..]
         );
+    }
+
+    #[test]
+    fn test_should_report_every_untyped_site_in_a_file() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef one():\n    a = pd.read_csv(\"x.csv\")\n    return a[\"x\"]\n\n\ndef two():\n    b = pd.read_csv(\"y.csv\")\n    print(b[\"y\"])\n    return keep(b)\n";
+        let linter = linter_for(source);
+
+        // act
+        let reports = report_all(source, &linter);
+
+        // assert
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].var, "a");
+        assert_eq!(reports[1].var, "b");
+        assert!(reports.iter().all(|r| r.snippet.is_some()));
+    }
+
+    #[test]
+    fn test_should_keep_an_import_the_remaining_code_still_uses_and_drop_one_it_does_not() {
+        // arrange
+        let source = "import numpy as np\nimport pandas as pd\n\n\nclass S:\n    def make(self, rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n\n    def use(self):\n        n = np.zeros(3)\n        df = self.make([])\n        return df[\"a\"], n\n";
+
+        // act
+        let snippet = report(source, "df").snippet.expect("snippet");
+
+        // assert
+        assert!(snippet.contains("import pandas as pd"), "{snippet}");
+        assert!(!snippet.contains("numpy"), "{snippet}");
     }
 
     #[test]

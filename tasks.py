@@ -1,12 +1,19 @@
 """Invoke tasks for typedframes development."""
 
 import importlib.machinery
+import sys
+from importlib.metadata import version
+from inspect import Parameter, isroutine, signature
 from pathlib import Path
+from types import ModuleType
+from typing import Any
+from warnings import catch_warnings, simplefilter
 
 from invoke import Context, task
 
 RUST_DIR = Path("rust")
 EXTENSION_DIR = Path("src") / "typedframes"
+LIBRARY_NAMES = RUST_DIR / "src" / "library_names.txt"
 
 
 def _compiled_extension() -> Path | None:
@@ -33,7 +40,7 @@ def _needs_build() -> bool:
     extension_mtime = extension.stat().st_mtime
     src_dir = RUST_DIR / "src"
 
-    for src_file in src_dir.rglob("*.rs"):
+    for src_file in [*src_dir.rglob("*.rs"), *src_dir.rglob("*.txt")]:
         if src_file.stat().st_mtime > extension_mtime:
             return True
 
@@ -49,6 +56,154 @@ def build(ctx: Context, *, force: bool = False) -> None:
         ctx.run("maturin develop --manifest-path rust/Cargo.toml")
     else:
         print("Rust checker is up to date.")
+
+
+def _targets() -> list[Any]:
+    """Modules, classes and live instances whose public names a snippet may use."""
+    import numpy as np
+    import pandas as pd
+    import polars as pl
+
+    frame = pd.DataFrame({"a": [1]})
+    series = pd.Series(["a"])
+    pl_frame = pl.DataFrame({"a": [1]})
+    pl_series = pl.Series("a", ["x"])
+    expr = pl.col("a")
+    return [
+        np,
+        np.random,
+        np.linalg,
+        np.fft,
+        np.char,
+        np.ma,
+        pd,
+        pd.api.types,
+        pl,
+        pl.selectors,
+        np.ndarray,
+        np.dtype,
+        frame,
+        series,
+        pd.Index,
+        pd.MultiIndex,
+        pd.DatetimeIndex,
+        pd.Timestamp,
+        pd.Timedelta,
+        pd.Period,
+        pd.Categorical,
+        frame.groupby("a"),
+        frame["a"].rolling(1),
+        frame["a"].expanding(),
+        frame["a"].ewm(com=1),
+        series.str,
+        pd.Series(pd.to_datetime(["2020-01-01"])).dt,
+        series.astype("category").cat,
+        pl_frame,
+        pl_frame.lazy(),
+        pl_series,
+        expr,
+        pl_frame.group_by("a"),
+        expr.str,
+        expr.dt,
+        expr.list,
+        expr.arr,
+        expr.struct,
+        expr.cat,
+        expr.name,
+        expr.bin,
+        expr.meta,
+        pl_series.str,
+        pl_series.dt,
+        pl_series.list,
+        pl_series.struct,
+    ]
+
+
+def _polars_error() -> type[Exception]:
+    """Polars' base exception, imported on demand."""
+    from polars.exceptions import PolarsError
+
+    return PolarsError
+
+
+def _member(target: Any, name: str) -> Any:
+    """A target's attribute, or None when reading it needs state the target lacks."""
+    with catch_warnings():
+        simplefilter("ignore")
+        try:
+            return getattr(target, name)
+        except (AttributeError, ImportError, ValueError, TypeError, NotImplementedError, _polars_error()):
+            return None
+
+
+def _parameter_names(member: Any) -> set[str]:
+    """The named parameters of a routine or class, without `self` placeholders and private ones."""
+    if not (isroutine(member) or isinstance(member, type)):
+        return set()
+    try:
+        parameters = signature(member).parameters.values()
+    except (ValueError, TypeError):
+        return set()
+    return {
+        p.name
+        for p in parameters
+        if p.kind not in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD) and not p.name.startswith("_")
+    }
+
+
+_LIBRARY_ROOTS = frozenset({"numpy", "pandas", "polars"})
+_MIN_NAME_LENGTH = 2
+
+
+def _from_library(member: Any) -> bool:
+    """Whether a module's attribute is numpy's, pandas' or polars' own, not something it imported."""
+    if isinstance(member, ModuleType):
+        return member.__name__.split(".")[0] in _LIBRARY_ROOTS
+    owner = getattr(member, "__module__", None)
+    return not isinstance(owner, str) or owner.split(".")[0] in _LIBRARY_ROOTS
+
+
+def _library_names() -> tuple[set[str], set[str], set[str]]:
+    """The module-level names, the class and instance member names, and the parameter names."""
+    module_names: set[str] = set()
+    members: set[str] = set()
+    keywords: set[str] = set()
+    for target in _targets():
+        names = module_names if isinstance(target, ModuleType) else members
+        for name in dir(target):
+            if name.startswith("_") or len(name) < _MIN_NAME_LENGTH:
+                continue
+            member = _member(target, name)
+            if not isinstance(target, ModuleType) or _from_library(member):
+                names.add(name)
+            keywords |= {k for k in _parameter_names(member) if len(k) >= _MIN_NAME_LENGTH}
+    return module_names, members, keywords
+
+
+@task
+def names(_ctx: Context) -> None:
+    """Regenerate the library names a bug-report snippet may keep, from the installed numpy, pandas and polars.
+
+    Each line of `rust/src/library_names.txt` is `m<name>` (a name numpy, pandas or polars defines
+    in a module), `a<name>` (a class or instance member) or `k<name>` (a parameter name). The
+    redactor keeps them only after a dot or as call keywords; names the libraries merely import
+    (`os`, `json`) and single letters are left out.
+    """
+    module_names, members, keywords = _library_names()
+    header = (
+        f"# Generated by `inv names` from numpy {version('numpy')}, "
+        f"pandas {version('pandas')}, polars {version('polars')}. Do not edit."
+    )
+    lines = [
+        header,
+        *(f"m{n}" for n in sorted(module_names)),
+        *(f"a{n}" for n in sorted(members - module_names)),
+        *(f"k{n}" for n in sorted(keywords)),
+    ]
+    LIBRARY_NAMES.write_text("\n".join(lines) + "\n")
+    sys.stdout.write(
+        f"wrote {LIBRARY_NAMES}: {len(module_names)} module names, {len(members)} members, {len(keywords)} keywords\n"
+    )
 
 
 @task(name="format-check")

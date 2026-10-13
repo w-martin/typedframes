@@ -127,6 +127,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            # jemalloc fixes its page size when it is built; 64 KiB also covers aarch64 kernels
+            # with larger pages. Ruff builds its aarch64 wheels the same way (astral-sh/ruff#3791).
+            docker_options: -e JEMALLOC_SYS_WITH_LG_PAGE=16
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: macos-latest
@@ -142,6 +145,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
+          docker-options: ${{ matrix.docker_options }}
 
       - uses: actions/upload-artifact@v4
         with:

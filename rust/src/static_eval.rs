@@ -7,6 +7,7 @@
 //! so every consumer in the checker sees a literal instead of a variable.
 
 use crate::constants::{LOAD_FUNCTIONS, LOAD_MODULES};
+use crate::fast_hash::{FastMap, FastSet};
 use ruff_python_ast::visitor::transformer::{self as ast_transformer, Transformer};
 use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
 use ruff_python_ast::{
@@ -1470,21 +1471,21 @@ enum Binding<'a> {
 struct Scope<'a> {
     kind: ScopeKind,
     parent: Option<usize>,
-    bindings: HashMap<String, Vec<Binding<'a>>>,
-    globals: HashSet<String>,
-    nonlocals: HashSet<String>,
+    bindings: FastMap<&'a str, Vec<Binding<'a>>>,
+    globals: FastSet<&'a str>,
+    nonlocals: FastSet<&'a str>,
 }
 
-struct Occurrence {
+struct Occurrence<'a> {
     offset: TextSize,
     scope: usize,
-    name: String,
+    name: &'a str,
     use_: Use,
     // The classification holds only while this builtin is not rebound anywhere.
     builtin: Option<&'static str>,
 }
 
-type GroupKey = (usize, String);
+type GroupKey<'a> = (usize, &'a str);
 
 // Builtins whose arguments they only inspect.
 const SAFE_BUILTINS: &[&str] = &[
@@ -1724,28 +1725,40 @@ fn annotation_is_plain(annotation: &Expr) -> bool {
     }
 }
 
+// `Final`, `Final[T]`, `typing.Final`.
+fn annotation_is_final(annotation: &Expr) -> bool {
+    match annotation {
+        Expr::Name(n) => n.id.as_str() == "Final",
+        Expr::Attribute(a) => a.attr.as_str() == "Final",
+        Expr::Subscript(s) => annotation_is_final(&s.value),
+        _ => false,
+    }
+}
+
 struct Collector<'a> {
     scopes: Vec<Scope<'a>>,
     current: usize,
-    occurrences: Vec<Occurrence>,
-    pending_nonlocal: Vec<(usize, String)>,
+    occurrences: Vec<Occurrence<'a>>,
+    pending_nonlocal: Vec<(usize, &'a str)>,
     // `Cls.NAME` loads, resolved to a class attribute once every scope is known.
-    attribute_occurrences: Vec<AttributeOccurrence>,
+    attribute_occurrences: Vec<AttributeOccurrence<'a>>,
     // `Cls.NAME = ...` / `del Cls.NAME` / `Cls.NAME += ...`: (scope, `Cls`, `NAME`).
-    pending_attribute_stores: Vec<(usize, String, String)>,
+    pending_attribute_stores: Vec<(usize, &'a str, &'a str)>,
+    // Names bound by `NAME: Final = ...`, which promises no subclass rebinds them.
+    final_bindings: HashSet<(usize, &'a str)>,
     // `setattr(Cls, ...)` / `delattr(Cls, ...)` / `vars(Cls)`: (scope, `Cls`).
-    dynamic_class_targets: Vec<(usize, String)>,
+    dynamic_class_targets: Vec<(usize, &'a str)>,
     // `globals()`/`vars()`/`exec`/`eval`/`locals()` or a star import: the module
     // namespace can change in ways no binding records.
     dynamic_namespace: bool,
     builtin: Option<&'static str>,
 }
 
-struct AttributeOccurrence {
+struct AttributeOccurrence<'a> {
     range: TextRange,
     scope: usize,
-    base: String,
-    attr: String,
+    base: &'a str,
+    attr: &'a str,
     use_: Use,
 }
 
@@ -1755,15 +1768,16 @@ impl<'a> Collector<'a> {
             scopes: vec![Scope {
                 kind: ScopeKind::Module,
                 parent: None,
-                bindings: HashMap::new(),
-                globals: HashSet::new(),
-                nonlocals: HashSet::new(),
+                bindings: FastMap::default(),
+                globals: FastSet::default(),
+                nonlocals: FastSet::default(),
             }],
             current: 0,
             occurrences: Vec::new(),
             pending_nonlocal: Vec::new(),
             attribute_occurrences: Vec::new(),
             pending_attribute_stores: Vec::new(),
+            final_bindings: HashSet::new(),
             dynamic_class_targets: Vec::new(),
             dynamic_namespace: false,
             builtin: None,
@@ -1774,39 +1788,39 @@ impl<'a> Collector<'a> {
         self.scopes.push(Scope {
             kind,
             parent: Some(self.current),
-            bindings: HashMap::new(),
-            globals: HashSet::new(),
-            nonlocals: HashSet::new(),
+            bindings: FastMap::default(),
+            globals: FastSet::default(),
+            nonlocals: FastSet::default(),
         });
         let id = self.scopes.len() - 1;
         self.current = id;
         id
     }
 
-    fn bind_in(&mut self, scope: usize, name: &str, binding: Binding<'a>) {
+    fn bind_in(&mut self, scope: usize, name: &'a str, binding: Binding<'a>) {
         if self.scopes[scope].globals.contains(name) {
             self.scopes[0]
                 .bindings
-                .entry(name.to_string())
+                .entry(name)
                 .or_default()
                 .push(binding);
         } else if self.scopes[scope].nonlocals.contains(name) {
-            self.pending_nonlocal.push((scope, name.to_string()));
+            self.pending_nonlocal.push((scope, name));
         } else {
             self.scopes[scope]
                 .bindings
-                .entry(name.to_string())
+                .entry(name)
                 .or_default()
                 .push(binding);
         }
     }
 
-    fn bind(&mut self, name: &str, binding: Binding<'a>) {
+    fn bind(&mut self, name: &'a str, binding: Binding<'a>) {
         self.bind_in(self.current, name, binding);
     }
 
     // A walrus inside a comprehension binds in the enclosing function/module scope.
-    fn bind_walrus(&mut self, name: &str) {
+    fn bind_walrus(&mut self, name: &'a str) {
         let mut scope = self.current;
         while self.scopes[scope].kind == ScopeKind::Comprehension {
             scope = self.scopes[scope].parent.unwrap_or(0);
@@ -1814,14 +1828,14 @@ impl<'a> Collector<'a> {
         self.bind_in(scope, name, Binding::Other);
     }
 
-    fn occurrence(&mut self, name: &ast::ExprName, use_: Use) {
+    fn occurrence(&mut self, name: &'a ast::ExprName, use_: Use) {
         if name.ctx != ExprContext::Load {
             return;
         }
         self.occurrences.push(Occurrence {
             offset: name.range().start(),
             scope: self.current,
-            name: name.id.to_string(),
+            name: name.id.as_str(),
             use_,
             builtin: self.builtin,
         });
@@ -1878,8 +1892,8 @@ impl<'a> Collector<'a> {
                 if let Expr::Name(base) = &*a.value {
                     self.pending_attribute_stores.push((
                         self.current,
-                        base.id.to_string(),
-                        a.attr.to_string(),
+                        base.id.as_str(),
+                        a.attr.as_str(),
                     ));
                 }
             }
@@ -1998,6 +2012,11 @@ impl<'a> Collector<'a> {
             Stmt::AnnAssign(a) => {
                 if let Some(v) = &a.value {
                     self.expr(v, Use::Escapes);
+                }
+                if let (Expr::Name(n), Some(_)) = (&*a.target, &a.value) {
+                    if annotation_is_final(&a.annotation) {
+                        self.final_bindings.insert((self.current, n.id.as_str()));
+                    }
                 }
                 match (&*a.target, &a.value) {
                     // An annotation can declare the name to be something its value isn't
@@ -2118,12 +2137,12 @@ impl<'a> Collector<'a> {
             }
             Stmt::Global(g) => {
                 for name in &g.names {
-                    self.scopes[self.current].globals.insert(name.to_string());
+                    self.scopes[self.current].globals.insert(name.as_str());
                 }
             }
             Stmt::Nonlocal(n) => {
                 for name in &n.names {
-                    self.scopes[self.current].nonlocals.insert(name.to_string());
+                    self.scopes[self.current].nonlocals.insert(name.as_str());
                 }
             }
             Stmt::TypeAlias(t) => self.target(&t.name),
@@ -2134,11 +2153,11 @@ impl<'a> Collector<'a> {
 
     // A name that is read and rebound in one statement (`x += y`): ruff gives its `ctx`
     // as Store, but it is a use all the same.
-    fn occurrence_force(&mut self, name: &ast::ExprName, use_: Use) {
+    fn occurrence_force(&mut self, name: &'a ast::ExprName, use_: Use) {
         self.occurrences.push(Occurrence {
             offset: name.range().start(),
             scope: self.current,
-            name: name.id.to_string(),
+            name: name.id.as_str(),
             use_,
             builtin: None,
         });
@@ -2149,12 +2168,16 @@ impl<'a> Collector<'a> {
             Expr::Name(n) => self.occurrence(n, use_),
             Expr::Attribute(a) => {
                 if let Expr::Name(base) = &*a.value {
+                    if a.attr.as_str() == "__dict__" {
+                        self.dynamic_class_targets
+                            .push((self.current, base.id.as_str()));
+                    }
                     if a.ctx == ExprContext::Load {
                         self.attribute_occurrences.push(AttributeOccurrence {
                             range: a.range(),
                             scope: self.current,
-                            base: base.id.to_string(),
-                            attr: a.attr.to_string(),
+                            base: base.id.as_str(),
+                            attr: a.attr.as_str(),
                             use_,
                         });
                     }
@@ -2328,7 +2351,7 @@ impl<'a> Collector<'a> {
                 if matches!(name, "setattr" | "delattr" | "vars") {
                     if let Some(Expr::Name(target)) = call.arguments.args.first() {
                         self.dynamic_class_targets
-                            .push((self.current, target.id.to_string()));
+                            .push((self.current, target.id.as_str()));
                     }
                 }
                 if let Some(b) = SAFE_BUILTINS.iter().find(|b| **b == name) {
@@ -2366,8 +2389,8 @@ impl<'a> Collector<'a> {
                     self.attribute_occurrences.push(AttributeOccurrence {
                         range: a.range(),
                         scope: self.current,
-                        base: base.id.to_string(),
-                        attr: a.attr.to_string(),
+                        base: base.id.as_str(),
+                        attr: a.attr.as_str(),
                         use_: Use::Safe,
                     });
                 }
@@ -2453,23 +2476,37 @@ enum Memo {
     Done(Option<Value>),
 }
 
+/// A class constant read through `self`/`cls` and resolved to its value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SelfConstantRead {
+    pub(crate) range: TextRange,
+    pub(crate) attr: String,
+    pub(crate) class: String,
+    /// Declared `NAME: Final = ...`, so no subclass can rebind it.
+    pub(crate) is_final: bool,
+}
+
 pub(crate) struct Analysis<'a> {
-    groups: HashMap<GroupKey, Group<'a>>,
-    occurrence_group: HashMap<TextSize, Option<GroupKey>>,
-    attribute_group: HashMap<TextRange, Option<GroupKey>>,
+    groups: FastMap<GroupKey<'a>, Group<'a>>,
+    occurrence_group: FastMap<TextSize, Option<GroupKey<'a>>>,
+    attribute_group: FastMap<TextRange, Option<GroupKey<'a>>>,
     // `cfg.NAME` where `cfg` is an imported module: the module's group and the member,
     // plus how this file uses that member (every use of it, across the whole file).
-    module_attribute: HashMap<TextRange, (GroupKey, String)>,
-    module_member_use: HashMap<(GroupKey, String), (bool, bool)>,
+    module_attribute: FastMap<TextRange, (GroupKey<'a>, &'a str)>,
+    module_member_use: FastMap<(GroupKey<'a>, &'a str), (bool, bool)>,
+    // Class constants read through `self`/`cls`, where a subclass in another file could
+    // have rebound the name.
+    self_reads: Vec<SelfConstantRead>,
     imports: &'a ImportedModules,
     shadowed: Vec<String>,
     complete: bool,
     dynamic_namespace: bool,
-    memo: RefCell<HashMap<GroupKey, Memo>>,
+    // Keyed by a group's address, which is stable because `groups` is not changed once built.
+    memo: RefCell<FastMap<usize, Memo>>,
     depth: Cell<u32>,
     // Functions being evaluated right now (a recursive one is refused) and how many calls
     // have been evaluated in total.
-    call_stack: RefCell<Vec<GroupKey>>,
+    call_stack: RefCell<Vec<usize>>,
     calls: Cell<u32>,
 }
 
@@ -2477,6 +2514,15 @@ const MAX_CALL_DEPTH: usize = 16;
 const MAX_CALLS: u32 = 10_000;
 
 impl<'a> Analysis<'a> {
+    /// Forgets what evaluating has cached and used up, so the next user of a shared analysis
+    /// gets the budgets and results a freshly built one would have.
+    pub(crate) fn reset(&self) {
+        self.memo.borrow_mut().clear();
+        self.depth.set(0);
+        self.call_stack.borrow_mut().clear();
+        self.calls.set(0);
+    }
+
     pub(crate) fn build(module: &'a ModModule, imports: &'a ImportedModules) -> Self {
         let mut collector = Collector::new();
         collector.body(&module.body);
@@ -2491,10 +2537,10 @@ impl<'a> Analysis<'a> {
         let complete = loads.offsets.iter().all(|o| recorded.contains(o));
 
         let scopes = &collector.scopes;
-        let mut groups: HashMap<GroupKey, Group<'a>> = HashMap::new();
+        let mut groups: FastMap<GroupKey<'a>, Group<'a>> = FastMap::default();
         for (id, scope) in scopes.iter().enumerate() {
             for (name, bindings) in &scope.bindings {
-                let group = groups.entry((id, name.clone())).or_default();
+                let group = groups.entry((id, name)).or_default();
                 group.bindings += bindings.len();
                 if let [only] = bindings.as_slice() {
                     match only {
@@ -2519,21 +2565,37 @@ impl<'a> Analysis<'a> {
             }
         }
 
+        let classes = ClassIndex::new(&groups);
         // A class whose attributes `setattr`/`delattr`/`vars` may change, and stores to a
         // class attribute, which are one more binding of it.
-        let mut dynamic_classes: HashSet<usize> = HashSet::new();
+        let mut dynamic_classes: FastSet<usize> = FastSet::default();
         for (scope, name) in &collector.dynamic_class_targets {
-            if let Some((_, body)) = lookup(scopes, *scope, name)
+            let class = enclosing_class(&classes, scopes, *scope, name)
+                .or_else(|| lookup(scopes, *scope, name))
                 .and_then(|key| groups.get(&key))
-                .and_then(|g| g.class)
-            {
+                .and_then(|g| g.class);
+            if let Some((_, body)) = class {
                 dynamic_classes.insert(body);
             }
         }
+        // A class that intercepts attribute assignment can give any attribute any value.
+        for group in groups.values() {
+            if let Some((_, body)) = group.class {
+                if scopes[body].bindings.contains_key("__setattr__") {
+                    dynamic_classes.insert(body);
+                }
+            }
+        }
         for (scope, base, attr) in &collector.pending_attribute_stores {
-            if let Some(key) =
-                class_attribute(&groups, scopes, &dynamic_classes, *scope, base, attr)
-            {
+            if let Some(key) = attribute_group_of(
+                &groups,
+                &classes,
+                scopes,
+                &dynamic_classes,
+                *scope,
+                base,
+                attr,
+            ) {
                 if let Some(group) = groups.get_mut(&key) {
                     group.bindings += 1;
                 }
@@ -2541,9 +2603,9 @@ impl<'a> Analysis<'a> {
         }
 
         let bound_anywhere = |name: &str| scopes.iter().any(|s| s.bindings.contains_key(name));
-        let mut occurrence_group = HashMap::new();
+        let mut occurrence_group = FastMap::default();
         for occurrence in &collector.occurrences {
-            let key = lookup(scopes, occurrence.scope, &occurrence.name)
+            let key = lookup(scopes, occurrence.scope, occurrence.name)
                 .filter(|key| groups.contains_key(key));
             let mut use_ = occurrence.use_;
             if occurrence.builtin.is_some_and(bound_anywhere) {
@@ -2561,17 +2623,20 @@ impl<'a> Analysis<'a> {
             occurrence_group.insert(occurrence.offset, key);
         }
 
-        let mut attribute_group = HashMap::new();
-        let mut module_attribute = HashMap::new();
-        let mut module_member_use: HashMap<(GroupKey, String), (bool, bool)> = HashMap::new();
+        let mut attribute_group = FastMap::default();
+        let mut self_reads = Vec::new();
+        let mut module_attribute = FastMap::default();
+        let mut module_member_use: FastMap<(GroupKey<'a>, &'a str), (bool, bool)> =
+            FastMap::default();
         for occurrence in &collector.attribute_occurrences {
-            let key = class_attribute(
+            let key = attribute_group_of(
                 &groups,
+                &classes,
                 scopes,
                 &dynamic_classes,
                 occurrence.scope,
-                &occurrence.base,
-                &occurrence.attr,
+                occurrence.base,
+                occurrence.attr,
             );
             if let Some(group) = key.as_ref().and_then(|k| groups.get_mut(k)) {
                 match occurrence.use_ {
@@ -2580,8 +2645,20 @@ impl<'a> Analysis<'a> {
                     Use::Escapes => group.escapes = true,
                 }
             }
+            if let Some(key) = key.as_ref() {
+                if let Some(class) =
+                    enclosing_class(&classes, scopes, occurrence.scope, occurrence.base)
+                {
+                    self_reads.push(SelfConstantRead {
+                        range: occurrence.range,
+                        attr: occurrence.attr.to_string(),
+                        class: class.1.to_string(),
+                        is_final: collector.final_bindings.contains(key),
+                    });
+                }
+            }
             if key.is_none() {
-                let module_group = lookup(scopes, occurrence.scope, &occurrence.base)
+                let module_group = lookup(scopes, occurrence.scope, occurrence.base)
                     .filter(|k| groups.get(k).is_some_and(|g| g.bindings == 1));
                 if let Some(base) = module_group.filter(|k| {
                     matches!(
@@ -2589,8 +2666,8 @@ impl<'a> Analysis<'a> {
                         Some(ImportRef::Module(_))
                     )
                 }) {
-                    let member = (base.clone(), occurrence.attr.clone());
-                    let flags = module_member_use.entry(member.clone()).or_default();
+                    let member = (base, occurrence.attr);
+                    let flags = module_member_use.entry(member).or_default();
                     match occurrence.use_ {
                         Use::Safe => {}
                         Use::Interior => flags.0 = true,
@@ -2608,6 +2685,7 @@ impl<'a> Analysis<'a> {
             attribute_group,
             module_attribute,
             module_member_use,
+            self_reads,
             imports,
             shadowed: EVALUATED_BUILTINS
                 .iter()
@@ -2616,15 +2694,16 @@ impl<'a> Analysis<'a> {
                 .collect(),
             complete,
             dynamic_namespace: collector.dynamic_namespace,
-            memo: RefCell::new(HashMap::new()),
+            memo: RefCell::new(FastMap::default()),
             depth: Cell::new(0),
             call_stack: RefCell::new(Vec::new()),
             calls: Cell::new(0),
         }
     }
 
-    fn group_value(&self, key: &GroupKey) -> Option<Value> {
-        match self.memo.borrow().get(key) {
+    fn group_value(&self, key: &GroupKey<'a>) -> Option<Value> {
+        let id = self.group_id(key)?;
+        match self.memo.borrow().get(&id) {
             Some(Memo::InProgress) => return None,
             Some(Memo::Done(v)) => return v.clone(),
             None => {}
@@ -2634,16 +2713,21 @@ impl<'a> Analysis<'a> {
             return None;
         }
         self.depth.set(depth);
-        self.memo.borrow_mut().insert(key.clone(), Memo::InProgress);
+        self.memo.borrow_mut().insert(id, Memo::InProgress);
         let value = self.compute(key);
         self.depth.set(depth - 1);
-        self.memo
-            .borrow_mut()
-            .insert(key.clone(), Memo::Done(value.clone()));
+        self.memo.borrow_mut().insert(id, Memo::Done(value.clone()));
         value
     }
 
-    fn compute(&self, key: &GroupKey) -> Option<Value> {
+    // A stable identity for the group `key` names, if there is one.
+    fn group_id(&self, key: &GroupKey<'a>) -> Option<usize> {
+        self.groups
+            .get(key)
+            .map(|group| std::ptr::from_ref(group) as usize)
+    }
+
+    fn compute(&self, key: &GroupKey<'a>) -> Option<Value> {
         let group = self.groups.get(key)?;
         // One plain assignment, and a module-level name only if nothing can rewrite the
         // module namespace behind the bindings' backs.
@@ -2735,11 +2819,9 @@ impl NameResolver for Analysis<'_> {
         args: Vec<Value>,
         kwargs: Vec<(String, Value)>,
     ) -> Option<Value> {
-        let key = self
-            .occurrence_group
-            .get(&callee.range().start())?
-            .clone()?;
+        let key = (*self.occurrence_group.get(&callee.range().start())?)?;
         let group = self.groups.get(&key)?;
+        let id = std::ptr::from_ref(group) as usize;
         if let Some(ImportRef::From(level, module, name)) = &group.import {
             if group.bindings != 1 || (key.0 == 0 && self.dynamic_namespace) {
                 return None;
@@ -2760,7 +2842,7 @@ impl NameResolver for Analysis<'_> {
         // No recursion, and a ceiling on the work one file can ask for.
         {
             let stack = self.call_stack.borrow();
-            if stack.contains(&key) || stack.len() >= MAX_CALL_DEPTH {
+            if stack.contains(&id) || stack.len() >= MAX_CALL_DEPTH {
                 return None;
             }
         }
@@ -2774,7 +2856,7 @@ impl NameResolver for Analysis<'_> {
             Evaluator::new(self).eval(default)
         })?;
 
-        self.call_stack.borrow_mut().push(key);
+        self.call_stack.borrow_mut().push(id);
         let result = Evaluator::new(self).run_body(bound, &def.body);
         self.call_stack.borrow_mut().pop();
         result
@@ -2801,7 +2883,7 @@ impl<'a> Analysis<'a> {
         if self.dynamic_namespace {
             return None;
         }
-        let group = self.groups.get(&(0, name.to_string()))?;
+        let group = self.groups.get(&(0, name))?;
         let def = group.function?;
         (group.bindings == 1 && is_plain_function(def) && def.decorator_list.is_empty())
             .then_some(def)
@@ -2824,7 +2906,7 @@ impl<'a> Analysis<'a> {
                 .then_some(CalleeBinding::Function(def));
         }
         matches!(group.import, Some(ImportRef::From(..))).then(|| CalleeBinding::Imported {
-            local: key.1.clone(),
+            local: key.1.to_string(),
         })
     }
 }
@@ -2957,9 +3039,7 @@ const EVALUATED_BUILTINS: &[&str] = &[
 ];
 
 /// The statically known constants and evaluable functions of `module`, for importers.
-pub(crate) fn export_module(module: &ModModule, source: &str) -> ModuleExports {
-    let none = ImportedModules::new();
-    let analysis = Analysis::build(module, &none);
+pub(crate) fn export_module(analysis: &Analysis, source: &str) -> ModuleExports {
     let mut exports = ModuleExports::default();
     if !analysis.complete || analysis.dynamic_namespace {
         return exports;
@@ -2971,14 +3051,14 @@ pub(crate) fn export_module(module: &ModModule, source: &str) -> ModuleExports {
             continue;
         }
         if group.assign.is_some() {
-            if let Some(value) = analysis.group_value(&(0, name.clone())) {
+            if let Some(value) = analysis.group_value(&(0, name)) {
                 if node_count(&value) <= MAX_EXPORTED_NODES {
-                    exports.constants.insert(name.clone(), value);
+                    exports.constants.insert(name.to_string(), value);
                 }
             }
         } else if let Some(def) = group.function {
             if group.bindings == 1 && is_plain_function(def) {
-                candidates.insert(name.as_str(), def);
+                candidates.insert(name, def);
             }
         }
     }
@@ -3097,15 +3177,26 @@ impl NameResolver for ForeignRun<'_> {
 // assigned in its body (or in its single user-defined base's). Refused for a class a
 // decorator, a metaclass, an outside base class (an enum, a `BaseSchema`, an ORM base),
 // several bases, a rebinding of its name, or `setattr`/`delattr`/`vars` could have changed.
-fn class_attribute(
-    groups: &HashMap<GroupKey, Group>,
-    scopes: &[Scope],
-    dynamic: &HashSet<usize>,
+fn class_attribute<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    scopes: &[Scope<'a>],
+    dynamic: &FastSet<usize>,
     from: usize,
     base: &str,
-    attr: &str,
-) -> Option<GroupKey> {
-    let mut key = lookup(scopes, from, base).filter(|k| groups.contains_key(k))?;
+    attr: &'a str,
+) -> Option<GroupKey<'a>> {
+    let key = lookup(scopes, from, base).filter(|k| groups.contains_key(k))?;
+    class_attribute_of(groups, scopes, dynamic, key, attr)
+}
+
+// `class_attribute` for the class whose name group is `key`.
+fn class_attribute_of<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    scopes: &[Scope<'a>],
+    dynamic: &FastSet<usize>,
+    mut key: GroupKey<'a>,
+    attr: &'a str,
+) -> Option<GroupKey<'a>> {
     let mut chain: Vec<usize> = Vec::new();
     loop {
         let group = groups.get(&key)?;
@@ -3139,34 +3230,155 @@ fn class_attribute(
     }
     chain
         .iter()
-        .find(|body| groups.contains_key(&(**body, attr.to_string())))
-        .map(|body| (*body, attr.to_string()))
+        .find(|body| groups.contains_key(&(**body, attr)))
+        .map(|body| (*body, attr))
+}
+
+// What `self`/`cls` lookups need to know about a file's classes, built once: a class body's
+// name group, and which classes list a given name as a base.
+struct ClassIndex<'a> {
+    by_body: FastMap<usize, GroupKey<'a>>,
+    children: FastMap<&'a str, Vec<(&'a str, usize)>>,
+}
+
+impl<'a> ClassIndex<'a> {
+    fn new(groups: &FastMap<GroupKey<'a>, Group<'a>>) -> Self {
+        let mut by_body = FastMap::default();
+        let mut children: FastMap<&'a str, Vec<(&'a str, usize)>> = FastMap::default();
+        for (key, group) in groups {
+            let Some((def, body)) = group.class else {
+                continue;
+            };
+            by_body.insert(body, *key);
+            for base in def.arguments.iter().flat_map(|a| a.args.iter()) {
+                if let Expr::Name(base) = base {
+                    children
+                        .entry(base.id.as_str())
+                        .or_default()
+                        .push((key.1, body));
+                }
+            }
+        }
+        ClassIndex { by_body, children }
+    }
+}
+
+// The group of the class whose method `from` is in, when `base` is that method's own `self`
+// or `cls` (bound once, so not reassigned).
+fn enclosing_class<'a>(
+    classes: &ClassIndex<'a>,
+    scopes: &[Scope<'a>],
+    from: usize,
+    base: &str,
+) -> Option<GroupKey<'a>> {
+    if !matches!(base, "self" | "cls") {
+        return None;
+    }
+    let mut method = from;
+    while matches!(scopes[method].kind, ScopeKind::Comprehension) {
+        method = scopes[method].parent?;
+    }
+    if !matches!(scopes[method].kind, ScopeKind::Function)
+        || scopes[method].bindings.get(base).map(Vec::len) != Some(1)
+    {
+        return None;
+    }
+    let body = scopes[method].parent?;
+    if !matches!(scopes[body].kind, ScopeKind::Class) {
+        return None;
+    }
+    classes.by_body.get(&body).cloned()
+}
+
+// Whether a class derived (in this file) from `class_name`, directly or not, binds `attr`:
+// then what `self.attr` is depends on which class `self` is an instance of.
+fn rebound_in_subclass(
+    classes: &ClassIndex,
+    scopes: &[Scope],
+    class_name: &str,
+    attr: &str,
+) -> bool {
+    let mut parents = vec![class_name];
+    let mut next = 0;
+    while next < parents.len() {
+        let parent = parents[next];
+        next += 1;
+        for (name, body) in classes.children.get(parent).into_iter().flatten() {
+            if scopes[*body].bindings.contains_key(attr) {
+                return true;
+            }
+            if !parents.contains(name) {
+                parents.push(name);
+            }
+        }
+    }
+    false
+}
+
+// The group `base.attr` reads or writes: a class attribute reached by the class's name, or
+// through `self`/`cls` in one of its methods when no class derived from it rebinds `attr`
+// (a subclass in another file can't be seen).
+fn attribute_group_of<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    classes: &ClassIndex<'a>,
+    scopes: &[Scope<'a>],
+    dynamic: &FastSet<usize>,
+    from: usize,
+    base: &str,
+    attr: &'a str,
+) -> Option<GroupKey<'a>> {
+    match enclosing_class(classes, scopes, from, base) {
+        Some(class) => {
+            if rebound_in_subclass(classes, scopes, class.1, attr) {
+                return None;
+            }
+            let key = class_attribute_of(groups, scopes, dynamic, class, attr)?;
+            // An empty placeholder is what a subclass elsewhere is expected to fill in.
+            let placeholder =
+                groups
+                    .get(&key)
+                    .and_then(|g| g.assign)
+                    .is_some_and(|rhs| match rhs {
+                        Expr::List(l) => l.elts.is_empty(),
+                        Expr::Tuple(t) => t.elts.is_empty(),
+                        Expr::Set(s) => s.elts.is_empty(),
+                        Expr::Dict(d) => d.items.is_empty(),
+                        _ => false,
+                    });
+            (!placeholder).then_some(key)
+        }
+        None => class_attribute(groups, scopes, dynamic, from, base, attr),
+    }
 }
 
 // Python's name lookup from `from` outward: the scope's own binding, else the nearest
 // enclosing one, not counting class scopes (a method can't see its class's names).
-fn lookup(scopes: &[Scope], from: usize, name: &str) -> Option<GroupKey> {
+fn lookup<'a>(scopes: &[Scope<'a>], from: usize, name: &str) -> Option<GroupKey<'a>> {
     let scope = &scopes[from];
-    if scope.globals.contains(name) {
-        return Some((0, name.to_string()));
+    if let Some(declared) = scope.globals.get(name) {
+        return Some((0, *declared));
     }
     if scope.nonlocals.contains(name) {
         let mut parent = scope.parent;
         while let Some(i) = parent {
-            if scopes[i].kind == ScopeKind::Function && scopes[i].bindings.contains_key(name) {
-                return Some((i, name.to_string()));
+            if scopes[i].kind == ScopeKind::Function {
+                if let Some((bound, _)) = scopes[i].bindings.get_key_value(name) {
+                    return Some((i, *bound));
+                }
             }
             parent = scopes[i].parent;
         }
         return None;
     }
-    if scope.bindings.contains_key(name) {
-        return Some((from, name.to_string()));
+    if let Some((bound, _)) = scope.bindings.get_key_value(name) {
+        return Some((from, *bound));
     }
     let mut parent = scope.parent;
     while let Some(i) = parent {
-        if scopes[i].kind != ScopeKind::Class && scopes[i].bindings.contains_key(name) {
-            return Some((i, name.to_string()));
+        if scopes[i].kind != ScopeKind::Class {
+            if let Some((bound, _)) = scopes[i].bindings.get_key_value(name) {
+                return Some((i, *bound));
+            }
         }
         parent = scopes[i].parent;
     }
@@ -3373,12 +3585,14 @@ impl Transformer for Folder<'_> {
 
 // The outermost expressions of `module` that evaluate statically, with their values.
 // Empty when the analysis can't be trusted for this file.
-fn find_sites(module: &ModModule, imports: &ImportedModules) -> HashMap<TextRange, Value> {
-    let analysis = Analysis::build(module, imports);
+fn find_sites(
+    module: &ModModule,
+    analysis: &Analysis,
+) -> (HashMap<TextRange, Value>, Vec<SelfConstantRead>) {
     if !analysis.complete {
-        return HashMap::new();
+        return (HashMap::new(), Vec::new());
     }
-    let evaluator = Evaluator::new(&analysis);
+    let evaluator = Evaluator::new(analysis);
     let mut finder = SiteFinder {
         evaluator: &evaluator,
         sites: HashMap::new(),
@@ -3387,23 +3601,55 @@ fn find_sites(module: &ModModule, imports: &ImportedModules) -> HashMap<TextRang
     for stmt in &module.body {
         finder.visit_stmt(stmt);
     }
-    finder.sites
+    // Only a read that ended up inside a folded value changed what the checker sees.
+    let reads = analysis
+        .self_reads
+        .iter()
+        .filter(|read| {
+            finder
+                .sites
+                .keys()
+                .any(|site| site.contains_range(read.range))
+        })
+        .cloned()
+        .collect();
+    (finder.sites, reads)
 }
 
-/// Replaces every expression that evaluates statically with the literal it equals, keeping
-/// source ranges so diagnostics still point at the original text. `None` when nothing
-/// changes (or the analysis can't be trusted for this file), so the caller keeps using the
-/// original module without paying for a clone.
+/// The expressions of a module that evaluate statically, and what they evaluate to.
+pub(crate) struct Folds(HashMap<TextRange, Value>);
+
+/// What `apply_folds` would replace in `module`, and the class constants read through
+/// `self`/`cls` that are among it. Empty when the analysis can't be trusted for the file.
+pub(crate) fn plan_folds(
+    module: &ModModule,
+    analysis: &Analysis,
+) -> (Folds, Vec<SelfConstantRead>) {
+    let (sites, reads) = find_sites(module, analysis);
+    (Folds(sites), reads)
+}
+
+/// Replaces every planned expression with the literal it equals, keeping source ranges so
+/// diagnostics still point at the original text. In place: the planning step is what needed
+/// the module as written, so a caller that is done with that owns nothing it must copy.
+pub(crate) fn apply_folds(module: &mut ModModule, folds: &Folds) {
+    if folds.0.is_empty() {
+        return;
+    }
+    let folder = Folder { sites: &folds.0 };
+    for stmt in &mut module.body {
+        folder.visit_stmt(stmt);
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn fold_constants(module: &ModModule, imports: &ImportedModules) -> Option<ModModule> {
-    let sites = find_sites(module, imports);
-    if sites.is_empty() {
+    let (folds, _) = plan_folds(module, &Analysis::build(module, imports));
+    if folds.0.is_empty() {
         return None;
     }
     let mut folded = module.clone();
-    let folder = Folder { sites: &sites };
-    for stmt in &mut folded.body {
-        folder.visit_stmt(stmt);
-    }
+    apply_folds(&mut folded, &folds);
     Some(folded)
 }
 
@@ -3838,9 +4084,11 @@ mod analysis_tests {
     // Every folded expression as (its source text, its value), in source order.
     fn folds(source: &str) -> Vec<(String, Value)> {
         let module = parse_module(source).unwrap().into_syntax();
-        let mut sites: Vec<(TextRange, Value)> = find_sites(&module, &ImportedModules::new())
-            .into_iter()
-            .collect();
+        let mut sites: Vec<(TextRange, Value)> =
+            find_sites(&module, &Analysis::build(&module, &ImportedModules::new()))
+                .0
+                .into_iter()
+                .collect();
         sites.sort_by_key(|(range, _)| range.start());
         sites
             .into_iter()

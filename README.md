@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.12.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.13.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -470,7 +470,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.12.0"]
+        additional_dependencies: ["typedframes==0.13.0"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -519,7 +519,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.12.0"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.13.0"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
@@ -547,7 +547,8 @@ and the files are written together or not at all. See the
 
 If `check` or `suggest` gets a site wrong and the code can't be shared, `typedframes report quiet-amber src/` prints a
 bug-report body with a redacted copy of the code around that site, checked against the checker so it reproduces the same
-result. Redacted is not anonymous: read it before posting, and don't use it on code you aren't allowed to share. See
+result. `typedframes report --all src/` does this for every untyped site, grouped by why the checker decided as it did.
+Redacted is not anonymous: read it before posting, and don't use it on code you aren't allowed to share. See
 [Reporting a problem](docs/usage.md#reporting-a-problem-report), and
 [Security and data handling](docs/security.md) for what the tool reads, writes and connects to.
 
@@ -658,17 +659,17 @@ plus the requested features, so both halves get checked normally. See
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (median of 5 runs ± one standard deviation, 3 warmup, caches cleared between runs):
-*2026-10-11 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
+*2026-10-13 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
 
 | Tool | Version | What it does | typedframes (14 files) | great_expectations (494 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.12.0 | DataFrame column checker | 41.1 ± 0.7 ms | 122.1 ± 0.6 ms |
-| ruff | 0.17.0 | Linter (no type checking) | 21.5 ± 0.6 ms | 212.9 ± 1.5 ms |
-| ty | 0.0.84 | Type checker | 50.2 ± 0.3 ms | 751.7 ± 7.6 ms |
-| pyrefly | 1.3.2 | Type checker | 91.5 ± 2.5 ms | 268.9 ± 3.8 ms |
-| mypy | 2.4.0 | Type checker (no plugin) | 1.82 ± 0.03 s | 3.04 ± 0.02 s |
-| mypy + typedframes | 2.4.0 | Type checker + column checker | 1.84 ± 0.02 s | 3.46 ± 0.02 s |
-| pyright | 1.1.414 | Type checker | 794.2 ± 13.8 ms | 3.90 ± 0.03 s |
+| typedframes | 0.13.0 | DataFrame column checker | 42.8 ± 0.3 ms | 72.4 ± 0.8 ms |
+| ruff | 0.17.0 | Linter (no type checking) | 27.6 ± 1.0 ms | 222.1 ± 2.7 ms |
+| ty | 0.0.84 | Type checker | 59.6 ± 1.4 ms | 761.4 ± 9.4 ms |
+| pyrefly | 1.3.2 | Type checker | 98.0 ± 12.2 ms | 276.6 ± 7.3 ms |
+| mypy | 2.4.0 | Type checker (no plugin) | 1.83 ± 0.13 s | 3.08 ± 0.03 s |
+| mypy + typedframes | 2.4.0 | Type checker + column checker | 1.84 ± 0.03 s | 3.32 ± 0.09 s |
+| pyright | 1.1.414 | Type checker | 812.0 ± 12.3 ms | 3.91 ± 0.04 s |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 

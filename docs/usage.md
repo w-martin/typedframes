@@ -891,13 +891,25 @@ another (`def load() -> pl.DataFrame`). Anything else is withheld.
 the parameter is known: every use is a read of a named column, or a further call that is.
 Those columns are counted. Returning the frame, calling a method on it that may use every
 column, storing it, or recursion all leave the call unknown. This works for functions of the
-same file and for functions imported from other project files (summaries are stored in the
-index); `module.func(df)` calls are not followed yet.
+same file, for methods called as `self.method(df)` (when the name is defined by one class in the
+file and the method is not decorated), and for functions imported from other project files
+(summaries are stored in the index); `module.func(df)` calls are not followed yet.
+
+*Returned frames.* Returning the frame is also not an unknown use when the function is a
+project function whose every call is an `x = name(...)` assignment, in functions, methods or
+module code outside loops, where `x` is only used to read named columns. The checker then takes
+the union of those reads as what the frame needs. Calls match by bare name, so a call to an
+unrelated function of the same name only adds columns. A single call that does anything else
+with the result (returns it, passes it on, iterates it, calls a method that may use every column),
+a function that is passed around as a value or decorated, or a function nothing in the project calls
+leaves it withheld. This needs the whole-project index: suggesting for a single file, or with
+`--no-index`, never sees callers. Callers outside the project (tests excluded from the scan,
+notebooks, other repositories) and dynamic calls can't be seen, so these suggestions are `review`.
 
 Narrowing is only safe when every use of the frame is visible and is a read of a named
 column, so a site is **withheld** (and listed under `Not suggested:` with the reason) when:
 
-- the frame is passed to a function that can't be followed, returned, stored in an attribute or
+- the frame is passed to a function that can't be followed, returned (see above), stored in an attribute or
   container, iterated over, or used through anything other than `df["col"]` / `df[["a", "b"]]`,
   including methods like `.groupby("region")`, `.drop(columns=...)` or `.head()`, which can
   use columns by string argument or use every column (`len(df)`, `.index` and `.empty` are
@@ -914,8 +926,10 @@ the scan can't see. It is `review` when it is probably right but a person should
 a column that is only read under a condition (the selection fails if the data lacks it), a frame
 that is printed with `print()`/`display()` (the output will show only the selected columns), a
 pandas frame that later has columns assigned into it (older pandas can raise
-`SettingWithCopyWarning` on a selection), or a module-level variable (another module may
-import it and read other columns). Each reason is printed as a `note:`.
+`SettingWithCopyWarning` on a selection), a module-level variable (another module may
+import it and read other columns), a read inside a `self.method()` (a subclass in another file could
+override it), or a returned frame narrowed to what its callers read (callers outside the project can't
+be seen). Each reason is printed as a `note:`.
 
 Only `.py` files are covered; passing a notebook is an error.
 
@@ -928,6 +942,17 @@ an issue body from the site's two-word name (the one `suggest` prints next to it
 typedframes report quiet-amber src/
 ```
 
+To report every untyped site at once, use `--all` with a path instead of a name:
+
+```shell
+typedframes report --all src/
+```
+
+Sites the checker decided about for the same reason are grouped, each group showing its sites by name
+and the smallest example. `--outcome suggested|withheld` keeps one kind of decision, `--format json`
+prints the groups as JSON, and `--output-dir DIR` writes one bug-report body per group instead of
+printing.
+
 It prints Markdown with the typedframes, Python and OS versions, what the checker decided about the
 site (names and numbers masked), and a redacted copy of the code around it. **Redacted is not
 anonymous**: read the whole body before posting it, and don't use it on code you aren't allowed to
@@ -937,18 +962,27 @@ share. The body starts with a reminder to do so.
 literals `c1`, `c2`; every number except 0 and 1 becomes a placeholder; comments and docstrings are
 dropped; imports other than pandas, polars, numpy, typing and typedframes are left out.
 
-*Kept as written:* the names pandas, polars, numpy and Python itself define (listed in
-`rust/src/report_names.rs`, including some ordinary words such as `values`, `first` and `count` when
-used as method or keyword names), option strings such as `how="left"` when they are the value of an
-option keyword, and the structure of the code: its branches, the order of operations and the number
-of columns. Structure alone can say something about what the code does.
+*Kept as written:* the names Python itself defines, `pd`, `pl` and `np`, and the public names of the
+numpy, pandas and polars versions installed when the list was generated (`rust/src/library_names.txt`,
+regenerated with `inv names`). A library name stays only after a dot (`np.percentile`, `.groupby`) or as
+a call keyword (`.fillna(value=...)`); a bare name stays only if a kept import brought it in
+(`from pandas import DataFrame`). Names you define (`def`, `class`) and bare variables are always
+renamed, even when they share a name with the library, so a variable called `value` or a class called
+`Config` is renamed. An attribute or keyword of yours that happens to be a public library name, for
+example `.count` or `label=`, is kept. Option strings such as
+`how="left"` are kept when they are the value of an option keyword, and so is the structure of the
+code: its branches, the order of operations and the number of columns. Structure alone can say
+something about what the code does.
 
-The snippet covers the enclosing function or class member, the same-file functions it calls, and,
-for a call to a function imported from another file whose return type the project index knew, a
-signature-only stand-in. Before printing it, `report` runs the checker on the snippet and prints it
-only if the site is classified exactly as the original was; otherwise the report says so and gives
-no code. It does the same when the code around the site is over 150 lines, or contains anything the
-redactor doesn't recognise. `report` only prints: it makes no network connection, and the only thing it writes is the index
+The snippet starts from the enclosing function or class member, the same-file functions it calls,
+and, for a call to a function imported from another file whose return type the project index knew, a
+signature-only stand-in. It is then cut down to the code the decision rests on: statements and
+parameters whose removal leaves the site classified the same way are dropped, and imports are
+dropped only when nothing left uses them. Before printing it, `report` runs the checker on the
+snippet and prints it only if the site is classified exactly as the original was (apart from how
+many further uses a reason lists); otherwise the report says so and gives no code. It does the same
+when the code that decides the verdict is still over 150 lines, or contains anything the redactor
+doesn't recognise. `report` only prints: it makes no network connection, and the only thing it writes is the index
 cache, which `--no-cache` skips. A name shared by identical statements in several files lists them; narrow the path to one
 file. Notebooks aren't covered.
 
@@ -956,6 +990,12 @@ file. Notebooks aren't covered.
 
 Files are indexed and checked in parallel, one worker per core (up to 16). Set `TYPEDFRAMES_JOBS=1` to run on a single thread, or
 a number to cap the workers.
+
+The checker allocates a lot of small objects, so it uses jemalloc (mimalloc on Windows, the platform allocator on targets
+jemalloc does not build for), the same split ruff uses. The command line sets `_RJEM_MALLOC_CONF` to
+`narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0` before the extension loads, which keeps memory close to the platform
+allocator's at nearly the same speed; set `_RJEM_MALLOC_CONF` yourself to use other jemalloc settings. Peak memory on a
+494-file project is about 40 MB, of which roughly 18 MB is the Python interpreter.
 
 What the checker learns about each file is also cached on disk and reused for every file whose contents have not
 changed, so repeat runs only re-index what you edited. A cached run reports exactly what an uncached run would. The cache

@@ -33,14 +33,39 @@
 //! Suppression is applied as a post-processing filter in [`Linter::check_file_internal`]
 //! after all errors have been collected.
 
+// The checker allocates heavily (syntax trees, strings, maps), and these allocators serve
+// that pattern faster than the platform's. The split matches ruff's: jemalloc where it
+// builds, mimalloc on Windows, the platform allocator on the targets jemalloc skips. Keep
+// the `cfg`s in step with `Cargo.toml`.
+#[cfg(all(
+    not(target_os = "windows"),
+    not(target_os = "openbsd"),
+    not(target_os = "aix"),
+    not(target_os = "android"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64",
+        target_arch = "riscv64"
+    )
+))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod apply;
 mod ast_extract;
+mod call_usage;
 mod column_consuming_methods;
 mod column_usage;
 mod config;
 mod constants;
 mod contract;
 mod errors;
+mod fast_hash;
 mod frame_ops;
 mod helpers;
 mod index;
@@ -50,6 +75,7 @@ mod parallel;
 mod phrase;
 mod pyapi;
 mod report;
+mod report_minimize;
 mod report_names;
 mod sql;
 mod static_eval;
@@ -67,8 +93,9 @@ fn _rust_checker(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pyapi::check_file, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::check_notebook, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::check_files, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::suggest_file, m)?)?;
-    m.add_function(wrap_pyfunction!(pyapi::report_file, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::report_files, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::suggest_files, m)?)?;
+    m.add_function(wrap_pyfunction!(pyapi::report_all_files, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::apply_suggestions, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::vcs_problem, m)?)?;
     m.add_function(wrap_pyfunction!(pyapi::build_project_index, m)?)?;

@@ -62,6 +62,13 @@ pub(crate) trait HelperResolver {
     /// Whether `callee` is certainly the builtin of that name, not something this file
     /// defines, imports or rebinds.
     fn is_unshadowed_builtin(&self, callee: &ast::ExprName) -> bool;
+
+    /// The summaries of the method a `self.<method>(...)` call reaches, by the position it
+    /// is called with (`self` is not counted), or `None` when the name can't be tied to a
+    /// single known method.
+    fn method_usage_of(&self, _method: &str) -> Option<Vec<ParamUsage>> {
+        None
+    }
 }
 
 /// A resolver that knows no function: every call is an unknown use.
@@ -411,10 +418,10 @@ impl UsageScan<'_> {
         &mut self,
         at: TextSize,
         passed: &str,
-        callee: Option<&ast::ExprName>,
+        via: Option<&str>,
         summary: Option<&ParamUsage>,
     ) {
-        let (Some(summary), Some(callee)) = (summary, callee) else {
+        let (Some(summary), Some(via)) = (summary, via) else {
             self.record_other(at, passed.to_string(), Consumption::Unknown);
             return;
         };
@@ -428,8 +435,25 @@ impl UsageScan<'_> {
                 column: column.clone(),
                 conditional: self.depth > 0 || *conditional,
                 line,
-                via: Some(callee.id.to_string()),
+                via: Some(via.to_string()),
             });
+        }
+    }
+
+    // What the called function does with each of its parameters, and how to name it: a bare
+    // function, or a method called on `self`.
+    fn summaries_for(&self, func: &Expr) -> Option<(String, Vec<ParamUsage>)> {
+        match func {
+            Expr::Name(f) => self
+                .helpers
+                .usage_of(f)
+                .map(|summaries| (f.id.to_string(), summaries)),
+            Expr::Attribute(a) if matches!(&*a.value, Expr::Name(n) if n.id.as_str() == "self") => {
+                self.helpers
+                    .method_usage_of(a.attr.as_str())
+                    .map(|summaries| (format!("self.{}", a.attr), summaries))
+            }
+            _ => None,
         }
     }
 
@@ -437,10 +461,7 @@ impl UsageScan<'_> {
     // the call's result is a new value rather than the tracked frame under another name
     // (a summarized function that handed its parameter back would not have a summary).
     fn call_is_fully_summarized(&self, call: &ast::ExprCall) -> bool {
-        let Expr::Name(callee) = &*call.func else {
-            return false;
-        };
-        let Some(summaries) = self.helpers.usage_of(callee) else {
+        let Some((_, summaries)) = self.summaries_for(&call.func) else {
             return false;
         };
         let positional_ok = call
@@ -920,13 +941,14 @@ impl UsageScan<'_> {
                     }
                     _ => passed_to(&call.func),
                 };
-                let summaries = callee.and_then(|f| self.helpers.usage_of(f));
+                let resolved = self.summaries_for(&call.func);
+                let via = resolved.as_ref().map(|(name, _)| name.as_str());
+                let summaries = resolved.as_ref().map(|(_, all)| all);
                 for (position, arg) in call.arguments.args.iter().enumerate() {
                     if self.is_tainted(arg) {
-                        let summary = summaries
-                            .as_ref()
-                            .and_then(|all| all.iter().find(|p| p.position == position));
-                        self.passed_argument(at, &passed, callee, summary);
+                        let summary =
+                            summaries.and_then(|all| all.iter().find(|p| p.position == position));
+                        self.passed_argument(at, &passed, via, summary);
                     } else {
                         self.visit_expr(arg);
                     }
@@ -934,11 +956,9 @@ impl UsageScan<'_> {
                 for kw in &call.arguments.keywords {
                     if self.is_tainted(&kw.value) {
                         let summary = kw.arg.as_ref().and_then(|name| {
-                            summaries
-                                .as_ref()
-                                .and_then(|all| all.iter().find(|p| p.name == name.as_str()))
+                            summaries.and_then(|all| all.iter().find(|p| p.name == name.as_str()))
                         });
-                        self.passed_argument(at, &passed, callee, summary);
+                        self.passed_argument(at, &passed, via, summary);
                     } else {
                         self.visit_expr(&kw.value);
                     }

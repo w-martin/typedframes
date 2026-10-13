@@ -83,10 +83,10 @@ class TestReport(TestCase):
         """Test the error for a name two files share, which a hash collision can still cause."""
 
         # arrange
-        def found(_file: str, name: str, _index: bytes | None = None) -> str:
-            return dumps({"name": name, "line": 6, "col": 5, "var": "df"})
+        def found(files: list[str], name: str, _index: bytes | None = None) -> list[tuple[str | None, str | None]]:
+            return [(dumps({"name": name, "line": 6, "col": 5, "var": "df"}), None) for _ in files]
 
-        stub = SimpleNamespace(report_file=found)
+        stub = SimpleNamespace(report_files=found)
         with TemporaryDirectory() as tmpdir, patch.dict(modules, {"typedframes._rust_checker": stub}):
             (Path(tmpdir) / "a.py").write_text("x = 1\n")
             (Path(tmpdir) / "b.py").write_text("x = 1\n")
@@ -100,8 +100,27 @@ class TestReport(TestCase):
             self.assertIn("a.py:6:5", err)
             self.assertIn("b.py:6:5", err)
 
-    def test_should_say_why_there_is_no_snippet_for_a_scope_too_large_to_paste(self) -> None:
+    def test_should_say_why_there_is_no_snippet_for_a_site_too_large_to_paste(self) -> None:
         """Test the refusal path: the verdict is still printed, with the reason for no code."""
+        # arrange
+        values = "".join(f'        "n{i}",\n' for i in range(200))
+        source = _PRIVATE.replace('sep=";")', f'sep=";",\n    na_values=[\n{values}    ],\n    )')
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "job.py").write_text(source)
+            name = _name_of(root)
+
+            # act
+            out, _err, code = _run(["report", name, str(root), "--no-index"])
+
+            # assert
+            self.assertIsNone(code)
+            self.assertIn("No snippet: the code that decides this is", out)
+            self.assertIn("- Outcome:", out)
+            self.assertNotIn("```python", out)
+
+    def test_should_drop_code_around_the_site_that_does_not_change_the_verdict(self) -> None:
+        """Test that a long scope is cut down to the lines the checker's decision rests on."""
         # arrange
         source = _PRIVATE.replace("    return", "".join(f"    print({i})\n" for i in range(200)) + "    return")
         with TemporaryDirectory() as tmpdir:
@@ -114,9 +133,8 @@ class TestReport(TestCase):
 
             # assert
             self.assertIsNone(code)
-            self.assertIn("No snippet: the code around the site is", out)
-            self.assertIn("- Outcome:", out)
-            self.assertNotIn("```python", out)
+            self.assertIn("```python", out)
+            self.assertNotIn("print(", out)
 
     def test_should_exit_1_when_the_extension_is_missing(self) -> None:
         """Test the same helpful message `check` gives without the Rust extension."""
@@ -133,11 +151,12 @@ class TestReport(TestCase):
         """Test that an unreadable file doesn't stop the search, and is named on stderr."""
 
         # arrange
-        def unreadable(_file: str, _name: str, _index: bytes | None = None) -> str:
-            msg = "permission denied"
-            raise OSError(msg)
+        def unreadable(
+            files: list[str], _name: str, _index: bytes | None = None
+        ) -> list[tuple[str | None, str | None]]:
+            return [(None, "permission denied") for _ in files]
 
-        stub = SimpleNamespace(report_file=unreadable)
+        stub = SimpleNamespace(report_files=unreadable)
         with TemporaryDirectory() as tmpdir, patch.dict(modules, {"typedframes._rust_checker": stub}):
             (Path(tmpdir) / "job.py").write_text("x = 1\n")
 

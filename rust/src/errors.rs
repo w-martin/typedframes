@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const CODE_UNKNOWN_COLUMN: &str = "unknown-column";
 pub(crate) const CODE_RESERVED_NAME: &str = "reserved-name";
 pub(crate) const CODE_UNTRACKED_DATAFRAME: &str = "untracked-dataframe";
+pub(crate) const CODE_ASSUMED_CONSTANT: &str = "assumed-constant";
 pub(crate) const CODE_DROPPED_UNKNOWN_COLUMN: &str = "dropped-unknown-column";
 pub(crate) const CODE_MISSING_COLUMN: &str = "missing-column";
 // A recognized DataFrame with no resolvable column list (unresolved entity_df in

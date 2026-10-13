@@ -252,6 +252,7 @@ never fails it, `--strict` included. `.ipynb_checkpoints` is pruned by default (
 | `untracked-dataframe` | Bare DataFrame load — no column info for checker | Always shown (use `--lenient-ingest` to downgrade to info) |
 | `dropped-unknown-column` | Dropped column doesn't exist in schema | Always shown |
 | `missing-column` | Argument's columns don't satisfy the called function's parameter contract | Always shown |
+| `assumed-constant` | `self.NAME` was read as a constant on the assumption that no subclass in another file overrides it; declare `NAME: Final = ...` to make that certain | Info; hidden by `--no-info` |
 
 ## Project-level configuration
 

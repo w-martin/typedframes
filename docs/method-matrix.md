@@ -90,6 +90,7 @@ checker.
 | `reserved-name` | Error | Renamed-from column `'<name>'` not found in `<Schema>` | Always reported |
 | `untracked-dataframe` | Warning | Columns unknown at lint time — annotate with a schema to enable column checking | Always reported |
 | `dropped-unknown-column` | Warning | Dropped column `'<name>'` does not exist in `<Schema>` | Always reported |
+| `assumed-constant` | Info | `self.<NAME>` is read as a constant, assuming no subclass in another file overrides it; declare `<NAME>: Final = ...` to make that certain | Hidden by `--no-info` |
 
 **untracked-dataframe** downgrades to a quiet info-level note when `--lenient-ingest` is passed to the
 CLI, for exploratory scripts that load data without a schema annotation and don't want the noise yet.

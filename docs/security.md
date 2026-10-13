@@ -39,8 +39,8 @@ on your code and check each claim yourself.
 
 ## `report` is the one command that emits code-derived text
 
-`typedframes report NAME` prints a bug-report body for pasting into an issue, with a redacted copy of
-the code around one site. Nothing runs it automatically: not `check`, the pre-commit hook or the
+`typedframes report NAME` (or `report --all`) prints a bug-report body for pasting into an issue, with a
+redacted copy of the code around one site, or around each group of sites. Nothing runs it automatically: not `check`, the pre-commit hook or the
 GitHub Action. The redaction is best-effort and is not anonymisation; what it replaces and what it
 keeps is described under [Reporting a problem](usage.md#reporting-a-problem-report). Do not use it
 on code you are not allowed to share.

@@ -11,20 +11,32 @@ def check_file(file_path: str, index_bytes: bytes | None = None) -> str: ...
 def check_notebook(file_path: str, index_bytes: bytes | None = None) -> str: ...
 def check_files(file_paths: list[str], index_bytes: bytes | None = None) -> list[tuple[str | None, str | None]]: ...
 
-# Dry-run suggestions as JSON: `{"suggestions": [...], "withheld": [...]}`. `display_path`
-# only names the file in diff headers; nothing is written.
-def suggest_file(file_path: str, display_path: str, index_bytes: bytes | None = None) -> str: ...
+# Per-file results of the many-file forms are `(json, error)` in input order: `json` is the
+# result, or `None` with the reason in `error`.
+#
+# Dry-run suggestions as JSON: `{"suggestions": [...], "withheld": [...]}`. The second name of
+# each request only names the file in diff headers; nothing is written.
+def suggest_files(
+    requests: list[tuple[str, str]], index_bytes: bytes | None = None
+) -> list[tuple[str | None, str | None]]: ...
 
-# Bug-report material for the untyped site with this two-word name, as JSON (`"null"` if
-# the file has none): its masked verdict plus a redacted snippet or the reason for none.
-def report_file(file_path: str, name: str, index_bytes: bytes | None = None) -> str: ...
+# Bug-report material for the untyped site with this two-word name, as JSON (`"null"` if the
+# file has none): its masked verdict plus a redacted snippet or the reason for none.
+def report_files(
+    file_paths: list[str], name: str, index_bytes: bytes | None = None
+) -> list[tuple[str | None, str | None]]: ...
+
+# Every site's report in each file, as a JSON array.
+def report_all_files(
+    file_paths: list[str], index_bytes: bytes | None = None
+) -> list[tuple[str | None, str | None]]: ...
 def apply_suggestions(
     requests: list[tuple[str, str, list[tuple[int, int]] | None]],
     index_bytes: bytes | None = None,
     require_tracked: bool = False,
 ) -> str: ...
 def vcs_problem(root: str) -> str | None: ...
-def build_project_index(project_root: str, cache_dir: str | None = None) -> bytes: ...
+def build_project_index(project_root: str, cache_dir: str | None = None, with_callers: bool = False) -> bytes: ...
 
 # `None` when no `pyproject.toml` exists anywhere above `file_path` -- there is then no
 # project root to resolve the file's imports against, so there is no index to build.

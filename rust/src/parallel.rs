@@ -26,6 +26,39 @@ pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + 
     map_with_workers(items, worker_count(items.len()), f)
 }
 
+/// `parallel_map` that starts the costliest items first, so the biggest are not left to finish
+/// last (a late big item on a slow core sets the finish time). `cost` estimates an item; results
+/// are still in input order.
+pub(crate) fn parallel_map_largest_first<T: Sync, R: Send>(
+    items: &[T],
+    cost: impl Fn(&T) -> u64,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    largest_first_with_workers(items, worker_count(items.len()), cost, f)
+}
+
+fn largest_first_with_workers<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    cost: impl Fn(&T) -> u64,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let costs: Vec<u64> = items.iter().map(cost).collect();
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(costs[i]));
+    let results = map_with_workers(&order, workers, |&i| f(&items[i]));
+    let mut slots: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    for (&i, result) in order.iter().zip(results) {
+        slots[i] = Some(result);
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// A file's size, as the cost of working on it; unreadable files count as free.
+pub(crate) fn file_cost(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
 fn map_with_workers<T: Sync, R: Send>(
     items: &[T],
     workers: usize,
@@ -66,6 +99,49 @@ fn map_with_workers<T: Sync, R: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_should_start_the_costliest_items_first_but_return_results_in_input_order() {
+        // arrange: one worker makes the start order observable.
+        let items: Vec<u64> = vec![3, 9, 1, 7, 5];
+        let started = Mutex::new(Vec::new());
+
+        // act
+        let results = largest_first_with_workers(
+            &items,
+            1,
+            |n| *n,
+            |n| {
+                started.lock().unwrap().push(*n);
+                n * 10
+            },
+        );
+
+        // assert
+        assert_eq!(*started.lock().unwrap(), vec![9, 7, 5, 3, 1]);
+        assert_eq!(results, vec![30, 90, 10, 70, 50]);
+    }
+
+    #[test]
+    fn test_should_keep_input_order_when_the_costliest_goes_first_across_many_workers() {
+        // arrange
+        let items: Vec<usize> = (0..200).collect();
+
+        // act
+        let doubled = parallel_map_largest_first(&items, |n| (*n as u64) % 7, |n| n * 2);
+
+        // assert
+        assert_eq!(doubled, items.iter().map(|n| n * 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_should_handle_no_items_when_the_costliest_goes_first() {
+        // act
+        let nothing: Vec<usize> = parallel_map_largest_first(&[] as &[usize], |_| 0, |n| *n);
+
+        // assert
+        assert!(nothing.is_empty());
+    }
 
     #[test]
     fn test_should_return_results_in_input_order() {

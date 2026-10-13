@@ -26,6 +26,7 @@ from typedframes.cli import (
     _collect_files,
     _collect_notebook_files,
     _collect_python_files,
+    _collect_suggestions,
     _coverage_failure_message,
     _coverage_json_payload,
     _coverage_message,
@@ -51,7 +52,6 @@ from typedframes.cli import (
     _plural,
     _relative_posix,
     _select_named_sites,
-    _suggest_one_file,
     _usage_lines,
     main,
 )
@@ -3569,39 +3569,39 @@ class TestCli(TestCase):
             self.assertEqual(1, ctx.exception.code)
             self.assertIn("Rust checker extension was not found", captured.getvalue())
 
-    def test_should_skip_a_file_whose_suggest_call_raises_oserror(self) -> None:
+    def test_should_skip_a_file_the_batch_suggest_call_could_not_read(self) -> None:
         """Test that an unreadable file is skipped with a message, not fatal."""
 
         # arrange
-        def failing(_file_path: str, _display_path: str, _index_bytes: bytes | None) -> str:
-            msg = "permission denied"
-            raise OSError(msg)
+        def failing(requests: list[tuple[str, str]], _index_bytes: bytes | None) -> list[tuple[str | None, str | None]]:
+            return [(None, "permission denied") for _ in requests]
 
         captured = StringIO()
 
         # act
         with patch("sys.stderr", captured):
-            result = _suggest_one_file(Path("x.py"), Path(), failing, None)
+            suggestions, withheld, files_by_display, unreadable = _collect_suggestions(
+                [Path("x.py")], Path(), failing, None
+            )
 
         # assert
-        self.assertIsNone(result)
+        self.assertEqual(([], [], {}, 1), (suggestions, withheld, files_by_display, unreadable))
         self.assertIn("x.py: skipped, permission denied", captured.getvalue())
 
-    def test_should_pass_the_display_path_and_index_to_the_suggest_call(self) -> None:
+    def test_should_pass_the_display_path_and_index_to_the_batch_suggest_call(self) -> None:
         """Test that the diff header name is project-relative and the index is forwarded."""
         # arrange
-        seen: list[tuple[str, str, bytes | None]] = []
+        seen: list[tuple[list[tuple[str, str]], bytes | None]] = []
 
-        def fake(file_path: str, display_path: str, index_bytes: bytes | None) -> str:
-            seen.append((file_path, display_path, index_bytes))
-            return '{"suggestions": [], "withheld": []}'
+        def fake(requests: list[tuple[str, str]], index_bytes: bytes | None) -> list[tuple[str | None, str | None]]:
+            seen.append((requests, index_bytes))
+            return [('{"suggestions": [], "withheld": []}', None) for _ in requests]
 
         # act
-        result = _suggest_one_file(Path("/proj/src/x.py"), Path("/proj"), fake, b"idx")
+        _collect_suggestions([Path("/proj/src/x.py")], Path("/proj"), fake, b"idx")
 
         # assert
-        self.assertEqual({"suggestions": [], "withheld": []}, result)
-        self.assertEqual([("/proj/src/x.py", "src/x.py", b"idx")], seen)
+        self.assertEqual([([("/proj/src/x.py", "src/x.py")], b"idx")], seen)
 
     def test_should_format_a_suggestion_with_notes_and_the_rust_diff(self) -> None:
         """Test the suggestion header, reason, notes and diff layout."""

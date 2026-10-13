@@ -479,7 +479,12 @@ class TestPartialExtension(TestCase):
     """An extension module missing the apply entry points exits with the usual message."""
 
     def _run_with(self, **attributes: object) -> tuple[str, int | None]:
-        stub = SimpleNamespace(suggest_file=lambda *_a: '{"suggestions": [], "withheld": []}', **attributes)
+        stub = SimpleNamespace(
+            suggest_files=lambda requests, _index=None: [
+                ('{"suggestions": [], "withheld": []}', None) for _ in requests
+            ],
+            **attributes,
+        )
         with TemporaryDirectory() as tmp, patch.dict(modules, {"typedframes._rust_checker": stub}):
             Path(tmp, "a.py").write_text("x = 1\n")
             _out, err, code = _run(["suggest", tmp, "--apply", "--no-index"])
@@ -507,7 +512,9 @@ class TestPartialExtension(TestCase):
             "diff": "",
         }
         stub = SimpleNamespace(
-            suggest_file=lambda *_a: dumps({"suggestions": [suggestion], "withheld": []}),
+            suggest_files=lambda requests, _index=None: [
+                (dumps({"suggestions": [suggestion], "withheld": []}), None) for _ in requests
+            ],
             vcs_problem=lambda _root: None,
         )
         with TemporaryDirectory() as tmp, patch.dict(modules, {"typedframes._rust_checker": stub}):

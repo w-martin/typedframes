@@ -197,10 +197,10 @@ uv run typedframes check .   # works with or without a JVM -- purely static
 
 No OSS Databricks emulator exists, but `databricks-connect` is itself built on Apache
 Spark's own open-source Spark Connect protocol. `databricks_session_shim.py` wraps a
-real local Spark Connect server (docker-compose, official `apache/spark:3.5.3` image)
+real local Spark Connect server (docker-compose, official `apache/spark:3.5.8` image)
 behind the same `DatabricksSession.builder.host(...).create()` shape real code uses —
 only the class is fake, the SQL execution underneath is real Spark. `pyspark[connect]`
-is pinned to exactly `3.5.3` client-side to match the server image, since Spark
+is pinned to exactly `3.5.8` client-side to match the server image, since Spark
 Connect's protobuf wire protocol isn't guaranteed compatible across versions.
 `load_via_sql_connector` (the `databricks-sql-connector`/Thrift path) has no stand-in
 at all — real proprietary protocol, no real endpoint — so it's left un-run.

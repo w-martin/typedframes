@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "Runnable typedframes example: SQL column inference against Databricks"
 requires-python = ">=3.11"
 dependencies = [
-    # Pinned exactly (not >=) to match the apache/spark:3.5.3 server image in
+    # Pinned exactly (not >=) to match the apache/spark:3.5.8 server image in
     # docker-compose.yml -- Spark Connect's client/server protobuf protocol isn't
     # guaranteed compatible across major/minor Spark versions.
-    "pyspark[connect]==3.5.3",
+    "pyspark[connect]==3.5.8",
     "databricks-sql-connector>=3.4",
     "pandas>=2.0",
 ]

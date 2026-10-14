@@ -1,10 +1,10 @@
 services:
   spark-connect:
-    image: apache/spark:3.5.3
+    image: apache/spark:3.5.8
     command:
       - "/opt/spark/sbin/start-connect-server.sh"
       - "--packages"
-      - "org.apache.spark:spark-connect_2.12:3.5.3"
+      - "org.apache.spark:spark-connect_2.12:3.5.8"
       - "--conf"
       - "spark.driver.host=0.0.0.0"
     ports:

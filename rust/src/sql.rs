@@ -7,9 +7,10 @@
 //! `untracked-dataframe` nudge is recoverable but a false `unknown-column` error (from a
 //! short, wrongly-inferred column set) is not.
 
-use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{Query, SelectItem, SetExpr};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 /// The grammar every query is parsed with, regardless of `SqlDialect` — see
 /// [`columns_from_select`]. Identical to [`sqlparser::dialect::GenericDialect`] (its
@@ -423,26 +424,23 @@ pub(crate) fn columns_from_select(sql: &str, dialect: SqlDialect) -> SqlOutcome 
     // identifiers — both perfectly valid SQL text) would otherwise cost real
     // inferences for no correctness benefit — we only ever read identifier names out
     // of a successfully parsed `SELECT` list, never validate engine-specific syntax.
-    let statements =
-        match Parser::new(&PermissiveDialect)
-            .try_with_sql(sql)
-            .and_then(|mut parser| {
-                parser = parser.with_recursion_limit(50);
-                parser.parse_statements()
-            }) {
-            Ok(stmts) => stmts,
-            Err(_) => return SqlOutcome::Unparsed,
-        };
+    match parse_single_query(sql) {
+        Some(query) => columns_from_query(&query, dialect),
+        None => SqlOutcome::Unparsed,
+    }
+}
 
-    let [statement] = statements.as_slice() else {
-        return SqlOutcome::Unparsed;
-    };
-
-    let Statement::Query(query) = statement else {
-        return SqlOutcome::Unparsed;
-    };
-
-    columns_from_query(query, dialect)
+/// The one query `sql` holds, with any `;` around it; `None` for anything else. Parsing a query
+/// directly, not a statement list, leaves the statement grammar out of the binary.
+fn parse_single_query(sql: &str) -> Option<Box<Query>> {
+    let mut parser = Parser::new(&PermissiveDialect)
+        .try_with_sql(sql)
+        .ok()?
+        .with_recursion_limit(50);
+    while parser.consume_token(&Token::SemiColon) {}
+    let query = parser.parse_query().ok()?;
+    while parser.consume_token(&Token::SemiColon) {}
+    (parser.peek_token().token == Token::EOF).then_some(query)
 }
 
 fn columns_from_query(query: &Query, dialect: SqlDialect) -> SqlOutcome {
@@ -531,6 +529,84 @@ mod tests {
 
     fn cols_d(sql: &str, dialect: SqlDialect) -> SqlOutcome {
         columns_from_select(sql, dialect)
+    }
+
+    // The statement-list path `parse_single_query` replaced.
+    fn via_statements(sql: &str) -> SqlOutcome {
+        let parsed = Parser::new(&PermissiveDialect)
+            .try_with_sql(sql)
+            .and_then(|parser| parser.with_recursion_limit(50).parse_statements());
+        match parsed.as_deref() {
+            Ok([sqlparser::ast::Statement::Query(query)]) => {
+                columns_from_query(query, SqlDialect::Generic)
+            }
+            _ => SqlOutcome::Unparsed,
+        }
+    }
+
+    #[test]
+    fn single_query_parse_agrees_with_the_statement_list_parse() {
+        let inputs = [
+            "SELECT a, b FROM t",
+            "SELECT a FROM t;",
+            ";SELECT a FROM t",
+            ";;SELECT a FROM t;;",
+            "SELECT a FROM t; SELECT b FROM u",
+            "SELECT a FROM t;; SELECT b FROM u;",
+            "SELECT a FROM t SELECT b FROM u",
+            "",
+            ";",
+            ";;",
+            "(SELECT a FROM t)",
+            "((SELECT a FROM t))",
+            "(SELECT a FROM t) UNION (SELECT a FROM u)",
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "WITH c AS (SELECT a FROM t) SELECT a FROM c",
+            "WITH c AS (SELECT a FROM t) INSERT INTO u SELECT a FROM c",
+            "VALUES (1, 2)",
+            "FROM t SELECT a",
+            "TABLE t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "DROP TABLE t",
+            "EXPLAIN SELECT a FROM t",
+            "CREATE TABLE t AS SELECT a FROM u",
+            "SELECT",
+            "SELECT a FROM",
+            "SELECT a, FROM t",
+            "SELECT * FROM t",
+            "SELECT a + 1 FROM t",
+            "SELECT 'x;y' AS a FROM t",
+            "SELECT a FROM t -- trailing; comment",
+            "/* lead */ SELECT a FROM t",
+            "SELECT a FROM t WHERE b = ?",
+            "SELECT [a b] FROM t",
+            "SELECT `a` FROM t;\n",
+            "\n\t SELECT a FROM t \n",
+            "SELECT a FROM t END",
+            "not sql at all",
+        ];
+        for sql in inputs {
+            if sql == "SELECT a FROM t END" {
+                // `parse_statements` stops at a stray `END`; a query followed by anything is `Unparsed` here.
+                assert_eq!(SqlOutcome::Unparsed, cols(sql), "{sql:?}");
+            } else {
+                assert_eq!(via_statements(sql), cols(sql), "{sql:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn deeply_nested_input_is_unparsed_not_a_stack_overflow() {
+        let sql = format!("SELECT {}1{} AS a", "(".repeat(5000), ")".repeat(5000));
+        let outcome = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || cols(&sql))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(SqlOutcome::Unparsed, outcome);
     }
 
     #[test]

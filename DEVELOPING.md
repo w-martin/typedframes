@@ -158,7 +158,11 @@ builds it in debug mode and installs it into the environment (`uv run inv build`
 when the Rust sources changed). For a release build of the wheel:
 
 ```shell
-uv run maturin build --release
+uv run maturin build --profile cli
 ```
+
+The `cli` profile (`rust/Cargo.toml`) is the release profile with `panic = "abort"` and `opt-level = "s"`:
+a much smaller executable, at some cost in speed. The extension module is built with `--release` and unwinds,
+because a panic there must become a Python exception.
 
 To run the executable without installing it, `cargo run --manifest-path rust/Cargo.toml -- check .`.

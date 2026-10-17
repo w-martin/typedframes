@@ -6,13 +6,11 @@ use super::collect::collect_files;
 use super::config::load_configured_excludes;
 use super::pyfmt::{dumps_indent2, repr_str};
 use crate::engine::{report_all_batch, report_batch};
-use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 const REVIEW_NOTICE: &str = "<!-- Review before posting, then delete this line. Names, comments and most strings are replaced, but numbers 0 and 1, library and option names and the shape of the code are kept as written. -->";
 
@@ -34,11 +32,10 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
 
 // How many more uses a reason mentions; sites differing only in that are one problem.
 fn strip_more_uses(reason: &str) -> String {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN
-        .get_or_init(|| Regex::new(", and N more$").expect("a fixed pattern compiles"))
-        .replace(reason, "")
-        .into_owned()
+    reason
+        .strip_suffix(", and N more")
+        .unwrap_or(reason)
+        .to_string()
 }
 
 fn snippet(report: &Value) -> Option<&str> {

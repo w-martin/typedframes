@@ -1475,7 +1475,6 @@ dependencies = [
  "clap",
  "criterion",
  "mimalloc",
- "regex",
  "rmp-serde",
  "ruff_notebook",
  "ruff_python_ast",

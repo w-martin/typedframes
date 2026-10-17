@@ -164,7 +164,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --profile cli --out dist
           manylinux: auto
           docker-options: ${{ matrix.docker_options }}
 

@@ -3,10 +3,9 @@
 //! Sites and events are the JSON objects the checker produced for each file, tagged with the
 //! `file` they came from.
 
-use super::config::{glob_to_regex, pattern_specificity, CoverageConfig};
+use super::config::{pattern_specificity, CoverageConfig, Glob};
 use super::pathutil::relative_posix;
 use super::pyfmt::{repr_str, round_half_even};
-use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -133,7 +132,7 @@ pub(crate) fn evaluate_coverage(
     root: &Path,
     cli_fail_under: Option<f64>,
 ) -> Vec<Bucket> {
-    let mut regexes: HashMap<&str, Regex> = HashMap::new();
+    let mut globs: HashMap<&str, Glob> = HashMap::new();
     let mut tallies: Vec<(Option<String>, f64, Tally)> = Vec::new();
     for (file, tally) in per_file {
         let (label, threshold) = match cli_fail_under {
@@ -144,9 +143,9 @@ pub(crate) fn evaluate_coverage(
                     .overrides
                     .iter()
                     .filter(|(pattern, _)| {
-                        regexes
+                        globs
                             .entry(pattern.as_str())
-                            .or_insert_with(|| glob_to_regex(pattern))
+                            .or_insert_with(|| Glob::new(pattern))
                             .is_match(&relative)
                     })
                     .max_by(|a, b| pattern_specificity(&a.0).cmp(&pattern_specificity(&b.0)));

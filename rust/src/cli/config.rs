@@ -2,7 +2,6 @@
 //! collecting files, and the opt-in DataFrame schema coverage gate.
 
 use super::pyfmt::{float_str, repr_str};
-use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -241,42 +240,98 @@ pub(crate) fn load_configured_excludes(path: &Path) -> Option<HashSet<String>> {
     )
 }
 
-/// An anchored regex for a project-relative path glob: `**` spans any number of path segments
-/// (`**/` consumes its separator too, so `**/x.py` still matches a bare `x.py`), `*` and `?` never
-/// cross a `/`, everything else is literal.
-pub(crate) fn glob_to_regex(pattern: &str) -> Regex {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut out = String::from("^(?:");
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '*' {
-            let mut star_end = i;
-            while star_end < chars.len() && chars[star_end] == '*' {
-                star_end += 1;
-            }
-            if chars[i..].starts_with(&['*', '*']) {
-                if star_end < chars.len() && chars[star_end] == '/' {
-                    out.push_str("(?:.*/)?");
-                    star_end += 1;
-                } else {
-                    out.push_str(".*");
+/// One step of a compiled glob.
+enum Step {
+    Literal(char),
+    /// `?`: one character other than `/`.
+    One,
+    /// `*`: any run of characters other than `/`.
+    Segment,
+    /// `**`: any run of characters, line breaks aside.
+    Any,
+    /// Front of `**/`: the two steps after it may be skipped, so `**/x.py` still matches a bare `x.py`.
+    Optional,
+}
+
+/// A project-relative path glob, matched against the whole path: `**` spans any number of path
+/// segments (`**/` consumes its separator too), `*` and `?` never cross a `/`, everything else is
+/// literal.
+pub(crate) struct Glob {
+    steps: Vec<Step>,
+}
+
+impl Glob {
+    pub(crate) fn new(pattern: &str) -> Self {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut steps = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '*' => {
+                    let mut end = i;
+                    while chars.get(end) == Some(&'*') {
+                        end += 1;
+                    }
+                    if end - i < 2 {
+                        steps.push(Step::Segment);
+                    } else if chars.get(end) == Some(&'/') {
+                        steps.extend([Step::Optional, Step::Any, Step::Literal('/')]);
+                        end += 1;
+                    } else {
+                        steps.push(Step::Any);
+                    }
+                    i = end;
                 }
-            } else {
-                out.push_str("[^/]*");
+                '?' => {
+                    steps.push(Step::One);
+                    i += 1;
+                }
+                ch => {
+                    steps.push(Step::Literal(ch));
+                    i += 1;
+                }
             }
-            i = star_end;
-        } else if ch == '?' {
-            out.push_str("[^/]");
-            i += 1;
-        } else {
-            out.push_str(&regex::escape(&ch.to_string()));
-            i += 1;
+        }
+        Self { steps }
+    }
+
+    /// Runs every live position through the path at once, so a pattern with several `**` cannot
+    /// backtrack exponentially.
+    pub(crate) fn is_match(&self, path: &str) -> bool {
+        let mut live = vec![false; self.steps.len() + 1];
+        self.enter(&mut live, 0);
+        for ch in path.chars() {
+            let mut next = vec![false; live.len()];
+            for (at, step) in self.steps.iter().enumerate() {
+                if !live[at] {
+                    continue;
+                }
+                match step {
+                    Step::Literal(expected) if *expected == ch => self.enter(&mut next, at + 1),
+                    Step::One if ch != '/' => self.enter(&mut next, at + 1),
+                    Step::Segment if ch != '/' => self.enter(&mut next, at),
+                    Step::Any if ch != '\n' => self.enter(&mut next, at),
+                    _ => {}
+                }
+            }
+            live = next;
+        }
+        live[self.steps.len()]
+    }
+
+    fn enter(&self, live: &mut [bool], at: usize) {
+        if std::mem::replace(&mut live[at], true) {
+            return;
+        }
+        match self.steps.get(at) {
+            Some(Step::Segment | Step::Any) => self.enter(live, at + 1),
+            Some(Step::Optional) => {
+                self.enter(live, at + 1);
+                self.enter(live, at + 3);
+            }
+            _ => {}
         }
     }
-    out.push_str(")$");
-    // The pattern is built from escaped literals and fixed pieces, so it always compiles.
-    Regex::new(&out).unwrap_or_else(|_| Regex::new("$^").expect("empty-match regex compiles"))
 }
 
 /// How specific an override pattern is, for most-specific-match-wins: the length of the literal
@@ -296,7 +351,7 @@ mod tests {
     use super::*;
 
     fn matches(pattern: &str, path: &str) -> bool {
-        glob_to_regex(pattern).is_match(path)
+        Glob::new(pattern).is_match(path)
     }
 
     #[test]
@@ -324,6 +379,46 @@ mod tests {
     fn test_should_treat_regex_characters_in_a_pattern_literally() {
         assert!(matches("a+b/(c).py", "a+b/(c).py"));
         assert!(!matches("a.py", "abpy"));
+    }
+
+    #[test]
+    fn test_should_match_a_trailing_double_star_directory_only_with_its_separator() {
+        assert!(matches("src/**/", "src/a/"));
+        assert!(matches("src/**/", "src/"));
+        assert!(!matches("src/**/", "src"));
+    }
+
+    #[test]
+    fn test_should_treat_three_stars_as_a_double_star() {
+        assert!(matches("a/***", "a/b/c.py"));
+        assert!(matches("a/***/c.py", "a/c.py"));
+    }
+
+    #[test]
+    fn test_should_match_the_whole_path_not_a_part_of_it() {
+        assert!(!matches("a", "ab"));
+        assert!(!matches("a", "ba"));
+        assert!(matches("", ""));
+        assert!(!matches("", "a"));
+    }
+
+    #[test]
+    fn test_should_not_let_double_star_cross_a_line_break() {
+        assert!(!matches("a/**", "a/b\nc"));
+        assert!(matches("a/*", "a/b\nc"));
+    }
+
+    #[test]
+    fn test_should_count_characters_not_bytes_for_a_question_mark() {
+        assert!(matches("src/?.py", "src/\u{e9}.py"));
+    }
+
+    #[test]
+    fn test_should_match_many_double_stars_in_linear_time() {
+        let pattern = "**/".repeat(40) + "x.py";
+        let path = "a/".repeat(200) + "y.py";
+        assert!(!matches(&pattern, &path));
+        assert!(matches(&pattern, &("a/".repeat(200) + "x.py")));
     }
 
     #[test]

@@ -4,21 +4,50 @@ import sys
 from importlib.metadata import version
 from inspect import Parameter, isroutine, signature
 from pathlib import Path
+from shutil import rmtree
 from sysconfig import get_config_var, get_path
 from types import ModuleType
 from typing import Any
 from warnings import catch_warnings, simplefilter
+from zipfile import ZipFile
 
 from invoke import Context, task
 
 RUST_DIR = Path("rust")
 LIBRARY_NAMES = RUST_DIR / "src" / "library_names.txt"
+PACKAGE_DIR = Path("src") / "typedframes"
+EXTENSION_BUILD_DIR = RUST_DIR / "target" / "extension"
+EXTENSION_SUFFIXES = {".so", ".pyd"}
 
 
 def _installed_binary() -> Path | None:
     """The `typedframes` executable `maturin develop` installed into this environment, if any."""
     candidate = Path(get_path("scripts")) / f"typedframes{get_config_var('EXE') or ''}"
     return candidate if candidate.is_file() else None
+
+
+def _staged_extensions() -> list[Path]:
+    """The compiled `typedframes._rust` extension module staged in the package directory, if any (not its stub)."""
+    return [path for path in PACKAGE_DIR.glob("_rust.*") if path.suffix in EXTENSION_SUFFIXES]
+
+
+def _stage_extension(ctx: Context, *, release: bool) -> None:
+    """Build the extension module and copy it into the package directory, where the wheel picks it up.
+
+    maturin builds it, not cargo, so the cross-compiling toolchains and the macOS link flags are the ones
+    the wheels use. The package's own wheel is built with `bindings = "bin"`, which cannot build it.
+    """
+    rmtree(EXTENSION_BUILD_DIR, ignore_errors=True)
+    profile = "--release" if release else ""
+    # From the crate's own directory: maturin would otherwise apply the `bindings = "bin"` of the root pyproject.toml.
+    with ctx.cd(RUST_DIR / "python"):
+        ctx.run(f'maturin build {profile} -o "{EXTENSION_BUILD_DIR.resolve()}"')
+    for stale in _staged_extensions():
+        stale.unlink()
+    with ZipFile(next(EXTENSION_BUILD_DIR.glob("*.whl"))) as wheel:
+        for member in wheel.namelist():
+            if Path(member).name.startswith("_rust.") and Path(member).suffix in EXTENSION_SUFFIXES:
+                (PACKAGE_DIR / Path(member).name).write_bytes(wheel.read(member))
 
 
 def _needs_build() -> bool:
@@ -29,20 +58,30 @@ def _needs_build() -> bool:
     a bare `cargo test` can leave this check thinking the installed one is fresh when it is stale.
     """
     binary = _installed_binary()
-    if binary is None:
+    extensions = _staged_extensions()
+    if binary is None or not extensions:
         return True
 
-    built = binary.stat().st_mtime
+    built = min(binary.stat().st_mtime, *(extension.stat().st_mtime for extension in extensions))
     src_dir = RUST_DIR / "src"
-    sources = [*src_dir.rglob("*.rs"), *src_dir.rglob("*.txt"), RUST_DIR / "Cargo.toml", RUST_DIR / "Cargo.lock"]
+    sources = [
+        *src_dir.rglob("*.rs"),
+        *src_dir.rglob("*.txt"),
+        *(RUST_DIR / "python").glob("src/*.rs"),
+        RUST_DIR / "python" / "build.rs",
+        RUST_DIR / "Cargo.toml",
+        RUST_DIR / "python" / "Cargo.toml",
+        RUST_DIR / "Cargo.lock",
+    ]
     return any(source.exists() and source.stat().st_mtime > built for source in sources)
 
 
 @task
 def build(ctx: Context, *, force: bool = False) -> None:
-    """Build the `typedframes` executable and install it with the package (maturin develop) if needed."""
+    """Build the `typedframes` executable and extension module, and install them with the package, if needed."""
     if force or _needs_build():
         print("Building Rust checker...")
+        _stage_extension(ctx, release=False)
         ctx.run("maturin develop --manifest-path rust/Cargo.toml")
     else:
         print("Rust checker is up to date.")
@@ -218,7 +257,7 @@ def lint(ctx: Context) -> None:
     print("Checking Rust formatting...")
     ctx.run(f"cd {RUST_DIR} && cargo fmt --all -- --check")
     print("Running Rust clippy...")
-    ctx.run(f"cd {RUST_DIR} && cargo clippy -- -D warnings")
+    ctx.run(f"cd {RUST_DIR} && cargo clippy --workspace -- -D warnings")
 
 
 @task
@@ -235,7 +274,7 @@ def test(ctx: Context) -> None:
     ctx.run("python -m pytest tests/")
     ctx.run("coverage-threshold")
     print("Running Rust tests...")
-    ctx.run(f"cd {RUST_DIR} && cargo test")
+    ctx.run(f"cd {RUST_DIR} && cargo test --workspace")
 
 
 @task

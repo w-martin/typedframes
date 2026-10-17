@@ -18,9 +18,12 @@ on your code and check each claim yourself.
   common HTTP or TLS crates, and the ruff parser crates are pinned to a release tag.
 - **It starts one kind of subprocess: `git`,** and only for `suggest --apply` and `--interactive`,
   to check that the work tree is clean and the files are tracked. The Python package starts the
-  `typedframes` executable (from the mypy plugin and `python -m typedframes`) and nothing else.
-- **Environment variables read:** `TYPEDFRAMES_JOBS` (worker count) and `TYPEDFRAMES_CACHE_DIR`
-  (cache location), plus `XDG_CACHE_HOME` or `LOCALAPPDATA` to find the default cache directory.
+  `typedframes` executable (from the mypy plugin and `python -m typedframes`) and nothing else. With
+  `TYPEDFRAMES_INPROC=1` it starts no process at all: the same checker runs inside the interpreter, as
+  an extension module in the wheel.
+- **Environment variables read:** `TYPEDFRAMES_JOBS` (worker count), `TYPEDFRAMES_CACHE_DIR`
+  (cache location) and `TYPEDFRAMES_INPROC` (run inside the Python interpreter), plus `XDG_CACHE_HOME` or
+  `LOCALAPPDATA` to find the default cache directory.
 
 ## What it writes
 

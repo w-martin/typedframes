@@ -637,6 +637,26 @@ fn test_should_group_every_untyped_site_with_report_all_and_write_one_file_per_g
 }
 
 #[test]
+fn test_should_print_one_short_entry_per_group_with_report_all_compact() {
+    // arrange
+    let project = Project::new();
+    project.write("job.py", PRIVATE_SITE);
+
+    // act
+    let output = project.run(&["report", "--all", ".", "--no-index", "--format", "compact"]);
+
+    // assert
+    assert!(
+        output.stdout.contains("1 site, 1 group"),
+        "{}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("1. x1 "), "{}", output.stdout);
+    assert!(!output.stdout.contains("<!--"), "{}", output.stdout);
+    assert!(output.stdout.lines().count() < 20, "{}", output.stdout);
+}
+
+#[test]
 fn test_should_say_there_are_no_untyped_sites_when_there_are_none() {
     // arrange
     let project = Project::new();

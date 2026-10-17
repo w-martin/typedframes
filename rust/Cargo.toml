@@ -1,12 +1,16 @@
 [package]
 name = "typedframes_checker"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2021"
 description = "A high-performance Rust-based checker for typedframes DataFrame column schemas"
 license = "MIT"
 repository = "https://github.com/w-martin/typedframes"
 homepage = "https://github.com/w-martin/typedframes"
 documentation = "https://github.com/w-martin/typedframes"
+
+[workspace]
+# `python` is the PyO3 glue. PyO3's macros expand to `unsafe`, which this crate forbids, so it is a crate of its own.
+members = ["python"]
 
 [[bin]]
 name = "typedframes"
@@ -15,7 +19,8 @@ path = "src/main.rs"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# Panics unwind (the default): this profile also builds the extension module, where a panic must become
+# a Python exception and not end the interpreter that loaded it.
 strip = "symbols"
 
 [lints.rust]
@@ -43,7 +48,8 @@ regex = "1.13.1"
 # has no MSVC support), the platform allocator elsewhere. Keep the `cfg`s in `src/lib.rs` in
 # step with these. jemalloc is tuned for a short run on many threads in `../.cargo/config.toml`.
 [target.'cfg(all(not(target_os = "windows"), not(target_os = "openbsd"), not(target_os = "aix"), not(target_os = "android"), any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64", target_arch = "riscv64")))'.dependencies]
-tikv-jemallocator = "0.7"
+# No initial-exec TLS: that model fails to `dlopen` into a process that did not link jemalloc at start (the extension module).
+tikv-jemallocator = { version = "0.7", features = ["disable_initial_exec_tls"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }

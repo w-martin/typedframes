@@ -196,6 +196,38 @@ fn format_report_groups(groups: &[Group]) -> String {
     lines.join("\n")
 }
 
+// A few lines per group, so a whole report fits in one screenshot.
+fn format_report_groups_compact(groups: &[Group]) -> String {
+    let total: usize = groups.iter().map(Vec::len).sum();
+    let mut lines = vec![format!(
+        "typedframes {} {}/{}: {total} {}, {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if total == 1 { "site" } else { "sites" },
+        groups.len(),
+        if groups.len() == 1 { "group" } else { "groups" }
+    )];
+    for (number, group) in groups.iter().enumerate() {
+        let best = representative(group);
+        lines.push(format!(
+            "{}. x{} {}",
+            number + 1,
+            group.len(),
+            group_title(group)
+        ));
+        match snippet(best).filter(|s| !s.is_empty()) {
+            Some(code) => lines.extend(
+                code.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| format!("    {l}")),
+            ),
+            None => lines.push(format!("    no snippet: {}", text(best, "refusal"))),
+        }
+    }
+    lines.join("\n")
+}
+
 fn report_groups_json(groups: &[Group]) -> String {
     let entries: Vec<Value> = groups
         .iter()
@@ -314,6 +346,8 @@ fn run_report_all(args: &ReportArgs, path: &Path, out: &mut impl Write) -> io::R
         }
     } else if args.report_format == ReportFormat::Json {
         writeln!(out, "{}", report_groups_json(&groups))?;
+    } else if args.report_format == ReportFormat::Compact {
+        writeln!(out, "{}", format_report_groups_compact(&groups))?;
     } else {
         writeln!(out, "{}", format_report_groups(&groups))?;
     }

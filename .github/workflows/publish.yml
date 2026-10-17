@@ -40,11 +40,11 @@ jobs:
         working-directory: rust
 
       - name: Rust lint
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
         working-directory: rust
 
       - name: Rust tests
-        run: cargo test
+        run: cargo test --workspace
         working-directory: rust
 
       - name: Python format check
@@ -137,12 +137,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The wheel is built with `bindings = "bin"`, which cannot build the extension module that runs
+      # the checker inside the Python interpreter. It is built on its own and staged into the package,
+      # where the wheel's `include` picks it up.
+      - name: Build the extension module
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out ../../extension-dist
+          working-directory: rust/python
+          manylinux: auto
+          docker-options: ${{ matrix.docker_options }}
+
+      - name: Stage the extension module
+        shell: python
+        run: |
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          with ZipFile(next(Path("extension-dist").glob("*.whl"))) as wheel:
+              for member in wheel.namelist():
+                  name = Path(member).name
+                  if name.startswith("_rust.") and Path(name).suffix in {".so", ".pyd"}:
+                      Path("src/typedframes", name).write_bytes(wheel.read(member))
+
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
           docker-options: ${{ matrix.docker_options }}
+
+      - name: Check the wheel holds the executable and the extension module
+        shell: python
+        run: |
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          names = ZipFile(next(Path("dist").glob("*.whl"))).namelist()
+          assert any("/scripts/typedframes" in n for n in names), "executable missing"
+          assert any(Path(n).name.startswith("_rust.") and n.startswith("typedframes/") for n in names), "extension missing"
+
+      # Loading is what fails when the extension is linked wrongly (e.g. jemalloc's TLS model), not the
+      # file being absent. Only on runners that can run the target.
+      - name: Load the extension module from the wheel
+        if: contains(fromJSON('["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]'), matrix.target)
+        shell: bash
+        run: |
+          python -m venv check-venv
+          if [ -d check-venv/Scripts ]; then PY=check-venv/Scripts/python; else PY=check-venv/bin/python; fi
+          $PY -m pip install --no-index --find-links dist typedframes
+          mkdir -p check-project && echo "x = 1" > check-project/a.py
+          TYPEDFRAMES_INPROC=1 $PY -m typedframes check check-project --no-cache
 
       - uses: actions/upload-artifact@v4
         with:

@@ -71,7 +71,7 @@ class TypedFramesPlugin(Plugin):
             completed = run_binary(["check", key, "--output-format", "json"], capture=True)
         except BinaryNotFoundError as e:
             msg = (
-                "typedframes checker executable not found. "
+                "typedframes checker not found. "
                 "Ensure the package is properly installed with 'uv add typedframes' "
                 "or build from source with 'uv run inv build'."
             )

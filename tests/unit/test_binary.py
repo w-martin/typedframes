@@ -1,13 +1,14 @@
 """Unit tests for finding and running the typedframes executable."""
 
+import os
 import sys
 from pathlib import Path
 from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from typedframes._binary import BinaryNotFoundError, find_binary, main, run_binary
+from typedframes._binary import IN_PROCESS_VARIABLE, BinaryNotFoundError, find_binary, main, run_binary
 
 
 def _touch(directory: str, *parts: str) -> Path:
@@ -148,3 +149,129 @@ class TestRunBinary(TestCase):
         # assert
         run.assert_called_once_with(["check", "."])
         self.assertEqual(3, ctx.exception.code)
+
+
+def _extension(status: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
+    extension = MagicMock()
+    extension.main.return_value = status
+    extension.run_captured.return_value = (status, stdout, stderr)
+    return extension
+
+
+class TestInProcess(TestCase):
+    """Running the command line inside this process, through the extension module."""
+
+    def test_should_run_the_extension_when_the_environment_asks_for_it(self) -> None:
+        """Test that `TYPEDFRAMES_INPROC` runs in this process and never looks for the executable."""
+        # arrange
+        extension = _extension(status=3)
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: "1"}),
+            patch("typedframes._binary.find_binary", side_effect=AssertionError("started the executable")),
+            patch("typedframes._binary.import_module", return_value=extension),
+        ):
+            # act
+            result = run_binary(["check", "."])
+
+        # assert
+        extension.main.assert_called_once_with(["typedframes", "check", "."])
+        self.assertEqual(3, result.returncode)
+
+    def test_should_return_the_captured_output_of_the_extension(self) -> None:
+        """Test that `capture` gives back the extension's standard output."""
+        # arrange
+        extension = _extension(status=2, stdout="{}", stderr="Error: path does not exist")
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: "1"}),
+            patch("typedframes._binary.import_module", return_value=extension),
+        ):
+            # act
+            result = run_binary(["check", "."], capture=True)
+
+        # assert
+        extension.run_captured.assert_called_once_with(["typedframes", "check", "."])
+        self.assertEqual("{}", result.stdout)
+        self.assertEqual("Error: path does not exist", result.stderr)
+        self.assertEqual(2, result.returncode)
+
+    def test_should_start_the_executable_when_the_variable_says_off(self) -> None:
+        """Test that `0`, `false`, `no` and `off`, in any case, are the same as unset."""
+        for value in ("0", "false", "No", " OFF "):
+            with self.subTest(value=value):
+                self._run_with_the_executable(value)
+
+    def _run_with_the_executable(self, value: str) -> None:
+        completed = CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: value}),
+            patch("typedframes._binary.find_binary", return_value=Path("/bin/typedframes")),
+            patch("typedframes._binary.import_module", side_effect=AssertionError("loaded the extension")),
+            patch("typedframes._binary.subprocess.run", return_value=completed) as run,
+        ):
+            # act
+            run_binary(["check", "."])
+
+        # assert
+        run.assert_called_once()
+
+    def test_should_use_the_extension_when_there_is_no_executable(self) -> None:
+        """Test the fallback for an install that has the extension but not the executable."""
+        # arrange
+        extension = _extension()
+        with (
+            patch.dict(os.environ, clear=True),
+            patch("typedframes._binary.find_binary", side_effect=BinaryNotFoundError),
+            patch("typedframes._binary.import_module", return_value=extension),
+        ):
+            # act
+            run_binary(["check", "."])
+
+        # assert
+        extension.main.assert_called_once_with(["typedframes", "check", "."])
+
+    def test_should_report_the_missing_executable_when_there_is_no_extension_either(self) -> None:
+        """Test that an install with neither raises the executable's error."""
+        # arrange
+        with (
+            patch.dict(os.environ, clear=True),
+            patch("typedframes._binary.find_binary", side_effect=BinaryNotFoundError("no executable")),
+            patch("typedframes._binary.import_module", side_effect=ImportError),
+            self.assertRaises(BinaryNotFoundError) as ctx,
+        ):
+            # act
+            run_binary(["check", "."])
+
+        # assert
+        self.assertEqual("no executable", str(ctx.exception))
+
+    def test_should_say_so_when_the_extension_was_asked_for_but_is_not_installed(self) -> None:
+        """Test the error for `TYPEDFRAMES_INPROC` without the extension module."""
+        # arrange
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: "1"}),
+            patch("typedframes._binary.import_module", side_effect=ImportError),
+            self.assertRaises(BinaryNotFoundError) as ctx,
+        ):
+            # act
+            run_binary(["check", "."])
+
+        # assert
+        self.assertIn("typedframes._rust", str(ctx.exception))
+
+    def test_should_exit_with_the_extensions_status_from_the_module_entry_point(self) -> None:
+        """Test that `python -m typedframes` runs in this process, not as a replacement, when asked."""
+        # arrange
+        extension = _extension(status=2)
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: "1"}),
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "argv", ["typedframes", "check", "."]),
+            patch("typedframes._binary.import_module", return_value=extension),
+            patch("typedframes._binary.os.execv", side_effect=AssertionError("started the executable")),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            # act
+            main()
+
+        # assert
+        self.assertEqual(2, ctx.exception.code)

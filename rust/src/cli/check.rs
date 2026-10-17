@@ -451,22 +451,29 @@ pub(crate) fn build_index(
     }
 }
 
-/// Resolves a command's path argument; a path that doesn't exist is reported and exit status 2.
-pub(crate) fn resolve_existing_path(original: &Path) -> Result<PathBuf, i32> {
+/// Resolves a command's path argument; `Err` is the message for a path that doesn't exist.
+fn resolve_or_explain(original: &Path) -> Result<PathBuf, String> {
     let path = resolve(original);
     if path.exists() {
         return Ok(path);
     }
     if original.is_absolute() {
-        eprintln!("Error: path does not exist: {}", path.display());
+        Err(format!("Error: path does not exist: {}", path.display()))
     } else {
-        eprintln!(
+        Err(format!(
             "Error: path does not exist: {} (resolved to {})",
             repr(original),
             path.display()
-        );
+        ))
     }
-    Err(2)
+}
+
+/// Resolves a command's path argument; a path that doesn't exist is reported and exit status 2.
+pub(crate) fn resolve_existing_path(original: &Path) -> Result<PathBuf, i32> {
+    resolve_or_explain(original).map_err(|message| {
+        eprintln!("{message}");
+        2
+    })
 }
 
 fn print_coverage_failures(
@@ -495,12 +502,20 @@ fn print_coverage_failures(
     Ok(())
 }
 
-/// Runs `check`, writing its report to `out`; returns the exit status.
-pub(crate) fn run_check(args: &CheckArgs, out: &mut impl Write) -> io::Result<i32> {
+/// Runs `check`, writing its report to `out` and the reason for a path that doesn't exist to `err`;
+/// returns the exit status.
+pub(crate) fn run_check(
+    args: &CheckArgs,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<i32> {
     let start = Instant::now();
-    let path = match resolve_existing_path(&args.path) {
+    let path = match resolve_or_explain(&args.path) {
         Ok(path) => path,
-        Err(code) => return Ok(code),
+        Err(message) => {
+            writeln!(err, "{message}")?;
+            return Ok(2);
+        }
     };
 
     // Loaded before the run so an unusable config is reported up front rather than after a long

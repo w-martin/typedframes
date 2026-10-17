@@ -3,6 +3,7 @@
 use super::cache::CacheAction;
 use super::config::CoverageDetail;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const CACHE_HELP: &str = "\
@@ -174,6 +175,7 @@ pub(crate) enum Outcome {
 pub(crate) enum ReportFormat {
     Markdown,
     Json,
+    Compact,
 }
 
 #[derive(Args, Debug)]
@@ -215,9 +217,14 @@ pub(crate) struct CacheArgs {
     pub(crate) cache_dir: Option<PathBuf>,
 }
 
-/// Parses the process arguments, exiting with clap's usage error (status 2) on a bad command line.
-pub(crate) fn parse() -> Cli {
-    Cli::parse()
+/// Parses `args` (program name first). A bad command line, `--help` and `--version` come back as
+/// the clap error for the caller to print, so nothing here ends the process.
+pub(crate) fn parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    Cli::try_parse_from(args)
 }
 
 #[cfg(test)]

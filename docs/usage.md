@@ -950,7 +950,8 @@ typedframes report --all src/
 
 Sites the checker decided about for the same reason are grouped, each group showing its sites by name
 and the smallest example. `--outcome suggested|withheld` keeps one kind of decision, `--format json`
-prints the groups as JSON, and `--output-dir DIR` writes one bug-report body per group instead of
+prints the groups as JSON, `--format compact` prints a few lines per group so the report fits in a
+phone screenshot, and `--output-dir DIR` writes one bug-report body per group instead of
 printing.
 
 It prints Markdown with the typedframes, Python and OS versions, what the checker decided about the

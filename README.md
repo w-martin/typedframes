@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.14.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.14.1) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -103,6 +103,13 @@ plugin. `typedframes` itself has no required dependencies; add the extra for whi
 pip install typedframes[pandas]   # includes pandas
 pip install typedframes[polars]   # includes polars
 ```
+
+Where the Python interpreter may run code but no other executable may be started, set `TYPEDFRAMES_INPROC=1`. Then
+`python -m typedframes` and the mypy plugin run the same checker inside the interpreter, through an extension module in
+the wheel, instead of starting the `typedframes` executable. Results and exit status are the same; when the checker is
+asked to capture its output (as the mypy plugin does), a usage error or a missing path comes back with it, and any
+warning a command prints still goes to the terminal. Without the extension installed (for example from a source
+distribution) `TYPEDFRAMES_INPROC=1` is an error.
 
 ---
 
@@ -471,7 +478,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.14.0"]
+        additional_dependencies: ["typedframes==0.14.1"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -520,7 +527,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.14.0"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.14.1"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
@@ -548,7 +555,7 @@ and the files are written together or not at all. See the
 
 If `check` or `suggest` gets a site wrong and the code can't be shared, `typedframes report quiet-amber src/` prints a
 bug-report body with a redacted copy of the code around that site, checked against the checker so it reproduces the same
-result. `typedframes report --all src/` does this for every untyped site, grouped by why the checker decided as it did.
+result. `typedframes report --all src/` does this for every untyped site, grouped by why the checker decided as it did; add `--format compact` for a few lines per group that fit in one screenshot.
 Redacted is not anonymous: read it before posting, and don't use it on code you aren't allowed to share. See
 [Reporting a problem](docs/usage.md#reporting-a-problem-report), and
 [Security and data handling](docs/security.md) for what the tool reads, writes and connects to.

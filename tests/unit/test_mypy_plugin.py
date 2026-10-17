@@ -186,7 +186,7 @@ class TestTypedFramesPluginUnit(unittest.TestCase):
             self.plugin._run_checker(self.test_file)
 
         # assert
-        self.assertIn("typedframes checker executable not found", str(ctx.exception))
+        self.assertIn("typedframes checker not found", str(ctx.exception))
 
     def test_should_raise_error_when_the_executable_fails(self) -> None:
         """Test that a failing run is reported with the executable's own message."""

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typedframes"
-version = "0.14.0"
+version = "0.14.1"
 description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
 keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"
@@ -49,6 +49,8 @@ bindings = "bin"
 module-name = "typedframes"
 # The cargo config carries the allocator tuning, so a build from the sdist is tuned too.
 include = [
+    { path = "src/typedframes/_rust.*", format = "wheel" },
+    { path = "rust/python/**/*", format = "sdist" },
     { path = "LICENSE", format = "sdist" },
     { path = ".cargo/config.toml", format = "sdist" },
 ]

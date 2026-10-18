@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typedframes"
-version = "0.14.3"
+version = "0.14.4"
 description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
 keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"
@@ -100,7 +100,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "SLF001", "S603", "S607"]
-"tests/fixtures/*" = ["T201"]
+"tests/fixtures/*" = ["T201", "ANN", "ARG", "B007", "D", "F841", "INP001", "PD011", "RET504"]
 "examples/*" = ["T201", "INP001", "D100", "D101", "D103", "BLE001", "ERA001", "F821", "PLR2004"]
 # S608: these connector examples deliberately build a query at runtime (an f-string, not
 # a literal) to demonstrate the untracked-dataframe case -- not a real injection risk in

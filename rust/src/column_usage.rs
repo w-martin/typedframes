@@ -69,6 +69,12 @@ pub(crate) trait HelperResolver {
     fn method_usage_of(&self, _method: &str) -> Option<Vec<ParamUsage>> {
         None
     }
+
+    /// What kind of function `func` is, for the reason a frame passed to it can't be
+    /// followed (one of the `CALLEE_*` labels), or `None` when it can't be told.
+    fn callee_class(&self, _func: &Expr) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A resolver that knows no function: every call is an unknown use.
@@ -126,7 +132,23 @@ pub struct OtherUse {
     /// See `ColumnAccess::line`.
     #[serde(skip)]
     pub(crate) line: usize,
+    /// For a frame passed to a call the checker can't follow: what kind of callee it is,
+    /// in words that name nothing from the user's code.
+    #[serde(skip)]
+    pub(crate) callee: Option<&'static str>,
 }
+
+pub(crate) const CALLEE_SAME_FILE: &str =
+    "a function in this file whose use of the frame can't be followed";
+pub(crate) const CALLEE_IMPORTED: &str = "an imported function the checker has no summary of";
+pub(crate) const CALLEE_UNBOUND: &str =
+    "a name this file never defines or imports (a builtin, or from a star import)";
+pub(crate) const CALLEE_MODULE_FUNCTION: &str = "a function of an imported module";
+pub(crate) const CALLEE_IMPORTED_NAME: &str =
+    "a function or method reached through an imported name";
+pub(crate) const CALLEE_OWN_METHOD: &str = "a method of this class that can't be followed";
+pub(crate) const CALLEE_OTHER_METHOD: &str = "a method of another object";
+pub(crate) const CALLEE_FORWARDS: &str = "a function that returns, stores or forwards the frame";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ColumnUsage {
@@ -420,9 +442,15 @@ impl UsageScan<'_> {
         passed: &str,
         via: Option<&str>,
         summary: Option<&ParamUsage>,
+        callee: Option<&'static str>,
     ) {
         let (Some(summary), Some(via)) = (summary, via) else {
-            self.record_other(at, passed.to_string(), Consumption::Unknown);
+            let callee = if via.is_some() {
+                Some(CALLEE_FORWARDS)
+            } else {
+                callee
+            };
+            self.record_other_via(at, passed.to_string(), Consumption::Unknown, callee);
             return;
         };
         let line = (self.line_of)(at);
@@ -541,12 +569,23 @@ impl UsageScan<'_> {
         description: impl Into<String>,
         consumes: Consumption,
     ) {
+        self.record_other_via(at, description, consumes, None);
+    }
+
+    fn record_other_via(
+        &mut self,
+        at: TextSize,
+        description: impl Into<String>,
+        consumes: Consumption,
+        callee: Option<&'static str>,
+    ) {
         let line = (self.line_of)(at);
         self.usage.other_uses.push(OtherUse {
             description: description.into(),
             conditional: self.depth > 0,
             consumes,
             line,
+            callee,
         });
     }
 
@@ -942,13 +981,14 @@ impl UsageScan<'_> {
                     _ => passed_to(&call.func),
                 };
                 let resolved = self.summaries_for(&call.func);
+                let callee_class = self.helpers.callee_class(&call.func);
                 let via = resolved.as_ref().map(|(name, _)| name.as_str());
                 let summaries = resolved.as_ref().map(|(_, all)| all);
                 for (position, arg) in call.arguments.args.iter().enumerate() {
                     if self.is_tainted(arg) {
                         let summary =
                             summaries.and_then(|all| all.iter().find(|p| p.position == position));
-                        self.passed_argument(at, &passed, via, summary);
+                        self.passed_argument(at, &passed, via, summary, callee_class);
                     } else {
                         self.visit_expr(arg);
                     }
@@ -958,7 +998,7 @@ impl UsageScan<'_> {
                         let summary = kw.arg.as_ref().and_then(|name| {
                             summaries.and_then(|all| all.iter().find(|p| p.name == name.as_str()))
                         });
-                        self.passed_argument(at, &passed, via, summary);
+                        self.passed_argument(at, &passed, via, summary, callee_class);
                     } else {
                         self.visit_expr(&kw.value);
                     }

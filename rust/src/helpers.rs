@@ -9,9 +9,10 @@
 
 use crate::column_usage::{
     blocks_narrowing, declares_global_or_nonlocal, first_nested_scope_mention, scan_usage_with,
-    HelperResolver, ParamUsage,
+    HelperResolver, ParamUsage, CALLEE_IMPORTED, CALLEE_IMPORTED_NAME, CALLEE_MODULE_FUNCTION,
+    CALLEE_OTHER_METHOD, CALLEE_OWN_METHOD, CALLEE_SAME_FILE, CALLEE_UNBOUND,
 };
-use crate::static_eval::{Analysis, CalleeBinding};
+use crate::static_eval::{Analysis, CalleeBinding, ImportKind};
 use ruff_python_ast::{self as ast, ModModule, Stmt};
 use ruff_text_size::{Ranged, TextSize};
 use std::cell::RefCell;
@@ -151,6 +152,32 @@ impl HelperResolver for FileHelpers<'_> {
                 })
                 .collect(),
         )
+    }
+
+    fn callee_class(&self, func: &ast::Expr) -> Option<&'static str> {
+        match func {
+            ast::Expr::Name(name) => {
+                if self.analysis.is_unbound_name(name) {
+                    return Some(CALLEE_UNBOUND);
+                }
+                match self.analysis.callee_binding(name)? {
+                    CalleeBinding::Function(_) => Some(CALLEE_SAME_FILE),
+                    CalleeBinding::Imported { .. } => Some(CALLEE_IMPORTED),
+                }
+            }
+            ast::Expr::Attribute(attribute) => {
+                let ast::Expr::Name(base) = &*attribute.value else {
+                    return None;
+                };
+                Some(match self.analysis.import_kind(base) {
+                    Some(ImportKind::Module) => CALLEE_MODULE_FUNCTION,
+                    Some(ImportKind::From) => CALLEE_IMPORTED_NAME,
+                    None if matches!(base.id.as_str(), "self" | "cls") => CALLEE_OWN_METHOD,
+                    None => CALLEE_OTHER_METHOD,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn usage_of(&self, callee: &ast::ExprName) -> Option<Vec<ParamUsage>> {

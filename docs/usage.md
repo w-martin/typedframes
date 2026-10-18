@@ -110,7 +110,8 @@ are themselves evaluable. A class attribute (`Cols.KEEP`) is read when the class
 most one base class, also defined in the same file, no decorator or `metaclass`, and the
 attribute is assigned once and never set, deleted or mutated. Across files, a module's
 constants and functions are read as above; `from config import X`, `import config` and
-relative imports are resolved, but `config.Cols.KEEP` (a class in another file) is not.
+relative imports are resolved, but `config.Cols.KEEP` (a class in another file) is not. Relative imports
+also bring in schemas, functions and helper summaries from the file they name, as absolute ones do.
 A function from another file can only read that file's own constants and functions, never
 the importing file's names.
 
@@ -818,7 +819,7 @@ quiet-amber  /repo/etl.py:5:5  sales  columns ["amount", "region"]  [review]
          print(sales["region"])
 
 Not suggested:
-  tempo-cherry  /repo/etl.py:12:5  raw  can't see everything done with it: passed to `clean()` (line 14)
+  tempo-cherry  /repo/etl.py:12:5  raw  can't see everything done with it: passed to `clean()`, an imported function the checker has no summary of (line 14)
   solid-triton  /repo/etl.py:18:5  d  can't see everything done with it: `.groupby()` (line 19)
 
 1 suggestion (0 safe, 1 review), 2 withheld, in 1 file. Dry run: no files were changed.
@@ -909,7 +910,10 @@ notebooks, other repositories) and dynamic calls can't be seen, so these suggest
 Narrowing is only safe when every use of the frame is visible and is a read of a named
 column, so a site is **withheld** (and listed under `Not suggested:` with the reason) when:
 
-- the frame is passed to a function that can't be followed, returned (see above), stored in an attribute or
+- the frame is passed to a function that can't be followed (the reason says what kind of callee it
+  is: a function in this file, an imported function the checker has no summary of, a function of an
+  imported module, a method of another object, or a name the file never defines or imports),
+  returned (see above), stored in an attribute or
   container, iterated over, or used through anything other than `df["col"]` / `df[["a", "b"]]`,
   including methods like `.groupby("region")`, `.drop(columns=...)` or `.head()`, which can
   use columns by string argument or use every column (`len(df)`, `.index` and `.empty` are
@@ -918,7 +922,12 @@ column, so a site is **withheld** (and listed under `Not suggested:` with the re
 - a nested function, class, lambda or comprehension also mentions the frame;
 - the name, or a name it was assigned to, is declared `global` or `nonlocal`, or
   `eval`/`exec`/`locals`/`globals`/`vars` is called after the load;
-- the load isn't recognisably pandas or polars, the assignment shares a line with other code,
+- the load isn't recognisably pandas or polars (a method called on a local or parameter is read
+  from its return annotation only when the local is built as `svc = Class(...)`, or the parameter
+  is annotated `Class`, the name is never rebound (by assignment, `:=`, `for`, `with`, `except`,
+  `match`, `import`, `global` or `nonlocal`), and the class in this file annotates the method
+  `-> pd.DataFrame` or `-> pl.DataFrame` without being `async`, decorated (other than
+  `@staticmethod`/`@classmethod`) or overridden differently by a subclass), the assignment shares a line with other code,
   it is a class attribute, or it is already followed by a column selection.
 
 **`safe` and `review`.** A suggestion is `safe` when nothing about it depends on code
@@ -949,7 +958,12 @@ typedframes report --all src/
 ```
 
 Sites the checker decided about for the same reason are grouped, each group showing its sites by name
-and the smallest example. `--outcome suggested|withheld` keeps one kind of decision, `--format json`
+and the smallest example. `--outcome suggested|withheld` keeps one kind of decision, `--outcome untracked`
+lists instead the frames used like a DataFrame (a column read, or a pandas or polars method) that
+come from a call the checker doesn't treat as a DataFrame source, so they are in no other report;
+it can include a call that merely shares a method name with pandas or polars, and leaves out a
+plain `Class(...)` construction. `--outcome` needs `--all`, and a name from that list works with
+`typedframes report NAME` too. `--format json`
 prints the groups as JSON, `--format compact` prints a few lines per group so the report fits in a
 phone screenshot, and `--output-dir DIR` writes one bug-report body per group instead of
 printing.

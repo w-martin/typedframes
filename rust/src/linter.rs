@@ -79,6 +79,22 @@ fn following<'a>(extra: &[&'a [Stmt]], rest: &'a [Stmt], tails: &[&'a [Stmt]]) -
     chain
 }
 
+// The function a body belongs to: its name, for finding its callers, and the locals and
+// parameters that are certainly an instance of a class (see `receiver_classes`).
+struct FunctionContext<'a> {
+    name: Option<&'a str>,
+    receivers: HashMap<String, String>,
+}
+
+impl FunctionContext<'_> {
+    fn module() -> Self {
+        FunctionContext {
+            name: None,
+            receivers: HashMap::new(),
+        }
+    }
+}
+
 // The function or module body being scanned, as every origin inside it sees it.
 struct UsageScope<'a> {
     libraries: &'a suggest::LibraryContext,
@@ -88,6 +104,8 @@ struct UsageScope<'a> {
     in_function: bool,
     // The function the body belongs to, for finding its callers.
     function_name: Option<&'a str>,
+    // Locals and parameters of the function that are certainly an instance of a class.
+    receivers: HashMap<String, String>,
 }
 
 // What one pass over a file's scopes learns about its untyped sites: their downstream
@@ -152,6 +170,148 @@ pub(crate) struct ParamGovernedAccess {
 pub(crate) struct UnresolvedDataframeShapedCall {
     pub(crate) name: String,
     pub(crate) is_attribute_call: bool,
+    // Where the variable is assigned, its name, and (once named) its two-word phrase, for
+    // `report --outcome untracked`.
+    pub(crate) line: usize,
+    pub(crate) col: usize,
+    pub(crate) var: String,
+    pub(crate) phrase: String,
+    // What kind of call it is, in words that name nothing from the user's code.
+    pub(crate) callee: &'static str,
+}
+
+// The local names and parameters of `func` that are certainly an instance of a class, by
+// class name: a parameter annotated `Name` that is never rebound, or a name bound exactly
+// once, by `name = Class(...)`. Which class a name stands for is all this decides; whether
+// that class is known, and what its methods return, is for the caller to look up. A rebinding
+// anywhere in the function, nested scopes included, rules the name out.
+fn receiver_classes(func: &ast::StmtFunctionDef) -> HashMap<String, String> {
+    #[derive(Default)]
+    struct Bindings {
+        counts: HashMap<String, usize>,
+        constructed: HashMap<String, String>,
+    }
+
+    impl Bindings {
+        fn bind(&mut self, name: &str) {
+            *self.counts.entry(name.to_string()).or_default() += 1;
+        }
+    }
+
+    impl<'a> Visitor<'a> for Bindings {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::Assign(assign) => {
+                    if let ([Expr::Name(target)], Expr::Call(call)) =
+                        (assign.targets.as_slice(), &*assign.value)
+                    {
+                        if let Expr::Name(class) = &*call.func {
+                            self.constructed
+                                .insert(target.id.to_string(), class.id.to_string());
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => self.bind(f.name.as_str()),
+                Stmt::ClassDef(c) => self.bind(c.name.as_str()),
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        self.bind(name.as_str().split('.').next().unwrap_or_default());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        self.bind(alias.asname.as_ref().unwrap_or(&alias.name).as_str());
+                    }
+                }
+                // A name another scope may rebind, however it is reached.
+                Stmt::Global(g) => g.names.iter().for_each(|n| {
+                    self.bind(n.as_str());
+                    self.bind(n.as_str());
+                }),
+                Stmt::Nonlocal(g) => g.names.iter().for_each(|n| {
+                    self.bind(n.as_str());
+                    self.bind(n.as_str());
+                }),
+                _ => {}
+            }
+            ast_visitor::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Name(name) = expr {
+                if !name.ctx.is_load() {
+                    self.bind(name.id.as_str());
+                }
+            }
+            ast_visitor::walk_expr(self, expr);
+        }
+
+        fn visit_pattern(&mut self, pattern: &'a ast::Pattern) {
+            match pattern {
+                ast::Pattern::MatchAs(p) => {
+                    if let Some(name) = &p.name {
+                        self.bind(name.as_str());
+                    }
+                }
+                ast::Pattern::MatchStar(p) => {
+                    if let Some(name) = &p.name {
+                        self.bind(name.as_str());
+                    }
+                }
+                ast::Pattern::MatchMapping(p) => {
+                    if let Some(rest) = &p.rest {
+                        self.bind(rest.as_str());
+                    }
+                }
+                _ => {}
+            }
+            ast_visitor::walk_pattern(self, pattern);
+        }
+
+        fn visit_except_handler(&mut self, handler: &'a ast::ExceptHandler) {
+            let ast::ExceptHandler::ExceptHandler(h) = handler;
+            if let Some(name) = &h.name {
+                self.bind(name.as_str());
+            }
+            ast_visitor::walk_except_handler(self, handler);
+        }
+
+        fn visit_parameter(&mut self, parameter: &'a ast::Parameter) {
+            self.bind(parameter.name.as_str());
+            ast_visitor::walk_parameter(self, parameter);
+        }
+    }
+
+    let mut bindings = Bindings::default();
+    let mut annotated: HashMap<String, String> = HashMap::new();
+    let parameters = &func.parameters;
+    for parameter in parameters
+        .posonlyargs
+        .iter()
+        .chain(&parameters.args)
+        .chain(&parameters.kwonlyargs)
+    {
+        bindings.bind(parameter.parameter.name.as_str());
+        if let Some(Expr::Name(class)) = parameter.parameter.annotation.as_deref() {
+            annotated.insert(parameter.parameter.name.to_string(), class.id.to_string());
+        }
+    }
+    for rest in [&parameters.vararg, &parameters.kwarg]
+        .into_iter()
+        .flatten()
+    {
+        bindings.bind(rest.name.as_str());
+    }
+    for stmt in &func.body {
+        bindings.visit_stmt(stmt);
+    }
+
+    annotated
+        .into_iter()
+        .chain(bindings.constructed.clone())
+        .filter(|(name, _)| bindings.counts.get(name) == Some(&1))
+        .collect()
 }
 
 // What `self.<attr> = <value>(...)` in `__init__` resolved `<attr>` to -- see
@@ -1811,6 +1971,7 @@ impl Linter {
         }
 
         self.observe_untyped_site_usage(module);
+        self.name_untracked_sites();
 
         errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
 
@@ -1845,7 +2006,7 @@ impl Linter {
             &helpers,
             body,
             &by_position,
-            None,
+            FunctionContext::module(),
             &mut results,
         );
         self.untyped_site_usage = results.usage;
@@ -1870,6 +2031,31 @@ impl Linter {
             .or_else(|| path.file_name().map(Path::new))
             .unwrap_or(path);
         relative.to_string_lossy().replace('\\', "/")
+    }
+
+    // Gives every frame the checker does not track (see `unresolved_dataframe_shaped_calls`) a
+    // two-word name, from a different salt than the untyped sites' so the two never collide.
+    fn name_untracked_sites(&mut self) {
+        let Some(index) = self.line_index.as_ref() else {
+            return;
+        };
+        if !self.collect_suggestions || self.unresolved_dataframe_shaped_calls.is_empty() {
+            return;
+        }
+        let sites: Vec<(usize, usize, &str)> = self
+            .unresolved_dataframe_shaped_calls
+            .iter()
+            .map(|c| (c.line, c.col, c.var.as_str()))
+            .collect();
+        let salt = format!("untracked:{}", self.name_salt());
+        let phrases = crate::phrase::site_phrases(&self.source, index, &salt, &sites);
+        for (call, phrase) in self
+            .unresolved_dataframe_shaped_calls
+            .iter_mut()
+            .zip(phrases)
+        {
+            call.phrase = phrase;
+        }
     }
 
     // Gives every untyped site its stable two-word name; see `phrase`.
@@ -1897,7 +2083,7 @@ impl Linter {
         helpers: &dyn column_usage::HelperResolver,
         scope_body: &[Stmt],
         by_position: &HashMap<(usize, usize), &str>,
-        function_name: Option<&str>,
+        function: FunctionContext,
         results: &mut SiteScanResults,
     ) {
         let scope = UsageScope {
@@ -1905,8 +2091,9 @@ impl Linter {
             helpers,
             body: scope_body,
             by_position,
-            in_function: function_name.is_some(),
-            function_name,
+            in_function: function.name.is_some(),
+            function_name: function.name,
+            receivers: function.receivers,
         };
         self.scan_block(&scope, scope_body, &[], false, results);
     }
@@ -1934,7 +2121,10 @@ impl Linter {
                         scope.helpers,
                         &func_def.body,
                         scope.by_position,
-                        Some(func_def.name.as_str()),
+                        FunctionContext {
+                            name: Some(func_def.name.as_str()),
+                            receivers: receiver_classes(func_def),
+                        },
                         results,
                     );
                 }
@@ -2013,7 +2203,10 @@ impl Linter {
                         scope.helpers,
                         &func_def.body,
                         scope.by_position,
-                        Some(func_def.name.as_str()),
+                        FunctionContext {
+                            name: Some(func_def.name.as_str()),
+                            receivers: receiver_classes(func_def),
+                        },
                         results,
                     );
                 }
@@ -2115,6 +2308,7 @@ impl Linter {
                 conditional: false,
                 consumes: column_usage::Consumption::Unknown,
                 line: line_of(offset),
+                callee: None,
             });
         }
         self.see_through_returns(scope, &mut usage);
@@ -2147,6 +2341,7 @@ impl Linter {
                         stmt_start: stmt.range().start().to_usize(),
                         stmt_end: stmt.range().end().to_usize(),
                         function_local: scope.in_function,
+                        receivers: &scope.receivers,
                     },
                     &usage,
                 )
@@ -2287,25 +2482,44 @@ impl Linter {
         let all_schemas = &index.all_schemas;
         let all_schema_locations = &index.all_schema_locations;
 
+        let importer = file_path.map(|p| {
+            let p = Path::new(p);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                project_root.join(p)
+            }
+        });
         for stmt in &module.body {
             let Stmt::ImportFrom(import_from) = stmt else {
                 continue;
             };
-            if import_from.level > 0 {
+            if import_from.level > 0 && import_from.module.is_none() {
                 continue;
             }
-            let Some(module_ident) = &import_from.module else {
-                continue;
+            let resolved = if import_from.level > 0 {
+                let module_name = import_from
+                    .module
+                    .as_ref()
+                    .map(|m| m.id.as_str())
+                    .unwrap_or_default();
+                importer.as_deref().and_then(|file| {
+                    resolve_relative_module(file, import_from.level, module_name, &index.files)
+                })
+            } else {
+                let Some(module_ident) = &import_from.module else {
+                    continue;
+                };
+                let module_name = module_ident.id.as_str();
+                if module_name.starts_with("typedframes") {
+                    continue;
+                }
+                // resolve_module_file also tries an explicitly allowlisted external
+                // package's site-packages location (see collect_external_package_files),
+                // not just project_root/project_root/src.
+                resolve_module_file(module_name, project_root, &index.files)
             };
-            let module_name = module_ident.id.as_str();
-            if module_name.starts_with("typedframes") {
-                continue;
-            }
-            // resolve_module_file also tries an explicitly allowlisted external
-            // package's site-packages location (see collect_external_package_files),
-            // not just project_root/project_root/src.
-            let Some(resolved_str) = resolve_module_file(module_name, project_root, &index.files)
-            else {
+            let Some(resolved_str) = resolved else {
                 continue;
             };
             let Some(entry) = index.files.get(&resolved_str) else {
@@ -3241,14 +3455,28 @@ impl Linter {
         if !self.dataframe_shaped_usage.contains(target.id.as_str()) {
             return;
         }
+        let (line, col) = self.source_location(target.range().start());
+        let var = target.id.to_string();
+        let mut record = |name: String, is_attribute_call: bool, callee: &'static str| {
+            self.unresolved_dataframe_shaped_calls
+                .push(UnresolvedDataframeShapedCall {
+                    name,
+                    is_attribute_call,
+                    line,
+                    col,
+                    var: var.clone(),
+                    phrase: String::new(),
+                    callee,
+                });
+        };
         match &*call.func {
             Expr::Attribute(attr) => {
                 if let Expr::Name(base) = &*attr.value {
-                    self.unresolved_dataframe_shaped_calls
-                        .push(UnresolvedDataframeShapedCall {
-                            name: base.id.to_string(),
-                            is_attribute_call: true,
-                        });
+                    record(
+                        base.id.to_string(),
+                        true,
+                        "a method called on a local, parameter or imported module",
+                    );
                 } else if let Expr::Attribute(recv_attr) = &*attr.value {
                     // self.<attr>.<method>(...), where <attr>'s class (from
                     // current_self_attrs) didn't resolve via class_methods -- not a
@@ -3263,11 +3491,12 @@ impl Linter {
                             if let Some(origin) =
                                 self.current_self_attrs.get(recv_attr.attr.as_str())
                             {
-                                self.unresolved_dataframe_shaped_calls.push(
-                                    UnresolvedDataframeShapedCall {
-                                        name: origin.resolve_name.clone(),
-                                        is_attribute_call: origin.is_attribute_call,
-                                    },
+                                let (name, is_attribute_call) =
+                                    (origin.resolve_name.clone(), origin.is_attribute_call);
+                                record(
+                                    name,
+                                    is_attribute_call,
+                                    "a method called on an attribute of `self`",
                                 );
                             }
                         }
@@ -3275,11 +3504,7 @@ impl Linter {
                 }
             }
             Expr::Name(func_name) => {
-                self.unresolved_dataframe_shaped_calls
-                    .push(UnresolvedDataframeShapedCall {
-                        name: func_name.id.to_string(),
-                        is_attribute_call: false,
-                    });
+                record(func_name.id.to_string(), false, "a plain function call");
             }
             _ => {}
         }
@@ -11902,7 +12127,77 @@ def load():
         assert_eq!(linter.withheld.len(), 1);
         assert_eq!(
             linter.withheld[0].reason,
-            "can't see everything done with it: passed to `clean()` (line 4)"
+            "can't see everything done with it: passed to `clean()`, a name this file never defines or imports (a builtin, or from a star import) (line 4)"
+        );
+    }
+
+    // The reason a frame passed to `call` is withheld, for the lines of a function around it.
+    fn withheld_reason_for_call(imports: &str, setup: &str, call: &str) -> String {
+        let source = format!(
+            "import pandas as pd\n{imports}\n\n{setup}\n\ndef run(other):\n    df = pd.read_csv(\"x.csv\")\n    print(df[\"a\"])\n    {call}\n"
+        );
+        let linter = suggest_for(&source);
+        assert_eq!(linter.withheld.len(), 1, "{:?}", linter.suggestions);
+        linter.withheld[0].reason.clone()
+    }
+
+    #[test]
+    fn test_should_say_what_kind_of_callee_a_frame_was_passed_to() {
+        let own_function =
+            withheld_reason_for_call("", "def leaky(frame):\n    return frame\n", "leaky(df)");
+        let imported = withheld_reason_for_call("from elsewhere import tidy", "", "tidy(df)");
+        let module_function = withheld_reason_for_call("import numpy as np", "", "np.log(df)");
+        let other_object = withheld_reason_for_call("", "", "other.merge(df)");
+        let own_method = withheld_reason_for_call(
+            "",
+            "class Job:\n    def helper(self, frame):\n        return frame\n\n    def go(self):\n        df = pd.read_csv(\"y.csv\")\n        print(df[\"a\"])\n        self.helper(df)\n",
+            "return None",
+        );
+
+        assert!(
+            own_function.contains(
+                "passed to `leaky()`, a function that returns, stores or forwards the frame"
+            ),
+            "{own_function}"
+        );
+        assert!(
+            imported
+                .contains("passed to `tidy()`, an imported function the checker has no summary of"),
+            "{imported}"
+        );
+        assert!(
+            module_function.contains("passed to `np.log()`, a function of an imported module"),
+            "{module_function}"
+        );
+        assert!(
+            other_object.contains("passed to `other.merge()`, a method of another object"),
+            "{other_object}"
+        );
+        assert!(
+            own_method.contains("a function that returns, stores or forwards the frame"),
+            "{own_method}"
+        );
+    }
+
+    #[test]
+    fn test_should_label_a_call_through_a_from_imported_name_as_such() {
+        let reason = withheld_reason_for_call("from pkg import sub", "", "sub.fn(df)");
+
+        assert!(
+            reason.contains(
+                "passed to `sub.fn()`, a function or method reached through an imported name"
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_label_a_call_on_an_attribute_of_an_object() {
+        let reason = withheld_reason_for_call("", "", "other.client.send(df)");
+
+        assert_eq!(
+            reason,
+            "can't see everything done with it: passed to a call (line 9)"
         );
     }
 
@@ -12082,6 +12377,310 @@ def run():
         assert_eq!(linter.suggestions[0].columns, vec!["a", "b"]);
         assert_eq!(linter.withheld.len(), 1);
         assert!(linter.withheld[0].reason.contains("passed to `leaky()`"));
+    }
+
+    // Writes `files` (relative path, contents) under a fresh project root and suggests for
+    // `main`, as `test_should_count_the_columns_an_imported_helper_reads` does.
+    fn suggest_in_project(files: &[(&str, &str)], main: &str) -> Linter {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        for (relative, contents) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let main_path = root.join(main);
+        let source = fs::read_to_string(&main_path).unwrap();
+        let index = build_index_internal(&root);
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+        linter.load_cross_file_symbols(&index, &source, &main_path, &root);
+        linter.check_file_internal(&source, &main_path).unwrap();
+        linter
+    }
+
+    const TOTAL_HELPER: &str = "def total(frame):\n    return frame[\"a\"].sum()\n";
+
+    #[test]
+    fn test_should_count_the_columns_a_relatively_imported_helper_reads() {
+        let main = "import pandas as pd\nfrom .helpers import total\n\n\ndef run():\n    df = pd.read_csv(\"x.csv\")\n    print(total(df))\n    return df[\"b\"]\n";
+
+        let linter = suggest_in_project(
+            &[
+                ("app/__init__.py", ""),
+                ("app/helpers.py", TOTAL_HELPER),
+                ("app/main.py", main),
+            ],
+            "app/main.py",
+        );
+
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert_eq!(linter.suggestions[0].columns, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_should_check_columns_against_a_relatively_imported_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::write(root.join("app/__init__.py"), "").unwrap();
+        fs::write(
+            root.join("app/schemas.py"),
+            "from typedframes import BaseSchema, Column\n\n\nclass CustomerSchema(BaseSchema):\n    name = Column(type=str)\n",
+        )
+        .unwrap();
+        let main = "from typing import Annotated\n\nimport pandas as pd\n\nfrom .schemas import CustomerSchema\n\n\ndef run(df: Annotated[pd.DataFrame, CustomerSchema]) -> None:\n    df[\"missing\"]\n";
+        let main_path = root.join("app/main.py");
+        fs::write(&main_path, main).unwrap();
+        let index = build_index_internal(&root);
+        let mut linter = Linter::new();
+        linter.load_cross_file_symbols(&index, main, &main_path, &root);
+
+        let errors = linter.check_file_internal(main, &main_path).unwrap();
+
+        assert!(
+            errors.iter().any(|e| e.code == "unknown-column"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_follow_a_relative_import_up_a_package() {
+        let main = "import pandas as pd\nfrom ..core.helpers import total\n\n\ndef run():\n    df = pd.read_csv(\"x.csv\")\n    return total(df)\n";
+
+        let linter = suggest_in_project(
+            &[
+                ("app/__init__.py", ""),
+                ("app/core/__init__.py", ""),
+                ("app/core/helpers.py", TOTAL_HELPER),
+                ("app/sub/__init__.py", ""),
+                ("app/sub/main.py", main),
+            ],
+            "app/sub/main.py",
+        );
+
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert_eq!(linter.suggestions[0].columns, vec!["a"]);
+    }
+
+    #[test]
+    fn test_should_withhold_when_a_relative_import_names_no_project_file() {
+        let main = "import pandas as pd\nfrom .missing import total\n\n\ndef run():\n    df = pd.read_csv(\"x.csv\")\n    return total(df)\n";
+
+        let linter = suggest_in_project(
+            &[("app/__init__.py", ""), ("app/main.py", main)],
+            "app/main.py",
+        );
+
+        assert!(linter.suggestions.is_empty());
+        assert!(linter.withheld[0].reason.contains("passed to `total()`"));
+    }
+
+    const SERVICES: &str = r#"
+import pandas as pd
+import polars as pl
+
+
+class PandasService:
+    def predict(self, rows) -> pd.DataFrame:
+        return pd.DataFrame(rows)
+
+
+class PolarsService:
+    def predict(self, rows) -> pl.DataFrame:
+        return pl.DataFrame(rows)
+"#;
+
+    fn suggested_edit(linter: &Linter) -> String {
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        linter.suggestions[0].edits[0].replacement.clone()
+    }
+
+    #[test]
+    fn test_should_read_the_library_from_a_method_called_on_a_local_instance() {
+        let source = format!(
+            "{SERVICES}\n\ndef run():\n    sut = PandasService()\n    frame = sut.predict([1])\n    return frame[\"score\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert!(suggested_edit(&linter).contains("[[\"score\"]]"));
+    }
+
+    #[test]
+    fn test_should_read_the_library_from_a_method_called_on_an_annotated_parameter() {
+        let source = format!(
+            "{SERVICES}\n\ndef run(sut: PolarsService):\n    frame = sut.predict([1])\n    return frame[\"score\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert!(suggested_edit(&linter).contains(".select(\"score\")"));
+    }
+
+    #[test]
+    fn test_should_tell_two_classes_with_the_same_method_name_apart() {
+        let source = format!(
+            "{SERVICES}\n\ndef run(a: PandasService, b: PolarsService):\n    left = a.predict([1])\n    right = b.predict([2])\n    return left[\"x\"].sum() + right[\"y\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert_eq!(linter.suggestions.len(), 2, "{:?}", linter.withheld);
+        assert!(linter.suggestions[0].edits[0]
+            .replacement
+            .contains("[[\"x\"]]"));
+        assert!(linter.suggestions[1].edits[0]
+            .replacement
+            .contains(".select(\"y\")"));
+    }
+
+    #[test]
+    fn test_should_withhold_when_the_receiver_is_rebound() {
+        let source = format!(
+            "{SERVICES}\n\ndef run():\n    sut = PandasService()\n    sut = PandasService()\n    frame = sut.predict([1])\n    return frame[\"score\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert!(linter.suggestions.is_empty());
+        let reason = &linter.withheld[0].reason;
+        assert!(reason.contains("can't tell whether it is pandas or polars"));
+        assert!(
+            reason.contains("`predict` is annotated to return a DataFrame in a class of this file"),
+            "{reason}"
+        );
+    }
+
+    // Suggestions for `sut`, annotated as the pandas service, that `body` goes on to rebind.
+    fn suggestions_for_a_rebound_receiver(body: &str) -> usize {
+        let source = format!(
+            "{SERVICES}\n\ndef run(sut: PandasService, other):\n{body}        frame = sut.predict([1])\n        return frame[\"x\"].sum()\n"
+        );
+        suggest_for(&source).suggestions.len()
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_receiver_rebound_by_a_walrus() {
+        assert_eq!(
+            suggestions_for_a_rebound_receiver("    if (sut := PolarsService()):\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_receiver_rebound_by_a_walrus_in_a_comprehension() {
+        assert_eq!(
+            suggestions_for_a_rebound_receiver(
+                "    [(sut := PolarsService()) for _ in other]\n    if True:\n"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_receiver_rebound_by_a_match_capture() {
+        let source = format!(
+            "{SERVICES}\n\ndef run(sut: PandasService, other):\n    match other:\n        case PolarsService() as sut:\n            pass\n    frame = sut.predict([1])\n    return frame[\"x\"].sum()\n"
+        );
+
+        assert!(suggest_for(&source).suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_receiver_rebound_by_an_import() {
+        assert_eq!(
+            suggestions_for_a_rebound_receiver("    import os as sut\n    if True:\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_receiver_rebound_by_a_loop_target() {
+        assert_eq!(
+            suggestions_for_a_rebound_receiver("    for sut in other:\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_receiver_rebound_by_a_nested_nonlocal() {
+        let source = format!(
+            "{SERVICES}\n\ndef run():\n    sut = PandasService()\n\n    def swap():\n        nonlocal sut\n        sut = PolarsService()\n\n    swap()\n    frame = sut.predict([1])\n    return frame[\"x\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert!(linter.suggestions.is_empty());
+    }
+
+    fn suggestions_for_a_service_method(class_body: &str, extra: &str) -> usize {
+        let source = format!(
+            "import pandas as pd\nimport polars as pl\nfrom functools import cache\n\n\nclass Service:\n{class_body}\n{extra}\n\ndef run(sut: Service):\n    frame = sut.predict([1])\n    return frame[\"x\"].sum()\n"
+        );
+        suggest_for(&source).suggestions.len()
+    }
+
+    #[test]
+    fn test_should_not_read_the_library_from_a_decorated_method() {
+        let plain =
+            "    def predict(self, rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n";
+        let decorated = "    @cache\n    def predict(self, rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n";
+
+        assert_eq!(suggestions_for_a_service_method(plain, ""), 1);
+        assert_eq!(suggestions_for_a_service_method(decorated, ""), 0);
+    }
+
+    #[test]
+    fn test_should_still_read_the_library_from_a_static_method() {
+        let body = "    @staticmethod\n    def predict(rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n";
+
+        assert_eq!(suggestions_for_a_service_method(body, ""), 1);
+    }
+
+    #[test]
+    fn test_should_not_read_the_library_from_an_async_method() {
+        let body = "    async def predict(self, rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n";
+
+        assert_eq!(suggestions_for_a_service_method(body, ""), 0);
+    }
+
+    #[test]
+    fn test_should_not_read_the_library_when_a_subclass_overrides_the_method_differently() {
+        let body =
+            "    def predict(self, rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n";
+        let subclass = "class Fast(Service):\n    def predict(self, rows) -> pl.DataFrame:\n        return pl.DataFrame(rows)\n";
+        let agreeing = "class Same(Service):\n    def predict(self, rows) -> pd.DataFrame:\n        return pd.DataFrame(rows)\n";
+
+        assert_eq!(suggestions_for_a_service_method(body, subclass), 0);
+        assert_eq!(suggestions_for_a_service_method(body, agreeing), 1);
+    }
+
+    #[test]
+    fn test_should_not_suggest_for_a_method_called_on_an_unknown_receiver() {
+        let source = format!(
+            "{SERVICES}\n\ndef run(sut):\n    frame = sut.predict([1])\n    return frame[\"score\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert!(linter.suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_should_withhold_when_a_class_is_defined_twice_with_different_libraries() {
+        let source = format!(
+            "{SERVICES}\n\nclass PandasService:\n    def predict(self, rows) -> pl.DataFrame:\n        return pl.DataFrame(rows)\n\n\ndef run():\n    sut = PandasService()\n    frame = sut.predict([1])\n    return frame[\"score\"].sum()\n"
+        );
+
+        let linter = suggest_for(&source);
+
+        assert!(linter.suggestions.is_empty());
+        assert!(linter.withheld[0]
+            .reason
+            .contains("can't tell whether it is pandas or polars"));
     }
 
     #[test]

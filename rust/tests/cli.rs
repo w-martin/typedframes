@@ -683,3 +683,63 @@ fn test_should_exit_2_when_report_has_neither_a_name_nor_all() {
         .stderr
         .contains("Error: `report` needs a site name, or --all"));
 }
+
+const UNTRACKED_SITE: &str =
+    "def run(client):\n    rows = client.fetch(\"q\")\n    return rows[\"price\"].sum()\n";
+
+#[test]
+fn test_should_list_frames_the_checker_does_not_track_with_outcome_untracked() {
+    // arrange
+    let project = Project::new();
+    project.write("job.py", UNTRACKED_SITE);
+
+    // act
+    let output = project.run(&[
+        "report",
+        "--all",
+        ".",
+        "--no-index",
+        "--outcome",
+        "untracked",
+    ]);
+
+    // assert
+    assert_eq!(0, output.code, "{}", output.stderr);
+    assert!(
+        output.stdout.contains("1 untracked frame in 1 group"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("untracked: it comes from"),
+        "{}",
+        output.stdout
+    );
+    assert!(!output.stdout.contains("price"), "{}", output.stdout);
+}
+
+#[test]
+fn test_should_say_there_are_no_untracked_frames_when_there_are_none() {
+    // arrange
+    let project = Project::new();
+    project.write("ok.py", "x = 1\n");
+
+    // act
+    let output = project.run(&["report", "--all", ".", "--outcome", "untracked"]);
+
+    // assert
+    assert_eq!("No untracked frames.\n", output.stdout);
+}
+
+#[test]
+fn test_should_exit_2_when_report_outcome_is_given_without_all() {
+    // arrange
+    let project = Project::new();
+
+    // act
+    let output = project.run(&["report", "some-name", "--outcome", "withheld"]);
+
+    // assert
+    assert_eq!(2, output.code);
+    assert!(output.stderr.contains("Error: `--outcome` needs --all"));
+}

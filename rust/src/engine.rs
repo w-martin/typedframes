@@ -144,9 +144,16 @@ pub(crate) fn report_all_file_impl(
     file_path: &str,
     index: Option<Arc<ProjectIndex>>,
     contexts: &ProjectContexts,
+    untracked: bool,
 ) -> Result<String, CheckError> {
     let reports = checked_for_report(file_path, index, contexts)?
-        .map(|(source, linter)| crate::report::report_all(&source, &linter))
+        .map(|(source, linter)| {
+            if untracked {
+                crate::report::untracked_all(&source, &linter)
+            } else {
+                crate::report::report_all(&source, &linter)
+            }
+        })
         .unwrap_or_default();
     serde_json::to_string(&reports).map_err(runtime)
 }
@@ -226,17 +233,18 @@ pub(crate) fn report_batch(
     )
 }
 
-/// Every untyped site's report in each file (a JSON array), in parallel, as one outcome per file in
-/// input order.
+/// Every untyped site's report in each file (a JSON array), or with `untracked` the report of every
+/// frame the checker does not track, in parallel, as one outcome per file in input order.
 pub(crate) fn report_all_batch(
     files: &[String],
     index: Option<Arc<ProjectIndex>>,
+    untracked: bool,
 ) -> Vec<FileOutcome> {
     let contexts = ProjectContexts::default();
     run_batch(
         files,
         |file| file,
-        |file| report_all_file_impl(file, index.clone(), &contexts),
+        |file| report_all_file_impl(file, index.clone(), &contexts, untracked),
     )
 }
 

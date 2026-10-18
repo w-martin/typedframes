@@ -8,7 +8,7 @@
 //! function whose library the index knew. The redacted code is then run through the
 //! checker; if it isn't classified exactly as the real site was, no snippet is given.
 
-use crate::linter::Linter;
+use crate::linter::{Linter, UnresolvedDataframeShapedCall};
 use crate::phrase;
 use crate::report_minimize::minimize;
 use crate::report_names::{keeps_library_name, keeps_name, keeps_string, KEPT_IMPORT_ROOTS};
@@ -18,7 +18,7 @@ use ruff_python_parser::parse_module;
 use ruff_source_file::LineIndex;
 use ruff_text_size::Ranged;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 /// Most lines a snippet may have once reduced; a bigger scope is left for the reporter to trim.
@@ -159,7 +159,11 @@ fn verify(snippet: &str, position: (usize, usize), real: &Verdict) -> Result<(),
         .untyped_sites
         .iter()
         .find(|s| (s.line, s.col) == position)
-        .ok_or("the snippet has no untyped site where the original was")?;
+        .ok_or(
+            "the snippet has no untyped site where the original was: the site depends on code the \
+             snippet does not keep (another class, an imported name, or the shape of a call), so \
+             describe how the frame is built by hand",
+        )?;
     let redacted = verdict_of(&linter, &site.phrase)
         .ok_or("the snippet's site was neither suggested nor withheld")?;
     if same_verdict(&redacted, real) {
@@ -537,6 +541,40 @@ fn end_of_logical_line(tokens: &[Tok], start: usize) -> usize {
         .map_or(start, |t| t.end)
 }
 
+// A class's header and the listed members, redacted into `redactor`'s output.
+fn redact_class(
+    redactor: &mut Redactor,
+    source: &str,
+    tokens: &[Tok],
+    stmt: &Stmt,
+    class: &StmtClassDef,
+    members: &BTreeSet<usize>,
+) {
+    redactor.out.push_str("\n\n");
+    let keyword = tokens
+        .iter()
+        .find(|t| t.start >= stmt.range().start().to_usize() && t.kind == "Class")
+        .map_or(stmt.range().start().to_usize(), |t| t.start);
+    let header_end = end_of_logical_line(tokens, keyword);
+    redactor.redact(keyword, header_end);
+    for &m in members {
+        let member = &class.body[m];
+        let start = member.range().start().to_usize();
+        let line_start = source[..start].rfind('\n').map_or(0, |p| p + 1);
+        let indent = &source[line_start..start];
+        redactor.out.push_str(if indent.trim().is_empty() {
+            indent
+        } else {
+            "    "
+        });
+        redactor.redact(start, member.range().end().to_usize());
+        redactor.out.push('\n');
+        if m != *members.iter().next_back().unwrap_or(&m) {
+            redactor.out.push('\n');
+        }
+    }
+}
+
 /// Redacted code around the site at `site_offset`, and where the site ended up in it.
 #[allow(clippy::too_many_lines)]
 fn build_snippet(
@@ -597,6 +635,11 @@ fn build_snippet(
         _ => None,
     });
 
+    // Other top-level classes with a method the kept code calls (`sut.predict(...)`),
+    // by statement index, with just those methods: what the checker needs to know which
+    // library a frame the method returns belongs to.
+    let mut other_classes: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+
     // Pull in same-file functions and class members the kept code calls.
     let mut added = 0;
     loop {
@@ -612,6 +655,20 @@ fn build_snippet(
         }
         if let Some(c) = class {
             for &m in &class_members {
+                let r = c.body[m].range();
+                wanted.extend(callee_names(
+                    source,
+                    &tokens,
+                    r.start().to_usize(),
+                    r.end().to_usize(),
+                ));
+            }
+        }
+        for (&i, members) in &other_classes {
+            let Stmt::ClassDef(c) = &body[i] else {
+                continue;
+            };
+            for &m in members {
                 let r = c.body[m].range();
                 wanted.extend(callee_names(
                     source,
@@ -642,6 +699,32 @@ fn build_snippet(
                         added += 1;
                         grew = true;
                     }
+                }
+            }
+        }
+        for (i, stmt) in body.iter().enumerate() {
+            let Stmt::ClassDef(c) = stmt else {
+                continue;
+            };
+            if class_top == Some(i) {
+                continue;
+            }
+            for (m, member) in c.body.iter().enumerate() {
+                let Stmt::FunctionDef(f) = member else {
+                    continue;
+                };
+                // Only a method that says it returns a frame can decide the library.
+                let returns_frame = f.returns.as_deref().is_some_and(|r| {
+                    let text = &source[r.range().start().to_usize()..r.range().end().to_usize()];
+                    text.contains("DataFrame") || text.contains("LazyFrame")
+                });
+                if added < MAX_HELPERS
+                    && returns_frame
+                    && wanted.contains(f.name.as_str())
+                    && other_classes.entry(i).or_default().insert(m)
+                {
+                    added += 1;
+                    grew = true;
                 }
             }
         }
@@ -741,29 +824,9 @@ fn build_snippet(
             redactor.out.push('\n');
         } else if class_top == Some(i) {
             let c = class.expect("class_top implies a class");
-            redactor.out.push_str("\n\n");
-            let keyword = tokens
-                .iter()
-                .find(|t| t.start >= stmt.range().start().to_usize() && t.kind == "Class")
-                .map_or(stmt.range().start().to_usize(), |t| t.start);
-            let header_end = end_of_logical_line(&tokens, keyword);
-            redactor.redact(keyword, header_end);
-            for &m in &class_members {
-                let member = &c.body[m];
-                let start = member.range().start().to_usize();
-                let line_start = source[..start].rfind('\n').map_or(0, |p| p + 1);
-                let indent = &source[line_start..start];
-                redactor.out.push_str(if indent.trim().is_empty() {
-                    indent
-                } else {
-                    "    "
-                });
-                redactor.redact(start, member.range().end().to_usize());
-                redactor.out.push('\n');
-                if m != *class_members.iter().next_back().unwrap_or(&m) {
-                    redactor.out.push('\n');
-                }
-            }
+            redact_class(&mut redactor, source, &tokens, stmt, c, &class_members);
+        } else if let (Some(members), Stmt::ClassDef(c)) = (other_classes.get(&i), stmt) {
+            redact_class(&mut redactor, source, &tokens, stmt, c, members);
         }
     }
 
@@ -792,6 +855,86 @@ fn build_snippet(
     Ok((snippet, (position.0 - removed_lines, position.1)))
 }
 
+// Confirms the redacted snippet records an untracked frame where the original had one.
+fn verify_untracked(snippet: &str, position: (usize, usize)) -> Result<(), String> {
+    let linter = analyse(snippet)?;
+    if linter
+        .unresolved_dataframe_shaped_calls
+        .iter()
+        .any(|call| (call.line, call.col) == position)
+    {
+        Ok(())
+    } else {
+        Err(
+            "the snippet no longer holds a frame the checker does not track where the original \
+             was"
+            .to_string(),
+        )
+    }
+}
+
+// `Name(...)` builds an object; it is listed only because a method of the object shares a
+// name with a DataFrame method.
+fn is_reportable_untracked(call: &UnresolvedDataframeShapedCall) -> bool {
+    !call.phrase.is_empty()
+        && (call.is_attribute_call || !call.name.chars().next().is_some_and(char::is_uppercase))
+}
+
+fn untracked_report(
+    source: &str,
+    index: &LineIndex,
+    linter: &Linter,
+    call: &UnresolvedDataframeShapedCall,
+) -> SiteReport {
+    let verdict = Verdict {
+        outcome: "untracked",
+        kind: None,
+        tier: None,
+        reason: format!(
+            "it comes from {}, which the checker does not treat as a DataFrame source, but it is \
+             used like a DataFrame",
+            call.callee
+        ),
+        notes: Vec::new(),
+    };
+    let built = phrase::offset_of(source, index, call.line, call.col)
+        .ok_or_else(|| "the frame's position could not be found".to_string())
+        .and_then(|offset| build_snippet(source, offset, linter.imported_function_libraries()))
+        .and_then(|(snippet, at)| {
+            verify_untracked(&snippet, at)?;
+            let (reduced, _) =
+                minimize(&snippet, at, |text, to| verify_untracked(text, to).is_ok());
+            Ok(reduced)
+        });
+    let (snippet, refusal) = match built {
+        Ok(snippet) => (Some(snippet), None),
+        Err(reason) => (None, Some(reason)),
+    };
+    SiteReport {
+        name: call.phrase.clone(),
+        line: call.line,
+        col: call.col,
+        var: call.var.clone(),
+        verdict,
+        snippet,
+        refusal,
+    }
+}
+
+/// A report for every frame in the file that is used like a DataFrame but comes from a call the
+/// checker does not treat as a DataFrame source, so it is not tracked and has no untyped site.
+/// These can include a call that merely shares a method name with pandas or polars; a plain
+/// `Class(...)` construction is left out.
+pub(crate) fn untracked_all(source: &str, linter: &Linter) -> Vec<SiteReport> {
+    let index = LineIndex::from_source_text(source);
+    linter
+        .unresolved_dataframe_shaped_calls
+        .iter()
+        .filter(|call| is_reportable_untracked(call))
+        .map(|call| untracked_report(source, &index, linter, call))
+        .collect()
+}
+
 /// The report for every untyped site in the file the linter has just checked, in file order.
 pub(crate) fn report_all(source: &str, linter: &Linter) -> Vec<SiteReport> {
     linter
@@ -803,7 +946,18 @@ pub(crate) fn report_all(source: &str, linter: &Linter) -> Vec<SiteReport> {
 
 /// The report for the untyped site called `name`, or `None` if this file has no such site.
 pub(crate) fn report_for(source: &str, linter: &Linter, name: &str) -> Option<SiteReport> {
-    let site = linter.untyped_sites.iter().find(|s| s.phrase == name)?;
+    let Some(site) = linter.untyped_sites.iter().find(|s| s.phrase == name) else {
+        let call = linter
+            .unresolved_dataframe_shaped_calls
+            .iter()
+            .find(|c| is_reportable_untracked(c) && c.phrase == name)?;
+        return Some(untracked_report(
+            source,
+            &LineIndex::from_source_text(source),
+            linter,
+            call,
+        ));
+    };
     let verdict = verdict_of(linter, name)?;
     let index = LineIndex::from_source_text(source);
     let offset = phrase::offset_of(source, &index, site.line, site.col);
@@ -1241,7 +1395,7 @@ def run(items, flag):
         assert_eq!(report.verdict.outcome, "withheld");
         assert_eq!(
             report.verdict.reason,
-            "can't see everything done with it: passed to `_` (line N)"
+            "can't see everything done with it: passed to `_`, a name this file never defines or imports (a builtin, or from a star import) (line N)"
         );
         assert!(!report.verdict.reason.contains("clean_the_data"));
         assert!(report.snippet.is_some());
@@ -1343,6 +1497,112 @@ def run(items, flag):
         assert_eq!(redacted.untyped_sites.len(), 1);
         let again = verdict_of(&redacted, &redacted.untyped_sites[0].phrase).unwrap();
         assert!(same_verdict(&again, &report.verdict));
+    }
+
+    #[test]
+    fn test_should_keep_the_class_whose_method_a_local_instance_calls() {
+        let source = r#"
+import pandas as pd
+
+
+class Service:
+    def predict(self, rows) -> pd.DataFrame:
+        return pd.DataFrame(rows)
+
+    def unrelated(self):
+        return 1
+
+
+def run():
+    sut = Service()
+    frame = sut.predict([1])
+    return frame["score"].sum()
+"#;
+
+        let report = report(source, "frame");
+
+        assert_eq!(report.refusal, None);
+        let snippet = report.snippet.expect("a snippet");
+        assert!(snippet.contains("-> pd.DataFrame"), "{snippet}");
+        assert!(!snippet.contains("unrelated"), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_report_a_frame_the_checker_does_not_track() {
+        let source = r#"
+def run(client):
+    rows = client.fetch("q")
+    return rows["price"].sum()
+"#;
+        let linter = linter_for(source);
+
+        let reports = untracked_all(source, &linter);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].verdict.outcome, "untracked");
+        assert!(reports[0]
+            .verdict
+            .reason
+            .contains("a method called on a local, parameter or imported module"));
+        assert!(linter.untyped_sites.is_empty());
+        let snippet = reports[0].snippet.as_deref().expect("a snippet");
+        assert!(
+            snippet.contains(".fetch(") && !snippet.contains("price"),
+            "{snippet}"
+        );
+    }
+
+    #[test]
+    fn test_should_report_an_untracked_frame_by_its_name() {
+        let source = r#"
+def run(client):
+    rows = client.fetch("q")
+    return rows["price"].sum()
+"#;
+        let linter = linter_for(source);
+        let name = untracked_all(source, &linter)[0].name.clone();
+
+        let single = report_for(source, &linter, &name).expect("a report");
+
+        assert_eq!(single.verdict.outcome, "untracked");
+        assert_eq!(single.name, name);
+    }
+
+    #[test]
+    fn test_should_not_report_an_object_construction_as_an_untracked_frame() {
+        let source = r#"
+def run(raw):
+    sut = Service()
+    return sut.transform(raw)
+"#;
+        let linter = linter_for(source);
+
+        let reports = untracked_all(source, &linter);
+
+        assert!(reports.is_empty(), "{reports:?}");
+    }
+
+    #[test]
+    fn test_should_not_keep_an_unrelated_class_that_shares_a_method_name() {
+        let source = r#"
+import pandas as pd
+
+
+class Unrelated:
+    def merge(self, other):
+        return other
+
+
+def run(a):
+    frame = pd.read_csv("x.csv")
+    a.merge(frame)
+    return frame["x"].sum()
+"#;
+
+        let report = report(source, "frame");
+
+        let snippet = report.snippet.expect("a snippet");
+        assert!(!snippet.contains("class"), "{snippet}");
     }
 
     #[test]

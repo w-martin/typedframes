@@ -169,6 +169,8 @@ pub(crate) struct SuggestArgs {
 pub(crate) enum Outcome {
     Suggested,
     Withheld,
+    /// Frames used like a DataFrame that the checker does not track at all.
+    Untracked,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -188,7 +190,7 @@ pub(crate) struct ReportArgs {
     /// Report every untyped site, grouped by why the checker decided as it did. Takes PATH, not NAME.
     #[arg(long)]
     pub(crate) all: bool,
-    /// With --all, only the sites the checker decided this way about.
+    /// With --all, only the sites the checker decided this way about. `untracked` lists instead the frames used like a DataFrame that the checker does not track, which are in no other report.
     #[arg(long, value_enum)]
     pub(crate) outcome: Option<Outcome>,
     /// With --all, how to print the groups (default: markdown).

@@ -147,12 +147,14 @@ fn names(group: &Group) -> Vec<&str> {
     group.iter().map(|r| text(r, "name")).collect()
 }
 
-fn format_report_groups(groups: &[Group]) -> String {
+fn format_report_groups(groups: &[Group], untracked: bool) -> String {
     let total: usize = groups.iter().map(Vec::len).sum();
-    let sites = format!(
-        "{total} untyped {}",
-        if total == 1 { "site" } else { "sites" }
-    );
+    let noun = if untracked {
+        "untracked frame"
+    } else {
+        "untyped site"
+    };
+    let sites = format!("{total} {noun}{}", if total == 1 { "" } else { "s" });
     let group_count = format!(
         "{} {}",
         groups.len(),
@@ -280,6 +282,10 @@ fn write_report_groups(groups: &[Group], directory: &Path) -> io::Result<Vec<Pat
 // The site name (None with --all) and path a `report` call names; exit status 2 on a bad
 // combination.
 fn report_target(args: &ReportArgs) -> Result<(Option<String>, PathBuf), i32> {
+    if args.outcome.is_some() && !args.all {
+        eprintln!("Error: `--outcome` needs --all");
+        return Err(2);
+    }
     if args.all {
         if args.name.is_some() && args.path != Path::new(".") {
             eprintln!("Error: `report --all` takes a path, not a site name");
@@ -315,7 +321,8 @@ fn run_report_all(args: &ReportArgs, path: &Path, out: &mut impl Write) -> io::R
         .map(|f| f.to_string_lossy().into_owned())
         .collect();
     let mut reports: Vec<Value> = Vec::new();
-    for (name, (result, error)) in names.iter().zip(report_all_batch(&names, index)) {
+    let untracked = args.outcome == Some(Outcome::Untracked);
+    for (name, (result, error)) in names.iter().zip(report_all_batch(&names, index, untracked)) {
         let Some(found) = result
             .as_deref()
             .and_then(|j| serde_json::from_str::<Value>(j).ok())
@@ -329,11 +336,17 @@ fn run_report_all(args: &ReportArgs, path: &Path, out: &mut impl Write) -> io::R
         let wanted = match outcome {
             Outcome::Suggested => "suggested",
             Outcome::Withheld => "withheld",
+            Outcome::Untracked => "untracked",
         };
         reports.retain(|r| text(&r["verdict"], "outcome") == wanted);
     }
     if reports.is_empty() {
-        writeln!(out, "No untyped sites.")?;
+        let none = if untracked {
+            "No untracked frames."
+        } else {
+            "No untyped sites."
+        };
+        writeln!(out, "{none}")?;
         return Ok(0);
     }
     let groups = group_reports(reports);
@@ -346,7 +359,7 @@ fn run_report_all(args: &ReportArgs, path: &Path, out: &mut impl Write) -> io::R
     } else if args.report_format == ReportFormat::Compact {
         writeln!(out, "{}", format_report_groups_compact(&groups))?;
     } else {
-        writeln!(out, "{}", format_report_groups(&groups))?;
+        writeln!(out, "{}", format_report_groups(&groups, untracked))?;
     }
     eprintln!("{REVIEW_REMINDER}");
     Ok(0)
@@ -398,7 +411,10 @@ pub(crate) fn run_report(args: &ReportArgs, out: &mut impl Write) -> io::Result<
         }
     }
     if matches.is_empty() {
-        eprintln!("Error: no untyped site is named {}", repr_str(&name));
+        eprintln!(
+            "Error: no untyped site or untracked frame is named {}",
+            repr_str(&name)
+        );
         return Ok(2);
     }
     if matches.len() > 1 {

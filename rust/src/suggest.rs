@@ -70,6 +70,9 @@ pub(crate) struct Origin<'a> {
     /// A local of a function rather than a module-level name. A module-level frame can
     /// be imported by other modules, which this scan can't see.
     pub(crate) function_local: bool,
+    /// Local names (and parameters) of the enclosing function that are certainly an
+    /// instance of a class, by class name: `svc = Service()`, `def f(svc: Service)`.
+    pub(crate) receivers: &'a HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -113,6 +116,9 @@ pub(crate) struct LibraryContext {
     // Functions whose return annotation says pandas or polars, by bare name: this file's
     // own, plus those imported from other project files (from the index).
     functions: HashMap<String, Library>,
+    // Methods of this file's classes whose return annotation says pandas or polars, by
+    // `(class, method)`: a call on a receiver known to be an instance of the class.
+    class_methods: HashMap<(String, String), Library>,
 }
 
 impl LibraryContext {
@@ -135,6 +141,7 @@ impl LibraryContext {
                 None => context.functions.remove(&name),
             };
         }
+        context.class_methods = class_method_libraries(body, &context);
         context
     }
 
@@ -149,6 +156,7 @@ impl LibraryContext {
                 None => self.functions.remove(&name),
             };
         }
+        self.class_methods = class_method_libraries(body, self);
     }
 
     fn collect_imports(&mut self, body: &[Stmt]) {
@@ -267,6 +275,86 @@ fn collect_function_returns(
     }
 }
 
+// Every method of every class in `body` with a return annotation that names a library,
+// keyed by `(class, method)`; `None` once two definitions of the pair disagree, or the
+// method is async or decorated (other than `staticmethod`/`classmethod`), so what it returns
+// can't be read from its annotation. `bases` collects `(subclass, base)` pairs by name.
+fn collect_class_method_returns(
+    body: &[Stmt],
+    context: &LibraryContext,
+    out: &mut HashMap<(String, String), Option<Library>>,
+    bases: &mut Vec<(String, String)>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(class) => {
+                for base in class.bases() {
+                    if let Expr::Name(base) = base {
+                        bases.push((class.name.to_string(), base.id.to_string()));
+                    }
+                }
+                for member in &class.body {
+                    let Stmt::FunctionDef(method) = member else {
+                        continue;
+                    };
+                    let plain = !method.is_async
+                        && method.decorator_list.iter().all(|d| {
+                            matches!(&d.expression, Expr::Name(n)
+                                if matches!(n.id.as_str(), "staticmethod" | "classmethod"))
+                        });
+                    let library = method
+                        .returns
+                        .as_deref()
+                        .and_then(|r| context.annotation_library(r))
+                        .filter(|_| plain);
+                    out.entry((class.name.to_string(), method.name.to_string()))
+                        .and_modify(|existing| {
+                            if *existing != library {
+                                *existing = None;
+                            }
+                        })
+                        .or_insert(library);
+                }
+                collect_class_method_returns(&class.body, context, out, bases);
+            }
+            Stmt::FunctionDef(function) => {
+                collect_class_method_returns(&function.body, context, out, bases);
+            }
+            _ => {}
+        }
+    }
+}
+
+// The library each `(class, method)` of `body` returns, leaving out a method that a subclass
+// in the file overrides with a different answer: a receiver annotated with the base class
+// may be the subclass.
+fn class_method_libraries(
+    body: &[Stmt],
+    context: &LibraryContext,
+) -> HashMap<(String, String), Library> {
+    let mut methods: HashMap<(String, String), Option<Library>> = HashMap::new();
+    let mut bases: Vec<(String, String)> = Vec::new();
+    collect_class_method_returns(body, context, &mut methods, &mut bases);
+    for (subclass, base) in &bases {
+        let overrides: Vec<(String, Option<Library>)> = methods
+            .iter()
+            .filter(|((class, _), _)| class == subclass)
+            .map(|((_, method), library)| (method.clone(), *library))
+            .collect();
+        for (method, library) in overrides {
+            if let Some(inherited) = methods.get_mut(&(base.clone(), method)) {
+                if *inherited != library {
+                    *inherited = None;
+                }
+            }
+        }
+    }
+    methods
+        .into_iter()
+        .filter_map(|(key, library)| Some((key, library?)))
+        .collect()
+}
+
 /// The library each function of `module` returns, by name -- what the index stores so
 /// other files can resolve a call to it.
 pub(crate) fn function_libraries(module: &ModModule) -> HashMap<String, Library> {
@@ -292,8 +380,11 @@ pub(crate) fn suggest_selection(
             0 => String::new(),
             n => format!(", and {n} more"),
         };
+        let callee = first
+            .callee
+            .map_or_else(String::new, |class| format!(", {class}"));
         return Err(format!(
-            "can't see everything done with it: {} (line {}){more}",
+            "can't see everything done with it: {}{callee} (line {}){more}",
             first.description, first.line
         ));
     }
@@ -671,6 +762,18 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
                         return Ok(*library);
                     }
                 }
+                if let (Some(method), Some(class), true) = (
+                    root_attribute,
+                    origin.receivers.get(id),
+                    innermost_call.is_some(),
+                ) {
+                    if let Some(library) = context
+                        .class_methods
+                        .get(&(class.clone(), method.to_string()))
+                    {
+                        return Ok(*library);
+                    }
+                }
                 match context.modules.get(id) {
                     Some(ModuleKind::Library(library)) => return Ok(*library),
                     Some(ModuleKind::Connectorx) => return Ok(connectorx_library(innermost_call)),
@@ -679,10 +782,26 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
                 if let Some(library) = context.names.get(id).or_else(|| context.functions.get(id)) {
                     return Ok(*library);
                 }
+                let evidence = root_attribute
+                    .filter(|method| {
+                        context
+                            .class_methods
+                            .keys()
+                            .any(|(_, defined)| defined == method)
+                    })
+                    .map(|method| {
+                        format!(
+                            "; `{method}` is annotated to return a DataFrame in a class of this \
+                             file, but `{id}` is not known to be an instance of that class (it \
+                             must be a local built as `{id} = Class(...)` or a parameter annotated \
+                             `Class`, and not rebound)"
+                        )
+                    })
+                    .unwrap_or_default();
                 return Err(format!(
                     "can't tell whether it is pandas or polars: the value is built from `{id}`, \
                      not a direct `pd.`/`pl.` call, a call to a function annotated \
-                     `-> pd.DataFrame` or `-> pl.DataFrame`, or a method like `.to_df()`"
+                     `-> pd.DataFrame` or `-> pl.DataFrame`, or a method like `.to_df()`{evidence}"
                 ));
             }
             _ => return Err("its origin isn't a call the library can be read from".to_string()),
@@ -855,6 +974,7 @@ mod tests {
                 stmt_start: assign.range().start().to_usize(),
                 stmt_end: assign.range().end().to_usize(),
                 function_local,
+                receivers: &HashMap::new(),
             },
             &usage,
         )
@@ -932,6 +1052,7 @@ mod tests {
                 stmt_start: assign.range().start().to_usize(),
                 stmt_end: assign.range().end().to_usize(),
                 function_local: true,
+                receivers: &HashMap::new(),
             },
             &usage,
         )
@@ -982,6 +1103,7 @@ mod tests {
                 stmt_start: 0,
                 stmt_end: source.len(),
                 function_local: true,
+                receivers: &HashMap::new(),
             },
             &usage,
         )
@@ -1322,6 +1444,7 @@ mod tests {
                 stmt_start: 0,
                 stmt_end: source.lines().next().unwrap().len(),
                 function_local: true,
+                receivers: &HashMap::new(),
             },
             &usage,
         )

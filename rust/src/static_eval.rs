@@ -2460,6 +2460,13 @@ enum ImportRef {
     Module(String),
 }
 
+/// How an imported name was brought in: `import x [as y]`, or `from x import y`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ImportKind {
+    Module,
+    From,
+}
+
 #[derive(Default)]
 struct Group<'a> {
     bindings: usize,
@@ -2887,6 +2894,20 @@ impl<'a> Analysis<'a> {
         let def = group.function?;
         (group.bindings == 1 && is_plain_function(def) && def.decorator_list.is_empty())
             .then_some(def)
+    }
+
+    /// How this name was imported, when it is bound once, by an import.
+    pub(crate) fn import_kind(&self, name: &ast::ExprName) -> Option<ImportKind> {
+        let key = self.occurrence_group.get(&name.range().start())?.as_ref()?;
+        let group = self.groups.get(key)?;
+        if group.bindings != 1 {
+            return None;
+        }
+        match group.import {
+            Some(ImportRef::Module(_)) => Some(ImportKind::Module),
+            Some(ImportRef::From(..)) => Some(ImportKind::From),
+            None => None,
+        }
     }
 
     /// The single function or import the name `callee` refers to at this occurrence: bound

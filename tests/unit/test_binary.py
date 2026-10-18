@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
-from typedframes._binary import IN_PROCESS_VARIABLE, BinaryNotFoundError, find_binary, main, run_binary
+from typedframes._binary import IN_PROCESS_VARIABLE, BinaryNotFoundError, find_binary, main, main_in_process, run_binary
 
 
 def _touch(directory: str, *parts: str) -> Path:
@@ -275,3 +275,21 @@ class TestInProcess(TestCase):
 
         # assert
         self.assertEqual(2, ctx.exception.code)
+
+    def test_should_run_in_process_from_the_in_process_entry_point_without_the_variable(self) -> None:
+        """Test that `typedframes-py` never starts the executable, whatever the environment says."""
+        # arrange
+        extension = _extension(status=4)
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: ""}),
+            patch.object(sys, "argv", ["typedframes-py", "check", "."]),
+            patch("typedframes._binary.find_binary", side_effect=AssertionError("started the executable")),
+            patch("typedframes._binary.import_module", return_value=extension),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            # act
+            main_in_process()
+
+        # assert
+        extension.main.assert_called_once_with(["typedframes", "check", "."])
+        self.assertEqual(4, ctx.exception.code)

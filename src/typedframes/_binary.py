@@ -113,3 +113,8 @@ def main() -> None:
         sys.exit(run_binary(sys.argv[1:]).returncode)
     binary = str(find_binary())
     os.execv(binary, [binary, *sys.argv[1:]])
+
+
+def main_in_process() -> None:
+    """Entry point for `typedframes-py`: always the checker inside this process, never the executable."""
+    sys.exit(_extension().main(["typedframes", *sys.argv[1:]]))

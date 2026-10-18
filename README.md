@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.14.2) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.14.3) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -109,7 +109,8 @@ Where the Python interpreter may run code but no other executable may be started
 the wheel, instead of starting the `typedframes` executable. Results and exit status are the same; when the checker is
 asked to capture its output (as the mypy plugin does), a usage error or a missing path comes back with it, and any
 warning a command prints still goes to the terminal. Without the extension installed (for example from a source
-distribution) `TYPEDFRAMES_INPROC=1` is an error.
+distribution) `TYPEDFRAMES_INPROC=1` is an error. The `typedframes-py` command always runs in the interpreter, without
+the variable.
 
 ---
 
@@ -478,7 +479,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.14.2"]
+        additional_dependencies: ["typedframes==0.14.3"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -527,7 +528,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.14.2"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.14.3"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |

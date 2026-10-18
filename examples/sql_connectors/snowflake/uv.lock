@@ -555,7 +555,7 @@ dev = [{ name = "typedframes", extras = ["mypy"], editable = "../../../" }]
 
 [[package]]
 name = "typedframes"
-version = "0.14.2"
+version = "0.14.3"
 source = { editable = "../../../" }
 
 [package.optional-dependencies]

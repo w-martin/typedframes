@@ -1,0 +1,4 @@
+#!python
+from typedframes._binary import main_in_process
+
+main_in_process()

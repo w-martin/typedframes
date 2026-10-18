@@ -1,6 +1,6 @@
 [package]
 name = "typedframes_python"
-version = "0.14.2"
+version = "0.14.3"
 edition = "2021"
 description = "The typedframes checker as a Python extension module, for interpreters that may not start new executables"
 license = "MIT"

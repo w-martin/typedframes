@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "dataenforce>=0.1.2",
     "mypy>=2.4.0",
-    "pandas>=3.0.1",
+    "pandas>=3.0.6",
 ]
 
 [dependency-groups]

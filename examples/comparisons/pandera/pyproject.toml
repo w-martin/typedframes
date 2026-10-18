@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
-    "pandas>=3.0.1",
+    "pandas>=3.0.6",
     "pandera[mypy]>=0.34.1",
 ]
 

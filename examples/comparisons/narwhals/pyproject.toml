@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Example comparing narwhals with typedframes"
 requires-python = ">=3.11"
 dependencies = [
-    "narwhals>=2.26.0",
+    "narwhals>=2.27.1",
     "pandas",
     "polars",
     "mypy",

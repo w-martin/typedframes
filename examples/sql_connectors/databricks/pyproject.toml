@@ -8,8 +8,8 @@ dependencies = [
     # docker-compose.yml -- Spark Connect's client/server protobuf protocol isn't
     # guaranteed compatible across major/minor Spark versions.
     "pyspark[connect]==3.5.8",
-    "databricks-sql-connector>=3.4",
-    "pandas>=2.0",
+    "databricks-sql-connector>=4.6.0",
+    "pandas>=2.3.3",
 ]
 
 [dependency-groups]

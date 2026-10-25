@@ -32,6 +32,7 @@ pub(crate) struct Findings {
     pub(crate) errors: Vec<Value>,
     pub(crate) total: u64,
     pub(crate) typed: u64,
+    pub(crate) unresolved: u64,
     pub(crate) per_file: BTreeMap<String, Tally>,
     pub(crate) untyped_sites: Vec<Value>,
     pub(crate) typed_sites: Vec<Value>,
@@ -82,6 +83,7 @@ pub(crate) fn gather(files: &[PathBuf], outcomes: Vec<FileOutcome>) -> Findings 
         };
         findings.total += tally.total;
         findings.typed += tally.typed;
+        findings.unresolved += stats["dataframes_unresolved"].as_u64().unwrap_or(0);
         findings.per_file.insert(name.clone(), tally);
         findings
             .untyped_sites
@@ -225,7 +227,12 @@ fn error_summary_parts(errors_only: &[&Value], warnings: usize) -> Vec<String> {
 /// A line noting the diagnostics below only reflect what little could be tracked: printed first
 /// when under half the DataFrames the checker saw had a concrete column list. `None` when there is
 /// nothing below it to caveat.
-pub(crate) fn low_coverage_caveat(total: u64, typed: u64, printed: usize) -> Option<String> {
+pub(crate) fn low_coverage_caveat(
+    total: u64,
+    typed: u64,
+    unresolved: u64,
+    printed: usize,
+) -> Option<String> {
     if printed == 0 || total == 0 || typed as f64 / total as f64 >= LOW_COVERAGE_THRESHOLD {
         return None;
     }
@@ -235,20 +242,30 @@ pub(crate) fn low_coverage_caveat(total: u64, typed: u64, printed: usize) -> Opt
     } else {
         ("findings", "cover")
     };
+    let unresolved_note = if unresolved > 0 {
+        format!(", {unresolved} annotated with an unresolved schema")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "\u{2139} {typed}/{total} DataFrames had column info ({pct}%) \u{2014} the {printed} {noun} below only {verb} what little could be tracked"
+        "\u{2139} {typed}/{total} DataFrames had column info ({pct}%){unresolved_note} \u{2014} the {printed} {noun} below only {verb} what little could be tracked"
     ))
 }
 
 /// The low-key coverage summary line: how much information the checker had, not a validation
 /// result.
-pub(crate) fn coverage_message(total: u64, typed: u64) -> String {
+pub(crate) fn coverage_message(total: u64, typed: u64, unresolved: u64) -> String {
     if total == 0 {
         return "\u{2139} No DataFrames with recognized loads/schemas found to check".to_string();
     }
     let pct = round_half_even(100.0 * typed as f64 / total as f64);
+    let unresolved_note = if unresolved > 0 {
+        format!(", {unresolved} annotated with an unresolved schema")
+    } else {
+        String::new()
+    };
     format!(
-        "\u{2139} {typed}/{total} DataFrames had column info ({pct}%) \u{2014} DataFrame schema coverage, not a pass/fail result"
+        "\u{2139} {typed}/{total} DataFrames had column info ({pct}%){unresolved_note} \u{2014} DataFrame schema coverage, not a pass/fail result"
     )
 }
 
@@ -271,6 +288,7 @@ struct Run {
     elapsed: f64,
     total: u64,
     typed: u64,
+    unresolved: u64,
 }
 
 fn drop_after_chars(text: &str, n: usize) -> &str {
@@ -294,7 +312,7 @@ fn print_results(
         .count();
     let color = format == OutputFormat::Text && io::stdout().is_terminal();
     let caveat = if show_info {
-        low_coverage_caveat(run.total, run.typed, errors.len())
+        low_coverage_caveat(run.total, run.typed, run.unresolved, errors.len())
     } else {
         None
     };
@@ -314,7 +332,7 @@ fn print_results(
             writeln!(
                 out,
                 "::notice title=typedframes DataFrame schema coverage::{}",
-                drop_after_chars(&coverage_message(run.total, run.typed), 2)
+                drop_after_chars(&coverage_message(run.total, run.typed, run.unresolved), 2)
             )?;
         }
         return Ok(());
@@ -351,7 +369,7 @@ fn print_results(
         writeln!(
             out,
             "{}",
-            paint(DIM, &coverage_message(run.total, run.typed))
+            paint(DIM, &coverage_message(run.total, run.typed, run.unresolved))
         )?;
     }
     Ok(())
@@ -367,7 +385,7 @@ fn print_json_results(
     payload.insert("errors".into(), Value::Array(errors));
     payload.insert(
         "stats".into(),
-        json!({"dataframes_total": run.total, "dataframes_typed": run.typed}),
+        json!({"dataframes_total": run.total, "dataframes_typed": run.typed, "dataframes_unresolved": run.unresolved}),
     );
     if let Some(coverage) = coverage {
         payload.insert("coverage".into(), coverage);
@@ -540,6 +558,7 @@ pub(crate) fn run_check(
         elapsed: start.elapsed().as_secs_f64(),
         total: findings.total,
         typed: findings.typed,
+        unresolved: findings.unresolved,
     };
 
     let errors = apply_diagnostic_policy(findings.errors.clone(), args);
@@ -549,6 +568,13 @@ pub(crate) fn run_check(
         .count();
     // The flag wins over the config key, so a one-off `--coverage-detail` doesn't mean editing
     // project config.
+    // Counted before --no-warnings hides the warnings: that flag silences output, and --strict
+    // must still fail on a schema the checker could not resolve.
+    let unresolved_schemas = findings
+        .errors
+        .iter()
+        .filter(|e| e["code"] == "unresolved-schema")
+        .count();
     let detail = args.coverage_detail.unwrap_or(coverage_config.detail);
     let format = args.format();
 
@@ -576,7 +602,7 @@ pub(crate) fn run_check(
         print_coverage_failures(out, &failing, format)?;
     }
     Ok(i32::from(
-        !failing.is_empty() || (args.strict && errors_only > 0),
+        !failing.is_empty() || (args.strict && (errors_only > 0 || unresolved_schemas > 0)),
     ))
 }
 
@@ -665,12 +691,12 @@ mod tests {
 
     #[test]
     fn test_should_lead_with_a_caveat_only_below_half_coverage_and_with_findings() {
-        assert_eq!(None, low_coverage_caveat(10, 4, 0));
-        assert_eq!(None, low_coverage_caveat(10, 5, 3));
-        assert_eq!(None, low_coverage_caveat(0, 0, 3));
+        assert_eq!(None, low_coverage_caveat(10, 4, 0, 0));
+        assert_eq!(None, low_coverage_caveat(10, 5, 0, 3));
+        assert_eq!(None, low_coverage_caveat(0, 0, 0, 3));
         assert_eq!(
             Some("\u{2139} 1/4 DataFrames had column info (25%) \u{2014} the 1 finding below only covers what little could be tracked".to_string()),
-            low_coverage_caveat(4, 1, 1)
+            low_coverage_caveat(4, 1, 0, 1)
         );
     }
 
@@ -678,11 +704,15 @@ mod tests {
     fn test_should_word_the_coverage_summary() {
         assert_eq!(
             "\u{2139} No DataFrames with recognized loads/schemas found to check",
-            coverage_message(0, 0)
+            coverage_message(0, 0, 0)
         );
         assert_eq!(
             "\u{2139} 1/3 DataFrames had column info (33%) \u{2014} DataFrame schema coverage, not a pass/fail result",
-            coverage_message(3, 1)
+            coverage_message(3, 1, 0)
+        );
+        assert_eq!(
+            "\u{2139} 1/3 DataFrames had column info (33%), 2 annotated with an unresolved schema \u{2014} DataFrame schema coverage, not a pass/fail result",
+            coverage_message(3, 1, 2)
         );
     }
 

@@ -359,16 +359,34 @@ pub(crate) fn summarize_helper(func_def: &ast::StmtFunctionDef) -> Option<Helper
     if matches!(first, "self" | "cls") {
         first = names.next()?;
     }
+    // `out = frame.copy()` as the first statement: the rest of the body works on `out`, a
+    // different object, so its edits reach the returned frame but not the caller's.
+    let body = func_def.body.as_slice();
+    let body = match body.first() {
+        Some(Stmt::Expr(doc)) if matches!(&*doc.value, Expr::StringLiteral(_)) => &body[1..],
+        _ => body,
+    };
+    let (tracked, alias, body) = match body.split_first() {
+        Some((Stmt::Assign(assign), rest)) => match assign.targets.as_slice() {
+            [Expr::Name(local)]
+                if local.id.as_str() != first && preserves_param(&assign.value, first) =>
+            {
+                (local.id.as_str(), Alias::No, rest)
+            }
+            _ => (first, Alias::Yes, body),
+        },
+        _ => (first, Alias::Yes, body),
+    };
     let mut scan = PassthroughScan {
-        param: first,
+        param: tracked,
         saw_return: false,
         ok: true,
         depth: 0,
-        alias: Alias::Yes,
+        alias,
         edits: Vec::new(),
         in_place: Vec::new(),
     };
-    for stmt in &func_def.body {
+    for stmt in body {
         scan.visit_stmt(stmt);
     }
     let returned = (scan.saw_return && scan.ok).then_some(scan.edits);

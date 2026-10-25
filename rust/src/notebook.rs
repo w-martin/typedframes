@@ -90,6 +90,7 @@ pub(crate) struct NotebookUntypedSiteUsage {
 pub(crate) struct NotebookFileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    pub dataframes_unresolved: usize,
     pub untyped_sites: Vec<NotebookUntypedSite>,
     pub typed_sites: Vec<NotebookTypedSite>,
     pub all_dataframe_calls: Vec<NotebookDataFrameCallSite>,
@@ -251,6 +252,7 @@ pub(crate) fn translate_result(
         stats: NotebookFileStats {
             dataframes_total: stats.dataframes_total,
             dataframes_typed: stats.dataframes_typed,
+            dataframes_unresolved: stats.dataframes_unresolved,
             untyped_sites,
             typed_sites,
             all_dataframe_calls,
@@ -360,6 +362,7 @@ mod tests {
         let stats = FileStats {
             dataframes_total: 3,
             dataframes_typed: 2,
+            dataframes_unresolved: 0,
             untyped_sites: vec![UntypedSite {
                 line: 1,
                 col: 1,

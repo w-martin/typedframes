@@ -385,6 +385,7 @@ pub(crate) fn check_file_impl(
         stats: FileStats {
             dataframes_total: linter.dataframes_total,
             dataframes_typed: linter.dataframes_typed,
+            dataframes_unresolved: linter.dataframes_unresolved,
             untyped_sites: std::mem::take(&mut linter.untyped_sites),
             typed_sites: std::mem::take(&mut linter.typed_sites),
             all_dataframe_calls: std::mem::take(&mut linter.all_dataframe_calls),
@@ -469,6 +470,7 @@ pub(crate) fn check_notebook_impl(
     let stats = FileStats {
         dataframes_total: linter.dataframes_total,
         dataframes_typed: linter.dataframes_typed,
+        dataframes_unresolved: linter.dataframes_unresolved,
         untyped_sites: std::mem::take(&mut linter.untyped_sites),
         typed_sites: std::mem::take(&mut linter.typed_sites),
         all_dataframe_calls: std::mem::take(&mut linter.all_dataframe_calls),

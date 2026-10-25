@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typedframes"
-version = "0.14.4"
+version = "0.14.5"
 description = "Static analysis for pandas and polars DataFrames. Catch column errors at lint-time, not runtime."
 keywords = ["pandas", "polars", "type-checking", "static-analysis", "dataframe", "linter", "mypy-plugin"]
 readme = "README.md"
@@ -128,11 +128,11 @@ convention = "google"
 
 [dependency-groups]
 docs = [
-    "mkdocs-material>=9.7.7",
-    "mkdocstrings-python>=2.0.9",
+    "mkdocs-material>=9.8.0",
+    "mkdocstrings-python>=2.0.10",
 ]
 dev = [
-    "pandas>=3.0.6",
+    "pandas>=3.1.0",
     "pandera>=0.34.1",
     "pip-audit>=2.10.1",
     "polars>=2.0.0",
@@ -147,11 +147,11 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-xdist>=3.8.0",
-    "ruff>=0.17.1",
-    "ty>=0.0.89",
+    "ruff>=0.17.2",
+    "ty>=0.0.91",
     "openpyxl>=3.1.5",
     "pyarrow>=26.0.0",
-    "xlsxwriter>=3.2.9",
+    "xlsxwriter>=3.3.0",
     "fastexcel>=0.21.0",
     "pandas-stubs>=3.0.5.260914",
     "mypy>=2.4.0",

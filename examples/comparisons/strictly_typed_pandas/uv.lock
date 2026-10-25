@@ -399,14 +399,15 @@ wheels = [
 
 [[package]]
 name = "python-dateutil"
-version = "2.9.0.post0"
+version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "six" },
+    { name = "tzdata" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/df/f15f80383f152452d8985b36d95cb8751f901a3e0ff4cd27f7e118f168e2/python_dateutil-3.0.0.tar.gz", hash = "sha256:7ebcb3c29a92f3ceafe79a7a48a5c45677e9e004bbeec5742ac0bbb00560b7a2", size = 271066, upload-time = "2026-10-21T23:41:45.075Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/17/cebee01d1c0c1441174cf0456ddc91b280d79acb65340c05e41d77866ee8/python_dateutil-3.0.0-py2.py3-none-any.whl", hash = "sha256:3c79630202e4152c6add678446984236efe4f57e84d8e892aab0637bab82e9fd", size = 94659, upload-time = "2026-10-21T23:41:43.431Z" },
 ]
 
 [[package]]
@@ -464,15 +465,15 @@ wheels = [
 
 [[package]]
 name = "typedframes"
-version = "0.14.1"
+version = "0.14.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/af/59/32b6d2be0d7f8aeca8a8ccc8686cbf063a4802f536005ecde66783bdee8c/typedframes-0.14.1.tar.gz", hash = "sha256:d64fde05006426e86a453705fcc2c9b37772ffaaf69c4847a52205c6257ed961", size = 439285, upload-time = "2026-10-17T15:44:21.928Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/00/e8e44562e81d6ca159b6fa4e8b0ac53c7ff5fa3c29f7fd3d95ac1f51f48c/typedframes-0.14.4.tar.gz", hash = "sha256:96c8c7c663928779013211824257f50cfbe40cc2453eb6f7d2aa072406ed6028", size = 450071, upload-time = "2026-10-18T17:07:14.566Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/82/18f36bd776f07515efb15d920ce506ffb2c646c47117855a239144925c67/typedframes-0.14.1-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:d5a66a34ee613eb3a8c081b752f7064acd642dfb9cf5558af7b1ee6b248403b2", size = 8167533, upload-time = "2026-10-17T15:44:12.576Z" },
-    { url = "https://files.pythonhosted.org/packages/a5/00/5710bc2c37f9431a5dc8af43d097087c511b68d598895e5c6e66781d8b0b/typedframes-0.14.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:5773bba2f0768ad569c43d8999f2d6a920524c91d326c683b77a2d9ec51f4859", size = 7595295, upload-time = "2026-10-17T15:44:14.364Z" },
-    { url = "https://files.pythonhosted.org/packages/35/55/52c66d1852250a166456c68237dfcd3d97bc72250a3563438d633aabfaca/typedframes-0.14.1-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:180e1e62962c55444fd9144cca64c741fdffcbc96237729fdafa93a45766d50f", size = 7936053, upload-time = "2026-10-17T15:44:16.469Z" },
-    { url = "https://files.pythonhosted.org/packages/c8/34/cfdb5b1ffd8113601a7780019c7d551fb02b87539c2b1362b5c3f3c74c42/typedframes-0.14.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c1130ea2f7f1cbc2a370ef47326a1e7d7cdf1db474038a63209d25926ddda194", size = 8513918, upload-time = "2026-10-17T15:44:18.229Z" },
-    { url = "https://files.pythonhosted.org/packages/23/77/298e71e94f0db0e9a2cf31bdee060d589d1f5eb9d15fa7d2ae2c822790b6/typedframes-0.14.1-py3-none-win_amd64.whl", hash = "sha256:61088a33c3f9e57c313d82743f3e6282fceb36d0add6b191007ecb3a18cf70bf", size = 8395227, upload-time = "2026-10-17T15:44:20.212Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/e2/18cdc96e52ed3bbd88fd4fc57f6edd638e83221fdcc002828c091f20e317/typedframes-0.14.4-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:a2c3d5d532ae7dc678f71d0650cc791c4f1b85c48dd99a8500c0ee19ecfc20e1", size = 5861195, upload-time = "2026-10-18T17:07:04.337Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/17/a64e453897faf58af350ca74ff2978b1f18e239eb7116ef581fbfd248707/typedframes-0.14.4-py3-none-macosx_11_0_arm64.whl", hash = "sha256:1dd85546a569afe998d3d306aed1d708b5709c6495ebc2036306da8c0588db9b", size = 5447698, upload-time = "2026-10-18T17:07:06.209Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/c6/a259540df6121642f51ed10d67530b5cfee81ceabc4146ead84c632f8279/typedframes-0.14.4-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:01daf5713cf1cb47e0b86dbc318b0c855ed2f5ee2a5262992189e906a7f5eca8", size = 5716356, upload-time = "2026-10-18T17:07:08.26Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/07/e57a83518c04e7bdb464a5e3dda1b0f6352b06f1298fdd00d515c2365087/typedframes-0.14.4-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f392cf36c7c09cc794fcfc48a7ccc6a346f78bdb4ebb6cf78d81991f28053aaa", size = 6110593, upload-time = "2026-10-18T17:07:10.119Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/7a/18c13928234d91323f1a56806ad177ed1c45f34bff3f0ce33332bc39656d/typedframes-0.14.4-py3-none-win_amd64.whl", hash = "sha256:563a771b3a8e4ccc83bf46898406c262ce3af8fb18ab08f998097b1eef03a545", size = 5741014, upload-time = "2026-10-18T17:07:12.131Z" },
 ]
 
 [package.optional-dependencies]

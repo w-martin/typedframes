@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.14.4) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.14.5) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -479,7 +479,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.14.4"]
+        additional_dependencies: ["typedframes==0.14.5"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -528,7 +528,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.14.4"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.14.5"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
@@ -668,17 +668,17 @@ plus the requested features, so both halves get checked normally. See
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (median of 5 runs ± one standard deviation, 3 warmup, caches cleared between runs):
-*2026-10-18 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
+*2026-10-24 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
 
 | Tool | Version | What it does | typedframes (12 files) | great_expectations (494 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.14.4 | DataFrame column checker | 21.1 ± 0.4 ms | 49.4 ± 0.5 ms |
-| ruff | 0.17.1 | Linter (no type checking) | 26.4 ± 1.6 ms | 227.1 ± 1.6 ms |
-| ty | 0.0.89 | Type checker | 51.4 ± 0.7 ms | 778.8 ± 8.8 ms |
-| pyrefly | 1.4.0 | Type checker | 110.8 ± 15.2 ms | 333.5 ± 10.3 ms |
-| mypy | 2.4.0 | Type checker (no plugin) | 1.88 ± 0.11 s | 3.15 ± 0.02 s |
-| mypy + typedframes | 2.4.0 | Type checker + column checker | 1.91 ± 0.02 s | 3.29 ± 0.01 s |
-| pyright | 1.1.414 | Type checker | 683.7 ± 2.5 ms | 4.01 ± 0.08 s |
+| typedframes | 0.14.5 | DataFrame column checker | 21.8 ± 0.1 ms | 55.0 ± 0.3 ms |
+| ruff | 0.17.2 | Linter (no type checking) | 29.5 ± 1.0 ms | 233.7 ± 2.1 ms |
+| ty | 0.0.91 | Type checker | 55.6 ± 0.4 ms | 821.0 ± 73.5 ms |
+| pyrefly | 1.4.0 | Type checker | 121.3 ± 6.0 ms | 386.6 ± 24.9 ms |
+| mypy | 2.4.0 | Type checker (no plugin) | 2.02 ± 0.12 s | 3.28 ± 0.15 s |
+| mypy + typedframes | 2.4.0 | Type checker + column checker | 2.06 ± 0.01 s | 3.50 ± 0.08 s |
+| pyright | 1.1.414 | Type checker | 778.0 ± 22.3 ms | 4.11 ± 0.09 s |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 

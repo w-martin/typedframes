@@ -23,6 +23,9 @@ pub(crate) const CODE_MISSING_COLUMN: &str = "missing-column";
 // unverifiable rather than definitely wrong. Raised at every access site, since
 // the unresolved state propagates through returns, reassignment, and merge/concat.
 pub(crate) const CODE_UNVERIFIABLE_COLUMN: &str = "unverifiable-column";
+// A frame annotated with a schema the checker could not resolve to a class with columns, so
+// nothing on it is checked. Counted apart from typed frames instead of passing as 100%.
+pub(crate) const CODE_UNRESOLVED_SCHEMA: &str = "unresolved-schema";
 
 // Return true if the source line at `line` (1-indexed) carries a
 // `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
@@ -63,6 +66,8 @@ pub(crate) fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
 pub struct FileStats {
     pub dataframes_total: usize,
     pub dataframes_typed: usize,
+    /// Frames annotated with a schema that did not resolve; a subset of the untyped ones.
+    pub dataframes_unresolved: usize,
     pub untyped_sites: Vec<UntypedSite>,
     pub typed_sites: Vec<TypedSite>,
     /// Every `<load module>.<load function>(...)`-shaped call found anywhere in the

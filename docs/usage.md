@@ -455,7 +455,16 @@ Two kinds of origin are recognized but never resolve to a concrete column list:
   pinned down (an untyped parameter, an unresolved upstream call, ...);
 - a **bare `-> pd.DataFrame` / `-> pl.DataFrame` return** with no attached `Schema` — the
   usual shape of an internal `py.typed` client library, reached through a plain call or
-  through `self._client.get_data(...)`. There's nothing to derive here at all.
+  through `self._client.get_data(...)`. There's nothing to derive here at all;
+- a frame or parameter **annotated with a schema the checker can't find** —
+  `Annotated[pd.DataFrame, Rows]` where `Rows` is neither defined in the file nor imported from
+  a module the checker can follow. It raises an `unresolved-schema` warning (a failure under
+  `--strict`), and the summary line reports it apart from the typed frames:
+  `4/6 DataFrames had column info (67%), 2 annotated with an unresolved schema`. Imports inside
+  an `if TYPE_CHECKING:` block are followed like any other, so the usual
+  annotation-only-import layout resolves. A parameter annotated this way gets the warning but
+  is not a frame the checker counts, so it does not change the coverage numbers. A file
+  checked on its own cannot follow every import, so check the whole project to resolve them.
 
 These do **not** count as covered, and every column accessed on one — at the origin or at
 any point downstream (a return, a reassignment, a `merge`/`concat`) — is flagged

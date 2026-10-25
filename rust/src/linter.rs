@@ -12,7 +12,8 @@ use crate::constants::{
 };
 use crate::errors::{
     is_line_ignored, CODE_ASSUMED_CONSTANT, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN,
-    CODE_RESERVED_NAME, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
+    CODE_RESERVED_NAME, CODE_UNKNOWN_COLUMN, CODE_UNRESOLVED_SCHEMA, CODE_UNTRACKED_DATAFRAME,
+    CODE_UNVERIFIABLE_COLUMN,
 };
 use crate::errors::{DataFrameCallSite, LegEvent, LintError, TypedSite, UntypedSite};
 use crate::frame_ops::{
@@ -406,6 +407,8 @@ pub struct Linter {
     // every access on it raises `unverifiable-column` instead. Falls into
     // `untyped_sites` like any other unresolved DataFrame (e.g. unparseable SQL).
     pub dataframes_typed: usize,
+    // Annotated frames whose schema name resolved to no class; also in `untyped_sites`.
+    pub dataframes_unresolved: usize,
     // Every origin counted in `dataframes_total` that did NOT resolve to a concrete
     // column set. Kept in step with the counters at each counting site rather than
     // reconstructed later.
@@ -552,6 +555,9 @@ pub struct Linter {
     // of these raises `unverifiable-column` (see `schema_has_column`'s call sites)
     // rather than passing or false-positiving on a column this checker can't see.
     pub(crate) unresolved_schemas: std::collections::HashSet<String>,
+    // Functions that call one of their own parameters with their `*args`, as `fn(*args)`:
+    // name -> (the callable's position, the number of positional parameters before `*args`).
+    forwarders: HashMap<String, (usize, usize)>,
     // Cursor variable name -> the SQL text most recently passed to `cursor.execute(sql)`
     // (the PEP 249 pattern used by Snowflake, Redshift, and similar connectors), until
     // a later `cursor.fetch_pandas_all()` materializes it into a DataFrame. A second
@@ -652,10 +658,6 @@ pub struct Linter {
     pub(crate) class_bases: HashMap<String, Vec<String>>,
 }
 
-// The first plain-name assignment target, used to label a coverage site with the
-// variable a reader of the report would actually recognize. Falls back to `fallback`
-// for a target with no single name of its own (tuple unpacking, `obj.attr = ...`,
-// `d["k"] = ...`), matching what the existing untyped-site call sites already do.
 // Whether the call passes any of `names` as a keyword argument.
 fn has_keyword(call: &ast::ExprCall, names: &[&str]) -> bool {
     call.arguments
@@ -664,6 +666,10 @@ fn has_keyword(call: &ast::ExprCall, names: &[&str]) -> bool {
         .any(|k| k.arg.as_ref().is_some_and(|a| names.contains(&a.as_str())))
 }
 
+// The first plain-name assignment target, used to label a coverage site with the
+// variable a reader of the report would actually recognize. Falls back to `fallback`
+// for a target with no single name of its own (tuple unpacking, `obj.attr = ...`,
+// `d["k"] = ...`), matching what the existing untyped-site call sites already do.
 fn assign_var_hint(assign: &ast::StmtAssign, fallback: &str) -> String {
     assign
         .targets
@@ -676,6 +682,122 @@ fn assign_var_hint(assign: &ast::StmtAssign, fallback: &str) -> String {
             }
         })
         .unwrap_or_else(|| fallback.to_string())
+}
+
+// `def run(name, fn, *args): return fn(*args)`: (position of `fn`, positional parameters before
+// `*args`). `fn` must be a positional parameter, called with exactly `*args` and nothing else,
+// and that call's result must be all the function ever returns: a wrapper that post-processes
+// the result, or forwards keywords, does not hand back what `fn` returns for those arguments.
+fn forwarder_shape(func_def: &ast::StmtFunctionDef) -> Option<(usize, usize)> {
+    struct Returns<'a> {
+        values: Vec<&'a Expr>,
+        bare: bool,
+    }
+    impl<'a> Visitor<'a> for Returns<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                Stmt::Return(ret) => match ret.value.as_deref() {
+                    Some(value) => self.values.push(value),
+                    None => self.bare = true,
+                },
+                _ => ast_visitor::walk_stmt(self, stmt),
+            }
+        }
+    }
+    let is_forward = |expr: &Expr, callable: &str, varargs: &str| match expr {
+        Expr::Call(call) => {
+            matches!(&*call.func, Expr::Name(n) if n.id.as_str() == callable)
+                && call.arguments.keywords.is_empty()
+                && matches!(
+                    call.arguments.args.as_ref(),
+                    [Expr::Starred(star)]
+                        if matches!(&*star.value, Expr::Name(n) if n.id.as_str() == varargs)
+                )
+        }
+        _ => false,
+    };
+    let parameters = &func_def.parameters;
+    let varargs = parameters.vararg.as_ref()?.name.as_str();
+    if parameters.kwarg.is_some() {
+        return None;
+    }
+    let mut returns = Returns {
+        values: Vec::new(),
+        bare: false,
+    };
+    func_def
+        .body
+        .iter()
+        .for_each(|stmt| returns.visit_stmt(stmt));
+    if returns.bare || returns.values.is_empty() {
+        return None;
+    }
+    let positional: Vec<&str> = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .map(|p| p.parameter.name.as_str())
+        .collect();
+    positional.iter().enumerate().find_map(|(index, callable)| {
+        // `result = fn(*args)` ... `return result`, with `result` bound nowhere else.
+        let bound_result = func_def.body.iter().find_map(|stmt| match stmt {
+            Stmt::Assign(assign) => match assign.targets.as_slice() {
+                [Expr::Name(target)] if is_forward(&assign.value, callable, varargs) => {
+                    Some(target.id.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        let rebound = |name: &str| {
+            func_def
+                .body
+                .iter()
+                .filter(|stmt| {
+                    matches!(stmt, Stmt::Assign(a) if a.targets.iter().any(
+                        |t| matches!(t, Expr::Name(n) if n.id.as_str() == name)))
+                })
+                .count()
+                > 1
+        };
+        returns
+            .values
+            .iter()
+            .all(|value| {
+                is_forward(value, callable, varargs)
+                    || matches!(value, Expr::Name(n)
+                        if Some(n.id.as_str()) == bound_result && !rebound(n.id.as_str()))
+            })
+            .then_some((index, positional.len()))
+    })
+}
+
+fn is_type_checking_guard(test: &Expr) -> bool {
+    match test {
+        Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
+        Expr::Attribute(attr) => {
+            attr.attr.as_str() == "TYPE_CHECKING"
+                && matches!(&*attr.value, Expr::Name(base) if matches!(base.id.as_str(), "typing" | "t"))
+        }
+        _ => false,
+    }
+}
+
+// The module's top-level statements plus the bodies of `if TYPE_CHECKING:` blocks. The
+// block never runs, but the checker never runs the program either, and the names it
+// imports are exactly the ones annotations refer to.
+pub(crate) fn top_level_and_type_checking_stmts(module: &ModModule) -> Vec<&Stmt> {
+    let mut out = Vec::new();
+    for stmt in &module.body {
+        match stmt {
+            Stmt::If(if_stmt) if is_type_checking_guard(&if_stmt.test) => {
+                out.extend(&if_stmt.body);
+            }
+            _ => out.push(stmt),
+        }
+    }
+    out
 }
 
 // The call a function returns, when `return <call>` is the only value-return in its body
@@ -1704,6 +1826,7 @@ impl Linter {
             file_display: String::new(),
             dataframes_total: 0,
             dataframes_typed: 0,
+            dataframes_unresolved: 0,
             untyped_sites: Vec::new(),
             untyped_site_usage: HashMap::new(),
             collect_suggestions: false,
@@ -1730,6 +1853,7 @@ impl Linter {
             stmt_var_candidates: HashMap::new(),
             retrieval_jobs: HashMap::new(),
             unresolved_schemas: std::collections::HashSet::new(),
+            forwarders: HashMap::new(),
             cursor_sql: HashMap::new(),
             param_governed_templates: HashMap::new(),
             all_function_names: std::collections::BTreeSet::new(),
@@ -1870,6 +1994,24 @@ impl Linter {
         (self.string_var_candidates, self.bool_var_candidates) =
             self.collect_literal_var_candidates(&module.body, path);
         self.dict_list_var_candidates = collect_row_var_candidates(&module.body);
+        self.forwarders = module
+            .body
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::FunctionDef(func_def) => {
+                    forwarder_shape(func_def).map(|shape| (func_def.name.to_string(), shape))
+                }
+                _ => None,
+            })
+            .collect();
+        // Registered ahead of the walk so a function can annotate with a schema defined below it.
+        // The walk registers each class again and reports its diagnostics, so these are dropped.
+        let mut registration_errors = Vec::new();
+        for stmt in &module.body {
+            if let Stmt::ClassDef(class_def) = stmt {
+                self.register_schema_class(class_def, &mut registration_errors);
+            }
+        }
         let mut df_usage_collector = DataFrameShapedUsageCollector {
             names: std::collections::HashSet::new(),
         };
@@ -2490,7 +2632,8 @@ impl Linter {
                 project_root.join(p)
             }
         });
-        for stmt in &module.body {
+        let import_stmts = top_level_and_type_checking_stmts(module);
+        for stmt in import_stmts.iter().copied() {
             let Stmt::ImportFrom(import_from) = stmt else {
                 continue;
             };
@@ -2569,6 +2712,14 @@ impl Linter {
                     all_schema_locations,
                 );
                 let local = alias.asname.as_ref().map_or(name, |a| a.id.as_str());
+                if local != name {
+                    if let Some(cols) = self.schemas.get(name).cloned() {
+                        self.schemas.insert(local.to_string(), cols);
+                    }
+                    if let Some(loc) = self.schema_locations.get(name).cloned() {
+                        self.schema_locations.insert(local.to_string(), loc);
+                    }
+                }
                 self.import_helper_summary(entry, name, None, local);
             }
         }
@@ -2579,7 +2730,7 @@ impl Linter {
         // site written as `module.func(df)` is resolved by check_call_requirements
         // looking up the bare name `func`, the same key space `from X import func`
         // would have populated (see visit_stmt's Expr::Attribute call-site handling).
-        for stmt in &module.body {
+        for stmt in import_stmts.iter().copied() {
             let Stmt::Import(import_stmt) = stmt else {
                 continue;
             };
@@ -2672,6 +2823,16 @@ impl Linter {
         }
         if let Some(loc) = entry.schema_locations.get(name) {
             self.schema_locations.insert(name.to_string(), loc.clone());
+        }
+        // A package's `__init__.py` usually re-exports its schemas (`from .schema import Rows`,
+        // often under `TYPE_CHECKING`) rather than defining them, so look the name up project-wide.
+        if file_path_display.ends_with("__init__.py") && !self.schemas.contains_key(name) {
+            if let Some(cols) = all_schemas.get(name) {
+                self.schemas.insert(name.to_string(), cols.clone());
+            }
+            if let Some(loc) = all_schema_locations.get(name) {
+                self.schema_locations.insert(name.to_string(), loc.clone());
+            }
         }
         // `name` may be a class (e.g. `from repository import DataRepository`) rather
         // than a function -- entry.functions.get(name) below would be None for that
@@ -4352,6 +4513,205 @@ impl Linter {
         }
     }
 
+    // Registers the schema a `BaseSchema`/ORM class declares, if it declares one.
+    fn register_schema_class(
+        &mut self,
+        class_def: &ast::StmtClassDef,
+        errors: &mut Vec<LintError>,
+    ) {
+        let (class_def_line, _) = self.source_location(class_def.range().start());
+        let is_schema = class_def.bases().iter().any(|base| match base {
+            Expr::Attribute(attr) => ast_extract::is_schema_base(attr.attr.as_str()),
+            Expr::Name(name) => {
+                ast_extract::is_schema_base(name.id.as_str())
+                    || self.schemas.contains_key(name.id.as_str())
+            }
+            _ => false,
+        });
+
+        if is_schema {
+            // Collect inherited columns first (multiple-inheritance support).
+            // Each named base that is already registered as a schema contributes
+            // its columns; later bases can shadow earlier ones by appending, but
+            // duplicate column names are left for the schema author to resolve.
+            let mut columns = Vec::new();
+            for base in class_def.bases() {
+                if let Expr::Name(name) = base {
+                    if let Some(parent_cols) = self.schemas.get(name.id.as_str()) {
+                        columns.extend(parent_cols.clone());
+                    }
+                }
+            }
+            // Walk the class body to extract column definitions.
+            // Three declaration forms are supported:
+            //   1. `col: Column(...)` / `col = Column(...)` — explicit column,
+            //      may have an `alias=` keyword that overrides the attribute name.
+            //   2. `col: ColumnSet(members=[...])` — a named group that also
+            //      expands its member strings as individual columns.
+            //   3. Any other annotated attribute — treated as a plain column
+            //      whose name equals the attribute name.
+            for body_stmt in &class_def.body {
+                if let Stmt::AnnAssign(ann_assign) = body_stmt {
+                    if let Expr::Name(name) = ann_assign.target.as_ref() {
+                        let mut col_added = false;
+                        if let Some(value) = &ann_assign.value {
+                            if let Expr::Call(call) = &**value {
+                                let func_name = match &*call.func {
+                                    Expr::Name(n) => Some(n.id.as_str()),
+                                    Expr::Attribute(a) => Some(a.attr.as_str()),
+                                    _ => None,
+                                };
+
+                                if let Some(f) = func_name {
+                                    if f == "Column" {
+                                        let mut alias = None;
+                                        for keyword in call.arguments.keywords.iter() {
+                                            if keyword.arg.as_ref().map(|s| s.as_str())
+                                                == Some("alias")
+                                            {
+                                                if let Some(s) = ast_extract::extract_string_literal(
+                                                    &keyword.value,
+                                                ) {
+                                                    alias = Some(s.to_string());
+                                                }
+                                            }
+                                        }
+                                        let col_name = alias.unwrap_or_else(|| name.id.to_string());
+                                        columns.push(col_name);
+                                        col_added = true;
+                                    } else if f == "ColumnSet" || f == "ColumnGroup" {
+                                        columns.push(name.id.to_string());
+                                        for keyword in call.arguments.keywords.iter() {
+                                            if keyword.arg.as_ref().map(|s| s.as_str())
+                                                == Some("members")
+                                            {
+                                                if let Expr::List(list) = &keyword.value {
+                                                    for el in &list.elts {
+                                                        if let Some(s) =
+                                                            ast_extract::extract_string_literal(el)
+                                                        {
+                                                            columns.push(s.to_string());
+                                                        } else if let Expr::Name(n) = el {
+                                                            columns.push(n.id.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        col_added = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !col_added {
+                            columns.push(name.id.to_string());
+                        }
+                    }
+                } else if let Stmt::Assign(assign) = body_stmt {
+                    for target in &assign.targets {
+                        if let Expr::Name(name) = target {
+                            let mut col_added = false;
+                            if let Expr::Call(call) = &*assign.value {
+                                let func_name = match &*call.func {
+                                    Expr::Name(n) => Some(n.id.as_str()),
+                                    Expr::Attribute(a) => Some(a.attr.as_str()),
+                                    _ => None,
+                                };
+
+                                if let Some(f) = func_name {
+                                    if f == "Column" {
+                                        let mut alias = None;
+                                        for keyword in call.arguments.keywords.iter() {
+                                            if keyword.arg.as_ref().map(|s| s.as_str())
+                                                == Some("alias")
+                                            {
+                                                if let Some(s) = ast_extract::extract_string_literal(
+                                                    &keyword.value,
+                                                ) {
+                                                    alias = Some(s.to_string());
+                                                }
+                                            }
+                                        }
+                                        columns.push(alias.unwrap_or_else(|| name.id.to_string()));
+                                        col_added = true;
+                                    } else if f == "ColumnSet" || f == "ColumnGroup" {
+                                        columns.push(name.id.to_string());
+                                        for keyword in call.arguments.keywords.iter() {
+                                            if keyword.arg.as_ref().map(|s| s.as_str())
+                                                == Some("members")
+                                            {
+                                                if let Expr::List(list) = &keyword.value {
+                                                    for el in &list.elts {
+                                                        if let Some(s) =
+                                                            ast_extract::extract_string_literal(el)
+                                                        {
+                                                            columns.push(s.to_string());
+                                                        } else if let Expr::Name(n) = el {
+                                                            columns.push(n.id.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        col_added = true;
+                                    }
+                                }
+                            }
+                            if !col_added {
+                                columns.push(name.id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // Deduplicate columns (MI may bring overlapping columns)
+            columns.sort();
+            columns.dedup();
+            // Warn about column names that conflict with reserved methods
+            for col_name in &columns {
+                if RESERVED_METHODS.contains(&col_name.as_str()) {
+                    let (line, col) = self.source_location(class_def.range().start());
+                    errors.push(LintError {
+                            line,
+                            col,
+                            code: CODE_RESERVED_NAME.to_string(),
+                            message: format!(
+                                "Column name '{}' in {} conflicts with a pandas/polars method. This will shadow the method when accessed via attribute syntax (df.{}). Consider renaming to '{}_value' or similar.",
+                                col_name, class_def.name, col_name, col_name
+                            ),
+                            severity: "error".to_string(),
+                        });
+                }
+            }
+            self.schemas.insert(class_def.name.to_string(), columns);
+            self.schema_locations.insert(
+                class_def.name.to_string(),
+                (self.file_display.clone(), class_def_line),
+            );
+        } else if ast_extract::class_body_has_tablename(class_def) {
+            // SQLAlchemy declarative model: `class Order(Base): __tablename__ =
+            // "orders"; ...`. Detected structurally, via `__tablename__` in the
+            // class's own body, rather than by base-class name — the declarative
+            // base is normally imported from a project-local module
+            // (`class Order(Base)`), so it's never one of the fixed names
+            // `is_schema_base` recognizes. Uses a separate, allowlist-based
+            // extractor rather than the permissive one above: see
+            // `extract_orm_columns` for why (its "any annotated attribute is a
+            // column" fallback would sweep in `relationship(...)` attributes,
+            // `__table_args__`, etc., which aren't real database columns).
+            let columns = ast_extract::extract_orm_columns(class_def);
+            // Deliberately no RESERVED_METHODS conflict check here: that
+            // warning is authoring advice for typedframes-native schemas
+            // ("rename the column"), but a mapped class's column names come
+            // from an external database schema the user doesn't control.
+            self.schemas.insert(class_def.name.to_string(), columns);
+            self.schema_locations.insert(
+                class_def.name.to_string(),
+                (self.file_display.clone(), class_def_line),
+            );
+        }
+    }
+
     // Visit every statement in a nested body (function/class/if/for/while/with/try) in
     // order. Pulled out as its own method since every one of those statement kinds
     // needs exactly this loop over one or more of its own `Vec<Stmt>` fields.
@@ -4481,6 +4841,15 @@ impl Linter {
         self.dataframes_total += 1;
         let var_hint = assign_var_hint(assign, func_name);
         self.count_typed_dataframe(&schema_name, &var_hint, line, col);
+        if marker_or_schema == OPEN_FRAME_MARKER {
+            self.record_leg_event(
+                &var_hint,
+                line,
+                col,
+                "unresolved",
+                format!("`{func_name}()` is annotated to return a bare DataFrame and its columns could not be derived from its argument"),
+            );
+        }
         for target in &assign.targets {
             if let Expr::Name(target_name) = target {
                 self.variables
@@ -4561,6 +4930,100 @@ impl Linter {
             );
         }
         (schema, line)
+    }
+
+    // The forwarder call `unwrap_forwarder` left alone because its callable is not a plain name.
+    fn note_unfollowed_forwarder(&mut self, assign: &ast::StmtAssign) {
+        let Expr::Call(call) = &*assign.value else {
+            return;
+        };
+        let Expr::Name(forwarder) = &*call.func else {
+            return;
+        };
+        let Some(&(callable_at, _)) = self.forwarders.get(forwarder.id.as_str()) else {
+            return;
+        };
+        if call.arguments.args.get(callable_at).is_none() {
+            return;
+        }
+        let (line, col) = self.source_location(assign.range().start());
+        for target in Self::assign_target_names(assign) {
+            self.record_leg_event(
+                &target,
+                line,
+                col,
+                "untracked",
+                format!(
+                    "`{}()` forwards a callable that is not a plain function name, so its result is not tracked",
+                    forwarder.id
+                ),
+            );
+        }
+    }
+
+    // `self.df: Annotated[pd.DataFrame, Missing] = ...`: an attribute is not a tracked name, so
+    // nothing is checked on it and it is not counted, but a schema nothing defines is still said.
+    fn warn_unresolved_attribute_schema(
+        &self,
+        ann_assign: &ast::StmtAnnAssign,
+        line: usize,
+        col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Some(schema_name) = ast_extract::extract_schema_from_annotation(&ann_assign.annotation)
+        else {
+            return;
+        };
+        if self.schemas.contains_key(schema_name) {
+            return;
+        }
+        errors.push(LintError {
+            line,
+            col,
+            code: CODE_UNRESOLVED_SCHEMA.to_string(),
+            message: format!(
+                "Schema `{schema_name}` annotating an attribute is not defined here or in any import the checker could follow, so no column on it is checked (a file checked on its own cannot follow every import; check the whole project)"
+            ),
+            severity: "warning".to_string(),
+        });
+    }
+
+    // `out = run("stage", fn, raw)` where `run` only calls `fn(*args)`: the statement the caller
+    // meant, `out = fn(raw)`. Only when `fn` is a plain name; a lambda or an expression stays
+    // as written, untracked.
+    fn unwrap_forwarder(&self, assign: &ast::StmtAssign) -> Option<ast::StmtAssign> {
+        let Expr::Call(call) = &*assign.value else {
+            return None;
+        };
+        let Expr::Name(forwarder) = &*call.func else {
+            return None;
+        };
+        let &(callable_at, forwarded_from) = self.forwarders.get(forwarder.id.as_str())?;
+        if !matches!(call.arguments.args.get(callable_at)?, Expr::Name(_)) {
+            return None;
+        }
+        let mut unwrapped = assign.clone();
+        let mut inner = call.clone();
+        *inner.func = call.arguments.args[callable_at].clone();
+        inner.arguments.args = call
+            .arguments
+            .args
+            .get(forwarded_from..)
+            .unwrap_or_default()
+            .to_vec()
+            .into_boxed_slice();
+        inner.arguments.keywords = Default::default();
+        unwrapped.value = Box::new(Expr::Call(inner));
+        Some(unwrapped)
+    }
+
+    // A bare `-> pd.DataFrame` return says nothing about columns, but the callee's body may:
+    // when it hands its first parameter back, the summary carries that frame's columns through.
+    fn summary_beats_open_marker(&self, marker: &str, value: &Expr) -> bool {
+        marker == OPEN_FRAME_MARKER
+            && self
+                .helper_call(value)
+                .is_some_and(|(_, summary)| summary.returned.is_some())
     }
 
     fn assign_target_names(assign: &ast::StmtAssign) -> Vec<String> {
@@ -4732,6 +5195,14 @@ impl Linter {
     // Wraps `visit_stmt_inner` so that, for any assignment, a tracked name the dispatch
     // left untouched can be checked afterwards -- see `end_stale_legs`.
     fn visit_stmt(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
+        let unwrapped = match stmt {
+            Stmt::Assign(assign) => self.unwrap_forwarder(assign).map(Stmt::Assign),
+            _ => None,
+        };
+        if let (None, Stmt::Assign(assign)) = (&unwrapped, stmt) {
+            self.note_unfollowed_forwarder(assign);
+        }
+        let stmt = unwrapped.as_ref().unwrap_or(stmt);
         self.untrack_rebound_names(stmt);
         let rebinding = self.snapshot_rebinding_targets(stmt);
         if let Stmt::Assign(assign) = stmt {
@@ -4758,204 +5229,7 @@ impl Linter {
     fn visit_stmt_inner(&mut self, stmt: &Stmt, errors: &mut Vec<LintError>) {
         match stmt {
             Stmt::ClassDef(class_def) => {
-                let (class_def_line, _) = self.source_location(class_def.range().start());
-                let is_schema = class_def.bases().iter().any(|base| match base {
-                    Expr::Attribute(attr) => ast_extract::is_schema_base(attr.attr.as_str()),
-                    Expr::Name(name) => {
-                        ast_extract::is_schema_base(name.id.as_str())
-                            || self.schemas.contains_key(name.id.as_str())
-                    }
-                    _ => false,
-                });
-
-                if is_schema {
-                    // Collect inherited columns first (multiple-inheritance support).
-                    // Each named base that is already registered as a schema contributes
-                    // its columns; later bases can shadow earlier ones by appending, but
-                    // duplicate column names are left for the schema author to resolve.
-                    let mut columns = Vec::new();
-                    for base in class_def.bases() {
-                        if let Expr::Name(name) = base {
-                            if let Some(parent_cols) = self.schemas.get(name.id.as_str()) {
-                                columns.extend(parent_cols.clone());
-                            }
-                        }
-                    }
-                    // Walk the class body to extract column definitions.
-                    // Three declaration forms are supported:
-                    //   1. `col: Column(...)` / `col = Column(...)` — explicit column,
-                    //      may have an `alias=` keyword that overrides the attribute name.
-                    //   2. `col: ColumnSet(members=[...])` — a named group that also
-                    //      expands its member strings as individual columns.
-                    //   3. Any other annotated attribute — treated as a plain column
-                    //      whose name equals the attribute name.
-                    for body_stmt in &class_def.body {
-                        if let Stmt::AnnAssign(ann_assign) = body_stmt {
-                            if let Expr::Name(name) = ann_assign.target.as_ref() {
-                                let mut col_added = false;
-                                if let Some(value) = &ann_assign.value {
-                                    if let Expr::Call(call) = &**value {
-                                        let func_name = match &*call.func {
-                                            Expr::Name(n) => Some(n.id.as_str()),
-                                            Expr::Attribute(a) => Some(a.attr.as_str()),
-                                            _ => None,
-                                        };
-
-                                        if let Some(f) = func_name {
-                                            if f == "Column" {
-                                                let mut alias = None;
-                                                for keyword in call.arguments.keywords.iter() {
-                                                    if keyword.arg.as_ref().map(|s| s.as_str())
-                                                        == Some("alias")
-                                                    {
-                                                        if let Some(s) =
-                                                            ast_extract::extract_string_literal(
-                                                                &keyword.value,
-                                                            )
-                                                        {
-                                                            alias = Some(s.to_string());
-                                                        }
-                                                    }
-                                                }
-                                                let col_name =
-                                                    alias.unwrap_or_else(|| name.id.to_string());
-                                                columns.push(col_name);
-                                                col_added = true;
-                                            } else if f == "ColumnSet" || f == "ColumnGroup" {
-                                                columns.push(name.id.to_string());
-                                                for keyword in call.arguments.keywords.iter() {
-                                                    if keyword.arg.as_ref().map(|s| s.as_str())
-                                                        == Some("members")
-                                                    {
-                                                        if let Expr::List(list) = &keyword.value {
-                                                            for el in &list.elts {
-                                                                if let Some(s) =
-                                                                    ast_extract::extract_string_literal(el)
-                                                                {
-                                                                    columns.push(s.to_string());
-                                                                } else if let Expr::Name(n) = el {
-                                                                    columns.push(n.id.to_string());
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                col_added = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                if !col_added {
-                                    columns.push(name.id.to_string());
-                                }
-                            }
-                        } else if let Stmt::Assign(assign) = body_stmt {
-                            for target in &assign.targets {
-                                if let Expr::Name(name) = target {
-                                    let mut col_added = false;
-                                    if let Expr::Call(call) = &*assign.value {
-                                        let func_name = match &*call.func {
-                                            Expr::Name(n) => Some(n.id.as_str()),
-                                            Expr::Attribute(a) => Some(a.attr.as_str()),
-                                            _ => None,
-                                        };
-
-                                        if let Some(f) = func_name {
-                                            if f == "Column" {
-                                                let mut alias = None;
-                                                for keyword in call.arguments.keywords.iter() {
-                                                    if keyword.arg.as_ref().map(|s| s.as_str())
-                                                        == Some("alias")
-                                                    {
-                                                        if let Some(s) =
-                                                            ast_extract::extract_string_literal(
-                                                                &keyword.value,
-                                                            )
-                                                        {
-                                                            alias = Some(s.to_string());
-                                                        }
-                                                    }
-                                                }
-                                                columns.push(
-                                                    alias.unwrap_or_else(|| name.id.to_string()),
-                                                );
-                                                col_added = true;
-                                            } else if f == "ColumnSet" || f == "ColumnGroup" {
-                                                columns.push(name.id.to_string());
-                                                for keyword in call.arguments.keywords.iter() {
-                                                    if keyword.arg.as_ref().map(|s| s.as_str())
-                                                        == Some("members")
-                                                    {
-                                                        if let Expr::List(list) = &keyword.value {
-                                                            for el in &list.elts {
-                                                                if let Some(s) =
-                                                                    ast_extract::extract_string_literal(el)
-                                                                {
-                                                                    columns.push(s.to_string());
-                                                                } else if let Expr::Name(n) = el {
-                                                                    columns.push(n.id.to_string());
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                col_added = true;
-                                            }
-                                        }
-                                    }
-                                    if !col_added {
-                                        columns.push(name.id.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Deduplicate columns (MI may bring overlapping columns)
-                    columns.sort();
-                    columns.dedup();
-                    // Warn about column names that conflict with reserved methods
-                    for col_name in &columns {
-                        if RESERVED_METHODS.contains(&col_name.as_str()) {
-                            let (line, col) = self.source_location(class_def.range().start());
-                            errors.push(LintError {
-                                line,
-                                col,
-                                code: CODE_RESERVED_NAME.to_string(),
-                                message: format!(
-                                    "Column name '{}' in {} conflicts with a pandas/polars method. This will shadow the method when accessed via attribute syntax (df.{}). Consider renaming to '{}_value' or similar.",
-                                    col_name, class_def.name, col_name, col_name
-                                ),
-                                severity: "error".to_string(),
-                            });
-                        }
-                    }
-                    self.schemas.insert(class_def.name.to_string(), columns);
-                    self.schema_locations.insert(
-                        class_def.name.to_string(),
-                        (self.file_display.clone(), class_def_line),
-                    );
-                } else if ast_extract::class_body_has_tablename(class_def) {
-                    // SQLAlchemy declarative model: `class Order(Base): __tablename__ =
-                    // "orders"; ...`. Detected structurally, via `__tablename__` in the
-                    // class's own body, rather than by base-class name — the declarative
-                    // base is normally imported from a project-local module
-                    // (`class Order(Base)`), so it's never one of the fixed names
-                    // `is_schema_base` recognizes. Uses a separate, allowlist-based
-                    // extractor rather than the permissive one above: see
-                    // `extract_orm_columns` for why (its "any annotated attribute is a
-                    // column" fallback would sweep in `relationship(...)` attributes,
-                    // `__table_args__`, etc., which aren't real database columns).
-                    let columns = ast_extract::extract_orm_columns(class_def);
-                    // Deliberately no RESERVED_METHODS conflict check here: that
-                    // warning is authoring advice for typedframes-native schemas
-                    // ("rename the column"), but a mapped class's column names come
-                    // from an external database schema the user doesn't control.
-                    self.schemas.insert(class_def.name.to_string(), columns);
-                    self.schema_locations.insert(
-                        class_def.name.to_string(),
-                        (self.file_display.clone(), class_def_line),
-                    );
-                }
+                self.register_schema_class(class_def, errors);
 
                 // Pre-scan this class's own __init__ for self.<attr> origins (see
                 // current_self_attrs' doc comment) BEFORE visiting the body, so calls
@@ -5151,6 +5425,19 @@ impl Linter {
                         if let Some(schema_name) =
                             ast_extract::extract_schema_from_annotation(annotation)
                         {
+                            if !self.schemas.contains_key(schema_name) {
+                                let (line, col) = self.source_location(p.range().start());
+                                errors.push(LintError {
+                                    line,
+                                    col,
+                                    code: CODE_UNRESOLVED_SCHEMA.to_string(),
+                                    message: format!(
+                                        "Schema `{schema_name}` annotating parameter `{}` is not defined here or in any import the checker could follow, so no column on it is checked (a file checked on its own cannot follow every import; check the whole project)",
+                                        p.parameter.name.id
+                                    ),
+                                    severity: "warning".to_string(),
+                                });
+                            }
                             self.variables.insert(
                                 p.parameter.name.id.to_string(),
                                 (schema_name.to_string(), fn_def_line),
@@ -5710,7 +5997,9 @@ impl Linter {
                             if let Expr::Name(receiver) = &*attr.value {
                                 if matches!(receiver.id.as_str(), "self" | "cls") {
                                     if let Some(marker_or_schema) =
-                                        self.resolve_self_method(func_name)
+                                        self.resolve_self_method(func_name).filter(|marker| {
+                                            !self.summary_beats_open_marker(marker, &assign.value)
+                                        })
                                     {
                                         self.bind_function_result(
                                             assign,
@@ -6872,8 +7161,11 @@ impl Linter {
                         // Handle df = load_users() where load_users() -> DataFrame[Schema]
                         // (or a bare -> pd.DataFrame/pl.DataFrame, resolved to an open
                         // schema by resolve_open_or_named_schema).
-                        if let Some(marker_or_schema) =
-                            self.functions.get(func_name.id.as_str()).cloned()
+                        if let Some(marker_or_schema) = self
+                            .functions
+                            .get(func_name.id.as_str())
+                            .cloned()
+                            .filter(|marker| !self.summary_beats_open_marker(marker, &assign.value))
                         {
                             self.bind_function_result(
                                 assign,
@@ -7040,6 +7332,15 @@ impl Linter {
                     _ => {}
                 }
 
+                if !matches!(&*ann_assign.target, Expr::Name(_)) {
+                    self.warn_unresolved_attribute_schema(
+                        ann_assign,
+                        current_line,
+                        current_col,
+                        errors,
+                    );
+                }
+
                 if schema_resolved {
                     self.dataframes_total += 1;
                     // Every branch above resolves by writing the target's schema into
@@ -7057,6 +7358,19 @@ impl Linter {
                         .get(var_hint.as_str())
                         .map(|(schema, _)| schema.clone())
                         .unwrap_or_default();
+                    if !self.schemas.contains_key(&schema_name) {
+                        self.unresolved_schemas.insert(schema_name.clone());
+                        self.dataframes_unresolved += 1;
+                        errors.push(LintError {
+                            line: current_line,
+                            col: current_col,
+                            code: CODE_UNRESOLVED_SCHEMA.to_string(),
+                            message: format!(
+                                "Schema `{schema_name}` annotating `{var_hint}` is not defined here or in any import the checker could follow, so no column on it is checked (a file checked on its own cannot follow every import; check the whole project)"
+                            ),
+                            severity: "warning".to_string(),
+                        });
+                    }
                     self.count_typed_dataframe(&schema_name, &var_hint, current_line, current_col);
                 }
 

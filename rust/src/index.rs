@@ -691,7 +691,7 @@ fn module_exports_and_imports(
     let mut exports = Vec::new();
     let mut imports: HashMap<String, String> = HashMap::new();
     let mut module_aliases: HashMap<String, String> = HashMap::new();
-    for stmt in &module.body {
+    for stmt in crate::linter::top_level_and_type_checking_stmts(module) {
         match stmt {
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
@@ -1176,6 +1176,8 @@ pub(crate) fn resolve_first_party_module_path(
     let candidate = [
         project_root.join(format!("{mod_path}.py")),
         project_root.join("src").join(format!("{mod_path}.py")),
+        project_root.join(&mod_path).join("__init__.py"),
+        project_root.join("src").join(&mod_path).join("__init__.py"),
     ]
     .into_iter()
     .find(|p| p.is_file())?;
@@ -1318,6 +1320,8 @@ pub(crate) fn resolve_module_file(
     let mut candidates = vec![
         project_root.join(format!("{mod_path}.py")),
         project_root.join("src").join(format!("{mod_path}.py")),
+        project_root.join(&mod_path).join("__init__.py"),
+        project_root.join("src").join(&mod_path).join("__init__.py"),
     ];
     // An explicitly allowlisted external package (see collect_external_package_files)
     // is indexed into the same `files` map under its real site-packages path — these

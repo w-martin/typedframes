@@ -5,7 +5,7 @@ description = "Runnable typedframes example: SQL column inference against connec
 requires-python = ">=3.11"
 dependencies = [
     "connectorx>=0.4.6",
-    "pandas>=3.0.6",
+    "pandas>=3.1.0",
 ]
 
 [dependency-groups]

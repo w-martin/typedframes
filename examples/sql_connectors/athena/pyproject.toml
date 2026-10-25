@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "Runnable typedframes example: SQL column inference against AWS Athena"
 requires-python = ">=3.11"
 dependencies = [
-    "pyathena>=4.1.0",
-    "pandas>=3.0.6",
-    "boto3>=1.43.114",
+    "pyathena>=4.2.1",
+    "pandas>=3.1.0",
+    "boto3>=1.43.118",
 ]
 
 [dependency-groups]

@@ -3,12 +3,18 @@
 //! before writing and left alone if it changed.
 
 use crate::config::{find_project_root, load_linter_config};
-use crate::engine::{linter_with_index, CheckError};
+use crate::engine::{
+    is_notebook, linter_with_index, load_python_notebook, notebook_linter, CheckError,
+};
 use crate::errors::LintError;
 use crate::index::ProjectIndex;
 use crate::suggest::{Edit, Suggestion};
-use ruff_python_parser::parse_module;
+use ruff_diagnostics::SourceMap;
+use ruff_notebook::{Cell, Notebook, SourceValue};
+use ruff_python_parser::{parse, parse_module, Mode, ParseOptions};
+use ruff_text_size::TextSize;
 use serde::Serialize;
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +31,10 @@ pub(crate) enum Selection {
 /// A source file's suggestions, the source they were made from, and its current errors.
 pub(crate) struct Analyzed {
     pub(crate) source: String,
+    /// The file as it is on disk: the same as `source`, except for a notebook, whose
+    /// `source` is the concatenation of its code cells.
+    pub(crate) raw: String,
+    pub(crate) notebook: Option<Notebook>,
     pub(crate) suggestions: Vec<Suggestion>,
     // Line numbers removed, so inserting a line doesn't change a key.
     pub(crate) errors: Vec<String>,
@@ -84,6 +94,98 @@ fn new_errors(before: &[String], after: &[String]) -> usize {
         .count()
 }
 
+fn check_source(
+    linter: &mut crate::linter::Linter,
+    source: &str,
+    path: &Path,
+    notebook: bool,
+) -> Result<Vec<LintError>, CheckError> {
+    let checked = if notebook {
+        linter.check_notebook_internal(source, path)
+    } else {
+        linter.check_file_internal(source, path)
+    };
+    checked.map_err(|e| CheckError::Runtime(e.to_string()))
+}
+
+/// Where each edit moves the notebook's cell boundaries, in the form `Notebook::update` reads.
+fn source_map_for(edits: &[Edit]) -> SourceMap {
+    let mut ordered: Vec<&Edit> = edits.iter().collect();
+    ordered.sort_by_key(|e| (e.start, e.end));
+    ordered.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.replacement == b.replacement);
+    let mut map = SourceMap::default();
+    let mut shift = 0isize;
+    let at = |offset: usize, shift: isize| TextSize::try_from((offset as isize + shift) as usize);
+    for edit in ordered {
+        let (Ok(start), Ok(end)) = (TextSize::try_from(edit.start), TextSize::try_from(edit.end))
+        else {
+            continue;
+        };
+        if let Ok(dest) = at(edit.start, shift) {
+            map.push_marker(start, dest);
+        }
+        shift += edit.replacement.len() as isize - (edit.end - edit.start) as isize;
+        if let Ok(dest) = at(edit.end, shift) {
+            map.push_marker(end, dest);
+        }
+    }
+    map
+}
+
+fn source_text(source: &SourceValue) -> String {
+    match source {
+        SourceValue::String(text) => text.clone(),
+        SourceValue::StringArray(lines) => lines.concat(),
+    }
+}
+
+/// `raw`, a notebook file, with only the `source` of the code cells `edits` changed replaced, so
+/// everything else (key order, ids, outputs, indentation) stays as it was.
+fn rewritten_notebook(
+    mut notebook: Notebook,
+    edits: &[Edit],
+    edited_source: String,
+    raw: &str,
+) -> Result<String, String> {
+    notebook.update(&source_map_for(edits), edited_source);
+    let mut document: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let cells = document
+        .get_mut("cells")
+        .and_then(Value::as_array_mut)
+        .filter(|cells| cells.len() == notebook.cells().len())
+        .ok_or("its cells do not match the parsed notebook")?;
+    for (cell, raw_cell) in notebook.cells().iter().zip(cells) {
+        let Cell::Code(code) = cell else { continue };
+        let before = match raw_cell.get("source") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(lines)) => lines.iter().filter_map(Value::as_str).collect(),
+            _ => String::new(),
+        };
+        if before != source_text(&code.source) {
+            raw_cell["source"] = serde_json::to_value(&code.source).map_err(|e| e.to_string())?;
+        }
+    }
+    let indent = raw
+        .lines()
+        .nth(1)
+        .map(|line| line.len() - line.trim_start().len())
+        .filter(|width| *width > 0)
+        .unwrap_or(1);
+    let indent = vec![b' '; indent];
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(
+        &mut out,
+        serde_json::ser::PrettyFormatter::with_indent(&indent),
+    );
+    document
+        .serialize(&mut serializer)
+        .map_err(|e| e.to_string())?;
+    if raw.ends_with('\n') {
+        out.push(b'\n');
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
 pub(crate) fn analyze(
     path: &Path,
     display_path: &str,
@@ -94,15 +196,23 @@ pub(crate) fn analyze(
     if !config.enabled.unwrap_or(true) {
         return Ok(None);
     }
-    let source = fs::read_to_string(path).map_err(|e| CheckError::Io(e.to_string()))?;
-    let (mut linter, _) = linter_with_index(path, &project_root, &config, &source, index);
+    let raw = fs::read_to_string(path).map_err(|e| CheckError::Io(e.to_string()))?;
+    let (mut linter, source, notebook) = if is_notebook(path) {
+        let notebook = load_python_notebook(path)?;
+        let source = notebook.source_code().to_string();
+        let linter = notebook_linter(&project_root, &config, &source, index);
+        (linter, source, Some(notebook))
+    } else {
+        let (linter, _) = linter_with_index(path, &project_root, &config, &raw, index);
+        (linter, raw.clone(), None)
+    };
     linter.collect_suggestions = true;
     linter.suggest_display_path = display_path.to_string();
-    let errors = linter
-        .check_file_internal(&source, path)
-        .map_err(|e| CheckError::Runtime(e.to_string()))?;
+    let errors = check_source(&mut linter, &source, path, notebook.is_some())?;
     Ok(Some(Analyzed {
         source,
+        raw,
+        notebook,
         suggestions: std::mem::take(&mut linter.suggestions),
         errors: error_keys(&errors),
     }))
@@ -115,6 +225,8 @@ pub struct AppliedSuggestion {
     pub col: usize,
     pub var: String,
     pub columns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell: Option<(usize, usize)>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -122,6 +234,8 @@ pub struct SkippedSuggestion {
     pub line: usize,
     pub col: usize,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell: Option<(usize, usize)>,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -147,6 +261,8 @@ pub(crate) struct Planned {
 pub(crate) fn apply_edits(source: &str, edits: &[Edit]) -> Option<String> {
     let mut ordered: Vec<&Edit> = edits.iter().collect();
     ordered.sort_by(|a, b| b.start.cmp(&a.start).then(b.end.cmp(&a.end)));
+    // Suggestions that each carry the same shared edit (an import) apply it once.
+    ordered.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.replacement == b.replacement);
     let mut out = source.to_string();
     let mut previous_start = usize::MAX;
     for edit in ordered {
@@ -206,6 +322,7 @@ pub(crate) fn plan_file(
                         col: *col,
                         reason: "no longer suggested: the file changed since it was analysed"
                             .to_string(),
+                        cell: None,
                     }),
                 }
             }
@@ -225,6 +342,7 @@ pub(crate) fn plan_file(
                 line: s.line,
                 col: s.col,
                 reason: reason.clone(),
+                cell: s.cell,
             });
         }
     };
@@ -235,7 +353,13 @@ pub(crate) fn plan_file(
         );
         return (outcome, None);
     };
-    if parse_module(&edited).is_err() {
+    let is_notebook = analyzed.notebook.is_some();
+    let parses = if is_notebook {
+        parse(&edited, ParseOptions::from(Mode::Ipython)).is_ok()
+    } else {
+        parse_module(&edited).is_ok()
+    };
+    if !parses {
         skip_all(&mut outcome, "the edited file would not parse".to_string());
         return (outcome, None);
     }
@@ -243,13 +367,17 @@ pub(crate) fn plan_file(
     // Check the edited source exactly as the original was checked.
     let project_root = find_project_root(path);
     let config = load_linter_config(&project_root);
-    let (mut linter, _) = linter_with_index(path, &project_root, &config, &edited, index);
-    let after = match linter.check_file_internal(&edited, path) {
+    let mut linter = if is_notebook {
+        notebook_linter(&project_root, &config, &edited, index)
+    } else {
+        linter_with_index(path, &project_root, &config, &edited, index).0
+    };
+    let after = match check_source(&mut linter, &edited, path, is_notebook) {
         Ok(errors) => error_keys(&errors),
         Err(e) => {
             skip_all(
                 &mut outcome,
-                format!("the edited file failed to check: {e}"),
+                format!("the edited file failed to check: {}", e.message()),
             );
             return (outcome, None);
         }
@@ -275,14 +403,29 @@ pub(crate) fn plan_file(
             col: s.col,
             var: s.var.clone(),
             columns: s.columns.clone(),
+            cell: s.cell,
         })
         .collect();
+    let text = match analyzed.notebook {
+        Some(notebook) => match rewritten_notebook(notebook, &edits, edited, &analyzed.raw) {
+            Ok(text) => text,
+            Err(error) => {
+                outcome.applied.clear();
+                skip_all(
+                    &mut outcome,
+                    format!("the notebook could not be rewritten: {error}"),
+                );
+                return (outcome, None);
+            }
+        },
+        None => edited,
+    };
     (
         outcome,
         Some(Planned {
             path: path.to_path_buf(),
-            original: analyzed.source,
-            edited,
+            original: analyzed.raw,
+            edited: text,
         }),
     )
 }
@@ -459,6 +602,7 @@ pub(crate) fn apply_all(
                     col: applied.col,
                     reason: "not written: the write step failed and every file was restored"
                         .to_string(),
+                    cell: applied.cell,
                 });
             }
         }
@@ -850,5 +994,188 @@ mod tests {
             "see line  and a.py:"
         );
         assert_eq!(strip_line_numbers("pipeline 5 at x:7"), "pipeline 5 at x:7");
+    }
+
+    #[test]
+    fn test_should_apply_an_identical_shared_edit_once() {
+        // arrange
+        let shared = Edit {
+            start: 0,
+            end: 0,
+            replacement: "import x\n".to_string(),
+        };
+
+        // act
+        let edited = apply_edits("y = 1\n", &[shared.clone(), shared]);
+
+        // assert
+        assert_eq!(edited.as_deref(), Some("import x\ny = 1\n"));
+    }
+
+    const NOTEBOOK: &str = r##"{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "aaaaaaaa",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "kept\n"
+     ]
+    }
+   ],
+   "source": [
+    "import pandas as pd\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bbbbbbbb",
+   "metadata": {},
+   "source": [
+    "Between the code cells"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "cccccccc",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class Base:\n",
+    "    TARGET = \"y\"\n",
+    "\n",
+    "\n",
+    "class Repo(Base):\n",
+    "    A: str = \"a\"\n",
+    "\n",
+    "    def load(self):\n",
+    "        return pd.DataFrame(columns=[self.A, self.TARGET])"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+"##;
+
+    #[test]
+    fn test_should_apply_a_suggestion_to_a_notebook_and_leave_everything_else() {
+        // arrange
+        let dir = project(&[("n.ipynb", NOTEBOOK)]);
+
+        // act
+        let result = apply_all(
+            &[request(&dir, "n.ipynb", Selection::SafeTier)],
+            None,
+            false,
+        );
+
+        // assert: the import joins cell 1, both constants change in cell 3, and the outputs,
+        // markdown cell and ids are untouched.
+        assert!(result.files[0].written, "{:?}", result.files[0]);
+        assert_eq!(result.files[0].applied.len(), 2);
+        let expected = NOTEBOOK
+            .replace(
+                "    \"import pandas as pd\\n\"\n",
+                "    \"import pandas as pd\\n\",\n    \"from typing import Final\\n\"\n",
+            )
+            .replace("    TARGET = ", "    TARGET: Final = ")
+            .replace("    A: str = ", "    A: Final[str] = ");
+        assert_eq!(read(&dir, "n.ipynb"), expected);
+    }
+
+    #[test]
+    fn test_should_write_a_notebook_unchanged_when_nothing_is_suggested() {
+        // arrange
+        let dir = project(&[("n.ipynb", NOTEBOOK)]);
+        let source = NOTEBOOK.replace("    TARGET = ", "    TARGET: Final = ");
+        let source = source.replace("    A: str = ", "    A: Final[str] = ");
+        fs::write(dir.path().join("n.ipynb"), &source).unwrap();
+
+        // act
+        let result = apply_all(
+            &[request(&dir, "n.ipynb", Selection::SafeTier)],
+            None,
+            false,
+        );
+
+        // assert
+        assert!(!result.files[0].written);
+        assert_eq!(read(&dir, "n.ipynb"), source);
+    }
+
+    #[test]
+    fn test_should_move_cell_boundaries_with_an_edit_that_changes_a_cells_length() {
+        // arrange: the edit sits in the first cell, so every later cell shifts.
+        let source = NOTEBOOK.replace(
+            "    \"import pandas as pd\\n\"\n",
+            "    \"A = 1\\n\",\n    \"import pandas as pd\\n\"\n",
+        );
+        let dir = project(&[("n.ipynb", &source)]);
+
+        // act
+        let result = apply_all(
+            &[request(&dir, "n.ipynb", Selection::SafeTier)],
+            None,
+            false,
+        );
+
+        // assert: still three cells, code split exactly as before.
+        assert!(result.files[0].written, "{:?}", result.files[0]);
+        let written: serde_json::Value = serde_json::from_str(&read(&dir, "n.ipynb")).unwrap();
+        let cells = written["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1]["cell_type"], "markdown");
+        assert!(cells[2]["source"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("class Base"));
+    }
+
+    #[test]
+    fn test_should_keep_an_import_in_the_cell_that_ends_with_it() {
+        // arrange: the last import is the last line of cell 1, which has no trailing newline.
+        let source = NOTEBOOK.replace(
+            "    \"import pandas as pd\\n\"\n",
+            "    \"import pandas as pd\"\n",
+        );
+        let dir = project(&[("n.ipynb", &source)]);
+
+        // act
+        let result = apply_all(
+            &[request(&dir, "n.ipynb", Selection::SafeTier)],
+            None,
+            false,
+        );
+
+        // assert: cell 1 gains the import line, the markdown and class cells are unmoved.
+        assert!(result.files[0].written, "{:?}", result.files[0]);
+        let written: serde_json::Value = serde_json::from_str(&read(&dir, "n.ipynb")).unwrap();
+        let cells = written["cells"].as_array().unwrap();
+        assert_eq!(
+            cells[0]["source"],
+            serde_json::json!(["import pandas as pd\n", "from typing import Final"])
+        );
+        assert_eq!(
+            cells[1]["source"],
+            serde_json::json!(["Between the code cells"])
+        );
+        assert!(cells[2]["source"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("class Base"));
     }
 }

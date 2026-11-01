@@ -25,6 +25,31 @@ fn int(value: &Value, key: &str) -> usize {
     value.get(key).and_then(Value::as_u64).unwrap_or(0) as usize
 }
 
+/// `path:line:col`, or `path cell N:line:col` for a site in a notebook, from its parts.
+fn place(file: &str, line: usize, col: usize, cell: Option<(usize, usize)>) -> String {
+    match cell {
+        Some((cell, cell_line)) => format!("{file} cell {cell}:{cell_line}:{col}"),
+        None => format!("{file}:{line}:{col}"),
+    }
+}
+
+/// `path:line:col`, or `path cell N:line:col` for a site in a notebook.
+fn location(display_path: &str, site: &Value) -> String {
+    match site
+        .get("cell")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    {
+        Some([cell, line]) => format!(
+            "{display_path} cell {}:{}:{}",
+            cell.as_u64().unwrap_or(0),
+            line.as_u64().unwrap_or(0),
+            int(site, "col")
+        ),
+        _ => format!("{display_path}:{}:{}", int(site, "line"), int(site, "col")),
+    }
+}
+
 pub(crate) fn plural(count: usize, word: &str) -> String {
     if count == 1 {
         format!("{count} {word}")
@@ -53,10 +78,9 @@ pub(crate) fn format_suggestion(display_path: &str, suggestion: &Value) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     let where_ = format!(
-        "{}  {display_path}:{}:{}",
+        "{}  {}",
         text(suggestion, "phrase"),
-        int(suggestion, "line"),
-        int(suggestion, "col")
+        location(display_path, suggestion)
     );
     let mut lines = vec![
         format!(
@@ -93,10 +117,9 @@ fn print_suggestions(
         for (display_path, site) in withheld {
             writeln!(
                 out,
-                "  {}  {display_path}:{}:{}  {}  {}",
+                "  {}  {}  {}  {}",
                 text(site, "phrase"),
-                int(site, "line"),
-                int(site, "col"),
+                location(display_path, site),
                 text(site, "var"),
                 text(site, "reason")
             )?;
@@ -199,12 +222,7 @@ fn select_named_sites(
                 repr_str(raw)
             );
             for (display_path, site) in found_suggestions.iter().chain(&found_withheld) {
-                eprintln!(
-                    "  {display_path}:{}:{}  {}",
-                    int(site, "line"),
-                    int(site, "col"),
-                    text(site, "var")
-                );
+                eprintln!("  {}  {}", location(display_path, site), text(site, "var"));
             }
             return Err(2);
         }
@@ -384,15 +402,18 @@ fn apply_and_report(
                 .join(", ");
             writeln!(
                 out,
-                "applied  {}  {}:{}:{}  {}  [{columns}]",
-                item.phrase, outcome.file, item.line, item.col, item.var
+                "applied  {}  {}  {}  [{columns}]",
+                item.phrase,
+                place(&outcome.file, item.line, item.col, item.cell),
+                item.var
             )?;
         }
         for item in &outcome.skipped {
             writeln!(
                 out,
-                "skipped  {}:{}:{}  {}",
-                outcome.file, item.line, item.col, item.reason
+                "skipped  {}  {}",
+                place(&outcome.file, item.line, item.col, item.cell),
+                item.reason
             )?;
         }
         applied += outcome.applied.len();
@@ -436,11 +457,6 @@ pub(crate) fn run_suggest(
         Ok(path) => path,
         Err(code) => return Ok(code),
     };
-    if path.extension().is_some_and(|ext| ext == "ipynb") {
-        eprintln!("Error: `suggest` doesn't cover notebooks");
-        return Ok(2);
-    }
-
     let index = build_index(
         &path,
         args.no_index,
@@ -454,7 +470,7 @@ pub(crate) fn run_suggest(
         path.parent().map(Path::to_path_buf).unwrap_or_default()
     };
     let excludes = load_configured_excludes(&path);
-    let files = collect_files(&path, &[".py"], excludes.as_ref());
+    let files = collect_files(&path, &[".py", ".ipynb"], excludes.as_ref());
 
     let editing = args.apply || args.interactive;
     if editing && !args.allow_dirty {

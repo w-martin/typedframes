@@ -433,8 +433,51 @@ fn apply_diagnostic_policy(mut errors: Vec<Value>, args: &CheckArgs) -> Vec<Valu
     }
     if args.no_info {
         errors.retain(|e| severity(e) != Some("info"));
+    } else if !args.verbose {
+        collapse_assumed_constants(&mut errors);
     }
     errors
+}
+
+// One note per run rather than one per `self.X` constant: a codebase that names its columns through
+// class attributes would otherwise drown the real findings. `--verbose` keeps them all.
+fn collapse_assumed_constants(errors: &mut Vec<Value>) {
+    let is_note = |e: &Value| str_of(e, "code") == "assumed-constant";
+    let count = errors.iter().filter(|e| is_note(e)).count();
+    if count < 2 {
+        return;
+    }
+    let first = errors.iter().position(is_note).unwrap_or(0);
+    // Anchored at the first note in path order, whatever order the files were checked in.
+    let key = |e: &Value| {
+        (
+            str_of(e, "file").to_string(),
+            int_of(e, "line"),
+            int_of(e, "col"),
+        )
+    };
+    let mut summary = errors
+        .iter()
+        .filter(|e| is_note(e))
+        .min_by_key(|e| key(e))
+        .cloned()
+        .unwrap_or_else(|| errors[first].clone());
+    let files: std::collections::HashSet<&str> = errors
+        .iter()
+        .filter(|e| is_note(e))
+        .map(|e| str_of(e, "file"))
+        .collect();
+    let across = if files.len() > 1 {
+        format!(" across {} files", files.len())
+    } else {
+        String::new()
+    };
+    summary["message"] = Value::String(format!(
+        "{count} `self.<NAME>` constants{across} are read assuming no subclass in another file \
+         overrides them; declare each `<NAME>: Final = ...` to make that certain (--verbose lists them)"
+    ));
+    errors.retain(|e| !is_note(e));
+    errors.insert(first.min(errors.len()), summary);
 }
 
 /// The index for this run, unless `--no-index` disabled it: the whole project for a directory
@@ -782,5 +825,41 @@ mod tests {
         assert_eq!(Some("info"), severity(&downgraded[0]));
         assert_eq!(1, filtered.len());
         assert_eq!(Some("error"), severity(&filtered[0]));
+    }
+
+    #[test]
+    fn test_should_collapse_assumed_constant_notes_into_one_unless_verbose() {
+        // arrange
+        let errors = vec![
+            error("a.py", 1, "info", "assumed-constant"),
+            error("a.py", 2, "error", "unknown-column"),
+            error("a.py", 3, "info", "assumed-constant"),
+            error("b.py", 4, "info", "assumed-constant"),
+        ];
+        let quiet = CheckArgs::for_test(|_| {});
+        let verbose = CheckArgs::for_test(|a| a.verbose = true);
+
+        // act
+        let collapsed = apply_diagnostic_policy(errors.clone(), &quiet);
+        let listed = apply_diagnostic_policy(errors, &verbose);
+
+        // assert
+        assert_eq!(2, collapsed.len());
+        assert_eq!("assumed-constant", str_of(&collapsed[0], "code"));
+        assert!(str_of(&collapsed[0], "message").starts_with("3 `self.<NAME>` constants"));
+        assert_eq!("unknown-column", str_of(&collapsed[1], "code"));
+        assert_eq!(4, listed.len());
+    }
+
+    #[test]
+    fn test_should_leave_a_single_assumed_constant_note_untouched() {
+        // arrange
+        let errors = vec![error("a.py", 1, "info", "assumed-constant")];
+
+        // act
+        let result = apply_diagnostic_policy(errors, &CheckArgs::for_test(|_| {}));
+
+        // assert
+        assert_eq!("m", str_of(&result[0], "message"));
     }
 }

@@ -41,6 +41,10 @@ pub struct Suggestion {
     pub notes: Vec<String>,
     pub edits: Vec<Edit>,
     pub diff: String,
+    /// In a notebook, the 1-indexed cell and the line within it; `line` stays the position in
+    /// the notebook's concatenated source, which is what edits and selections are keyed on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell: Option<(usize, usize)>,
 }
 
 /// A site that got no suggestion, and why.
@@ -51,6 +55,8 @@ pub struct Withheld {
     pub col: usize,
     pub var: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell: Option<(usize, usize)>,
 }
 
 pub(crate) struct Origin<'a> {
@@ -571,6 +577,7 @@ pub(crate) fn suggest_selection(
         notes,
         edits: vec![edit],
         diff: render_unified_diff(origin.display_path, origin.source, &new_source),
+        cell: None,
     })
 }
 
@@ -869,6 +876,372 @@ fn insertion_point(origin: &Origin) -> Result<InsertionPoint, String> {
 /// A unified diff of `old` -> `new`, or an empty string when they are equal. Assumes
 /// the change is one contiguous region (true of every edit made here), found by
 /// trimming the common leading and trailing lines.
+/// Where `Final` comes from in a module: a name already imported, or the line to add.
+enum FinalName {
+    Imported(String),
+    Add(Edit),
+}
+
+// The line ending the file uses where `offset` is: `\r\n` if the line before it ends that way.
+fn line_ending_at(source: &str, offset: usize) -> &'static str {
+    let line_end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |i| offset + i);
+    if source[..line_end].ends_with('\r') {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+// The end of the logical line holding the offset `end`: past a trailing comment, a `;` and
+// whatever follows it, and past a statement that begins on this line and continues onto the
+// next. A new line inserted here is never inside another statement or between code and
+// its comment.
+fn logical_line_end(module: &ModModule, source: &str, end: usize) -> usize {
+    let mut at = end;
+    loop {
+        let newline = source[at..].find('\n').map_or(source.len(), |i| at + i);
+        let continued = module.body.iter().find(|stmt| {
+            let range = stmt.range();
+            (at..newline).contains(&range.start().to_usize()) && range.end().to_usize() > newline
+        });
+        match continued {
+            Some(stmt) => at = stmt.range().end().to_usize(),
+            None => return newline,
+        }
+    }
+}
+
+fn rebinds_final(module: &ModModule) -> bool {
+    module.body.iter().any(|stmt| match stmt {
+        Stmt::ClassDef(c) => c.name.as_str() == "Final",
+        Stmt::FunctionDef(f) => f.name.as_str() == "Final",
+        Stmt::ImportFrom(import) => {
+            let typing = import
+                .module
+                .as_ref()
+                .is_some_and(|m| matches!(m.as_str(), "typing" | "typing_extensions"));
+            !typing
+                && import
+                    .names
+                    .iter()
+                    .any(|a| a.asname.as_ref().unwrap_or(&a.name).as_str() == "Final")
+        }
+        other => binds_name(other, "Final"),
+    })
+}
+
+fn final_name(module: &ModModule, source: &str) -> Result<FinalName, String> {
+    if rebinds_final(module) {
+        return Err("`Final` is already bound to something else in this file".to_string());
+    }
+    for stmt in &module.body {
+        match stmt {
+            Stmt::ImportFrom(import)
+                if import.level == 0
+                    && import
+                        .module
+                        .as_ref()
+                        .is_some_and(|m| matches!(m.as_str(), "typing" | "typing_extensions")) =>
+            {
+                if let Some(alias) = import.names.iter().find(|a| a.name.as_str() == "Final") {
+                    let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                    return Ok(FinalName::Imported(name.to_string()));
+                }
+            }
+            Stmt::Import(import) => {
+                if let Some(alias) = import.names.iter().find(|a| a.name.as_str() == "typing") {
+                    let name = alias.asname.as_ref().map_or("typing", |a| a.as_str());
+                    return Ok(FinalName::Imported(format!("{name}.Final")));
+                }
+            }
+            _ => {}
+        }
+    }
+    let is_import = |stmt: &&Stmt| matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_));
+    let is_docstring =
+        |stmt: &Stmt| matches!(stmt, Stmt::Expr(e) if matches!(&*e.value, Expr::StringLiteral(_)));
+    let leading: Vec<&Stmt> = module
+        .body
+        .iter()
+        .skip_while(|stmt| is_docstring(stmt))
+        .take_while(|stmt| is_import(stmt))
+        .collect();
+    let edit = match leading.last() {
+        Some(last) => {
+            // Inserted before the line's newline, so in a notebook the import stays in
+            // the cell that holds the last import.
+            let at = logical_line_end(module, source, last.range().end().to_usize());
+            let eol = line_ending_at(source, at.saturating_sub(1));
+            let at = if source[..at].ends_with('\r') {
+                at - 1
+            } else {
+                at
+            };
+            Edit {
+                start: at,
+                end: at,
+                replacement: format!("{eol}from typing import Final"),
+            }
+        }
+        None => {
+            let first = module.body.iter().find(|stmt| !is_docstring(stmt));
+            let at = first.map_or(source.len(), |stmt| {
+                let start = stmt.range().start().to_usize();
+                source[..start].rfind('\n').map_or(0, |i| i + 1)
+            });
+            let eol = line_ending_at(source, at.saturating_sub(1));
+            Edit {
+                start: at,
+                end: at,
+                replacement: format!("from typing import Final{eol}{eol}"),
+            }
+        }
+    };
+    Ok(FinalName::Add(edit))
+}
+
+/// The one top-level class named `name`, if the file defines exactly one.
+fn local_class<'a>(module: &'a ModModule, name: &str) -> Option<&'a ast::StmtClassDef> {
+    let mut found = module.body.iter().filter_map(|stmt| match stmt {
+        Stmt::ClassDef(c) if c.name.as_str() == name => Some(c),
+        _ => None,
+    });
+    match (found.next(), found.next()) {
+        (Some(class), None) => Some(class),
+        _ => None,
+    }
+}
+
+fn is_class_var(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(name) => name.id.as_str() == "ClassVar",
+        Expr::Attribute(attr) => attr.attr.as_str() == "ClassVar",
+        _ => false,
+    }
+}
+
+fn binds_name(stmt: &Stmt, attr: &str) -> bool {
+    let is_attr = |target: &Expr| matches!(target, Expr::Name(n) if n.id.as_str() == attr);
+    match stmt {
+        Stmt::Assign(a) => a.targets.iter().any(is_attr),
+        Stmt::AnnAssign(a) => is_attr(&a.target),
+        _ => false,
+    }
+}
+
+/// The name of the class in this file that `attr` resolves to when read through `class`,
+/// and its one binding. Bases are searched in order; a base this file does not define
+/// might supply `attr` first, so reaching one ends the search.
+fn defining_binding<'a>(
+    module: &'a ModModule,
+    class: &str,
+    attr: &str,
+    visiting: &mut Vec<String>,
+) -> Result<(&'a str, &'a Stmt), String> {
+    let Some(class_def) = local_class(module, class) else {
+        return Err(format!(
+            "class `{class}` is not defined exactly once at the top level of this file"
+        ));
+    };
+    if visiting.iter().any(|seen| seen == class) {
+        return Err(format!("`{class}` inherits from itself"));
+    }
+    visiting.push(class.to_string());
+    let mut own = class_def.body.iter().filter(|stmt| binds_name(stmt, attr));
+    match (own.next(), own.next()) {
+        (Some(binding), None) => return Ok((class_def.name.as_str(), binding)),
+        (Some(_), Some(_)) => {
+            return Err(format!("`{attr}` is assigned more than once in `{class}`"))
+        }
+        _ => {}
+    }
+    for base in class_def.bases() {
+        match base {
+            Expr::Name(name) if local_class(module, name.id.as_str()).is_some() => {
+                if let Ok(found) = defining_binding(module, name.id.as_str(), attr, visiting) {
+                    return Ok(found);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "`{attr}` is not assigned in `{class}`; it may come from a base class \
+                     defined in another file"
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "`{attr}` is not assigned in `{class}` or its bases in this file"
+    ))
+}
+
+fn descends_from(module: &ModModule, class: &str, ancestor: &str, depth: usize) -> bool {
+    let Some(class_def) = local_class(module, class) else {
+        return false;
+    };
+    depth < 32
+        && class_def.bases().iter().any(|base| match base {
+            Expr::Name(name) => {
+                name.id.as_str() == ancestor
+                    || descends_from(module, name.id.as_str(), ancestor, depth + 1)
+            }
+            _ => false,
+        })
+}
+
+/// A class in this file, below `defining`, that assigns `attr` again.
+fn rebinding_subclass<'a>(module: &'a ModModule, defining: &str, attr: &str) -> Option<&'a str> {
+    module.body.iter().find_map(|stmt| match stmt {
+        Stmt::ClassDef(c)
+            if c.name.as_str() != defining
+                && c.body.iter().any(|s| binds_name(s, attr))
+                && descends_from(module, c.name.as_str(), defining, 0) =>
+        {
+            Some(c.name.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// `NAME: Final = ...` for a class constant read through `self`, so no subclass in another
+/// file can rebind what the checker resolved. Withheld unless the constant is one plain
+/// assignment directly in the body of a top-level class of this file, the reading class or
+/// a base of it, and no class below that one assigns it again.
+pub(crate) fn suggest_final_constant(
+    module: &ModModule,
+    source: &str,
+    display_path: &str,
+    class: &str,
+    attr: &str,
+) -> Result<Suggestion, String> {
+    let (defining, binding) = defining_binding(module, class, attr, &mut Vec::new())?;
+    if let Some(rebinder) = rebinding_subclass(module, defining, attr) {
+        return Err(format!(
+            "`{rebinder}` rebinds `{attr}`, which `Final` would forbid"
+        ));
+    }
+    let class = defining;
+
+    let (target, mut edits) = match binding {
+        Stmt::Assign(assign) => {
+            let [target] = assign.targets.as_slice() else {
+                return Err(format!("`{attr}` is assigned in a chained assignment"));
+            };
+            (target, Vec::new())
+        }
+        Stmt::AnnAssign(ann) => {
+            if ann.value.is_none() {
+                return Err(format!("`{attr}` is annotated but not assigned a value"));
+            }
+            (&*ann.target, Vec::new())
+        }
+        _ => unreachable!("filtered to assignments above"),
+    };
+    let final_ref = match final_name(module, source)? {
+        FinalName::Imported(name) => name,
+        FinalName::Add(edit) => {
+            edits.push(edit);
+            "Final".to_string()
+        }
+    };
+    match binding {
+        Stmt::AnnAssign(ann) => {
+            let range = ann.annotation.range();
+            // `Final` already means a class-level constant, and `Final[ClassVar[T]]` is invalid.
+            let replacement = match &*ann.annotation {
+                Expr::Subscript(sub) if is_class_var(&sub.value) => {
+                    format!("{final_ref}[{}]", &source[sub.slice.range()])
+                }
+                bare if is_class_var(bare) => final_ref.clone(),
+                _ => format!("{final_ref}[{}]", &source[range]),
+            };
+            edits.push(Edit {
+                start: range.start().to_usize(),
+                end: range.end().to_usize(),
+                replacement,
+            });
+        }
+        _ => {
+            let end = target.range().end().to_usize();
+            edits.push(Edit {
+                start: end,
+                end,
+                replacement: format!(": {final_ref}"),
+            });
+        }
+    }
+
+    let edited = crate::apply::apply_edits(source, &edits)
+        .ok_or_else(|| "its edits overlap or don't fit the file".to_string())?;
+    let line = source[..target.range().start().to_usize()]
+        .matches('\n')
+        .count()
+        + 1;
+    let col = target.range().start().to_usize()
+        - source[..target.range().start().to_usize()]
+            .rfind('\n')
+            .map_or(0, |i| i + 1)
+        + 1;
+    Ok(Suggestion {
+        phrase: "assumed-constant".to_string(),
+        kind: "final",
+        line,
+        col,
+        var: attr.to_string(),
+        tier: "safe",
+        columns: Vec::new(),
+        reason: format!(
+            "`{attr}` of `{class}` is read through `self` as a constant; declaring it `Final` \
+             rules out a subclass in another file rebinding it (a type checker will flag one)"
+        ),
+        notes: Vec::new(),
+        diff: render_unified_diff(display_path, source, &edited),
+        edits,
+        cell: None,
+    })
+}
+
+// The lines between the trimmed ends, in order. Edits in two places leave the code between
+// them in both versions; shown as context rather than removed and added again. Past a size
+// where the table gets large, all removals then all additions.
+fn interleave<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(char, &'a str)> {
+    const MAX_CELLS: usize = 4_000_000;
+    let (n, m) = (old.len(), new.len());
+    if n == 0 || m == 0 || n.saturating_mul(m) > MAX_CELLS {
+        let removed = old.iter().map(|l| ('-', *l));
+        return removed.chain(new.iter().map(|l| ('+', *l))).collect();
+    }
+    // shared[i][j]: the longest run of lines old[i..] and new[j..] have in common.
+    let mut shared = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            shared[i][j] = if old[i] == new[j] {
+                shared[i + 1][j + 1] + 1
+            } else {
+                shared[i + 1][j].max(shared[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(n + m);
+    while i < n || j < m {
+        if i < n && j < m && old[i] == new[j] {
+            out.push((' ', old[i]));
+            i += 1;
+            j += 1;
+        } else if j == m || (i < n && shared[i + 1][j] >= shared[i][j + 1]) {
+            out.push(('-', old[i]));
+            i += 1;
+        } else {
+            out.push(('+', new[j]));
+            j += 1;
+        }
+    }
+    out
+}
+
 pub(crate) fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     const CONTEXT: usize = 3;
     let old_lines: Vec<&str> = old.lines().collect();
@@ -915,11 +1288,11 @@ pub(crate) fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     for line in &old_lines[start..prefix] {
         push(' ', line);
     }
-    for line in &old_lines[prefix..old_changed_end] {
-        push('-', line);
-    }
-    for line in &new_lines[prefix..new_changed_end] {
-        push('+', line);
+    for (marker, line) in interleave(
+        &old_lines[prefix..old_changed_end],
+        &new_lines[prefix..new_changed_end],
+    ) {
+        push(marker, line);
     }
     for line in &old_lines[old_changed_end..old_end] {
         push(' ', line);
@@ -1450,5 +1823,272 @@ mod tests {
         )
         .unwrap();
         assert!(s.diff.contains(".select(\"a\")"));
+    }
+
+    fn final_fix(source: &str, class: &str, attr: &str) -> Result<(Suggestion, String), String> {
+        let module = parse_module(source).unwrap().into_syntax();
+        let suggestion = suggest_final_constant(&module, source, "f.py", class, attr)?;
+        let edited = crate::apply::apply_edits(source, &suggestion.edits).unwrap();
+        Ok((suggestion, edited))
+    }
+
+    #[test]
+    fn test_should_declare_a_plain_class_constant_final_and_import_final() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass Repo:\n    A = \"a\"\n";
+
+        // act
+        let (suggestion, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert
+        assert_eq!(suggestion.kind, "final");
+        assert_eq!(suggestion.tier, "safe");
+        assert_eq!(
+            edited,
+            "import pandas as pd\nfrom typing import Final\n\n\nclass Repo:\n    A: Final = \"a\"\n"
+        );
+    }
+
+    #[test]
+    fn test_should_wrap_an_existing_annotation_in_final() {
+        // arrange
+        let source = "from typing import Final\n\n\nclass Repo:\n    A: str = \"a\"\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert: `Final` was already imported, so no second import.
+        assert_eq!(
+            edited,
+            "from typing import Final\n\n\nclass Repo:\n    A: Final[str] = \"a\"\n"
+        );
+    }
+
+    #[test]
+    fn test_should_reuse_the_typing_module_or_an_alias_instead_of_importing() {
+        // arrange
+        let module_import = "import typing as t\n\n\nclass Repo:\n    A = 1\n";
+        let alias = "from typing import Final as F\n\n\nclass Repo:\n    A = 1\n";
+
+        // act
+        let (_, via_module) = final_fix(module_import, "Repo", "A").unwrap();
+        let (_, via_alias) = final_fix(alias, "Repo", "A").unwrap();
+
+        // assert
+        assert!(via_module.contains("A: t.Final = 1"), "{via_module}");
+        assert!(via_alias.contains("A: F = 1"), "{via_alias}");
+    }
+
+    #[test]
+    fn test_should_import_final_after_a_docstring_and_future_import() {
+        // arrange
+        let source =
+            "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations\n\n\nclass Repo:\n    A = 1\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert
+        assert!(
+            edited.starts_with(
+                "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations\nfrom typing import Final\n"
+            ),
+            "{edited}"
+        );
+    }
+
+    #[test]
+    fn test_should_import_final_before_the_first_statement_when_there_are_no_imports() {
+        // arrange
+        let source = "\"\"\"Doc.\"\"\"\n\n\nclass Repo:\n    A = 1\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert
+        assert!(
+            edited.contains("\"\"\"Doc.\"\"\"\n\n\nfrom typing import Final\n\nclass Repo:"),
+            "{edited}"
+        );
+    }
+
+    #[test]
+    fn test_should_withhold_a_constant_not_assigned_once_in_the_class_body() {
+        // arrange
+        let inherited = "from lib import Base\n\n\nclass Repo(Base):\n    pass\n";
+        let twice = "class Repo:\n    A = 1\n    A = 2\n";
+        let chained = "class Repo:\n    A = B = 1\n";
+        let unassigned = "class Repo:\n    A: int\n";
+
+        // act / assert
+        for source in [inherited, twice, chained, unassigned] {
+            assert!(final_fix(source, "Repo", "A").is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn test_should_withhold_a_class_not_defined_once_at_the_top_level() {
+        // arrange
+        let source = "def make():\n    class Repo:\n        A = 1\n";
+
+        // act
+        let result = final_fix(source, "Repo", "A");
+
+        // assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_should_show_code_between_two_edits_as_context_in_the_diff() {
+        // arrange
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let new = "a\nX\nb\nc\nd\ne\nf\ng\nh\nY\n";
+
+        // act
+        let diff = render_unified_diff("f.py", old, new);
+
+        // assert
+        assert!(diff.contains("+X\n b\n c\n"), "{diff}");
+        assert!(!diff.contains("-b"), "{diff}");
+    }
+
+    #[test]
+    fn test_should_declare_final_on_the_base_class_that_defines_the_constant() {
+        // arrange
+        let source = "class Base:\n    TARGET = \"y\"\n\n\nclass Mid(Base):\n    pass\n\n\nclass Repo(Mid):\n    pass\n";
+
+        // act
+        let (suggestion, edited) = final_fix(source, "Repo", "TARGET").unwrap();
+
+        // assert
+        assert_eq!(suggestion.line, 2);
+        assert!(edited.contains("    TARGET: Final = \"y\""), "{edited}");
+        assert!(
+            suggestion.reason.contains("`Base`"),
+            "{}",
+            suggestion.reason
+        );
+    }
+
+    #[test]
+    fn test_should_prefer_the_nearest_base_that_assigns_the_constant() {
+        // arrange
+        let source = "class Base:\n    T = 1\n\n\nclass Mid(Base):\n    T = 2\n\n\nclass Repo(Mid):\n    pass\n";
+
+        // act
+        let result = final_fix(source, "Repo", "T");
+
+        // assert: Mid defines it, but it rebinds Base's, which Final on Mid does not touch.
+        let (suggestion, _) = result.unwrap();
+        assert_eq!(suggestion.line, 6);
+    }
+
+    #[test]
+    fn test_should_withhold_when_a_subclass_in_the_file_rebinds_the_constant() {
+        // arrange
+        let source = "class Base:\n    T = 1\n\n\nclass Child(Base):\n    T = 2\n";
+
+        // act
+        let result = final_fix(source, "Base", "T");
+
+        // assert
+        let reason = result.map(|_| ()).unwrap_err();
+        assert!(reason.contains("`Child` rebinds `T`"), "{reason}");
+    }
+
+    #[test]
+    fn test_should_withhold_when_an_earlier_base_is_defined_in_another_file() {
+        // arrange
+        let source = "from lib import Mixin\n\n\nclass Base:\n    T = 1\n\n\nclass Repo(Mixin, Base):\n    pass\n";
+
+        // act
+        let result = final_fix(source, "Repo", "T");
+
+        // assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_should_insert_the_import_on_its_own_line_after_a_trailing_comment() {
+        // arrange
+        let source = "import pandas as pd  # noqa: F401\n\n\nclass Repo:\n    A = 1\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert: the pragma stays on the import it belongs to.
+        assert!(
+            edited.starts_with("import pandas as pd  # noqa: F401\nfrom typing import Final\n"),
+            "{edited}"
+        );
+    }
+
+    #[test]
+    fn test_should_insert_the_import_after_everything_sharing_the_last_import_line() {
+        // arrange
+        let source = "import os; x = 1\n\n\nclass Repo:\n    A = 1\n";
+        let continued = "import os; x = (\n    1\n)\n\n\nclass Repo:\n    A = 1\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+        let (_, edited_continued) = final_fix(continued, "Repo", "A").unwrap();
+
+        // assert
+        assert!(
+            edited.starts_with("import os; x = 1\nfrom typing import Final\n"),
+            "{edited}"
+        );
+        assert!(
+            edited_continued.starts_with("import os; x = (\n    1\n)\nfrom typing import Final\n"),
+            "{edited_continued}"
+        );
+    }
+
+    #[test]
+    fn test_should_use_the_files_line_ending_for_the_import() {
+        // arrange
+        let source = "import os\r\n\r\n\r\nclass Repo:\r\n    A = 1\r\n";
+        let bare = "\"\"\"Doc.\"\"\"\r\n\r\n\r\nclass Repo:\r\n    A = 1\r\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+        let (_, edited_bare) = final_fix(bare, "Repo", "A").unwrap();
+
+        // assert: no bare `\n` among the CRLFs.
+        for text in [edited, edited_bare] {
+            assert!(text.contains("from typing import Final\r\n"), "{text:?}");
+            assert_eq!(
+                text.matches('\n').count(),
+                text.matches("\r\n").count(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_turn_a_class_var_annotation_into_final() {
+        // arrange
+        let source = "from typing import ClassVar, Final\n\n\nclass Repo:\n    A: ClassVar[str] = \"a\"\n    B: ClassVar = \"b\"\n";
+
+        // act
+        let (_, edited_a) = final_fix(source, "Repo", "A").unwrap();
+        let (_, edited_b) = final_fix(source, "Repo", "B").unwrap();
+
+        // assert
+        assert!(edited_a.contains("A: Final[str] = \"a\""), "{edited_a}");
+        assert!(edited_b.contains("B: Final = \"b\""), "{edited_b}");
+    }
+
+    #[test]
+    fn test_should_withhold_when_final_is_already_something_else() {
+        // arrange
+        let assigned = "import os\n\nFinal = 3\n\n\nclass Repo:\n    A = 1\n";
+        let imported = "from other import Final\n\n\nclass Repo:\n    A = 1\n";
+
+        // act / assert
+        for source in [assigned, imported] {
+            let reason = final_fix(source, "Repo", "A").map(|_| ()).unwrap_err();
+            assert!(reason.contains("`Final`"), "{reason}");
+        }
     }
 }

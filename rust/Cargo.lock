@@ -1474,6 +1474,7 @@ dependencies = [
  "criterion",
  "mimalloc",
  "rmp-serde",
+ "ruff_diagnostics",
  "ruff_notebook",
  "ruff_python_ast",
  "ruff_python_parser",

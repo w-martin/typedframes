@@ -110,7 +110,7 @@ pub(crate) struct NotebookCheckResult {
 /// both 1-indexed. Falls back to `(1, line)` for a line the index has no cell for --
 /// defensive only: every line the linter reports comes from the exact source the
 /// index was itself built from, so a miss here should never actually happen.
-fn translate(index: &NotebookIndex, line: usize) -> (usize, usize) {
+pub(crate) fn translate(index: &NotebookIndex, line: usize) -> (usize, usize) {
     let Some(row) = OneIndexed::new(line) else {
         return (1, line);
     };

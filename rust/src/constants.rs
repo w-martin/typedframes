@@ -223,11 +223,12 @@ pub(crate) const CONNECTORX_MODULES: &[&str] = &["connectorx", "cx"];
 
 // DataFrame-materializing method that finalizes a connector call chain into an actual
 // DataFrame: google-cloud-bigquery's `.to_dataframe()`, PySpark/Databricks Connect's
-// `.toPandas()`, DuckDB's `.df()`/`.pl()`. Only dispatches when the call it's chained
+// `.toPandas()`, Snowpark's `.to_pandas()`, DuckDB's `.df()`/`.pl()`. Only dispatches when the call it's chained
 // onto is confirmed to be one of `SQL_PRODUCING_METHODS` — see
 // `sql_producing_call_args`, and its call sites for why "any receiver's `.df()`" isn't
 // enough on its own (that name in particular is common and unrelated most of the time).
-pub(crate) const SQL_FINALIZE_METHODS: &[&str] = &["to_dataframe", "toPandas", "df", "pl"];
+pub(crate) const SQL_FINALIZE_METHODS: &[&str] =
+    &["to_dataframe", "toPandas", "to_pandas", "df", "pl"];
 
 // Methods/bare functions whose first positional (or `sql=`/`query=` keyword) argument
 // is SQL text, chained into one of `SQL_FINALIZE_METHODS`: `client.query(sql)`

@@ -96,6 +96,9 @@ pub(crate) struct CheckArgs {
     /// Suppress informational output: the DataFrame schema coverage summary and info-level diagnostics.
     #[arg(long)]
     pub(crate) no_info: bool,
+    /// List every assumed-constant note (a `self.X` column constant read without `Final`) instead of one summary line.
+    #[arg(long)]
+    pub(crate) verbose: bool,
     /// Enforce a minimum DataFrame schema coverage: exit 1 if fewer than N% of DataFrames have recognized column info. A total override: it applies one threshold everywhere and ignores [tool.typedframes.coverage] entirely, per-path overrides included.
     #[arg(long = "coverage-fail-under", value_name = "N", value_parser = parse_percentage)]
     pub(crate) fail_under: Option<f64>,

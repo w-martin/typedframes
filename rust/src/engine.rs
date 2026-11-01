@@ -59,6 +59,37 @@ pub(crate) fn linter_with_index(
     (linter, index)
 }
 
+pub(crate) fn is_notebook(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "ipynb")
+}
+
+/// The notebook at `path`, which must be a Python one.
+pub(crate) fn load_python_notebook(path: &Path) -> Result<Notebook, CheckError> {
+    let notebook = Notebook::from_path(path).map_err(|e| match e {
+        NotebookError::Io(io_err) => CheckError::Io(io_err.to_string()),
+        other => runtime(other),
+    })?;
+    if !notebook.is_python_notebook() {
+        return Err(runtime("not a Python notebook (kernel is not Python)"));
+    }
+    Ok(notebook)
+}
+
+/// `linter_with_index` for a notebook's concatenated source.
+pub(crate) fn notebook_linter(
+    project_root: &Path,
+    config: &LinterConfig,
+    source: &str,
+    index: Option<Arc<ProjectIndex>>,
+) -> Linter {
+    let mut linter = Linter::new();
+    linter.with_context(project_root.to_path_buf(), config);
+    if let Some(idx) = &index {
+        linter.load_cross_file_symbols_notebook(idx, source, project_root);
+    }
+    linter
+}
+
 #[derive(Serialize)]
 struct SuggestFileResult {
     suggestions: Vec<Suggestion>,
@@ -79,7 +110,25 @@ pub(crate) fn suggest_file_impl(
         suggestions: Vec::new(),
         withheld: Vec::new(),
     };
-    if config.enabled.unwrap_or(true) {
+    if config.enabled.unwrap_or(true) && is_notebook(path) {
+        let notebook = load_python_notebook(path)?;
+        let source = notebook.source_code();
+        let mut linter = notebook_linter(project_root, config, source, index);
+        linter.collect_suggestions = true;
+        linter.suggest_display_path = display_path.to_string();
+        linter
+            .check_notebook_internal(source, path)
+            .map_err(runtime)?;
+        result.suggestions = std::mem::take(&mut linter.suggestions);
+        result.withheld = std::mem::take(&mut linter.withheld);
+        let cell_of = |line| Some(notebook::translate(notebook.index(), line));
+        for suggestion in &mut result.suggestions {
+            suggestion.cell = cell_of(suggestion.line);
+        }
+        for withheld in &mut result.withheld {
+            withheld.cell = cell_of(withheld.line);
+        }
+    } else if config.enabled.unwrap_or(true) {
         let source = fs::read_to_string(path).map_err(|e| CheckError::Io(e.to_string()))?;
         let (mut linter, _index) = linter_with_index(path, project_root, config, &source, index);
         linter.collect_suggestions = true;

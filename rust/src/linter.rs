@@ -800,10 +800,10 @@ pub(crate) fn top_level_and_type_checking_stmts(module: &ModModule) -> Vec<&Stmt
     out
 }
 
-// The call a function returns, when `return <call>` is the only value-return in its body
+// The expression a function returns, when it is the only value-return in its body
 // (nested functions and classes aside): a second return may hand back something else, so no
 // one return describes what callers get.
-fn only_returned_call(stmts: &[Stmt]) -> Option<&ast::ExprCall> {
+fn only_returned_expr(stmts: &[Stmt]) -> Option<&Expr> {
     fn collect<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Expr>) {
         for stmt in stmts {
             match stmt {
@@ -840,7 +840,14 @@ fn only_returned_call(stmts: &[Stmt]) -> Option<&ast::ExprCall> {
     let mut returned = Vec::new();
     collect(stmts, &mut returned);
     match returned.as_slice() {
-        [Expr::Call(call)] => Some(call),
+        [expr] => Some(expr),
+        _ => None,
+    }
+}
+
+fn only_returned_call(stmts: &[Stmt]) -> Option<&ast::ExprCall> {
+    match only_returned_expr(stmts)? {
+        Expr::Call(call) => Some(call),
         _ => None,
     }
 }
@@ -2072,6 +2079,34 @@ impl Linter {
         for read in self_constant_reads.iter().filter(|r| !r.is_final) {
             if advised.insert((read.class.clone(), read.attr.clone())) {
                 let (line, col) = self.source_location(read.range.start());
+                if self.collect_suggestions {
+                    match suggest::suggest_final_constant(
+                        module,
+                        source,
+                        &self.suggest_display_path,
+                        &read.class,
+                        &read.attr,
+                    ) {
+                        Ok(suggestion) => {
+                            // Two classes reading the same inherited constant share one edit.
+                            let known = self.suggestions.iter().any(|s| {
+                                s.kind == suggestion.kind
+                                    && (s.line, s.col) == (suggestion.line, suggestion.col)
+                            });
+                            if !known {
+                                self.suggestions.push(suggestion);
+                            }
+                        }
+                        Err(reason) => self.withheld.push(suggest::Withheld {
+                            phrase: "assumed-constant".to_string(),
+                            line,
+                            col,
+                            var: read.attr.clone(),
+                            reason,
+                            cell: None,
+                        }),
+                    }
+                }
                 errors.push(LintError {
                     line,
                     col,
@@ -2526,6 +2561,7 @@ impl Linter {
                     col: pos.1,
                     var: var_at.get(&pos).cloned().unwrap_or_default(),
                     reason,
+                    cell: None,
                 }),
             }
         }
@@ -2541,6 +2577,7 @@ impl Linter {
                              module (it is a class attribute, unpacked, or an attribute or \
                              subscript target)"
                             .to_string(),
+                    cell: None,
                 });
             }
         }
@@ -4025,6 +4062,88 @@ impl Linter {
             name
         } else {
             marker_or_schema.to_string()
+        }
+    }
+
+    // The columns an expression evaluates to, when they follow from a resolved frame
+    // and edits whose arguments are literal; `None` as soon as any step is not understood.
+    fn returned_expr_columns(&self, expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Name(name) => {
+                let (schema, _) = self.variables.get(name.id.as_str())?;
+                if self.schema_is_unresolved(schema) {
+                    return None;
+                }
+                self.schemas.get(schema).cloned()
+            }
+            Expr::Subscript(subscript) => {
+                self.returned_expr_columns(&subscript.value)?;
+                ast_extract::extract_string_list(&subscript.slice)
+            }
+            Expr::Call(call) => {
+                let Expr::Attribute(attr) = &*call.func else {
+                    return None;
+                };
+                let method = attr.attr.as_str();
+                let from_sql =
+                    |sql: Option<String>| match sql::columns_from_select(&sql?, self.sql_dialect) {
+                        sql::SqlOutcome::Columns(cols) => Some(cols),
+                        sql::SqlOutcome::Wildcard | sql::SqlOutcome::Unparsed => None,
+                    };
+                if SQL_FINALIZE_METHODS.contains(&method) {
+                    let inner = ast_extract::sql_producing_call(&attr.value)?;
+                    return from_sql(self.extract_sql_literal(inner));
+                }
+                if method == "fetch_pandas_all" {
+                    let Expr::Name(cursor) = &*attr.value else {
+                        return None;
+                    };
+                    return from_sql(self.cursor_sql.get(cursor.id.as_str()).cloned());
+                }
+                // `inplace=True` returns None, not a frame.
+                if keyword(call, "inplace").is_some() {
+                    return None;
+                }
+                let base = self.returned_expr_columns(&attr.value)?;
+                // Without `columns=` or `axis=`, pandas reads `drop(x)` and `rename({..})` as
+                // row-label operations, which leave the columns alone.
+                match method {
+                    "rename" if keyword(call, "columns").is_some() => {
+                        let mapping = ast_extract::extract_rename_mapping(call)?;
+                        apply_edits(&base, &[ColumnEdit::Rename(mapping)])
+                    }
+                    "drop"
+                        if keyword(call, "columns").is_some()
+                            || keyword(call, "axis").is_some() =>
+                    {
+                        let dropped = ast_extract::extract_drop_columns(call)?;
+                        apply_edits(&base, &[ColumnEdit::Remove(dropped)])
+                    }
+                    "rename" | "drop" => None,
+                    // Keeps the old index as a column unless it is dropped.
+                    "reset_index" => matches!(
+                        keyword(call, "drop").map(|k| &k.value),
+                        Some(Expr::BooleanLiteral(b)) if b.value
+                    )
+                    .then_some(base),
+                    "assign" => {
+                        let added = call
+                            .arguments
+                            .keywords
+                            .iter()
+                            .map(|k| k.arg.as_ref().map(|a| a.to_string()))
+                            .collect::<Option<Vec<_>>>()?;
+                        apply_edits(&base, &[ColumnEdit::Add(added)])
+                    }
+                    _ if ROW_PASSTHROUGH_METHODS.contains(&method)
+                        || SCHEMA_PRESERVING_METHODS.contains(&method) =>
+                    {
+                        Some(base)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -5565,6 +5684,19 @@ impl Linter {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                // `return df.rename(...)` / `return df[["a"]]` / `return cursor.fetch_pandas_all()`:
+                // a returned expression whose columns follow from tracked frames and
+                // literal edits, which neither inference above handles.
+                if !self.functions.contains_key(func_def.name.as_str()) {
+                    if let Some(expr) = only_returned_expr(&func_def.body) {
+                        if let Some(cols) = self.returned_expr_columns(expr) {
+                            let line = self.source_location(expr.range().start()).0;
+                            let schema =
+                                self.make_inferred_schema(cols, func_def.name.as_str(), line);
+                            self.functions.insert(func_def.name.to_string(), schema);
                         }
                     }
                 }
@@ -10601,6 +10733,160 @@ class C:
             .find(|e| e.code == CODE_UNKNOWN_COLUMN)
             .expect("an unknown-column error");
         assert!(error.message.contains("{a, b}"), "{}", error.message);
+    }
+
+    fn returned_columns_message(helper_body: &str) -> String {
+        let source = format!(
+            "import pandas as pd\n\n\ndef make(conn, sess):\n{helper_body}\n\ndef use(conn, sess):\n    df = make(conn, sess)\n    return df[\"zz\"]\n"
+        );
+        let (_typed, errors) = typed_count(&source);
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNVERIFIABLE_COLUMN),
+            "{errors:?}"
+        );
+        errors
+            .iter()
+            .find(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .unwrap_or_else(|| panic!("an unknown-column error: {errors:?}"))
+            .message
+            .clone()
+    }
+
+    #[test]
+    fn test_should_resolve_a_returned_rename_of_a_resolved_frame() {
+        // arrange
+        let body = "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n    return df.rename(columns={\"a\": \"x\"})\n";
+
+        // act
+        let message = returned_columns_message(body);
+
+        // assert
+        assert!(message.contains("{x, b}"), "{message}");
+    }
+
+    #[test]
+    fn test_should_resolve_a_returned_drop_and_column_selection() {
+        // arrange
+        let drop = "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n    return df.drop(columns=[\"a\"])\n";
+        let select =
+            "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n    return df[[\"a\"]].copy()\n";
+
+        // act / assert
+        assert!(returned_columns_message(drop).contains("{b}"));
+        assert!(returned_columns_message(select).contains("{a}"));
+    }
+
+    #[test]
+    fn test_should_resolve_a_returned_chain_of_edits() {
+        // arrange
+        let body = "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n    return df.rename(columns={\"a\": \"x\"}).assign(c=1).drop(columns=[\"b\"])\n";
+
+        // act
+        let message = returned_columns_message(body);
+
+        // assert
+        assert!(message.contains("{x, c}"), "{message}");
+    }
+
+    fn returned_columns_resolve(helper_body: &str) -> bool {
+        let source = format!(
+            "import pandas as pd\n\n\ndef make(conn, sess):\n{helper_body}\n\ndef use(conn, sess):\n    df = make(conn, sess)\n    return df[\"zz\"]\n"
+        );
+        let (_typed, errors) = typed_count(&source);
+        errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN)
+    }
+
+    #[test]
+    fn test_should_not_read_a_positional_drop_or_rename_as_a_column_edit() {
+        // arrange: in pandas these address row labels, so the columns are unchanged.
+        let load = "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n";
+        let drop = format!("{load}    return df.drop([\"a\"])\n");
+        let rename = format!("{load}    return df.rename({{\"a\": \"x\"}})\n");
+
+        // act / assert
+        assert!(!returned_columns_resolve(&drop));
+        assert!(!returned_columns_resolve(&rename));
+    }
+
+    #[test]
+    fn test_should_resolve_a_drop_by_axis_and_a_reset_index_that_drops() {
+        // arrange
+        let load = "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n";
+        let by_axis = format!("{load}    return df.drop(\"a\", axis=1)\n");
+        let reset = format!("{load}    return df.reset_index(drop=True)\n");
+
+        // act / assert
+        assert!(returned_columns_resolve(&by_axis));
+        assert!(returned_columns_resolve(&reset));
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_reset_index_that_adds_a_column_or_an_inplace_edit() {
+        // arrange
+        let load = "    df = pd.read_sql(\"SELECT a, b FROM t\", conn)\n";
+        let reset = format!("{load}    return df.reset_index()\n");
+        let inplace =
+            format!("{load}    return df.rename(columns={{\"a\": \"x\"}}, inplace=True)\n");
+
+        // act / assert
+        assert!(!returned_columns_resolve(&reset));
+        assert!(!returned_columns_resolve(&inplace));
+    }
+
+    #[test]
+    fn test_should_resolve_a_returned_cursor_fetch() {
+        // arrange
+        let body = "    cur = conn.cursor()\n    cur.execute(\"SELECT a, b FROM t\")\n    return cur.fetch_pandas_all()\n";
+
+        // act
+        let message = returned_columns_message(body);
+
+        // assert
+        assert!(message.contains("{a, b}"), "{message}");
+    }
+
+    #[test]
+    fn test_should_resolve_a_returned_snowpark_to_pandas() {
+        // arrange
+        let body = "    return sess.sql(\"SELECT a, b FROM t\").to_pandas()\n";
+
+        // act
+        let message = returned_columns_message(body);
+
+        // assert
+        assert!(message.contains("{a, b}"), "{message}");
+    }
+
+    #[test]
+    fn test_should_resolve_columns_for_an_assigned_snowpark_to_pandas() {
+        // arrange
+        let source =
+            "df = session.sql(\"SELECT a, b FROM t\").to_pandas()\nprint(df[\"missing\"])\n";
+
+        // act
+        let errors = Linter::new()
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn test_should_keep_a_returned_edit_of_an_unresolvable_frame_unresolved() {
+        // arrange: dynamic SQL cannot be resolved, so neither can a rename of it.
+        let source = "import pandas as pd\n\n\ndef make(conn, cols) -> pd.DataFrame:\n    df = pd.read_sql(f\"SELECT {cols} FROM t\", conn)\n    return df.rename(columns={\"a\": \"x\"})\n\n\ndef use(conn, cols):\n    df = make(conn, cols)\n    return df[\"zz\"]\n";
+
+        // act
+        let (_typed, errors) = typed_count(source);
+
+        // assert
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNVERIFIABLE_COLUMN),
+            "{errors:?}"
+        );
+        assert!(errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN));
     }
 
     #[test]

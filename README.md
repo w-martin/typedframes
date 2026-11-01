@@ -104,6 +104,18 @@ pip install typedframes[pandas]   # includes pandas
 pip install typedframes[polars]   # includes polars
 ```
 
+Without Python, for example in a minimal container, each release also carries a static Linux executable
+(`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`) with no libc dependency, so it runs on any distribution,
+including Alpine and an empty `scratch` image:
+
+```shell
+curl -fsSL https://github.com/w-martin/typedframes/releases/latest/download/typedframes-x86_64-unknown-linux-musl.tar.gz \
+  | tar -xz --strip-components=1 typedframes-x86_64-unknown-linux-musl/typedframes
+./typedframes check src
+```
+
+Each archive has a matching `.sha256` file next to it.
+
 Where the Python interpreter may run code but no other executable may be started, set `TYPEDFRAMES_INPROC=1`. Then
 `python -m typedframes` and the mypy plugin run the same checker inside the interpreter, through an extension module in
 the wheel, instead of starting the `typedframes` executable. Results and exit status are the same; when the checker is

@@ -6,6 +6,7 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
   schedule:
     - cron: '0 6 * * 1'  # Weekly Monday 06:00 UTC — catches toolchain/dep drift on main
     - cron: "0 9 * * 1"  # Weekly Monday 09:00 UTC (security-audit)
@@ -195,6 +196,68 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
 
+  # Static musl executables for containers and hosts without Python. Not gated on verify-version so a
+  # manual dispatch can dry-run it; on a tag, `publish` still depends on verify-version via build_wheels.
+  build_static_binaries:
+    name: Static binary (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            # Same jemalloc page-size pin as the aarch64 wheel.
+            jemalloc_page: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig and cargo-zigbuild
+        run: pip install cargo-zigbuild ziglang
+
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        env:
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_page }}
+        run: cargo zigbuild --profile cli --target ${{ matrix.target }} --bin typedframes
+        working-directory: rust
+
+      - name: Check the executable is static
+        run: |
+          BIN=rust/target/${{ matrix.target }}/cli/typedframes
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP || readelf -d "$BIN" | grep -q NEEDED; then
+            echo "::error::$BIN links dynamically"
+            exit 1
+          fi
+
+      - name: Run it on a fixture
+        run: |
+          BIN="$PWD/rust/target/${{ matrix.target }}/cli/typedframes"
+          mkdir check-project && echo "x = 1" > check-project/a.py
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get update && sudo apt-get install -y qemu-user-static
+            qemu-aarch64-static "$BIN" check check-project --no-cache
+          else
+            "$BIN" check check-project --no-cache
+          fi
+
+      - name: Package
+        run: |
+          NAME="typedframes-${{ matrix.target }}"
+          mkdir -p "release-assets/$NAME"
+          cp rust/target/${{ matrix.target }}/cli/typedframes LICENSE "release-assets/$NAME/"
+          tar -C release-assets -czf "release-assets/$NAME.tar.gz" "$NAME"
+          rm -r "release-assets/$NAME"
+          (cd release-assets && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: static-${{ matrix.target }}
+          path: release-assets/*
+
   build_sdist:
     name: Build sdist
     needs: [verify-version]
@@ -214,16 +277,24 @@ jobs:
           path: dist/*.tar.gz
 
   publish:
-    needs: [ build_wheels, build_sdist ]
+    needs: [ build_wheels, build_sdist, build_static_binaries ]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
       contents: write
     steps:
+      # Kept apart from dist/: the PyPI action uploads everything in it, and a binary tarball is not an sdist.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: "{wheels-*,sdist}"
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: static-*
           merge-multiple: true
 
       - uses: pypa/gh-action-pypi-publish@release/v1
@@ -235,6 +306,7 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
+            release-assets/*
 
   test-published:
     needs: [publish]

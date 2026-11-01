@@ -203,6 +203,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -218,10 +219,14 @@ jobs:
       - name: Add the target
         run: rustup target add ${{ matrix.target }}
 
+      # Set only when the matrix gives a value: an empty JEMALLOC_SYS_WITH_LG_PAGE reaches configure as
+      # `--with-lg-page=` and jemalloc then fails to compile.
       - name: Build
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_page }}
-        run: cargo zigbuild --profile cli --target ${{ matrix.target }} --bin typedframes
+        run: |
+          if [ -n "${{ matrix.jemalloc_page }}" ]; then
+            export JEMALLOC_SYS_WITH_LG_PAGE=${{ matrix.jemalloc_page }}
+          fi
+          cargo zigbuild --profile cli --target ${{ matrix.target }} --bin typedframes
         working-directory: rust
 
       - name: Check the executable is static

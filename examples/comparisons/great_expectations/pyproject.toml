@@ -21,3 +21,10 @@ dev = [
 
 [tool.setuptools]
 packages = []
+
+[tool.uv]
+# Security floors for transitive dependencies (Dependabot advisories).
+constraint-dependencies = [
+    "certifi>=2026.10.18",
+    "urllib3>=2.8.0",
+]

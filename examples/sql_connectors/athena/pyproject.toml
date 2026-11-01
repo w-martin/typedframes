@@ -20,3 +20,10 @@ typedframes = { path = "../../..", editable = true }
 
 [tool.typedframes]
 enabled = true
+
+[tool.uv]
+# Security floors for transitive dependencies (Dependabot advisories).
+constraint-dependencies = [
+    "certifi>=2026.10.18",
+    "werkzeug>=3.1.9",
+]

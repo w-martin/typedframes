@@ -21,3 +21,11 @@ typedframes = { path = "../../..", editable = true }
 [tool.typedframes]
 enabled = true
 sql_dialect = "bigquery"
+
+[tool.uv]
+# Security floors for transitive dependencies (Dependabot advisories).
+constraint-dependencies = [
+    "certifi>=2026.10.18",
+    "pyasn1>=0.6.5",
+    "setuptools>=84.1.0",
+]

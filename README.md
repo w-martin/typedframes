@@ -114,7 +114,12 @@ curl -fsSL https://github.com/w-martin/typedframes/releases/latest/download/type
 ./typedframes check src
 ```
 
-Each archive has a matching `.sha256` file next to it.
+Each archive has a matching `.sha256` file next to it, and a build provenance attestation signed by the release
+workflow. To verify an archive you have downloaded:
+
+```shell
+gh attestation verify typedframes-x86_64-unknown-linux-musl.tar.gz --repo w-martin/typedframes
+```
 
 Where the Python interpreter may run code but no other executable may be started, set `TYPEDFRAMES_INPROC=1`. Then
 `python -m typedframes` and the mypy plugin run the same checker inside the interpreter, through an extension module in

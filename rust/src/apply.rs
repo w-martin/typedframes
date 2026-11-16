@@ -2,13 +2,13 @@
 //! or none. Edits are byte ranges against the analysed source, so each file is re-read
 //! before writing and left alone if it changed.
 
-use crate::config::{find_project_root, load_linter_config};
+use crate::config::{import_root, load_linter_config};
 use crate::engine::{
     is_notebook, linter_with_index, load_python_notebook, notebook_linter, CheckError,
 };
 use crate::errors::LintError;
 use crate::index::ProjectIndex;
-use crate::suggest::{Edit, Suggestion};
+use crate::suggest::{imports_in_order, without_orphaned_class_var, Edit, Suggestion};
 use ruff_diagnostics::SourceMap;
 use ruff_notebook::{Cell, Notebook, SourceValue};
 use ruff_python_parser::{parse, parse_module, Mode, ParseOptions};
@@ -191,7 +191,7 @@ pub(crate) fn analyze(
     display_path: &str,
     index: Option<Arc<ProjectIndex>>,
 ) -> Result<Option<Analyzed>, CheckError> {
-    let project_root = find_project_root(path);
+    let project_root = import_root(path);
     let config = load_linter_config(&project_root);
     if !config.enabled.unwrap_or(true) {
         return Ok(None);
@@ -353,6 +353,11 @@ pub(crate) fn plan_file(
         );
         return (outcome, None);
     };
+    let edited = if analyzed.notebook.is_some() {
+        edited
+    } else {
+        without_orphaned_class_var(&analyzed.source, &edited)
+    };
     let is_notebook = analyzed.notebook.is_some();
     let parses = if is_notebook {
         parse(&edited, ParseOptions::from(Mode::Ipython)).is_ok()
@@ -364,8 +369,17 @@ pub(crate) fn plan_file(
         return (outcome, None);
     }
 
+    // An added import must not turn an ordered import block into one `ruff` rejects.
+    if !is_notebook && imports_in_order(&analyzed.source) && !imports_in_order(&edited) {
+        skip_all(
+            &mut outcome,
+            "the edited file's imports would no longer be in order".to_string(),
+        );
+        return (outcome, None);
+    }
+
     // Check the edited source exactly as the original was checked.
-    let project_root = find_project_root(path);
+    let project_root = import_root(path);
     let config = load_linter_config(&project_root);
     let mut linter = if is_notebook {
         notebook_linter(&project_root, &config, &edited, index)
@@ -1090,7 +1104,7 @@ mod tests {
         let expected = NOTEBOOK
             .replace(
                 "    \"import pandas as pd\\n\"\n",
-                "    \"import pandas as pd\\n\",\n    \"from typing import Final\\n\"\n",
+                "    \"from typing import Final\\n\",\n    \"\\n\",\n    \"import pandas as pd\\n\"\n",
             )
             .replace("    TARGET = ", "    TARGET: Final = ")
             .replace("    A: str = ", "    A: Final[str] = ");
@@ -1148,10 +1162,7 @@ mod tests {
     #[test]
     fn test_should_keep_an_import_in_the_cell_that_ends_with_it() {
         // arrange: the last import is the last line of cell 1, which has no trailing newline.
-        let source = NOTEBOOK.replace(
-            "    \"import pandas as pd\\n\"\n",
-            "    \"import pandas as pd\"\n",
-        );
+        let source = NOTEBOOK.replace("    \"import pandas as pd\\n\"\n", "    \"import os\"\n");
         let dir = project(&[("n.ipynb", &source)]);
 
         // act
@@ -1167,7 +1178,7 @@ mod tests {
         let cells = written["cells"].as_array().unwrap();
         assert_eq!(
             cells[0]["source"],
-            serde_json::json!(["import pandas as pd\n", "from typing import Final"])
+            serde_json::json!(["import os\n", "from typing import Final"])
         );
         assert_eq!(
             cells[1]["source"],

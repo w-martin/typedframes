@@ -146,9 +146,9 @@ fn parse_percentage(value: &str) -> Result<f64, String> {
 
 #[derive(Args, Debug)]
 pub(crate) struct SuggestArgs {
-    /// File or directory to suggest fixes for (default: current directory).
-    #[arg(default_value = ".")]
-    pub(crate) path: PathBuf,
+    /// Files or directories to suggest fixes for (default: current directory). Each is looked at on its own, with its own cross-file index.
+    #[arg(default_value = ".", num_args = 1..)]
+    pub(crate) path: Vec<PathBuf>,
     /// Disable the cross-file index entirely; look at every file in isolation, following no imports.
     #[arg(long)]
     pub(crate) no_index: bool,
@@ -300,6 +300,19 @@ mod tests {
             panic!("not a suggest command");
         };
         assert_eq!(vec!["quiet-amber", "bold-fox"], args.only);
+    }
+
+    #[test]
+    fn test_should_take_several_paths_for_suggest() {
+        let parsed = Cli::try_parse_from(["typedframes", "suggest", "nb", "platform"]).unwrap();
+
+        let Some(Command::Suggest(args)) = parsed.command else {
+            panic!("not a suggest command");
+        };
+        assert_eq!(
+            vec![PathBuf::from("nb"), PathBuf::from("platform")],
+            args.path
+        );
     }
 
     #[test]

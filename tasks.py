@@ -3,6 +3,7 @@
 import sys
 from importlib.metadata import version
 from inspect import Parameter, isroutine, signature
+from os import environ
 from pathlib import Path
 from shutil import rmtree
 from sysconfig import get_config_var, get_path
@@ -16,7 +17,9 @@ from invoke import Context, task
 RUST_DIR = Path("rust")
 LIBRARY_NAMES = RUST_DIR / "src" / "library_names.txt"
 PACKAGE_DIR = Path("src") / "typedframes"
-EXTENSION_BUILD_DIR = RUST_DIR / "target" / "extension"
+EXAMPLES_DIR = Path("examples")
+TARGET_DIR = Path(environ.get("CARGO_TARGET_DIR", RUST_DIR / "target"))
+EXTENSION_BUILD_DIR = TARGET_DIR / "extension"
 EXTENSION_SUFFIXES = {".so", ".pyd"}
 
 
@@ -275,6 +278,48 @@ def test(ctx: Context) -> None:
     ctx.run("coverage-threshold")
     print("Running Rust tests...")
     ctx.run(f"cd {RUST_DIR} && cargo test --workspace")
+
+
+def _tree_size(path: Path) -> int:
+    """Disk usage in bytes (allocated blocks, as `du` reports, not apparent size)."""
+    files = [path] if not path.is_dir() else [child for child in path.rglob("*") if not child.is_dir()]
+    return sum(file.lstat().st_blocks * 512 for file in files)
+
+
+def _stale_paths() -> list[Path]:
+    """Rebuildable output to remove: old Rust build artifacts, a stray `rust/target`, and example virtualenvs."""
+    keep = {"debug", "CACHEDIR.TAG", ".rustc_info.json"}
+    stale = [path for path in sorted(TARGET_DIR.glob("*")) if path.name not in keep]
+    stale += [path for path in [TARGET_DIR / "debug" / "incremental"] if path.exists()]
+    local_target = RUST_DIR / "target"
+    if local_target.is_dir() and local_target.resolve() != TARGET_DIR.resolve():
+        stale.append(local_target)
+    stale += sorted(EXAMPLES_DIR.glob("**/.venv"))
+    return stale
+
+
+@task
+def clean(_ctx: Context, *, dry_run: bool = False) -> None:
+    """Remove rebuildable build output: stale Rust artifacts and the examples' virtualenvs.
+
+    Keeps only the current debug build: deletes incremental compilation caches and every other target
+    profile or triple (release, cross targets, extension and wheel staging). Also deletes a leftover
+    `rust/target` when `CARGO_TARGET_DIR` points elsewhere, and every `examples/**/.venv` (`uv sync` in
+    an example recreates it). Honours `CARGO_TARGET_DIR`, so with a shared target directory it cleans
+    that one for every checkout.
+    """
+    total = 0
+    for path in _stale_paths():
+        size = _tree_size(path)
+        total += size
+        sys.stdout.write(f"{'would remove' if dry_run else 'removing'} {path} ({size / 1e6:.0f} MB)\n")
+        if dry_run:
+            continue
+        if path.is_dir():
+            rmtree(path)
+        else:
+            path.unlink()
+    sys.stdout.write(f"{'would free' if dry_run else 'freed'} {total / 1e9:.2f} GB\n")
 
 
 @task

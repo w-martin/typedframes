@@ -1467,7 +1467,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "typedframes_checker"
-version = "0.14.5"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "typedframes_python"
-version = "0.14.5"
+version = "0.15.0"
 dependencies = [
  "pyo3",
  "pyo3-build-config",

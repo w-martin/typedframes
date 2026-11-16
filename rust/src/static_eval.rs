@@ -42,7 +42,6 @@ pub(crate) enum Value {
 
 impl Value {
     /// The strings of a list/tuple/set of strings -- a column list.
-    #[cfg(test)]
     pub(crate) fn as_string_list(&self) -> Option<Vec<String>> {
         let items = match self {
             Value::List(v) | Value::Tuple(v) | Value::Set(v) => v,
@@ -55,6 +54,22 @@ impl Value {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The value holds a string somewhere, so it could be (or build) a column name. A number,
+    /// a flag or `None` cannot, and a tuning constant read through `self` is not worth a
+    /// notice about what a subclass might rebind.
+    pub(crate) fn can_name_columns(&self) -> bool {
+        match self {
+            Value::Str(_) => true,
+            Value::Int(_) | Value::Bool(_) | Value::None => false,
+            Value::List(v) | Value::Tuple(v) | Value::Set(v) => {
+                v.iter().any(Value::can_name_columns)
+            }
+            Value::Dict(items) => items
+                .iter()
+                .any(|(k, v)| k.can_name_columns() || v.can_name_columns()),
+        }
     }
 
     /// Nothing reachable from the value can be changed: a scalar, or a tuple of such. It
@@ -214,6 +229,52 @@ pub(crate) trait NameResolver {
     }
 }
 
+/// Evaluates expressions that read one frame's `.columns` (`{c: c.lower() for c in
+/// df.columns}`) given that frame's known column list. Every other name is treated as a
+/// builtin, which only a call to a recognized builtin can use.
+pub(crate) struct FrameColumns<'a> {
+    pub(crate) frame: &'a str,
+    pub(crate) columns: &'a [String],
+}
+
+impl NameResolver for FrameColumns<'_> {
+    fn resolve(&self, name: &ast::ExprName) -> Resolved {
+        if name.id.as_str() == self.frame {
+            Resolved::Unknown
+        } else {
+            Resolved::Builtin
+        }
+    }
+
+    fn resolve_attribute(&self, attribute: &ast::ExprAttribute) -> Resolved {
+        match &*attribute.value {
+            Expr::Name(n)
+                if n.id.as_str() == self.frame && attribute.attr.as_str() == "columns" =>
+            {
+                Resolved::Value(Value::List(
+                    self.columns.iter().cloned().map(Value::Str).collect(),
+                ))
+            }
+            _ => Resolved::Unknown,
+        }
+    }
+}
+
+/// Evaluates an expression over loop variables bound to known values; every other name is a
+/// builtin, which only a call to a recognized builtin can use.
+pub(crate) struct LoopNames<'a> {
+    pub(crate) bound: &'a HashMap<String, Value>,
+}
+
+impl NameResolver for LoopNames<'_> {
+    fn resolve(&self, name: &ast::ExprName) -> Resolved {
+        match self.bound.get(name.id.as_str()) {
+            Some(value) => Resolved::Value(value.clone()),
+            None => Resolved::Builtin,
+        }
+    }
+}
+
 struct DepthGuard<'e>(&'e Cell<u32>);
 
 impl Drop for DepthGuard<'_> {
@@ -314,6 +375,13 @@ impl<'r> Evaluator<'r> {
                 }
                 match self.resolver.resolve_attribute(a) {
                     Resolved::Value(v) => Some(v),
+                    // `Col.HR.value`: the member's value is what the class attribute holds.
+                    _ if a.attr.as_str() == "value" && matches!(&*a.value, Expr::Attribute(_)) => {
+                        match self.ev(&a.value)? {
+                            v @ Value::Str(_) => Some(v),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -412,6 +480,11 @@ impl<'r> Evaluator<'r> {
         Self::capped(Value::List(out))
     }
 
+    /// The sequence a `for` loop runs over, where a lazy `enumerate`/`zip` is consumed once.
+    pub(crate) fn eval_iterable(&self, expr: &Expr) -> Option<Value> {
+        self.arg(expr, true)
+    }
+
     fn address(call: &ast::ExprCall) -> usize {
         std::ptr::from_ref(call) as usize
     }
@@ -437,7 +510,7 @@ impl<'r> Evaluator<'r> {
 
     // Ordered iteration. A set is refused: Python's order for it depends on hash
     // seeds, so the result would be a guess.
-    fn iterate(value: &Value) -> Option<Vec<Value>> {
+    pub(crate) fn iterate(value: &Value) -> Option<Vec<Value>> {
         match value {
             Value::List(v) | Value::Tuple(v) => Some(v.clone()),
             Value::Dict(d) => Some(d.iter().map(|(k, _)| k.clone()).collect()),
@@ -2457,7 +2530,8 @@ impl<'a> Visitor<'a> for AllNameLoads {
 #[derive(Clone)]
 enum ImportRef {
     From(u32, String, String),
-    Module(String),
+    // `import a.b as m`, or `from a import b` where `b` is a submodule: (leading dots, module).
+    Module(u32, String),
 }
 
 /// How an imported name was brought in: `import x [as y]`, or `from x import y`.
@@ -2483,6 +2557,84 @@ enum Memo {
     Done(Option<Value>),
 }
 
+/// A module-level name of another module that this file may change: `COLS.append(..)` after
+/// `from m import COLS` (`rebinds` false: only a mutable value is affected), or `m.NAME = ..`
+/// (`rebinds`: any value is). The module is `(leading dots, dotted name)` as written here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ForeignWrite {
+    pub(crate) level: u32,
+    pub(crate) module: String,
+    pub(crate) name: String,
+    pub(crate) rebinds: bool,
+}
+
+fn foreign_writes<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    scopes: &[Scope<'a>],
+    member_use: &FastMap<(GroupKey<'a>, &'a str), (bool, bool)>,
+    collector: &Collector<'a>,
+) -> Vec<ForeignWrite> {
+    let mut out = Vec::new();
+    // The module(s) `base.attr` may name: `import m` -> m.attr; `from p import x` -> p.x.attr
+    // (x a submodule) or p's `x.attr` (x a class).
+    let mut member = |base: &GroupKey<'a>, attr: &str, rebinds: bool| match groups
+        .get(base)
+        .and_then(|g| g.import.as_ref())
+    {
+        Some(ImportRef::Module(level, module)) => out.push(ForeignWrite {
+            level: *level,
+            module: module.clone(),
+            name: attr.to_string(),
+            rebinds,
+        }),
+        Some(ImportRef::From(level, module, imported)) => {
+            let submodule = if module.is_empty() {
+                imported.clone()
+            } else {
+                format!("{module}.{imported}")
+            };
+            out.push(ForeignWrite {
+                level: *level,
+                module: submodule,
+                name: attr.to_string(),
+                rebinds,
+            });
+            out.push(ForeignWrite {
+                level: *level,
+                module: module.clone(),
+                name: format!("{imported}.{attr}"),
+                rebinds,
+            });
+        }
+        None => {}
+    };
+    for ((base, attr), (_, escapes)) in member_use {
+        if *escapes {
+            member(base, attr, false);
+        }
+    }
+    for (scope, base, attr) in &collector.pending_attribute_stores {
+        if let Some(key) = lookup(scopes, *scope, base) {
+            member(&key, attr, true);
+        }
+    }
+    for group in groups.values() {
+        if let (true, Some(ImportRef::From(level, module, imported))) =
+            (group.escapes, group.import.as_ref())
+        {
+            out.push(ForeignWrite {
+                level: *level,
+                module: module.clone(),
+                name: imported.clone(),
+                rebinds: false,
+            });
+        }
+    }
+    out.sort_by(|a, b| (a.level, &a.module, &a.name).cmp(&(b.level, &b.module, &b.name)));
+    out.dedup();
+    out
+}
+
 /// A class constant read through `self`/`cls` and resolved to its value.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SelfConstantRead {
@@ -2494,6 +2646,8 @@ pub(crate) struct SelfConstantRead {
 }
 
 pub(crate) struct Analysis<'a> {
+    /// Names of other modules this file may change: see `ForeignWrite`.
+    pub(crate) foreign_writes: Vec<ForeignWrite>,
     groups: FastMap<GroupKey<'a>, Group<'a>>,
     occurrence_group: FastMap<TextSize, Option<GroupKey<'a>>>,
     attribute_group: FastMap<TextRange, Option<GroupKey<'a>>>,
@@ -2501,6 +2655,12 @@ pub(crate) struct Analysis<'a> {
     // plus how this file uses that member (every use of it, across the whole file).
     module_attribute: FastMap<TextRange, (GroupKey<'a>, &'a str)>,
     module_member_use: FastMap<(GroupKey<'a>, &'a str), (bool, bool)>,
+    // `Col.HR` where `Col` is a class imported with `from module import Col`: the import and the attribute.
+    imported_class_member: FastMap<TextRange, (GroupKey<'a>, &'a str)>,
+    // The attributes of this file's own module-level classes that importers may read.
+    class_exports: Vec<(String, String, GroupKey<'a>)>,
+    // This file's module-level string enums and every name their body binds.
+    string_enums: FastMap<&'a str, Vec<String>>,
     // Class constants read through `self`/`cls`, where a subclass in another file could
     // have rebound the name.
     self_reads: Vec<SelfConstantRead>,
@@ -2555,11 +2715,10 @@ impl<'a> Analysis<'a> {
                         Binding::Function(f) => group.function = Some(f),
                         Binding::Class(c, body) => group.class = Some((c, *body)),
                         Binding::ImportFrom(level, module, name) => {
-                            group.import =
-                                Some(ImportRef::From(*level, module.clone(), name.clone()))
+                            group.import = Some(import_from_ref(imports, *level, module, name))
                         }
                         Binding::ImportModule(module) => {
-                            group.import = Some(ImportRef::Module(module.clone()))
+                            group.import = Some(ImportRef::Module(0, module.clone()))
                         }
                         Binding::Other => {}
                     }
@@ -2635,6 +2794,7 @@ impl<'a> Analysis<'a> {
         let mut module_attribute = FastMap::default();
         let mut module_member_use: FastMap<(GroupKey<'a>, &'a str), (bool, bool)> =
             FastMap::default();
+        let mut imported_class_member = FastMap::default();
         for occurrence in &collector.attribute_occurrences {
             let key = attribute_group_of(
                 &groups,
@@ -2670,7 +2830,7 @@ impl<'a> Analysis<'a> {
                 if let Some(base) = module_group.filter(|k| {
                     matches!(
                         groups.get(k).and_then(|g| g.import.as_ref()),
-                        Some(ImportRef::Module(_))
+                        Some(ImportRef::Module(..))
                     )
                 }) {
                     let member = (base, occurrence.attr);
@@ -2681,17 +2841,84 @@ impl<'a> Analysis<'a> {
                         Use::Escapes => flags.1 = true,
                     }
                     module_attribute.insert(occurrence.range, member);
+                } else if let Some(base) = module_group.filter(|k| {
+                    matches!(
+                        groups.get(k).and_then(|g| g.import.as_ref()),
+                        Some(ImportRef::From(..))
+                    )
+                }) {
+                    let member = (base, occurrence.attr);
+                    let flags = module_member_use.entry(member).or_default();
+                    match occurrence.use_ {
+                        Use::Safe => {}
+                        Use::Interior => flags.0 = true,
+                        Use::Escapes => flags.1 = true,
+                    }
+                    imported_class_member.insert(occurrence.range, member);
                 }
             }
             attribute_group.insert(occurrence.range, key);
         }
 
+        let foreign_writes = foreign_writes(&groups, scopes, &module_member_use, &collector);
+
+        let mut class_exports = Vec::new();
+        let mut string_enums = FastMap::default();
+        for (key, group) in &groups {
+            let Some((def, body)) = group.class else {
+                continue;
+            };
+            if key.0 != 0 || group.bindings != 1 || dynamic_classes.contains(&body) {
+                continue;
+            }
+            if let Some(bodies) = string_enum_bodies(&groups, scopes, def, body) {
+                let mut members: Vec<String> = bodies
+                    .iter()
+                    .flat_map(|b| scopes[*b].bindings.keys())
+                    .map(|m| m.to_string())
+                    .collect();
+                members.sort();
+                members.dedup();
+                string_enums.insert(key.1, members);
+            }
+            for attr in scopes[body].bindings.keys() {
+                if let Some(member) =
+                    class_attribute_of(&groups, scopes, &dynamic_classes, *key, attr)
+                {
+                    class_exports.push((key.1.to_string(), attr.to_string(), member));
+                }
+            }
+        }
+        // `N.a` with `N = Names()`, `Names` a frozen dataclass: the field's default.
+        for key in groups.keys() {
+            if key.0 != 0 {
+                continue;
+            }
+            let Some(class) = frozen_dataclass_instance_class(&groups, scopes, *key) else {
+                continue;
+            };
+            let Some((_, body)) = groups.get(&class).and_then(|g| g.class) else {
+                continue;
+            };
+            for attr in scopes[body].bindings.keys() {
+                if let Some(member) =
+                    class_attribute_of(&groups, scopes, &dynamic_classes, class, attr)
+                {
+                    class_exports.push((key.1.to_string(), attr.to_string(), member));
+                }
+            }
+        }
+
         Analysis {
+            foreign_writes,
             groups,
             occurrence_group,
             attribute_group,
             module_attribute,
             module_member_use,
+            imported_class_member,
+            class_exports,
+            string_enums,
             self_reads,
             imports,
             shadowed: EVALUATED_BUILTINS
@@ -2776,6 +3003,9 @@ impl NameResolver for Analysis<'_> {
     }
 
     fn resolve_attribute(&self, attribute: &ast::ExprAttribute) -> Resolved {
+        if let Some(value) = self.module_class_attribute(attribute) {
+            return Resolved::Value(value);
+        }
         match self.attribute_group.get(&attribute.range()) {
             Some(Some(key)) => {
                 return self
@@ -2784,6 +3014,9 @@ impl NameResolver for Analysis<'_> {
             }
             Some(None) => {}
             None => return Resolved::Unknown,
+        }
+        if let Some(value) = self.imported_class_attribute(attribute) {
+            return value;
         }
         let Some(member) = self.imported_member(attribute) else {
             return Resolved::Unknown;
@@ -2885,6 +3118,12 @@ impl<'a> Analysis<'a> {
         matches!(self.resolve(name), Resolved::Builtin)
     }
 
+    /// Whether this occurrence of a name is bound nowhere in the file: a builtin, or a name a
+    /// `*` import brought in.
+    pub(crate) fn binds_nowhere(&self, name: &ast::ExprName) -> bool {
+        matches!(self.occurrence_group.get(&name.range().start()), Some(None))
+    }
+
     /// The one plain, undecorated function a module-level `name` is bound to.
     pub(crate) fn single_module_function(&self, name: &str) -> Option<&'a ast::StmtFunctionDef> {
         if self.dynamic_namespace {
@@ -2904,7 +3143,7 @@ impl<'a> Analysis<'a> {
             return None;
         }
         match group.import {
-            Some(ImportRef::Module(_)) => Some(ImportKind::Module),
+            Some(ImportRef::Module(..)) => Some(ImportKind::Module),
             Some(ImportRef::From(..)) => Some(ImportKind::From),
             None => None,
         }
@@ -2933,16 +3172,55 @@ impl<'a> Analysis<'a> {
 }
 
 impl Analysis<'_> {
+    // `Col.HR` with `from cols import Col`: the attribute of the class that module exports,
+    // under the same rule as any constant -- a container this file aliases, passes on or hands
+    // out the elements of is not fixed.
+    fn imported_class_attribute(&self, attribute: &ast::ExprAttribute) -> Option<Resolved> {
+        let (key, attr) = self.imported_class_member.get(&attribute.range())?;
+        if key.0 == 0 && self.dynamic_namespace {
+            return Some(Resolved::Unknown);
+        }
+        let ImportRef::From(level, module, name) = self.groups.get(key)?.import.as_ref()? else {
+            return None;
+        };
+        let exports = self.imports.get(&(*level, module.clone()))?;
+        let value = exports.constants.get(&format!("{name}.{attr}"))?;
+        let (interior, escapes) = self
+            .module_member_use
+            .get(&(*key, *attr))
+            .copied()
+            .unwrap_or((true, true));
+        if (escapes && !value.is_immutable()) || (interior && !value.has_immutable_elements()) {
+            return Some(Resolved::Unknown);
+        }
+        Some(Resolved::Value(value.clone()))
+    }
+
     // The exports of the project module a `cfg.NAME` reaches through `import cfg`.
     fn imported_member(&self, attribute: &ast::ExprAttribute) -> Option<&Arc<ModuleExports>> {
         let (key, _) = self.module_attribute.get(&attribute.range())?;
         if key.0 == 0 && self.dynamic_namespace {
             return None;
         }
-        let ImportRef::Module(module) = self.groups.get(key)?.import.as_ref()? else {
+        let ImportRef::Module(level, module) = self.groups.get(key)?.import.as_ref()? else {
             return None;
         };
-        self.imports.get(&(0, module.clone()))
+        self.imports.get(&(*level, module.clone()))
+    }
+
+    // `cols.Col.A` through `import pkg.cols as cols`: the class attribute that module exports.
+    // Only an immutable value, since this file's uses of it are not tracked.
+    fn module_class_attribute(&self, attribute: &ast::ExprAttribute) -> Option<Value> {
+        let Expr::Attribute(inner) = &*attribute.value else {
+            return None;
+        };
+        let exports = self.imported_member(inner)?;
+        let key = format!("{}.{}", inner.attr, attribute.attr);
+        exports
+            .constants
+            .get(&key)
+            .filter(|v| v.is_immutable())
+            .cloned()
     }
 
     fn call_foreign(
@@ -3019,6 +3297,13 @@ fn bind_arguments(
 pub(crate) struct ModuleExports {
     pub(crate) constants: HashMap<String, Value>,
     pub(crate) functions: HashMap<String, String>,
+    // String enums the module defines, by class name, with every name their body binds.
+    #[serde(default)]
+    pub(crate) enums: HashMap<String, Vec<String>>,
+    // `from module import name [as local]` at module level, by local name: what an importer
+    // of this module (a package `__init__.py` re-exporting, typically) reaches through it.
+    #[serde(default)]
+    pub(crate) reexports: HashMap<String, (u32, String, String)>,
     // Evaluable builtins the module rebinds, so one of its functions isn't evaluated as
     // if `len` were the builtin.
     shadowed: Vec<String>,
@@ -3026,7 +3311,10 @@ pub(crate) struct ModuleExports {
 
 impl ModuleExports {
     pub(crate) fn is_empty(&self) -> bool {
-        self.constants.is_empty() && self.functions.is_empty()
+        self.constants.is_empty()
+            && self.functions.is_empty()
+            && self.enums.is_empty()
+            && self.reexports.is_empty()
     }
 }
 
@@ -3080,6 +3368,22 @@ pub(crate) fn export_module(analysis: &Analysis, source: &str) -> ModuleExports 
         } else if let Some(def) = group.function {
             if group.bindings == 1 && is_plain_function(def) {
                 candidates.insert(name, def);
+            }
+        } else if let Some(ImportRef::From(level, module, imported)) = &group.import {
+            if group.bindings == 1 {
+                exports
+                    .reexports
+                    .insert(name.to_string(), (*level, module.clone(), imported.clone()));
+            }
+        }
+    }
+    for (class, members) in &analysis.string_enums {
+        exports.enums.insert(class.to_string(), members.clone());
+    }
+    for (class, attr, key) in &analysis.class_exports {
+        if let Some(value) = analysis.group_value(key) {
+            if node_count(&value) <= MAX_EXPORTED_NODES {
+                exports.constants.insert(format!("{class}.{attr}"), value);
             }
         }
     }
@@ -3196,8 +3500,10 @@ impl NameResolver for ForeignRun<'_> {
 
 // The group holding `base.attr` when `base` is a class defined in the file and `attr` is
 // assigned in its body (or in its single user-defined base's). Refused for a class a
-// decorator, a metaclass, an outside base class (an enum, a `BaseSchema`, an ORM base),
-// several bases, a rebinding of its name, or `setattr`/`delattr`/`vars` could have changed.
+// decorator (other than `dataclasses.dataclass`), a metaclass, an outside base class (an
+// enum, a `BaseSchema`, an ORM base), several bases, a rebinding of its name, or
+// `setattr`/`delattr`/`vars` could have changed. `base` may also be a frozen dataclass
+// instance built with no arguments, whose fields are the class's defaults.
 fn class_attribute<'a>(
     groups: &FastMap<GroupKey<'a>, Group<'a>>,
     scopes: &[Scope<'a>],
@@ -3206,9 +3512,282 @@ fn class_attribute<'a>(
     base: &str,
     attr: &'a str,
 ) -> Option<GroupKey<'a>> {
-    let key = lookup(scopes, from, base).filter(|k| groups.contains_key(k))?;
+    let mut key = lookup(scopes, from, base).filter(|k| groups.contains_key(k))?;
+    if groups.get(&key)?.class.is_none() {
+        key = frozen_dataclass_instance_class(groups, scopes, key)?;
+    }
     class_attribute_of(groups, scopes, dynamic, key, attr)
 }
+
+// Methods that could hand an instance attribute a value other than the class default.
+const INSTANCE_HOOKS: &[&str] = &[
+    "__init__",
+    "__post_init__",
+    "__new__",
+    "__setattr__",
+    "__getattr__",
+    "__getattribute__",
+];
+
+// The class of `key` when it is bound once to `Cls()`, `Cls` a frozen dataclass of this
+// module (as are its bases) that defines no hook able to change an attribute.
+fn frozen_dataclass_instance_class<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    scopes: &[Scope<'a>],
+    key: GroupKey<'a>,
+) -> Option<GroupKey<'a>> {
+    let group = groups.get(&key)?;
+    let Some(Expr::Call(call)) = group.assign else {
+        return None;
+    };
+    if group.bindings != 1 || !call.arguments.is_empty() {
+        return None;
+    }
+    let Expr::Name(class) = &*call.func else {
+        return None;
+    };
+    let class_key = lookup(scopes, key.0, class.id.as_str())?;
+    let mut current = class_key;
+    for _ in 0..8 {
+        let (def, body) = groups.get(&current)?.class?;
+        if dataclass_decorator(groups, scopes, def) != Some(true)
+            || INSTANCE_HOOKS
+                .iter()
+                .any(|hook| scopes[body].bindings.contains_key(hook))
+        {
+            return None;
+        }
+        let parent = match def.arguments.as_deref().map(|a| a.args.as_ref()) {
+            None | Some([]) => return Some(class_key),
+            Some([Expr::Name(parent)]) => parent,
+            Some(_) => return None,
+        };
+        current = lookup(scopes, scopes[body].parent?, parent.id.as_str())?;
+    }
+    None
+}
+
+// `Some(frozen)` when `def`'s only decorator is `dataclasses.dataclass`, bare or called with
+// options that keep fields as class attributes (`slots=True` does not).
+fn dataclass_decorator<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    scopes: &[Scope<'a>],
+    def: &ast::StmtClassDef,
+) -> Option<bool> {
+    let [decorator] = def.decorator_list.as_slice() else {
+        return None;
+    };
+    let (callee, keywords) = match &decorator.expression {
+        Expr::Call(call) if call.arguments.args.is_empty() => {
+            (&*call.func, call.arguments.keywords.as_ref())
+        }
+        other => (other, &[][..]),
+    };
+    let imported = |name: &str| {
+        lookup(scopes, 0, name)
+            .and_then(|k| groups.get(&k))
+            .filter(|g| g.bindings == 1)
+            .and_then(|g| g.import.as_ref())
+            .cloned()
+    };
+    let is_dataclass = match callee {
+        Expr::Name(n) => matches!(
+            imported(n.id.as_str()),
+            Some(ImportRef::From(0, m, d)) if m == "dataclasses" && d == "dataclass"
+        ),
+        Expr::Attribute(a) => match &*a.value {
+            Expr::Name(n) => {
+                a.attr.as_str() == "dataclass"
+                    && matches!(
+                        imported(n.id.as_str()),
+                        Some(ImportRef::Module(0, m)) if m == "dataclasses"
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !is_dataclass {
+        return None;
+    }
+    let mut frozen = false;
+    for keyword in keywords {
+        let flag = match &keyword.value {
+            Expr::BooleanLiteral(b) => b.value,
+            _ => return None,
+        };
+        match keyword.arg.as_ref()?.as_str() {
+            "frozen" => frozen = flag,
+            "init" | "repr" | "eq" | "order" | "unsafe_hash" | "kw_only" | "match_args" => {}
+            _ => return None,
+        }
+    }
+    Some(frozen)
+}
+
+// The class bodies whose bindings make up a string enum's names: its own, and those of
+// the member-less string enums of this module it derives from (`class Col(Base)`).
+fn string_enum_bodies<'a>(
+    groups: &FastMap<GroupKey<'a>, Group<'a>>,
+    scopes: &[Scope<'a>],
+    mut def: &'a ast::StmtClassDef,
+    mut body: usize,
+) -> Option<Vec<usize>> {
+    let mut bodies = vec![body];
+    for _ in 0..8 {
+        if is_string_enum(def) {
+            return Some(bodies);
+        }
+        let arguments = def.arguments.as_deref()?;
+        let [Expr::Name(base)] = arguments.args.as_ref() else {
+            return None;
+        };
+        if !def.decorator_list.is_empty() || !arguments.keywords.is_empty() {
+            return None;
+        }
+        let group = groups.get(&lookup(scopes, scopes[body].parent?, base.id.as_str())?)?;
+        if group.bindings != 1 {
+            return None;
+        }
+        (def, body) = group.class?;
+        bodies.push(body);
+    }
+    None
+}
+
+// `class Col(StrEnum)` / `class Col(str, Enum)` with no decorator, metaclass or other base:
+// its members are exactly the names its body binds.
+fn is_string_enum(def: &ast::StmtClassDef) -> bool {
+    let Some(arguments) = def.arguments.as_deref() else {
+        return false;
+    };
+    let bases: Vec<&str> = arguments
+        .args
+        .iter()
+        .map(|base| match base {
+            Expr::Name(n) => n.id.as_str(),
+            _ => "",
+        })
+        .collect();
+    def.decorator_list.is_empty()
+        && arguments.keywords.is_empty()
+        && bases
+            .iter()
+            .all(|b| matches!(*b, "StrEnum" | "Enum" | "str"))
+        && (bases.contains(&"StrEnum") || (bases.contains(&"str") && bases.contains(&"Enum")))
+}
+
+/// `Col.NOPE` where `Col` is a string enum (this file's, or imported with
+/// `from module import Col`) whose body binds no `NOPE`: an AttributeError when it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MissingMember {
+    pub(crate) range: TextRange,
+    pub(crate) class: String,
+    pub(crate) attr: String,
+    pub(crate) members: Vec<String>,
+}
+
+impl Analysis<'_> {
+    pub(crate) fn missing_enum_members(&self, module: &ModModule) -> Vec<MissingMember> {
+        struct Finder<'s, 'a> {
+            analysis: &'s Analysis<'a>,
+            found: Vec<MissingMember>,
+        }
+        impl<'v> Visitor<'v> for Finder<'_, '_> {
+            fn visit_expr(&mut self, expr: &'v Expr) {
+                if let Expr::Attribute(a) = expr {
+                    let attr = a.attr.as_str();
+                    // Members are spelled in capitals; a lower-case name may be a method
+                    // the enum inherits from `str`.
+                    let member_like = a.ctx == ExprContext::Load
+                        && attr.starts_with(|c: char| c.is_ascii_uppercase())
+                        && attr
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                    let class = match &*a.value {
+                        Expr::Name(class) if member_like => self
+                            .analysis
+                            .enum_members_of(class)
+                            .map(|m| (class.id.to_string(), m)),
+                        // `cols.Col.NOPE` through `import pkg.cols as cols`.
+                        Expr::Attribute(inner) if member_like => self
+                            .analysis
+                            .imported_member(inner)
+                            .and_then(|m| m.enums.get(inner.attr.as_str()))
+                            .map(|m| (inner.attr.to_string(), m.clone())),
+                        _ => None,
+                    };
+                    if let Some((class, members)) = class {
+                        if !members.iter().any(|m| m == attr) {
+                            self.found.push(MissingMember {
+                                range: a.range(),
+                                class,
+                                attr: attr.to_string(),
+                                members,
+                            });
+                        }
+                    }
+                }
+                ast_visitor::walk_expr(self, expr);
+            }
+        }
+        if !self.complete || self.dynamic_namespace {
+            return Vec::new();
+        }
+        let mut finder = Finder {
+            analysis: self,
+            found: Vec::new(),
+        };
+        for stmt in &module.body {
+            finder.visit_stmt(stmt);
+        }
+        finder.found
+    }
+
+    fn enum_members_of(&self, name: &ast::ExprName) -> Option<Vec<String>> {
+        let key = self.occurrence_group.get(&name.range().start())?.as_ref()?;
+        let group = self.groups.get(key)?;
+        if key.0 != 0 || group.bindings != 1 {
+            return None;
+        }
+        if group.class.is_some() {
+            return self.string_enums.get(key.1).cloned();
+        }
+        let Some(ImportRef::From(level, module, imported)) = &group.import else {
+            return None;
+        };
+        self.imports
+            .get(&(*level, module.clone()))?
+            .enums
+            .get(imported)
+            .cloned()
+    }
+}
+
+// `from module import name`: a submodule when the importer found one by that name and the
+// package itself defines nothing called `name`.
+fn import_from_ref(imports: &ImportedModules, level: u32, module: &str, name: &str) -> ImportRef {
+    let submodule = if module.is_empty() {
+        name.to_string()
+    } else {
+        format!("{module}.{name}")
+    };
+    let defined_by_package = imports.get(&(level, module.to_string())).is_some_and(|m| {
+        let prefix = format!("{name}.");
+        m.constants.contains_key(name)
+            || m.functions.contains_key(name)
+            || m.enums.contains_key(name)
+            || m.constants.keys().any(|k| k.starts_with(&prefix))
+    });
+    if !defined_by_package && imports.contains_key(&(level, submodule.clone())) {
+        ImportRef::Module(level, submodule)
+    } else {
+        ImportRef::From(level, module.to_string(), name.to_string())
+    }
+}
+
+// Bases whose subclasses are enumerations: their members are the class's own assignments.
+const ENUM_BASES: &[&str] = &["Enum", "StrEnum", "IntEnum", "str", "int"];
 
 // `class_attribute` for the class whose name group is `key`.
 fn class_attribute_of<'a>(
@@ -3224,7 +3803,8 @@ fn class_attribute_of<'a>(
         let (def, body) = group.class?;
         if group.bindings != 1
             || dynamic.contains(&body)
-            || !def.decorator_list.is_empty()
+            || (!def.decorator_list.is_empty()
+                && dataclass_decorator(groups, scopes, def).is_none())
             || chain.len() >= 8
             || chain.contains(&body)
         {
@@ -3234,10 +3814,19 @@ fn class_attribute_of<'a>(
         let Some(arguments) = def.arguments.as_deref() else {
             break;
         };
-        if !arguments.keywords.is_empty() || arguments.args.len() > 1 {
+        if !arguments.keywords.is_empty() {
             return None;
         }
-        match arguments.args.first() {
+        // `class Col(StrEnum)` / `class Col(str, Enum)`: the members are plain class attributes.
+        let mut parents = arguments
+            .args
+            .iter()
+            .filter(|base| !matches!(base, Expr::Name(n) if ENUM_BASES.contains(&n.id.as_str())));
+        let parent = parents.next();
+        if parents.next().is_some() {
+            return None;
+        }
+        match parent {
             None => break,
             Some(Expr::Name(parent)) => {
                 match lookup(scopes, scopes[body].parent?, parent.id.as_str()) {
@@ -3629,8 +4218,8 @@ fn find_sites(
         .filter(|read| {
             finder
                 .sites
-                .keys()
-                .any(|site| site.contains_range(read.range))
+                .iter()
+                .any(|(site, value)| site.contains_range(read.range) && value.can_name_columns())
         })
         .cloned()
         .collect();
@@ -4698,7 +5287,6 @@ mod analysis_tests {
     #[test]
     fn test_should_refuse_a_class_it_cannot_vouch_for() {
         for header in [
-            "class Cols(Enum):",
             "class Cols(BaseSchema):",
             "class Cols(Base1, Base2):",
             "class Cols(metaclass=Meta):",
@@ -4708,6 +5296,106 @@ mod analysis_tests {
             let source = format!("{header}\n    NAMES = [\"a\"]\n\n\nprint(usecols=Cols.NAMES)\n");
             assert_eq!(folded(&source, "Cols.NAMES"), None, "{header}");
         }
+    }
+
+    #[test]
+    fn test_should_resolve_the_fields_of_a_frozen_dataclass_instance_built_without_arguments() {
+        let dataclass = "from dataclasses import dataclass, field\nimport dataclasses\n\n\n";
+        let class = |decorator: &str, extra: &str| {
+            format!("{dataclass}{decorator}\nclass N:\n    a: str = \"a\"\n{extra}\n\n")
+        };
+        let resolved = [
+            format!(
+                "{}X = N()\nprint(X.a)\n",
+                class("@dataclass(frozen=True)", "")
+            ),
+            format!(
+                "{}X = N()\nprint(X.a)\n",
+                class("@dataclasses.dataclass(frozen=True)", "")
+            ),
+            format!("{}print(N.a)\n", class("@dataclass", "")),
+        ];
+        for source in &resolved {
+            let expr = if source.contains("X.a") { "X.a" } else { "N.a" };
+            assert_eq!(
+                folded(source, expr),
+                Some(Value::Str("a".into())),
+                "{source}"
+            );
+        }
+        let post_init =
+            "    def __post_init__(self):\n        object.__setattr__(self, \"a\", \"b\")\n";
+        let refused = [
+            // can be changed after it is built
+            format!("{}X = N()\nprint(X.a)\n", class("@dataclass", "")),
+            format!(
+                "{}X = N()\nprint(X.a)\n",
+                class("@dataclass(frozen=True)", post_init)
+            ),
+            // built with a value, or rebound
+            format!(
+                "{}X = N(a=\"b\")\nprint(X.a)\n",
+                class("@dataclass(frozen=True)", "")
+            ),
+            format!(
+                "{}X = N()\nX = N()\nprint(X.a)\n",
+                class("@dataclass(frozen=True)", "")
+            ),
+            // a slotted class holds no defaults
+            format!(
+                "{}X = N()\nprint(X.a)\n",
+                class("@dataclass(frozen=True, slots=True)", "")
+            ),
+            format!("{}print(N.a)\n", class("@dataclass(slots=True)", "")),
+        ];
+        for source in &refused {
+            assert_eq!(
+                folded(source, "X.a").or(folded(source, "N.a")),
+                None,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_list_the_members_of_an_enum_derived_from_a_member_less_one() {
+        let source = "from enum import StrEnum\n\n\nclass Base(StrEnum):\n    pass\n\n\nclass Col(Base):\n    A = \"a\"\n\n\nprint(Col.A, Col.B)\n";
+        let parsed = ruff_python_parser::parse_module(source).unwrap();
+        let imports = ImportedModules::new();
+        let analysis = Analysis::build(parsed.syntax(), &imports);
+
+        let missing = analysis.missing_enum_members(parsed.syntax());
+
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(
+            (missing[0].class.as_str(), missing[0].attr.as_str()),
+            ("Col", "B")
+        );
+    }
+
+    #[test]
+    fn test_should_resolve_the_members_of_an_enumeration() {
+        for header in [
+            "class Cols(StrEnum):",
+            "class Cols(Enum):",
+            "class Cols(str, Enum):",
+        ] {
+            let source = format!("{header}\n    HR = \"hr\"\n\n\nprint(usecols=Cols.HR)\n");
+            assert_eq!(
+                folded(&source, "Cols.HR"),
+                Some(Value::Str("hr".into())),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_resolve_the_value_of_an_enumeration_member() {
+        let source = "class Cols(StrEnum):\n    HR = \"hr\"\n\n\nprint(usecols=Cols.HR.value)\n";
+        assert_eq!(
+            folded(source, "Cols.HR.value"),
+            Some(Value::Str("hr".into()))
+        );
     }
 
     #[test]

@@ -6,11 +6,14 @@
 //! individual files, and the linter calls back here to resolve cross-file symbols.
 
 use crate::ast_extract;
-use crate::config::{find_project_root_opt, load_linter_config, LinterConfig};
+use crate::config::{load_linter_config, LinterConfig};
 use crate::constants::DEFAULT_EXCLUDED_DIRS;
 use crate::errors::{LintError, CODE_UNKNOWN_COLUMN, CODE_UNTRACKED_DATAFRAME};
 use crate::frame_ops::{ColumnEdit, HelperSummary};
-use crate::linter::{collect_self_attr_origins, Linter, ParamGovernedTemplate, SelfAttrOrigin};
+use crate::linter::{
+    annotated_param_origins, collect_self_attr_origins, Linter, ParamGovernedTemplate,
+    SelfAttrOrigin,
+};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, SourceCode};
@@ -73,6 +76,13 @@ pub(crate) struct IndexFunction {
     // and `param_schema_name` above.
     #[serde(skip)]
     pub(crate) param_governed: Option<ParamGovernedTemplate>,
+    // Whether every read behind `requires` runs on each call: the body (and each body it
+    // delegates to) is straight-line, or a schema annotation gave the columns. Only then do
+    // call sites check against `requires`. Build-time only, like `delegates`.
+    #[serde(skip)]
+    pub(crate) straight: bool,
+    #[serde(skip)]
+    pub(crate) requires_certain: bool,
     // What a call to this (module-level) function does to the frame it is handed -- see
     // `frame_ops::summarize_helper`. Already resolved within this file, so an importer can
     // apply it without seeing the body. Absent for a function that does neither.
@@ -141,6 +151,29 @@ pub(crate) struct IndexEntry {
     // Statically known constants and evaluable functions, for importing files to fold.
     #[serde(default)]
     pub(crate) eval: crate::static_eval::ModuleExports,
+    // Names of other modules this file may change, which their importers must not fold;
+    // applied (and emptied) by `finalise_index`.
+    #[serde(default)]
+    pub(crate) foreign_writes: Vec<crate::static_eval::ForeignWrite>,
+    // Every module this file's top-level imports may load, as `(leading dots, dotted name)`;
+    // `from a import b` lists both `a` and `a.b`, since `b` may be a submodule.
+    #[serde(default)]
+    pub(crate) import_targets: Vec<(u32, String)>,
+    // Column requirements per parameter of this file's functions (`name`) and methods
+    // (`Class.name`), for those with any; see `call_contracts`.
+    #[serde(default)]
+    pub(crate) contracts: HashMap<String, crate::call_contracts::FuncContract>,
+    // Parameters handed on to a function of another file, by contract key; resolved one
+    // level deep by `resolve_contract_forwards`. Empty in a finished index.
+    #[serde(default)]
+    pub(crate) contract_forwards: Vec<(String, crate::call_contracts::Forward)>,
+    // Method names of each class, and which classes are protocols, for `method_agreement`.
+    // Empty in a finished index.
+    #[serde(default)]
+    pub(crate) class_method_names: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub(crate) protocol_classes: Vec<String>,
+    // Last: skipped when empty, and the cache encodes fields by position.
     // See `CallSites`. Empty in a finished index.
     #[serde(default, skip_serializing_if = "CallSites::is_empty")]
     pub(crate) call_sites: CallSites,
@@ -222,6 +255,51 @@ pub(crate) struct ProjectIndex {
     // whole project: an index built around one file's imports never sees its callers.
     #[serde(default)]
     pub(crate) call_usage: HashMap<String, CallUsage>,
+    // Method name -> the requirement every class of the project defining it agrees on (with
+    // a description of where), for calls through a protocol-typed receiver. Only methods
+    // with a requirement; empty unless the index covers the whole project.
+    #[serde(default)]
+    pub(crate) method_agreement: HashMap<String, (crate::call_contracts::FuncContract, String)>,
+    // Class name -> (method, file) for each method a class of the project defines over one
+    // it inherits from that class, matched by name.
+    #[serde(default)]
+    pub(crate) overridden: HashMap<String, Vec<(String, String)>>,
+    // Resolved re-exports per module, so a module is walked once per run, not once per
+    // importer and per path to it. Never serialised.
+    #[serde(skip)]
+    pub(crate) exports_memo: ExportsMemo,
+    #[serde(skip)]
+    pub(crate) package_roots: crate::config::PackageRoots,
+}
+
+type ExportsKey = (String, usize, PathBuf);
+
+/// What `linter::module_exports` computed for (file, remaining re-export depth, project
+/// root). A pure function of the index, so concurrent fills agree.
+#[derive(Default)]
+pub(crate) struct ExportsMemo(
+    std::sync::RwLock<
+        HashMap<ExportsKey, Option<std::sync::Arc<crate::static_eval::ModuleExports>>>,
+    >,
+);
+
+impl ExportsMemo {
+    pub(crate) fn get(
+        &self,
+        key: &ExportsKey,
+    ) -> Option<Option<std::sync::Arc<crate::static_eval::ModuleExports>>> {
+        self.0.read().ok()?.get(key).cloned()
+    }
+
+    pub(crate) fn insert(
+        &self,
+        key: ExportsKey,
+        value: Option<std::sync::Arc<crate::static_eval::ModuleExports>>,
+    ) {
+        if let Ok(mut memo) = self.0.write() {
+            memo.insert(key, value);
+        }
+    }
 }
 
 /// The columns read from the result of every call to a function, across the project.
@@ -239,17 +317,45 @@ pub(crate) fn compute_all_schemas(
     files: &HashMap<String, IndexEntry>,
 ) -> HashMap<String, Vec<String>> {
     let mut all_schemas: HashMap<String, Vec<String>> = HashMap::new();
+    let ambiguous = ambiguous_schema_names(files);
     // Sorted by path so a schema name defined in two files always resolves the same way.
     let mut ordered: Vec<(&String, &IndexEntry)> = files.iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
     for (_, entry) in ordered {
         for (name, cols) in &entry.schemas {
+            if ambiguous.contains(name) {
+                continue;
+            }
             all_schemas
                 .entry(name.clone())
                 .or_insert_with(|| cols.clone());
         }
     }
     all_schemas
+}
+
+// Schema class names that two files define with different columns: the bare name cannot say
+// which one a reference means (two packages in one tree can both have a `TestRaw`), so it
+// resolves to neither.
+fn ambiguous_schema_names(
+    files: &HashMap<String, IndexEntry>,
+) -> std::collections::HashSet<String> {
+    let mut seen: HashMap<&str, &Vec<String>> = HashMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for entry in files.values() {
+        for (name, cols) in &entry.schemas {
+            match seen.get(name.as_str()) {
+                Some(first) if *first != cols => {
+                    ambiguous.insert(name.clone());
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(name.as_str(), cols);
+                }
+            }
+        }
+    }
+    ambiguous
 }
 
 // Union schema name -> (file, definition line) across every file's `schema_locations`
@@ -260,10 +366,14 @@ pub(crate) fn compute_all_schema_locations(
     files: &HashMap<String, IndexEntry>,
 ) -> HashMap<String, (String, usize)> {
     let mut all_schema_locations: HashMap<String, (String, usize)> = HashMap::new();
+    let ambiguous = ambiguous_schema_names(files);
     let mut ordered: Vec<(&String, &IndexEntry)> = files.iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
     for (_, entry) in ordered {
         for (name, loc) in &entry.schema_locations {
+            if ambiguous.contains(name) {
+                continue;
+            }
             all_schema_locations
                 .entry(name.clone())
                 .or_insert_with(|| loc.clone());
@@ -275,7 +385,7 @@ pub(crate) fn compute_all_schema_locations(
 // ── Index cache ────────────────────────────────────────────────────────────────
 
 // Bump when the cached representation changes shape.
-const INDEX_CACHE_FORMAT: u32 = 3;
+const INDEX_CACHE_FORMAT: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct CachedFile {
@@ -742,6 +852,41 @@ fn module_exports_and_imports(
     (exports, imports, module_aliases)
 }
 
+fn import_targets(module: &ruff_python_ast::ModModule) -> Vec<(u32, String)> {
+    let mut targets = Vec::new();
+    for stmt in crate::linter::top_level_and_type_checking_stmts(module) {
+        match stmt {
+            Stmt::Import(import) => {
+                targets.extend(import.names.iter().map(|a| (0, a.name.to_string())));
+            }
+            Stmt::ImportFrom(import) => {
+                let module = import
+                    .module
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default();
+                for alias in &import.names {
+                    if alias.name.as_str() != "*" {
+                        targets.push((import.level, join_module(&module, alias.name.as_str())));
+                    }
+                }
+                targets.push((import.level, module));
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// `package.name`, or `name` alone for a bare relative import (`from . import name`).
+pub(crate) fn join_module(package: &str, name: &str) -> String {
+    if package.is_empty() {
+        name.to_string()
+    } else {
+        format!("{package}.{name}")
+    }
+}
+
 /// The index entry for `source` (the contents of `path`), the external-package candidates
 /// it names, and whether the result depends on nothing but `source` -- `false` when
 /// indexing read another file (a `.sql` file), so a cached copy could go stale without
@@ -762,11 +907,17 @@ pub(crate) fn index_source(
     let parsed_module = ruff_python_parser::parse_module(source).ok();
     let no_imports = crate::static_eval::ImportedModules::new();
     let mut as_written = None;
+    let mut targets = Vec::new();
+    let mut foreign_writes = Vec::new();
     if let Some(parsed) = &parsed_module {
         let module = parsed.syntax();
+        targets = import_targets(module);
         let analysis = crate::static_eval::Analysis::build(module, &no_imports);
         let eval = crate::static_eval::export_module(&analysis, source);
+        foreign_writes = analysis.foreign_writes.clone();
         analysis.reset();
+        linter.contract_targets = crate::linter::contract_targets(&analysis, module);
+        linter.contract_targets_ready = true;
         let usages = crate::helpers::module_param_usages_in(&analysis, module);
         analysis.reset();
         let folds = crate::static_eval::plan_folds(module, &analysis);
@@ -836,6 +987,7 @@ pub(crate) fn index_source(
             } else {
                 def_line
             };
+            let straight = linter.straight_line_functions.contains(&name);
             (
                 name,
                 IndexFunction {
@@ -847,6 +999,8 @@ pub(crate) fn index_source(
                     delegates,
                     param_schema_name,
                     param_governed,
+                    straight,
+                    requires_certain: false,
                     helper_summary,
                 },
             )
@@ -913,6 +1067,37 @@ pub(crate) fn index_source(
         }
     }
 
+    let mut contracts = HashMap::new();
+    let mut contract_forwards = Vec::new();
+    for (key, contract) in linter.local_contracts {
+        if key
+            .0
+            .as_ref()
+            .is_some_and(|c| linter.protocol_classes.contains(c))
+        {
+            continue;
+        }
+        let name = crate::call_contracts::index_key(&key);
+        let loose = key.0.is_none()
+            && (linter.requires.contains_key(&key.1) || linter.delegates.contains_key(&key.1));
+        if contract.has_requirements() || !contract.forwards.is_empty() || loose {
+            for forward in &contract.forwards {
+                contract_forwards.push((name.clone(), forward.clone()));
+            }
+            contracts.insert(name, contract);
+        }
+    }
+    let mut protocol_classes: Vec<String> = linter.protocol_classes.iter().cloned().collect();
+    protocol_classes.sort();
+    let class_method_names = linter
+        .class_method_names
+        .into_iter()
+        .map(|(class, methods)| {
+            let mut methods: Vec<String> = methods.into_iter().collect();
+            methods.sort();
+            (class, methods)
+        })
+        .collect();
     Some((
         IndexEntry {
             schemas,
@@ -925,7 +1110,13 @@ pub(crate) fn index_source(
             class_bases: linter.class_bases,
             class_helper_summaries,
             eval,
+            foreign_writes,
+            import_targets: targets,
             call_sites,
+            contracts,
+            contract_forwards,
+            class_method_names,
+            protocol_classes,
         },
         external_package_candidates,
         !depends_on_other_files,
@@ -1042,7 +1233,7 @@ fn build_index_inner(
         &indexer,
     );
     indexer.save(true);
-    finalise_index(project_root, files, with_callers)
+    finalise_index(project_root, files, true, with_callers)
 }
 
 // A configured `exclude` REPLACES DEFAULT_EXCLUDED_DIRS entirely -- it does not add to
@@ -1085,6 +1276,58 @@ pub(crate) fn index_traced_external_packages(
     }
 }
 
+// A constant another indexed file may change (`COLS.append(..)` after importing it, or
+// `cfg.NAME = ..`) is no longer offered to importers; through re-exports too.
+fn apply_foreign_writes(project_root: &Path, files: &mut HashMap<String, IndexEntry>) {
+    let no_excluded = std::collections::HashSet::new();
+    let mut removals: Vec<(String, String, bool)> = Vec::new();
+    for (importer, entry) in files.iter_mut() {
+        let writes = std::mem::take(&mut entry.foreign_writes);
+        for write in writes {
+            let Some(target) = resolve_import_path(
+                write.level,
+                &write.module,
+                Path::new(importer),
+                project_root,
+                &no_excluded,
+            ) else {
+                continue;
+            };
+            if let Some(target) = target.to_str() {
+                removals.push((target.to_string(), write.name, write.rebinds));
+            }
+        }
+    }
+    for (file, name, rebinds) in removals {
+        let mut at = (file, name);
+        for _ in 0..4 {
+            let Some(entry) = files.get_mut(&at.0) else {
+                break;
+            };
+            let mutable = entry
+                .eval
+                .constants
+                .get(&at.1)
+                .is_some_and(|v| !v.is_immutable());
+            if rebinds || mutable {
+                entry.eval.constants.remove(&at.1);
+            }
+            let Some((level, module, imported)) = entry.eval.reexports.get(&at.1).cloned() else {
+                break;
+            };
+            let Some(next) =
+                resolve_import_path(level, &module, Path::new(&at.0), project_root, &no_excluded)
+            else {
+                break;
+            };
+            let Some(next) = next.to_str() else {
+                break;
+            };
+            at = (next.to_string(), imported);
+        }
+    }
+}
+
 // Final resolution pass, shared by the whole-project and single-file entry points.
 // Every step here is a fold over the `files` map that was handed in — it never goes
 // looking for more files — so it costs whatever that map contains and nothing more,
@@ -1093,19 +1336,30 @@ pub(crate) fn finalise_index(
     project_root: &Path,
     mut files: HashMap<String, IndexEntry>,
     whole_project: bool,
+    with_callers: bool,
 ) -> ProjectIndex {
+    apply_foreign_writes(project_root, &mut files);
     let all_schemas = compute_all_schemas(&files);
     let all_schema_locations = compute_all_schema_locations(&files);
     resolve_param_schema_requires(&mut files, &all_schemas);
     resolve_transitive_requires(project_root, &mut files);
+    resolve_contract_forwards(project_root, &mut files);
+    let method_agreement = if whole_project {
+        resolve_method_agreement(&files)
+    } else {
+        HashMap::new()
+    };
+    let overridden = resolve_overridden_methods(&files);
     resolve_transitive_helper_summaries(project_root, &mut files);
     let governed = resolve_param_governed_call_sites(project_root, &files);
     let called_functions = resolve_called_functions(project_root, &files);
     // Served their purpose: the index that goes on to the checks does not carry them.
     for entry in files.values_mut() {
         entry.call_sites = CallSites::default();
+        entry.class_method_names = HashMap::new();
+        entry.protocol_classes = Vec::new();
     }
-    let call_usage = if whole_project {
+    let call_usage = if with_callers {
         resolve_call_usage(&files)
     } else {
         HashMap::new()
@@ -1119,6 +1373,10 @@ pub(crate) fn finalise_index(
         resolved_governed: governed.resolved_governed,
         called_functions,
         call_usage,
+        method_agreement,
+        overridden,
+        exports_memo: ExportsMemo::default(),
+        package_roots: crate::config::PackageRoots::default(),
     }
 }
 
@@ -1189,6 +1447,40 @@ pub(crate) fn resolve_first_party_module_path(
     (!under_excluded_dir).then_some(candidate)
 }
 
+// The file `from <dots><name> import ...` / `import <name>` in `importer` loads: relative to
+// the importer, or under the project root, else under the importer's own `package_root`.
+fn resolve_import_path(
+    level: u32,
+    name: &str,
+    importer: &Path,
+    project_root: &Path,
+    excluded_dirs: &std::collections::HashSet<String>,
+) -> Option<PathBuf> {
+    if level == 0 {
+        if name.is_empty() {
+            return None;
+        }
+        return resolve_first_party_module_path(name, project_root, excluded_dirs).or_else(|| {
+            let own = crate::config::package_root(importer);
+            (own != project_root)
+                .then(|| resolve_first_party_module_path(name, &own, excluded_dirs))
+                .flatten()
+        });
+    }
+    let mut dir = importer.parent()?;
+    for _ in 1..level {
+        dir = dir.parent()?;
+    }
+    let base = if name.is_empty() {
+        dir.to_path_buf()
+    } else {
+        dir.join(name.replace('.', "/"))
+    };
+    [base.with_extension("py"), base.join("__init__.py")]
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
 // Build a ProjectIndex scoped to ONE file: the file itself, the project-local modules
 // its own `import` / `from ... import ...` statements reach (transitively, bounded by
 // MAX_SINGLE_FILE_IMPORT_DEPTH and MAX_SINGLE_FILE_INDEXED_FILES), and any external
@@ -1203,11 +1495,7 @@ pub(crate) fn resolve_first_party_module_path(
 // `finalise_index`'s cross-file resolution — are shared verbatim, since both are folds
 // over whatever file set they're handed.
 //
-// Returns `None` when there is no project root at all (no `pyproject.toml` anywhere
-// above the file). That is not an error: without a root there is no place to resolve a
-// project-local import against and no `.venv` to find installed packages in, so the
-// caller falls back to the same no-index behaviour it had before, having genuinely
-// tried first.
+// Without a `pyproject.toml` above the file, imports resolve from its `package_root`.
 #[cfg(test)]
 pub(crate) fn build_single_file_index_internal(file_path: &Path) -> Option<ProjectIndex> {
     build_single_file_index_cached(file_path, None)
@@ -1218,7 +1506,7 @@ pub(crate) fn build_single_file_index_cached(
     file_path: &Path,
     cache_dir: Option<&Path>,
 ) -> Option<ProjectIndex> {
-    let project_root = find_project_root_opt(file_path)?;
+    let project_root = crate::config::import_root(file_path);
     let config = load_linter_config(&project_root);
     let indexer = FileIndexer::new(&project_root, &config, cache_dir);
     let excluded_dirs = resolve_excluded_dirs(&config);
@@ -1241,16 +1529,15 @@ pub(crate) fn build_single_file_index_cached(
             continue;
         };
         discovered_candidates.extend(candidates);
-        // Only absolute imports are followed. A relative import (`from .schemas import
-        // UserSchema`) is skipped by `index_file` itself and, more to the point, by
-        // `load_cross_file_symbols` at check time — so its target could never be looked
-        // up even if it were indexed here.
         if depth < MAX_SINGLE_FILE_IMPORT_DEPTH {
-            let imported_modules = entry.imports.values().chain(entry.module_aliases.values());
-            for module_name in imported_modules {
-                let Some(target) =
-                    resolve_first_party_module_path(module_name, &project_root, &excluded_dirs)
-                else {
+            for (level, module_name) in &entry.import_targets {
+                let Some(target) = resolve_import_path(
+                    *level,
+                    module_name,
+                    &current,
+                    &project_root,
+                    &excluded_dirs,
+                ) else {
                     continue;
                 };
                 if seen.insert(target.clone()) {
@@ -1271,7 +1558,7 @@ pub(crate) fn build_single_file_index_cached(
         &indexer,
     );
     indexer.save(false);
-    Some(finalise_index(&project_root, files, false))
+    Some(finalise_index(&project_root, files, false, false))
 }
 
 // Resolve each function's `param_schema_name` (the schema its first parameter is
@@ -1297,6 +1584,7 @@ pub(crate) fn resolve_param_schema_requires(
                 cols.sort();
                 cols.dedup();
                 func.requires = cols;
+                func.straight = true;
             }
         }
     }
@@ -1335,6 +1623,26 @@ pub(crate) fn resolve_module_file(
         .filter_map(|p| p.to_str())
         .find(|p| files.contains_key(*p))
         .map(str::to_string)
+}
+
+// `resolve_module_file`, falling back to the importer's own `package_root` when the
+// project root (a `pyproject.toml` above code that is not on its import path) misses. The
+// importer's root is walked once per `own_root` and once per directory in `roots`.
+pub(crate) fn resolve_module_file_with_root(
+    module_name: &str,
+    project_root: &Path,
+    importer: Option<&Path>,
+    own_root: &std::cell::OnceCell<PathBuf>,
+    roots: &crate::config::PackageRoots,
+    files: &HashMap<String, IndexEntry>,
+) -> Option<String> {
+    resolve_module_file(module_name, project_root, files).or_else(|| {
+        let importer = importer?;
+        let own = own_root.get_or_init(|| roots.of_file(importer));
+        (own != project_root)
+            .then(|| resolve_module_file(module_name, own, files))
+            .flatten()
+    })
 }
 
 // Resolve a delegate call target (a bare name, as written at the call site) to the
@@ -1597,7 +1905,11 @@ fn collect_call_sites(
                 for body_stmt in &class_def.body {
                     if let Stmt::FunctionDef(func_def) = body_stmt {
                         if func_def.name.as_str() == "__init__" {
-                            collect_self_attr_origins(&func_def.body, &mut class_self_attrs);
+                            collect_self_attr_origins(
+                                &func_def.body,
+                                &annotated_param_origins(func_def),
+                                &mut class_self_attrs,
+                            );
                         }
                     }
                 }
@@ -1999,6 +2311,16 @@ pub(crate) fn resolve_transitive_requires(
         resolved.push((node, r));
     }
 
+    let mut certain_memo: HashMap<FuncNode, bool> = HashMap::new();
+    let certain: Vec<(FuncNode, bool)> = resolved
+        .iter()
+        .map(|(node, _)| {
+            let mut visiting = std::collections::HashSet::new();
+            let c =
+                resolve_node_certain(node, project_root, files, &mut certain_memo, &mut visiting);
+            (node.clone(), c)
+        })
+        .collect();
     for ((file, func), reqs) in resolved {
         if let Some(entry) = files.get_mut(&file) {
             if let Some(f) = entry.functions.get_mut(&func) {
@@ -2006,6 +2328,208 @@ pub(crate) fn resolve_transitive_requires(
             }
         }
     }
+    for ((file, func), c) in certain {
+        if let Some(f) = files
+            .get_mut(&file)
+            .and_then(|e| e.functions.get_mut(&func))
+        {
+            f.requires_certain = c;
+        }
+    }
+}
+
+// Whether a function and everything it delegates to are straight-line (see
+// `IndexFunction::straight`); a cycle counts as not.
+fn resolve_node_certain(
+    node: &FuncNode,
+    project_root: &Path,
+    files: &HashMap<String, IndexEntry>,
+    memo: &mut HashMap<FuncNode, bool>,
+    visiting: &mut std::collections::HashSet<FuncNode>,
+) -> bool {
+    if let Some(&done) = memo.get(node) {
+        return done;
+    }
+    if !visiting.insert(node.clone()) {
+        return false;
+    }
+    let certain = files
+        .get(&node.0)
+        .and_then(|e| e.functions.get(&node.1))
+        .is_some_and(|func| {
+            func.straight
+                && func.delegates.iter().all(|name| {
+                    resolve_delegate_target(&node.0, name, project_root, files).is_none_or(
+                        |target| resolve_node_certain(&target, project_root, files, memo, visiting),
+                    )
+                })
+        });
+    visiting.remove(node);
+    memo.insert(node.clone(), certain);
+    certain
+}
+
+// Folds into each contract what a function of another file requires of a parameter handed
+// straight on to it (one level: the callee's own contract as its file computed it), and the
+// first parameter's transitive requirement from `resolve_transitive_requires`.
+pub(crate) fn resolve_contract_forwards(
+    project_root: &Path,
+    files: &mut HashMap<String, IndexEntry>,
+) {
+    use crate::call_contracts::ForwardTarget;
+    let mut updates: Vec<(String, String, crate::call_contracts::FuncContract)> = Vec::new();
+    for (file, entry) in files.iter() {
+        for (key, forward) in &entry.contract_forwards {
+            let target = match &forward.target {
+                ForwardTarget::Imported(name) => entry
+                    .imports
+                    .get(name)
+                    .and_then(|module| resolve_module_file(module, project_root, files))
+                    .map(|target_file| (target_file, name.clone())),
+                ForwardTarget::Module(alias, name) => {
+                    resolve_module_call_target(file, alias, name, project_root, files)
+                }
+                _ => None,
+            };
+            let Some(callee) = target.and_then(|(f, name)| files.get(&f)?.contracts.get(&name))
+            else {
+                continue;
+            };
+            let base = updates
+                .iter()
+                .rposition(|(f, k, _)| f == file && k == key)
+                .map(|i| updates[i].2.clone())
+                .or_else(|| entry.contracts.get(key).cloned());
+            if let Some(mut contract) = base {
+                contract.inherit(forward, callee);
+                updates.push((file.clone(), key.clone(), contract));
+            }
+        }
+    }
+    for entry in files.values_mut() {
+        entry.contract_forwards = Vec::new();
+    }
+    for (file, key, contract) in updates {
+        if let Some(slot) = files.get_mut(&file).and_then(|e| e.contracts.get_mut(&key)) {
+            *slot = contract;
+        }
+    }
+    // `requires` is keyed by bare name, so it describes a module function only when no
+    // method of the file shares the name; and it counts only when no guard can skip a read.
+    for entry in files.values_mut() {
+        let method_names: std::collections::HashSet<&str> = entry
+            .contracts
+            .keys()
+            .filter_map(|k| k.split_once('.').map(|(_, m)| m))
+            .chain(
+                entry
+                    .class_method_names
+                    .values()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .collect();
+        let mut merged: Vec<(String, Vec<String>)> = Vec::new();
+        for (key, contract) in &entry.contracts {
+            if key.contains('.')
+                || method_names.contains(key.as_str())
+                || contract.loose_param.is_none()
+            {
+                continue;
+            }
+            if let Some(function) = entry.functions.get(key) {
+                if function.requires_certain && !function.requires.is_empty() {
+                    merged.push((key.clone(), function.requires.clone()));
+                }
+            }
+        }
+        for (key, requires) in merged {
+            if let Some(contract) = entry.contracts.get_mut(&key) {
+                if let Some(param) = contract.loose_param {
+                    contract.add_required(param, &requires);
+                }
+            }
+        }
+        entry.contracts.retain(|_, c| c.has_requirements());
+    }
+}
+
+// See `ProjectIndex::overridden`. Bases are matched by name across files, so two classes
+// sharing a name only make more methods count as overridden.
+pub(crate) fn resolve_overridden_methods(
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, Vec<(String, String)>> {
+    let mut bases: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in files.values() {
+        for (class, parents) in &entry.class_bases {
+            bases
+                .entry(class.clone())
+                .or_default()
+                .extend(parents.iter().cloned());
+        }
+    }
+    let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (file, entry) in files {
+        for (class, methods) in &entry.class_method_names {
+            for ancestor in crate::frame_ops::class_chain(&bases, class)
+                .into_iter()
+                .skip(1)
+            {
+                let slot = out.entry(ancestor).or_default();
+                slot.extend(methods.iter().map(|m| (m.clone(), file.clone())));
+            }
+        }
+    }
+    out
+}
+
+// For each method name, the requirement shared by every class in the project defining it
+// (a class without a contract for it requires nothing), when there is one.
+pub(crate) fn resolve_method_agreement(
+    files: &HashMap<String, IndexEntry>,
+) -> HashMap<String, (crate::call_contracts::FuncContract, String)> {
+    let mut seen: HashMap<&str, Option<(&crate::call_contracts::FuncContract, &str)>> =
+        HashMap::new();
+    // Sorted so the "e.g." location in messages is stable across runs.
+    let mut ordered: Vec<(&String, &IndexEntry)> = files.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (file, entry) in ordered {
+        let mut classes: Vec<(&String, &Vec<String>)> = entry.class_method_names.iter().collect();
+        classes.sort_by(|a, b| a.0.cmp(b.0));
+        for (class, methods) in classes {
+            if entry.protocol_classes.contains(class) {
+                continue;
+            }
+            for method in methods {
+                let contract = entry.contracts.get(&format!("{class}.{method}"));
+                let agreed = match (seen.get(method.as_str()), contract) {
+                    (None, Some(c)) => Some((c, file.as_str())),
+                    (Some(Some((first, at))), Some(c)) if first.agrees_with(c) => {
+                        Some((*first, *at))
+                    }
+                    _ => None,
+                };
+                seen.insert(method.as_str(), agreed);
+            }
+        }
+    }
+    seen.into_iter()
+        .filter_map(|(method, agreed)| {
+            let (contract, file) = agreed?;
+            contract.has_requirements().then(|| {
+                (
+                    method.to_string(),
+                    (
+                        contract.clone(),
+                        format!(
+                            "every '{method}' in the project (e.g. {file}:{})",
+                            contract.def_line
+                        ),
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 // Resolve every function's and self-method's `helper_summary` to what it actually does
@@ -2660,7 +3184,13 @@ mod tests {
                 class_bases: HashMap::new(),
                 class_helper_summaries: HashMap::new(),
                 eval: Default::default(),
+                foreign_writes: Vec::new(),
+                import_targets: Vec::new(),
                 call_sites: CallSites::default(),
+                contracts: HashMap::new(),
+                contract_forwards: Vec::new(),
+                class_method_names: HashMap::new(),
+                protocol_classes: Vec::new(),
             },
         );
         let candidates: std::collections::HashSet<String> =
@@ -3181,6 +3711,30 @@ def run(path: str) -> None:
     }
 
     #[test]
+    fn test_should_not_resolve_a_schema_name_two_packages_define_differently() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let schema = |extra: &str| {
+            format!(
+                "from typedframes import BaseSchema, Column\n\n\nclass TestRaw(BaseSchema):\n    uid = Column()\n{extra}\n\n\nclass Same(BaseSchema):\n    a = Column()\n"
+            )
+        };
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/schema.py"), schema("    x1 = Column()")).unwrap();
+        fs::write(root.join("b/schema.py"), schema("    Age = Column()")).unwrap();
+
+        // act
+        let index = build_index_internal(root);
+
+        // assert
+        assert!(!index.all_schemas.contains_key("TestRaw"));
+        assert!(!index.all_schema_locations.contains_key("TestRaw"));
+        assert!(index.all_schemas.contains_key("Same"));
+    }
+
+    #[test]
     fn test_should_not_index_project_files_the_checked_file_never_references() {
         // The whole point of single-file mode: cost proportional to what the checked
         // file references, not to what the project contains. An unrelated file sitting
@@ -3418,17 +3972,26 @@ class Pipeline:
     }
 
     #[test]
-    fn test_should_skip_single_file_indexing_when_there_is_no_project_root() {
-        // A lone script with no pyproject.toml anywhere above it has no root to
-        // resolve imports against and no .venv to find packages in. Skipping is the
-        // documented graceful outcome (the caller falls back to no index at all), not
-        // an error.
+    fn test_should_index_a_lone_script_s_sibling_imports_without_a_project_root() {
+        // arrange: no pyproject.toml; Python would import `schemas` from the script's own
+        // directory, and `cols` relative to the package.
         let dir = tempfile::tempdir().unwrap();
         let lone = dir.path().join("lone_script.py");
-        fs::write(&lone, "from schemas import UserSchema\n").unwrap();
+        fs::write(&lone, "from schemas import A\nfrom pkg.use import B\n").unwrap();
+        fs::write(dir.path().join("schemas.py"), "A = 'a'\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkg")).unwrap();
+        fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+        fs::write(dir.path().join("pkg/use.py"), "from .cols import B\n").unwrap();
+        fs::write(dir.path().join("pkg/cols.py"), "B = 'b'\n").unwrap();
 
-        // act / assert
-        assert!(build_single_file_index_internal(&lone).is_none());
+        // act
+        let index = build_single_file_index_internal(&lone).expect("indexed");
+
+        // assert
+        for file in ["schemas.py", "pkg/use.py", "pkg/cols.py"] {
+            let path = dir.path().join(file);
+            assert!(index.files.contains_key(path.to_str().unwrap()), "{file}");
+        }
     }
 
     #[test]

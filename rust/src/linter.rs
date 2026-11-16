@@ -11,19 +11,23 @@ use crate::constants::{
     SQL_LOAD_FUNCTIONS,
 };
 use crate::errors::{
-    is_line_ignored, CODE_ASSUMED_CONSTANT, CODE_DROPPED_UNKNOWN_COLUMN, CODE_MISSING_COLUMN,
-    CODE_RESERVED_NAME, CODE_UNKNOWN_COLUMN, CODE_UNRESOLVED_SCHEMA, CODE_UNTRACKED_DATAFRAME,
-    CODE_UNVERIFIABLE_COLUMN,
+    is_line_ignored_in, CODE_ASSUMED_CONSTANT, CODE_DROPPED_UNKNOWN_COLUMN, CODE_LIKELY_TYPO,
+    CODE_MISSING_COLUMN, CODE_READ_BEFORE_ASSIGNMENT, CODE_RESERVED_NAME, CODE_UNKNOWN_COLUMN,
+    CODE_UNRESOLVED_SCHEMA, CODE_UNTRACKED_DATAFRAME, CODE_UNVERIFIABLE_COLUMN,
 };
 use crate::errors::{DataFrameCallSite, LegEvent, LintError, TypedSite, UntypedSite};
 use crate::frame_ops::{
     apply_edits, class_chain, classify_rhs, column_write_target, describe_rhs,
-    inplace_drop_columns, inplace_rename_mapping, keyword, resolve_delegates, summarize_helper,
-    ColumnEdit, FnKey, HelperSummary, InplaceColumns, Kind,
+    dynamic_column_write_receiver, inplace_drop_columns, inplace_literal, inplace_rename_mapping,
+    keyword, merged_columns, resolve_delegates, row_insert_receiver, summarize_helper, ColumnEdit,
+    FnKey, HelperSummary, InplaceColumns, Kind, Merged,
 };
-use crate::index::{resolve_module_file, IndexEntry, ProjectIndex};
+use crate::index::{resolve_module_file_with_root, IndexEntry, ProjectIndex};
 use crate::typo::find_best_match;
-use crate::{ast_extract, column_usage, contract, helpers, sql, static_eval, suggest};
+use crate::{
+    ast_extract, call_contracts, column_usage, contract, helpers, query_names, sql, static_eval,
+    suggest,
+};
 use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
 use ruff_python_parser::{parse, parse_module, Mode, ParseOptions};
@@ -373,10 +377,63 @@ pub(crate) struct PendingPassthroughReversal {
 /// definitions, `del` statements).  `visit_expr` handles expression-level column access
 /// checks (`df["col"]`, `df.col`, `pl.col("col")`).  Both methods recurse into child
 /// nodes manually rather than using a trait-based visitor, keeping control flow explicit.
+// The result of a polars frame operation the checker can follow: the columns it reads
+// from each frame (frame variable, column names) and the columns it produces.
+struct PolarsJoin {
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+    columns: Vec<String>,
+}
+
+struct PolarsFrameOp {
+    reads: Vec<(String, Vec<String>)>,
+    columns: Vec<String>,
+}
+
+fn imports_only_polars(body: &[Stmt]) -> bool {
+    let imports = |module: &str| {
+        body.iter().any(|stmt| match stmt {
+            Stmt::Import(import) => import
+                .names
+                .iter()
+                .any(|a| a.name.as_str().split('.').next() == Some(module)),
+            Stmt::ImportFrom(import) => import
+                .module
+                .as_ref()
+                .is_some_and(|m| m.as_str().split('.').next() == Some(module)),
+            _ => false,
+        })
+    };
+    imports("polars") && !imports("pandas")
+}
+
+/// Where a column was first read: the statement counter, line and column.
+type FirstRead = (usize, usize, usize);
+
+/// A DataFrame the checker knows to be one but not the columns of, with the columns it knows
+/// the frame certainly does not have: a name dropped, renamed away or replaced since its
+/// load. Only unconditional edits are recorded, so each entry is a fact about every path.
+#[derive(Clone, Default)]
+struct OpenFrame {
+    depth: usize,
+    // Column -> why it is gone and the line that removed it.
+    absent: HashMap<String, (String, usize)>,
+    // Columns assigned (or read off a frame that already had them) at any point so far.
+    written: std::collections::HashSet<String>,
+}
+
+struct LoopBinding {
+    names: Vec<String>,
+    rows: Vec<Vec<static_eval::Value>>,
+}
+
 pub struct Linter {
     pub(crate) schemas: HashMap<String, Vec<String>>,
     pub(crate) variables: HashMap<String, (String, usize)>, // var_name -> (schema_name, defined_at_line)
     pub(crate) functions: HashMap<String, String>, // func_name -> schema_name (from return type)
+    // A function of this file returning a tuple: the schema of each element that is a frame
+    // with known columns.
+    tuple_functions: HashMap<String, Vec<Option<String>>>,
     pub(crate) schema_origins: HashMap<String, String>, // inferred schema name -> "func (path:line)"
     // Named schema (BaseSchema subclass / SQLAlchemy declarative model) name -> (file
     // its class is defined in, definition line). Populated wherever `self.schemas`
@@ -386,8 +443,9 @@ pub struct Linter {
     // be an entirely different file than wherever the erroring variable was bound.
     pub(crate) schema_locations: HashMap<String, (String, usize)>,
     pub(crate) requires: HashMap<String, (Vec<String>, usize)>, // func_name -> (direct required cols on 1st param, def line)
+    // Functions in `requires` whose body is straight-line (`call_contracts::is_straight_line`).
+    pub(crate) straight_line_functions: std::collections::HashSet<String>,
     pub(crate) delegates: HashMap<String, Vec<String>>, // func_name -> names called with its own (tainted) param forwarded
-    pub(crate) param_requires: HashMap<String, (Vec<String>, String)>, // func_name -> (required cols, origin "func (path:line)")
     pub(crate) param_schema_names: HashMap<String, (String, usize)>, // func_name -> (first-param schema annotation name, def line)
     pub(crate) line_index: Option<LineIndex>,
     pub(crate) source: String,
@@ -495,6 +553,71 @@ pub struct Linter {
     // Set once indexing reads a file other than the one being checked (a `.sql` file), so
     // a cached result for this file can't be trusted to track its own contents alone.
     pub(crate) read_external_file: std::cell::Cell<bool>,
+    // The frame each unresolved schema leg descends from, and the frames already reported
+    // as unverifiable: one `unverifiable-column` per frame, not one per use.
+    unresolved_root: HashMap<String, String>,
+    // Unresolved legs that still know some columns the frame certainly has (what it had before a
+    // write under a computed name), so a read of one of those is not reported as unverifiable.
+    partial_columns: HashMap<String, Vec<String>>,
+    // The enclosing `for` loops that run over a fixed list: the names bound and each iteration's values.
+    loop_bindings: Vec<LoopBinding>,
+    // The file imports polars and not pandas, so a method both libraries have (`join`) is
+    // read the polars way.
+    polars_only_file: bool,
+    // Names that always hold a polars frame, for the methods both libraries have.
+    polars_names: std::collections::HashSet<String>,
+    // Every column name a frame of this file is known to have, once the walk is done.
+    known_columns: Vec<String>,
+    reported_unverifiable: std::cell::RefCell<std::collections::HashSet<String>>,
+    // Schema name -> the index levels of a frame that groupby/pivot_table gave a named index,
+    // which `reset_index()` turns back into columns.
+    schema_index: HashMap<String, Vec<String>>,
+    // Schemas of frames given an index whose names are not known (`index=idx`,
+    // `df.index.name = name`): any argument name may be an index level.
+    unknown_index: std::collections::HashSet<String>,
+    // DataFrames known only by name, in the scope being visited -- see `OpenFrame`.
+    open_frames: HashMap<String, OpenFrame>,
+    // (block depth, name, outer value) of open frames rebound inside a nested block.
+    shadowed_frames: Vec<(usize, String, OpenFrame)>,
+    // How many blocks (branch, loop, `with`, `try`, function) deep the statement being
+    // visited is, and which statement of the file it is.
+    block_depth: usize,
+    stmt_counter: usize,
+    // (frame, column) -> (statement, line, col) of the first read of a column the frame was
+    // not known to have, for the read-before-assignment warning.
+    open_reads: std::cell::RefCell<HashMap<(String, String), FirstRead>>,
+    // (line, col, column) of every literal column read off a frame whose columns are unknown,
+    // for `likely-column-typo`.
+    unknown_frame_reads: std::cell::RefCell<Vec<(usize, usize, String)>>,
+    // Calls already checked against a callee's parameter contract, by (file, offset): the
+    // statement-level check and the nested-call walk both reach a call written in place.
+    contract_calls_checked: std::cell::RefCell<std::collections::HashSet<(String, u32)>>,
+    // Column requirements per parameter (see `call_contracts`), keyed like helper summaries:
+    // `(None, f)` for this file's functions, `(Some(Class), m)` for methods, and
+    // `(Some(IMPORTED_SLOT), local)` / `(Some("module:alias"), f)` for imported ones.
+    contracts: HashMap<FnKey, (call_contracts::FuncContract, String)>,
+    // This file's own contracts, with forwards only the project index can resolve.
+    pub(crate) local_contracts: HashMap<FnKey, call_contracts::FuncContract>,
+    pub(crate) imported_contracts: HashMap<FnKey, (call_contracts::FuncContract, String)>,
+    // Callee position -> contract key, for calls whose name binds to one function or module.
+    pub(crate) contract_targets: HashMap<u32, FnKey>,
+    // Set when `contract_targets` was already built from the module as written.
+    pub(crate) contract_targets_ready: bool,
+    // Methods each class of this file defines, and which classes are protocols.
+    pub(crate) class_method_names: HashMap<String, std::collections::HashSet<String>>,
+    pub(crate) protocol_classes: std::collections::HashSet<String>,
+    // Class -> the classes of this file that have it among their ancestors.
+    subclasses: HashMap<String, Vec<String>>,
+    // Class -> methods a class of another file overrides on it (see `ProjectIndex::overridden`).
+    overridden_elsewhere: HashMap<String, std::collections::HashSet<String>>,
+    // Requirement every implementor in the project agrees on, by method name.
+    method_agreement: HashMap<String, (call_contracts::FuncContract, String)>,
+    method_contract_memo: std::cell::RefCell<HashMap<FnKey, Option<FnKey>>>,
+    // Undefined members of string enums, found before folding replaced the defined ones.
+    missing_enum_members: Vec<static_eval::MissingMember>,
+    // The value of the assignment being visited was already checked, against the frames as
+    // they were before the statement rebound one of them.
+    value_checked_early: bool,
     // Libraries of functions imported from other project files, by name, from the index.
     imported_function_libraries: HashMap<String, suggest::Library>,
     // What functions imported from other project files do with their parameters, by local
@@ -611,6 +734,11 @@ pub struct Linter {
     // (`loader = Loader()`) -- so `source.load()` can be resolved against that class's
     // methods. Per function; a nested function starts from its enclosing function's.
     pub(crate) receiver_classes: HashMap<String, String>,
+    // Pydantic models and dataclasses defined in this file, by name, with their field names;
+    // and the parameters of the function being visited annotated with one, so
+    // `pd.DataFrame([txn.model_dump()])` has the model's fields as its columns.
+    record_fields: HashMap<String, Vec<String>>,
+    record_params: HashMap<String, String>,
     // Instance attribute name -> class name, for `self.<attr> = <ClassName>(...)` /
     // `self.<attr> = <module>.<ClassName>(...)` assignments found in the CURRENTLY
     // VISITED class's own `__init__`. Populated by a pre-scan in the `Stmt::ClassDef`
@@ -637,6 +765,8 @@ pub struct Linter {
     // never to resolve an actual column set (that precision lives in
     // `current_self_attrs`/`class_methods`, both unaffected by this field).
     pub(crate) all_self_attr_origins: HashMap<String, SelfAttrOrigin>,
+    // Frames stored on `self`, by the start of each method they are rewritten in.
+    method_frames: crate::self_frames::MethodFrames,
     // Class name -> {method name -> return schema name}, for every class VISITED SO
     // FAR in this file (top-to-bottom, like every other map this checker builds while
     // walking a file -- a class defined textually AFTER its use isn't in here yet,
@@ -656,6 +786,122 @@ pub struct Linter {
     // Base-class names of every class defined in this file, so an inherited method can be
     // found. Populated before the walk, so a class may inherit from one defined later.
     pub(crate) class_bases: HashMap<String, Vec<String>>,
+}
+
+// Which argument of an `.assign()` / `.with_columns()` call has no readable output name, for the
+// explain row.
+fn unnamed_argument_hint(call: &ast::ExprCall) -> String {
+    if call.arguments.keywords.iter().any(|k| k.arg.is_none()) {
+        return "a `**` mapping".to_string();
+    }
+    for arg in &call.arguments.args {
+        match arg {
+            Expr::Starred(_) => return "a `*` argument".to_string(),
+            Expr::List(_) | Expr::Tuple(_) => return "a list of expressions".to_string(),
+            Expr::Name(n) => return format!("the variable `{}`", n.id),
+            other if ast_extract::pl_expr_output_name(other).is_none() => {
+                return "an expression without a literal `.alias()`".to_string()
+            }
+            _ => {}
+        }
+    }
+    "an argument".to_string()
+}
+
+// One `untracked-dataframe` warning per distinct message in a file, with how many more there were:
+// the advice is the same for every site, and the sites are listed by `--coverage-detail`.
+fn collapse_repeated_untracked_warnings(errors: &mut Vec<LintError>) {
+    let mut first: HashMap<String, usize> = HashMap::new();
+    let mut repeats: HashMap<usize, usize> = HashMap::new();
+    let mut drop = Vec::new();
+    for (index, e) in errors.iter().enumerate() {
+        if e.code != CODE_UNTRACKED_DATAFRAME {
+            continue;
+        }
+        match first.get(&e.message) {
+            Some(&kept) => {
+                *repeats.entry(kept).or_default() += 1;
+                drop.push(index);
+            }
+            None => {
+                first.insert(e.message.clone(), index);
+            }
+        }
+    }
+    for (kept, count) in repeats {
+        let noun = if count == 1 { "site" } else { "sites" };
+        errors[kept].message.push_str(&format!(
+            " ({count} more {noun} in this file with the same advice not repeated; `--coverage-detail=explain` lists them)"
+        ));
+    }
+    let mut index = 0;
+    errors.retain(|_| {
+        index += 1;
+        !drop.contains(&(index - 1))
+    });
+}
+
+// The ranges of every operand of a comparison in `module`.
+fn compared_ranges(module: &ModModule) -> Vec<ruff_text_size::TextRange> {
+    struct Compared(Vec<ruff_text_size::TextRange>);
+    impl<'a> Visitor<'a> for Compared {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Compare(compare) = expr {
+                self.0.push(compare.left.range());
+                self.0.extend(compare.comparators.iter().map(Ranged::range));
+            }
+            ast_visitor::walk_expr(self, expr);
+        }
+    }
+    let mut compared = Compared(Vec::new());
+    for stmt in &module.body {
+        compared.visit_stmt(stmt);
+    }
+    compared.0
+}
+
+// `frame["c"].notna()`, `frame["c"].str.contains("x")`: methods called on one column, whose
+// result is a mask over rows (a selection of columns would be a list of names).
+fn is_series_method_chain(expr: &Expr) -> bool {
+    let mut current = expr;
+    let mut called = false;
+    loop {
+        match current {
+            Expr::Call(call) => {
+                called = true;
+                current = &call.func;
+            }
+            Expr::Attribute(attr) => current = &attr.value,
+            Expr::Subscript(sub) => {
+                return called
+                    && matches!(&*sub.value, Expr::Name(_))
+                    && ast_extract::extract_string_literal(&sub.slice).is_some();
+            }
+            _ => return false,
+        }
+    }
+}
+
+// A frame method whose result is a frame with columns nothing here can name.
+fn is_reshaping_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call(call) if matches!(&*call.func, Expr::Attribute(a)
+    if matches!(
+        a.attr.as_str(),
+        "merge" | "join" | "pivot" | "pivot_table" | "melt" | "set_index" | "reset_index"
+            | "select_dtypes" | "stack" | "unstack"
+    )))
+}
+
+// `pd.concat(...)` / `concat(...)`.
+fn is_concat_call(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    match &*call.func {
+        Expr::Name(name) => name.id.as_str() == "concat",
+        Expr::Attribute(attr) => attr.attr.as_str() == "concat",
+        _ => false,
+    }
 }
 
 // Whether the call passes any of `names` as a keyword argument.
@@ -837,9 +1083,37 @@ fn only_returned_expr(stmts: &[Stmt]) -> Option<&Expr> {
             }
         }
     }
+    // The load `crate::returned_loads` bound to a name just before returning it.
+    fn lifted_load<'a>(stmts: &'a [Stmt]) -> Option<&'a Expr> {
+        for stmt in stmts {
+            let nested: Vec<&'a [Stmt]> = match stmt {
+                Stmt::Assign(a)
+                    if matches!(a.targets.as_slice(), [Expr::Name(n)] if n.id.as_str() == crate::returned_loads::LIFTED_NAME)
+                        && matches!(&*a.value, Expr::Call(_)) =>
+                {
+                    return Some(&a.value);
+                }
+                Stmt::If(s) => std::iter::once(&s.body[..])
+                    .chain(s.elif_else_clauses.iter().map(|c| &c.body[..]))
+                    .collect(),
+                Stmt::For(s) => vec![&s.body[..], &s.orelse[..]],
+                Stmt::While(s) => vec![&s.body[..], &s.orelse[..]],
+                Stmt::With(s) => vec![&s.body[..]],
+                Stmt::Try(s) => vec![&s.body[..], &s.orelse[..], &s.finalbody[..]],
+                _ => continue,
+            };
+            if let Some(found) = nested.into_iter().find_map(lifted_load) {
+                return Some(found);
+            }
+        }
+        None
+    }
     let mut returned = Vec::new();
     collect(stmts, &mut returned);
     match returned.as_slice() {
+        [Expr::Name(n)] if n.id.as_str() == crate::returned_loads::LIFTED_NAME => {
+            lifted_load(stmts)
+        }
         [expr] => Some(expr),
         _ => None,
     }
@@ -905,7 +1179,61 @@ fn find_returned_var(stmts: &[Stmt]) -> Option<String> {
 // elsewhere in this file. Only the first assignment to a given attr name wins (a
 // later reassignment is silently ignored), matching this checker's existing
 // single-binding conventions (e.g. `string_var_candidates`).
-pub(crate) fn collect_self_attr_origins(stmts: &[Stmt], out: &mut HashMap<String, SelfAttrOrigin>) {
+// The class a type annotation names, in the `SelfAttrOrigin` shape: `Store` or `ports.Store`
+// (also quoted). Anything richer (`Optional[Store]`, a union) names no single class.
+fn annotation_origin(annotation: &Expr) -> Option<SelfAttrOrigin> {
+    match annotation {
+        Expr::Name(name) => Some(SelfAttrOrigin {
+            class_name: name.id.to_string(),
+            resolve_name: name.id.to_string(),
+            is_attribute_call: false,
+        }),
+        Expr::Attribute(attr) => match &*attr.value {
+            Expr::Name(module) => Some(SelfAttrOrigin {
+                class_name: attr.attr.to_string(),
+                resolve_name: module.id.to_string(),
+                is_attribute_call: true,
+            }),
+            _ => None,
+        },
+        Expr::StringLiteral(text) => {
+            let text = text.value.to_str();
+            text.chars()
+                .all(|c| c.is_alphanumeric() || c == '_')
+                .then(|| SelfAttrOrigin {
+                    class_name: text.to_string(),
+                    resolve_name: text.to_string(),
+                    is_attribute_call: false,
+                })
+        }
+        _ => None,
+    }
+}
+
+// The annotated parameters of a function, by name, as the class each annotation names.
+pub(crate) fn annotated_param_origins(
+    func_def: &ast::StmtFunctionDef,
+) -> HashMap<String, SelfAttrOrigin> {
+    let params = &func_def.parameters;
+    params
+        .posonlyargs
+        .iter()
+        .chain(&params.args)
+        .chain(&params.kwonlyargs)
+        .filter_map(|p| {
+            let origin = annotation_origin(p.parameter.annotation.as_deref()?)?;
+            Some((p.parameter.name.to_string(), origin))
+        })
+        .collect()
+}
+
+// Collect `self.<attr>` origins from `__init__`: constructor calls, and a typed parameter
+// stored as is (`self.store = store` with `store: Store`) -- the dependency-injection shape.
+pub(crate) fn collect_self_attr_origins(
+    stmts: &[Stmt],
+    params: &HashMap<String, SelfAttrOrigin>,
+    out: &mut HashMap<String, SelfAttrOrigin>,
+) {
     for stmt in stmts {
         match stmt {
             Stmt::Assign(assign) if assign.targets.len() == 1 => {
@@ -920,6 +1248,12 @@ pub(crate) fn collect_self_attr_origins(stmts: &[Stmt], out: &mut HashMap<String
                 }
                 let attr_name = target_attr.attr.to_string();
                 if out.contains_key(&attr_name) {
+                    continue;
+                }
+                if let Expr::Name(param) = &*assign.value {
+                    if let Some(origin) = params.get(param.id.as_str()) {
+                        out.insert(attr_name, origin.clone());
+                    }
                     continue;
                 }
                 let Expr::Call(call) = &*assign.value else {
@@ -952,14 +1286,14 @@ pub(crate) fn collect_self_attr_origins(stmts: &[Stmt], out: &mut HashMap<String
                 }
             }
             Stmt::If(if_stmt) => {
-                collect_self_attr_origins(&if_stmt.body, out);
+                collect_self_attr_origins(&if_stmt.body, params, out);
                 for clause in &if_stmt.elif_else_clauses {
-                    collect_self_attr_origins(&clause.body, out);
+                    collect_self_attr_origins(&clause.body, params, out);
                 }
             }
-            Stmt::For(for_stmt) => collect_self_attr_origins(&for_stmt.body, out),
-            Stmt::While(while_stmt) => collect_self_attr_origins(&while_stmt.body, out),
-            Stmt::With(with_stmt) => collect_self_attr_origins(&with_stmt.body, out),
+            Stmt::For(for_stmt) => collect_self_attr_origins(&for_stmt.body, params, out),
+            Stmt::While(while_stmt) => collect_self_attr_origins(&while_stmt.body, params, out),
+            Stmt::With(with_stmt) => collect_self_attr_origins(&with_stmt.body, params, out),
             _ => {}
         }
     }
@@ -1460,6 +1794,93 @@ fn collect_name_targets(target: &Expr, why: &'static str, out: &mut Vec<(String,
 
 // The expressions a statement evaluates itself, excluding those in nested bodies (each
 // nested statement is visited on its own).
+// Builtins that cannot reach a frame or object they are not handed.
+const HARMLESS_CALLEES: &[&str] = &[
+    "print",
+    "len",
+    "type",
+    "isinstance",
+    "list",
+    "set",
+    "tuple",
+    "dict",
+    "sorted",
+    "str",
+    "repr",
+    "display",
+    "id",
+    "min",
+    "max",
+    "sum",
+    "any",
+    "all",
+    "bool",
+    "int",
+    "float",
+    "enumerate",
+    "zip",
+    "iter",
+    "next",
+    "hash",
+    "vars",
+    "dir",
+];
+
+// `reset_index(drop=True)`: the index is discarded, not turned into columns.
+fn resets_index_dropping(call: &ast::ExprCall) -> bool {
+    keyword(call, "drop").is_some_and(|k| matches!(&k.value, Expr::BooleanLiteral(b) if b.value))
+}
+
+// The `index=` of a pandas `DataFrame(..)` constructor call.
+fn constructor_index(call: &ast::ExprCall) -> Option<&Expr> {
+    let is_constructor = match &*call.func {
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "DataFrame"
+                && matches!(&*a.value, Expr::Name(n) if matches!(n.id.as_str(), "pd" | "pandas"))
+        }
+        Expr::Name(n) => n.id.as_str() == "DataFrame",
+        _ => false,
+    };
+    is_constructor
+        .then(|| keyword(call, "index").map(|k| &k.value))
+        .flatten()
+}
+
+// The level names an index expression gives a frame: none for a literal list, the literal
+// `name=`/`names=` of an index constructor, otherwise unknown (`None`).
+fn index_name_of(index: &Expr) -> Option<Vec<String>> {
+    match index {
+        Expr::List(_) | Expr::Tuple(_) => Some(Vec::new()),
+        Expr::Call(call) => {
+            let names = keyword(call, "name").or_else(|| keyword(call, "names"))?;
+            ast_extract::extract_string_list_or_single(&names.value)
+        }
+        _ => None,
+    }
+}
+
+// `df` in `df.index`.
+fn index_owner(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Attribute(a) if a.attr.as_str() == "index" => match &*a.value {
+            Expr::Name(n) => Some(n.id.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// `obj.attr = ..` on anything but `self` may store through an alias of `self`.
+fn stores_to_foreign_attribute(target: &Expr) -> bool {
+    match target {
+        Expr::Attribute(a) => !matches!(&*a.value, Expr::Name(n) if n.id.as_str() == "self"),
+        Expr::Tuple(t) => t.elts.iter().any(stores_to_foreign_attribute),
+        Expr::List(l) => l.elts.iter().any(stores_to_foreign_attribute),
+        Expr::Starred(s) => stores_to_foreign_attribute(&s.value),
+        _ => false,
+    }
+}
+
 fn own_expressions(stmt: &Stmt) -> Vec<&Expr> {
     match stmt {
         Stmt::Expr(s) => vec![&*s.value],
@@ -1510,6 +1931,238 @@ fn global_names(body: &[Stmt]) -> Vec<String> {
         collector.visit_stmt(stmt);
     }
     collector.0
+}
+
+// Names of the classes `body` defines (also inside classes) and of everything it imports.
+fn collect_class_and_imported_names<'a>(
+    body: &'a [Stmt],
+    out: &mut std::collections::HashSet<&'a str>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(class) => {
+                out.insert(class.name.as_str());
+                collect_class_and_imported_names(&class.body, out);
+            }
+            Stmt::ImportFrom(import) => {
+                for alias in &import.names {
+                    out.insert(alias.name.as_str());
+                }
+            }
+            Stmt::If(if_stmt) => collect_class_and_imported_names(&if_stmt.body, out),
+            _ => {}
+        }
+    }
+}
+
+// Every function and method of a file with its column contract (`None` when its definition
+// is repeated with a different one, or decorated in a way that may change the call).
+struct ContractCollector<'l> {
+    linter: &'l Linter,
+    class: Option<String>,
+    contracts: HashMap<FnKey, Option<call_contracts::FuncContract>>,
+    class_methods: HashMap<String, std::collections::HashSet<String>>,
+    protocols: std::collections::HashSet<String>,
+}
+
+impl ContractCollector<'_> {
+    fn stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::FunctionDef(def) => {
+                let key = (self.class.clone(), def.name.to_string());
+                if let Some(class) = &self.class {
+                    let methods = self.class_methods.entry(class.clone()).or_default();
+                    methods.insert(def.name.to_string());
+                    // `self.process = ..` shadows a method of that name on the instance.
+                    methods.extend(instance_attribute_stores(def));
+                }
+                let linter = self.linter;
+                let contract = call_contracts::binding_of(def, self.class.is_some()).map(|bound| {
+                    let (line, _) = linter.source_location(def.range().start());
+                    call_contracts::derive(def, bound, line, &|name| {
+                        linter.schemas.get(name).cloned()
+                    })
+                });
+                match self.contracts.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut seen) => {
+                        let same = seen
+                            .get()
+                            .as_ref()
+                            .zip(contract.as_ref())
+                            .is_some_and(|(a, b)| a.agrees_with(b));
+                        if !same {
+                            seen.insert(None);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(contract);
+                    }
+                }
+            }
+            Stmt::ClassDef(class_def) => {
+                let name = class_def.name.to_string();
+                let is_protocol = class_def.bases().iter().any(|base| {
+                    let base = match base {
+                        Expr::Subscript(sub) => &*sub.value,
+                        other => other,
+                    };
+                    matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol")
+                        || matches!(base, Expr::Attribute(a) if a.attr.as_str() == "Protocol")
+                });
+                if is_protocol {
+                    self.protocols.insert(name.clone());
+                }
+                self.class_methods.entry(name.clone()).or_default();
+                let outer = self.class.replace(name.clone());
+                for member in &class_def.body {
+                    // `name = other_function` in a class body also defines a method.
+                    if let Stmt::Assign(assign) = member {
+                        for target in &assign.targets {
+                            if let Expr::Name(t) = target {
+                                self.class_methods
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .insert(t.id.to_string());
+                            }
+                        }
+                    }
+                    self.stmt(member);
+                }
+                self.class = outer;
+            }
+            _ => {}
+        }
+    }
+}
+
+// Attributes a method stores on its first parameter (`self.x = ..`, `setattr(self, "x", ..)`),
+// nested functions included.
+fn instance_attribute_stores(def: &ast::StmtFunctionDef) -> Vec<String> {
+    struct Stores<'n> {
+        receiver: &'n str,
+        found: Vec<String>,
+    }
+    impl<'a> Visitor<'a> for Stores<'_> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Attribute(a)
+                    if a.ctx == ast::ExprContext::Store
+                        && matches!(&*a.value, Expr::Name(n) if n.id.as_str() == self.receiver) =>
+                {
+                    self.found.push(a.attr.to_string());
+                }
+                Expr::Call(call) if matches!(&*call.func, Expr::Name(n) if n.id.as_str() == "setattr") => {
+                    if let [Expr::Name(n), Expr::StringLiteral(s), ..] =
+                        call.arguments.args.as_ref()
+                    {
+                        if n.id.as_str() == self.receiver {
+                            self.found.push(s.value.to_str().to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ast_visitor::walk_expr(self, expr);
+        }
+    }
+    let Some(first) = def
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(&def.parameters.args)
+        .next()
+    else {
+        return Vec::new();
+    };
+    let mut stores = Stores {
+        receiver: first.parameter.name.as_str(),
+        found: Vec::new(),
+    };
+    for stmt in &def.body {
+        stores.visit_stmt(stmt);
+    }
+    stores.found
+}
+
+// Callee position -> contract key, for each call whose name binds to a single module-level
+// function of the file, a `from` import, or a function of a plainly imported module.
+struct ContractTargets<'a, 'k> {
+    analysis: &'k static_eval::Analysis<'a>,
+    module_functions: std::collections::HashSet<u32>,
+    out: HashMap<u32, FnKey>,
+}
+
+// See `ContractTargets`. Built from the module as written: folding keeps every source range.
+pub(crate) fn contract_targets(
+    analysis: &static_eval::Analysis,
+    module: &ModModule,
+) -> HashMap<u32, FnKey> {
+    let mut targets = ContractTargets {
+        analysis,
+        module_functions: module
+            .body
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::FunctionDef(def) => Some(def.range().start().to_u32()),
+                _ => None,
+            })
+            .collect(),
+        out: HashMap::new(),
+    };
+    for stmt in &module.body {
+        targets.visit_stmt(stmt);
+    }
+    targets.out
+}
+
+impl<'v> Visitor<'v> for ContractTargets<'_, '_> {
+    fn visit_expr(&mut self, expr: &'v Expr) {
+        if let Expr::Call(call) = expr {
+            let at = call.func.range().start().to_u32();
+            match &*call.func {
+                Expr::Name(name) => match self.analysis.callee_binding(name) {
+                    Some(static_eval::CalleeBinding::Function(def))
+                        if self
+                            .module_functions
+                            .contains(&def.range().start().to_u32()) =>
+                    {
+                        self.out.insert(at, (None, def.name.to_string()));
+                    }
+                    Some(static_eval::CalleeBinding::Function(_)) => {}
+                    Some(static_eval::CalleeBinding::Imported { local }) => {
+                        self.out
+                            .insert(at, (Some(call_contracts::IMPORTED_SLOT.to_string()), local));
+                    }
+                    // Only a `*` import's contracts are stored under a name the file never binds.
+                    None if self.analysis.binds_nowhere(name) => {
+                        self.out.insert(
+                            at,
+                            (
+                                Some(call_contracts::IMPORTED_SLOT.to_string()),
+                                name.id.to_string(),
+                            ),
+                        );
+                    }
+                    None => {}
+                },
+                Expr::Attribute(attr) => {
+                    if let Expr::Name(base) = &*attr.value {
+                        if matches!(
+                            self.analysis.import_kind(base),
+                            Some(static_eval::ImportKind::Module)
+                        ) {
+                            self.out.insert(
+                                at,
+                                (Some(format!("module:{}", base.id)), attr.attr.to_string()),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
 }
 
 // AST visitor collecting the name of every function and method defined anywhere in the
@@ -1822,11 +2475,12 @@ impl Linter {
             schemas: HashMap::new(),
             variables: HashMap::new(),
             functions: HashMap::new(),
+            tuple_functions: HashMap::new(),
             schema_origins: HashMap::new(),
             schema_locations: HashMap::new(),
             requires: HashMap::new(),
+            straight_line_functions: std::collections::HashSet::new(),
             delegates: HashMap::new(),
-            param_requires: HashMap::new(),
             param_schema_names: HashMap::new(),
             line_index: None,
             source: String::new(),
@@ -1851,6 +2505,35 @@ impl Linter {
             project_root: None,
             imported_modules: static_eval::ImportedModules::new(),
             read_external_file: std::cell::Cell::new(false),
+            unresolved_root: HashMap::new(),
+            polars_only_file: false,
+            polars_names: std::collections::HashSet::new(),
+            known_columns: Vec::new(),
+            reported_unverifiable: std::cell::RefCell::new(std::collections::HashSet::new()),
+            schema_index: HashMap::new(),
+            unknown_index: std::collections::HashSet::new(),
+            open_frames: HashMap::new(),
+            shadowed_frames: Vec::new(),
+            partial_columns: HashMap::new(),
+            loop_bindings: Vec::new(),
+            block_depth: 0,
+            stmt_counter: 0,
+            open_reads: std::cell::RefCell::new(HashMap::new()),
+            unknown_frame_reads: std::cell::RefCell::new(Vec::new()),
+            contract_calls_checked: std::cell::RefCell::new(std::collections::HashSet::new()),
+            contracts: HashMap::new(),
+            local_contracts: HashMap::new(),
+            imported_contracts: HashMap::new(),
+            contract_targets: HashMap::new(),
+            contract_targets_ready: false,
+            class_method_names: HashMap::new(),
+            protocol_classes: std::collections::HashSet::new(),
+            method_agreement: HashMap::new(),
+            method_contract_memo: std::cell::RefCell::new(HashMap::new()),
+            subclasses: HashMap::new(),
+            overridden_elsewhere: HashMap::new(),
+            missing_enum_members: Vec::new(),
+            value_checked_early: false,
             imported_function_libraries: HashMap::new(),
             imported_param_usage: HashMap::new(),
             project_index: None,
@@ -1872,8 +2555,11 @@ impl Linter {
             current_class_functions: HashMap::new(),
             current_class_name: None,
             receiver_classes: HashMap::new(),
+            record_fields: HashMap::new(),
+            record_params: HashMap::new(),
             current_self_attrs: HashMap::new(),
             all_self_attr_origins: HashMap::new(),
+            method_frames: crate::self_frames::MethodFrames::new(),
             class_methods: HashMap::new(),
             class_bases: HashMap::new(),
         }
@@ -1980,6 +2666,9 @@ impl Linter {
         // a literal where there was a variable -- see `static_eval`.
         let (folds, reads) = {
             let analysis = static_eval::Analysis::build(&module, &self.imported_modules);
+            self.missing_enum_members = analysis.missing_enum_members(&module);
+            self.contract_targets = contract_targets(&analysis, &module);
+            self.contract_targets_ready = true;
             static_eval::plan_folds(&module, &analysis)
         };
         static_eval::apply_folds(&mut module, &folds);
@@ -1989,6 +2678,29 @@ impl Linter {
     // Everything after folding: `module` already has its constants replaced, and `reads` are
     // the class constants read through `self`/`cls` that went into that.
     pub(crate) fn lint_folded(
+        &mut self,
+        module: &ModModule,
+        self_constant_reads: Vec<static_eval::SelfConstantRead>,
+        source: &str,
+        path: &Path,
+    ) -> Vec<LintError> {
+        let lifted = crate::returned_loads::lift(module);
+        let module = lifted.as_ref().unwrap_or(module);
+        let dicts = crate::dict_frames::rewrite(module);
+        let module = dicts.as_ref().unwrap_or(module);
+        match crate::self_frames::rewrite(module) {
+            Some((rewritten, frames)) => {
+                self.method_frames = frames;
+                self.lint_lifted(&rewritten, self_constant_reads, source, path)
+            }
+            None => {
+                self.method_frames.clear();
+                self.lint_lifted(module, self_constant_reads, source, path)
+            }
+        }
+    }
+
+    fn lint_lifted(
         &mut self,
         module: &ModModule,
         self_constant_reads: Vec<static_eval::SelfConstantRead>,
@@ -2026,6 +2738,8 @@ impl Linter {
             df_usage_collector.visit_stmt(stmt);
         }
         self.dataframe_shaped_usage = df_usage_collector.names;
+        self.polars_only_file = imports_only_polars(&module.body);
+        self.polars_names = crate::polars_names::polars_names(&module.body);
         let mut function_names = FunctionNameCollector {
             names: std::collections::HashSet::new(),
             summaries: HashMap::new(),
@@ -2053,6 +2767,7 @@ impl Linter {
             &self.class_bases,
             self.preserve_unresolved_delegates,
         );
+        self.prepare_contracts(module);
 
         self.all_dataframe_calls = {
             let mut load_call_collector = LoadCallSiteCollector {
@@ -2071,12 +2786,35 @@ impl Linter {
         for stmt in &module.body {
             self.visit_stmt(stmt, &mut errors);
         }
+        for missing in std::mem::take(&mut self.missing_enum_members) {
+            let (line, col) = self.source_location(missing.range.start());
+            let mut message = format!(
+                "`{}` has no member '{}', so this raises AttributeError",
+                missing.class, missing.attr
+            );
+            if let Some(suggestion) = find_best_match(&missing.attr, &missing.members) {
+                message.push_str(&format!(" (did you mean '{suggestion}'?)"));
+            }
+            errors.push(LintError {
+                line,
+                col,
+                code: CODE_UNKNOWN_COLUMN.to_string(),
+                message,
+                severity: "error".to_string(),
+            });
+        }
 
         // A class constant read through `self` is trusted unless a subclass elsewhere
         // rebinds it, which can't be seen from here; `Final` rules that out.
         let mut advised: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        for read in self_constant_reads.iter().filter(|r| !r.is_final) {
+        // A string compared against a cell value (`df["route"] == self.IV`) is data, not a column
+        // name, and nothing in a column check depends on it staying fixed.
+        let compared = compared_ranges(module);
+        for read in self_constant_reads
+            .iter()
+            .filter(|r| !r.is_final && !compared.iter().any(|c| c.contains_range(r.range)))
+        {
             if advised.insert((read.class.clone(), read.attr.clone())) {
                 let (line, col) = self.source_location(read.range.start());
                 if self.collect_suggestions {
@@ -2149,10 +2887,198 @@ impl Linter {
 
         self.observe_untyped_site_usage(module);
         self.name_untracked_sites();
+        self.report_likely_typos(module, &mut errors);
 
-        errors.retain(|e| !is_line_ignored(source, e.line, &e.code));
+        let lines: Vec<&str> = source.lines().collect();
+        errors.retain(|e| !is_line_ignored_in(&lines, e.line, &e.code));
+        // The same read can be reached by the assignment dispatch and by the argument checks.
+        // The one that suggests a spelling says the most.
+        let mut best: HashMap<(usize, String, String), usize> = HashMap::new();
+        for (index, e) in errors.iter().enumerate() {
+            if e.code != CODE_UNKNOWN_COLUMN {
+                best.insert((index, String::new(), String::new()), index);
+                continue;
+            }
+            let stem = e.message.split(" (did you mean").next().unwrap_or_default();
+            let key = (e.line, e.code.clone(), stem.to_string());
+            match best.get(&key) {
+                Some(&kept) if errors[kept].message.len() >= e.message.len() => {}
+                _ => {
+                    best.insert(key, index);
+                }
+            }
+        }
+        let keep: std::collections::HashSet<usize> = best.into_values().collect();
+        let mut index = 0;
+        errors.retain(|_| {
+            index += 1;
+            keep.contains(&(index - 1))
+        });
+        // One frame seen before and after the statement that reads it (the post-statement
+        // set only adds that statement's outputs): one mistake, so one error. Operands with
+        // unrelated column sets (both sides of a merge) still report separately.
+        let column_and_set = |e: &LintError| -> Option<(String, Vec<String>)> {
+            let rest = e.message.strip_prefix("Column '")?;
+            let (column, rest) = rest.split_once("' does not exist in inferred column set {")?;
+            let (set, _) = rest.split_once('}')?;
+            Some((
+                column.to_string(),
+                set.split(", ").map(str::to_string).collect(),
+            ))
+        };
+        let rank = |e: &LintError| (e.message.contains("(did you mean"), e.col);
+        let mut dropped = vec![false; errors.len()];
+        // Compared only within a line, so a file with very many errors stays linear.
+        let parsed: Vec<Option<(String, Vec<String>)>> =
+            errors.iter().map(column_and_set).collect();
+        let mut by_line: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, e) in errors.iter().enumerate() {
+            if parsed[i].is_some() {
+                by_line.entry(e.line).or_default().push(i);
+            }
+        }
+        for same_line in by_line.values() {
+            for &i in same_line {
+                for &j in same_line {
+                    if i == j || dropped[i] || dropped[j] {
+                        continue;
+                    }
+                    let (Some((ci, si)), Some((cj, sj))) = (&parsed[i], &parsed[j]) else {
+                        continue;
+                    };
+                    let nested =
+                        si.iter().all(|c| sj.contains(c)) || sj.iter().all(|c| si.contains(c));
+                    if ci == cj && nested && rank(&errors[i]) < rank(&errors[j]) {
+                        dropped[i] = true;
+                    }
+                }
+            }
+        }
+        let mut index = 0;
+        errors.retain(|_| {
+            index += 1;
+            !dropped[index - 1]
+        });
+        // A test should see the whole frame, so narrowing advice there contradicts `suggest`.
+        let tests: Vec<(usize, usize)> = module
+            .body
+            .iter()
+            .flat_map(|stmt| match stmt {
+                Stmt::FunctionDef(f) => vec![f],
+                Stmt::ClassDef(c) => c
+                    .body
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::FunctionDef(f) => Some(f),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .filter(|f| f.name.as_str() == "test" || f.name.as_str().starts_with("test_"))
+            .map(|f| {
+                (
+                    self.source_location(f.range.start()).0,
+                    self.source_location(f.range.end()).0,
+                )
+            })
+            .collect();
+        for e in errors.iter_mut().filter(|e| {
+            e.code == CODE_UNTRACKED_DATAFRAME
+                && e.message.contains("specify `usecols`/`columns`")
+                && tests
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&e.line))
+        }) {
+            e.message = "columns unknown at lint time; in a test, annotate the variable's type \
+                         to check the columns read, e.g. `df: Annotated[pd.DataFrame, MySchema] = \
+                         pd.read_csv(...)`"
+                .to_string();
+        }
+        // A test's own column reads are the run-time check; flagging them as unverifiable is
+        // noise.
+        errors.retain(|e| {
+            !(e.code == CODE_UNVERIFIABLE_COLUMN
+                && tests
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&e.line)))
+        });
+        collapse_repeated_untracked_warnings(&mut errors);
 
         errors
+    }
+
+    // A column read off a frame of unknown columns that the file names nowhere else, one slip
+    // from exactly one name the file or the project modules it imports do mention.
+    fn report_likely_typos(&self, module: &ModModule, errors: &mut Vec<LintError>) {
+        let reads = std::mem::take(&mut *self.unknown_frame_reads.borrow_mut());
+        if reads.is_empty() {
+            return;
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut mentions = NameMentions {
+            counts: &mut counts,
+            identifiers: true,
+        };
+        for stmt in &module.body {
+            mentions.visit_stmt(stmt);
+        }
+        let mut imported = std::collections::HashSet::new();
+        for exports in self.imported_modules.values() {
+            for value in exports.constants.values() {
+                collect_value_strings(value, &mut imported);
+            }
+            for members in exports.enums.values() {
+                imported.extend(members.iter().cloned());
+            }
+        }
+        let mut literals: HashMap<String, usize> = HashMap::new();
+        let mut named = NameMentions {
+            counts: &mut literals,
+            identifiers: false,
+        };
+        for stmt in &module.body {
+            named.visit_stmt(stmt);
+        }
+        let mut evidence =
+            crate::typo::Evidence::new(literals.keys().chain(imported.iter()).cloned());
+        let mut reported = std::collections::HashSet::new();
+        let mut found = Vec::new();
+        // Comparing every read with every name is quadratic over a very large file; past the
+        // budget the rest is left unchecked.
+        let mut work = TYPO_WORK_BUDGET;
+        for (line, col, column) in reads {
+            if work == 0 {
+                break;
+            }
+            if counts.get(&column).copied().unwrap_or(0) != 1
+                || imported.contains(&column)
+                || !reported.insert((line, col))
+            {
+                continue;
+            }
+            if let Some(intended) = evidence.typo(&column, &mut work) {
+                found.push((line, col, column, intended));
+            }
+        }
+        // Two names read once each, each the other's nearest: nothing says which is the slip.
+        let pairs: std::collections::HashSet<(String, String)> = found
+            .iter()
+            .map(|(_, _, c, i)| (c.clone(), i.clone()))
+            .collect();
+        for (line, col, column, intended) in found {
+            if !pairs.contains(&(intended.clone(), column.clone())) {
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_LIKELY_TYPO.to_string(),
+                    message: format!(
+                        "Column '{column}' is read here and named nowhere else, but the code does name '{intended}' (did you mean '{intended}'?); the frame's columns are unknown, so this is a guess"
+                    ),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
     }
 
     // For each `untyped_sites` entry whose own origin statement sits at the top
@@ -2166,6 +3092,12 @@ impl Linter {
             return;
         }
         let body = module.body.as_slice();
+        self.known_columns = {
+            let mut names: Vec<String> = self.schemas.values().flatten().cloned().collect();
+            names.sort();
+            names.dedup();
+            names
+        };
         self.name_untyped_sites();
         let by_position: HashMap<(usize, usize), &str> = self
             .untyped_sites
@@ -2372,6 +3304,19 @@ impl Linter {
         class_body: &[Stmt],
         results: &mut SiteScanResults,
     ) {
+        // `self.store = store` with `store: Store` in `__init__`: methods can call `self.store`.
+        let mut self_attrs = HashMap::new();
+        for stmt in class_body {
+            if let Stmt::FunctionDef(func_def) = stmt {
+                if func_def.name.as_str() == "__init__" {
+                    collect_self_attr_origins(
+                        &func_def.body,
+                        &annotated_param_origins(func_def),
+                        &mut self_attrs,
+                    );
+                }
+            }
+        }
         for stmt in class_body {
             match stmt {
                 Stmt::FunctionDef(func_def) => {
@@ -2382,7 +3327,13 @@ impl Linter {
                         scope.by_position,
                         FunctionContext {
                             name: Some(func_def.name.as_str()),
-                            receivers: receiver_classes(func_def),
+                            receivers: {
+                                let mut receivers = receiver_classes(func_def);
+                                receivers.extend(self_attrs.iter().map(|(attr, o)| {
+                                    (format!("self.{attr}"), o.class_name.clone())
+                                }));
+                                receivers
+                            },
                         },
                         results,
                     );
@@ -2454,6 +3405,10 @@ impl Linter {
         let Some(&var) = scope.by_position.get(&pos) else {
             return;
         };
+        // Other methods read a frame stored on `self`; this scope can't see them.
+        if var.starts_with(crate::self_frames::SELF_PREFIX) || var.contains('[') {
+            return;
+        }
         if in_loop {
             if self.collect_suggestions {
                 results.outcomes.push((
@@ -2504,6 +3459,15 @@ impl Linter {
                     "`{var}` (or a name it was assigned to) is declared `global` or `nonlocal` here, so other \
                      code can read it"
                 ))
+            } else if scope
+                .function_name
+                .is_some_and(|name| name == "test" || name.starts_with("test_"))
+            {
+                Err(
+                    "it is inside a test, which should see the whole frame rather than a \
+                     narrowed copy"
+                        .to_string(),
+                )
             } else {
                 suggest::suggest_selection(
                     &suggest::Origin {
@@ -2519,6 +3483,7 @@ impl Linter {
                         stmt_end: stmt.range().end().to_usize(),
                         function_local: scope.in_function,
                         receivers: &scope.receivers,
+                        known_columns: &self.known_columns,
                     },
                     &usage,
                 )
@@ -2565,8 +3530,14 @@ impl Linter {
                 }),
             }
         }
+        // A later leg of a frame (`items["a"] = ...` on a frame already reported) is not a
+        // second frame; say it once, under the origin's own reason.
+        let mut said: std::collections::HashSet<&str> = reached
+            .iter()
+            .filter_map(|pos| var_at.get(pos).map(String::as_str))
+            .collect();
         for site in &self.untyped_sites {
-            if !reached.contains(&(site.line, site.col)) {
+            if !reached.contains(&(site.line, site.col)) && said.insert(site.var.as_str()) {
                 self.withheld.push(suggest::Withheld {
                     phrase: site.phrase.clone(),
                     line: site.line,
@@ -2632,6 +3603,37 @@ impl Linter {
         file_path: Option<&str>,
     ) {
         self.imported_modules = collect_imported_modules(index, module, project_root, file_path);
+        let own_root = std::cell::OnceCell::new();
+        let mut class_names = std::collections::HashSet::new();
+        collect_class_and_imported_names(&module.body, &mut class_names);
+        let own_file = file_path.map(|p| {
+            let p = Path::new(p);
+            if p.is_absolute() {
+                p.to_string_lossy().to_string()
+            } else {
+                project_root.join(p).to_string_lossy().to_string()
+            }
+        });
+        self.overridden_elsewhere = class_names
+            .into_iter()
+            .filter_map(|class| {
+                let methods: std::collections::HashSet<String> = index
+                    .overridden
+                    .get(class)?
+                    .iter()
+                    .filter(|(_, file)| Some(file) != own_file.as_ref())
+                    .map(|(method, _)| method.clone())
+                    .collect();
+                (!methods.is_empty()).then(|| (class.to_string(), methods))
+            })
+            .collect();
+        self.method_agreement = index
+            .method_agreement
+            .iter()
+            .map(|(method, (contract, origin))| {
+                (method.clone(), (contract.clone(), origin.clone()))
+            })
+            .collect();
         // Pre-seed cross-file confirmation for pending pass-through reversals (see
         // `pending_passthrough_reversals`'s doc comment) BEFORE this file's own
         // statement walk runs, so the existing end-of-walk resolution loop in
@@ -2697,7 +3699,14 @@ impl Linter {
                 // resolve_module_file also tries an explicitly allowlisted external
                 // package's site-packages location (see collect_external_package_files),
                 // not just project_root/project_root/src.
-                resolve_module_file(module_name, project_root, &index.files)
+                resolve_module_file_with_root(
+                    module_name,
+                    project_root,
+                    importer.as_deref(),
+                    &own_root,
+                    &index.package_roots,
+                    &index.files,
+                )
             };
             let Some(resolved_str) = resolved else {
                 continue;
@@ -2736,6 +3745,13 @@ impl Linter {
                         all_schema_locations,
                     );
                     self.import_helper_summary(entry, name, None, name);
+                    self.import_contract(
+                        entry,
+                        name,
+                        call_contracts::IMPORTED_SLOT,
+                        name,
+                        &file_path_display,
+                    );
                 }
                 continue;
             }
@@ -2758,6 +3774,13 @@ impl Linter {
                     }
                 }
                 self.import_helper_summary(entry, name, None, local);
+                self.import_contract(
+                    entry,
+                    name,
+                    call_contracts::IMPORTED_SLOT,
+                    local,
+                    &file_path_display,
+                );
             }
         }
 
@@ -2776,9 +3799,15 @@ impl Linter {
                 if dotted.starts_with("typedframes") {
                     continue;
                 }
-                let Some(resolved_path) =
-                    resolve_module_file(dotted, project_root, &index.files).map(PathBuf::from)
-                else {
+                let Some(resolved_path) = resolve_module_file_with_root(
+                    dotted,
+                    project_root,
+                    importer.as_deref(),
+                    &own_root,
+                    &index.package_roots,
+                    &index.files,
+                )
+                .map(PathBuf::from) else {
                     continue;
                 };
                 let Some(resolved_str) = resolved_path.to_str() else {
@@ -2811,7 +3840,31 @@ impl Linter {
                         );
                     }
                 }
+                if let Some(module_alias) = &module_alias {
+                    let slot = format!("module:{module_alias}");
+                    for name in entry.contracts.keys().filter(|k| !k.contains('.')) {
+                        self.import_contract(entry, name, &slot, name, &file_path_display);
+                    }
+                }
             }
+        }
+    }
+
+    // Records the column contract of `entry`'s function `name` under `(slot, local)`.
+    fn import_contract(
+        &mut self,
+        entry: &IndexEntry,
+        name: &str,
+        slot: &str,
+        local: &str,
+        file_path_display: &str,
+    ) {
+        if let Some(contract) = entry.contracts.get(name) {
+            let origin = format!("{name} ({file_path_display}:{})", contract.def_line);
+            self.imported_contracts.insert(
+                (Some(slot.to_string()), local.to_string()),
+                (contract.clone(), origin),
+            );
         }
     }
 
@@ -2915,6 +3968,20 @@ impl Linter {
         // `class_methods` just above -- lets `self.<method>()` inside THIS file's own
         // classes follow a mutating method inherited from `name`, one hop deep. Same
         // same-file-wins guard.
+        let prefix = format!("{name}.");
+        let classes = if entry.class_bases.contains_key(name) {
+            entry.contracts.iter()
+        } else {
+            Default::default()
+        };
+        for (key, contract) in classes {
+            if let Some(method) = key.strip_prefix(&prefix) {
+                let origin = format!("{method} ({file_path_display}:{})", contract.def_line);
+                self.imported_contracts
+                    .entry((Some(name.to_string()), method.to_string()))
+                    .or_insert((contract.clone(), origin));
+            }
+        }
         if let Some(methods) = entry.class_helper_summaries.get(name) {
             for (method, summary) in methods {
                 self.imported_summaries
@@ -2963,14 +4030,6 @@ impl Linter {
                     .insert(func.returns_schema.clone(), loc.clone());
             }
         }
-        // Record the parameter-column contract so calls to this function
-        // (e.g. `trim(customers)`) can be validated at the call site,
-        // where the actual argument's inferred schema is known.
-        if !func.requires.is_empty() {
-            let origin = format!("{name} ({file_path_display}:{})", func.def_line);
-            self.param_requires
-                .insert(name.to_string(), (func.requires.clone(), origin));
-        }
     }
 
     // Check if a base class name indicates a typedframes schema
@@ -2987,7 +4046,10 @@ impl Linter {
                         return (Some(cols), LoadKind::File);
                     }
                 }
-                Some("dtype") | Some("schema") => {
+                // Only polars' `schema=` is the complete column set. A pandas `dtype=`
+                // (or `dtypes=`) mapping overrides the types of some columns and says
+                // nothing about the rest.
+                Some("schema") => {
                     if let Expr::Dict(dict) = &keyword.value {
                         let keys: Vec<String> = dict
                             .items
@@ -3000,6 +4062,24 @@ impl Linter {
                             return (Some(keys), LoadKind::File);
                         }
                     }
+                    // `pl.DataFrame(rows, schema=["a", "b"])`: the names, as strings or as
+                    // `(name, dtype)` pairs.
+                    if let (true, Expr::List(list)) = (func_name == "DataFrame", &keyword.value) {
+                        let names: Option<Vec<String>> = list
+                            .elts
+                            .iter()
+                            .map(|element| match element {
+                                Expr::Tuple(pair) => pair.elts.first(),
+                                other => Some(other),
+                            })
+                            .map(|name| {
+                                ast_extract::extract_string_literal(name?).map(str::to_string)
+                            })
+                            .collect();
+                        if let Some(names) = names.filter(|n| !n.is_empty()) {
+                            return (Some(names), LoadKind::File);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -3007,7 +4087,7 @@ impl Linter {
 
         // DataFrame({"a": [...], "b": [...]}) — a dict literal passed positionally to
         // the constructor itself already names every column as its keys, the same
-        // signal `dtype=`/`schema=` gives explicitly. Gated on func_name so this
+        // signal `schema=` gives explicitly. Gated on func_name so this
         // never fires for read_csv/read_json/etc., whose first positional argument is
         // a path or buffer, not column data — a dict there means something else
         // entirely and inferring columns from it would be wrong.
@@ -3016,6 +4096,14 @@ impl Linter {
         // this file's own pre-pass traced back to such a list built via `.append()`
         // in a loop -- see `Linter::dict_list_var_candidates`.
         if func_name == "DataFrame" {
+            // A `columns=` that is not a literal list decides the columns, whatever the data names.
+            if keyword(call, "columns").is_some() {
+                return (None, LoadKind::File);
+            }
+            // `pd.DataFrame()` / `pd.DataFrame(index=..)`: no columns yet, they arrive by assignment.
+            if call.arguments.args.is_empty() && keyword(call, "data").is_none() {
+                return (Some(Vec::new()), LoadKind::File);
+            }
             match call.arguments.args.first() {
                 Some(Expr::Dict(dict)) => {
                     let keys: Vec<String> = dict
@@ -3030,7 +4118,9 @@ impl Linter {
                     }
                 }
                 Some(Expr::List(list)) => {
-                    if let Some(cols) = ast_extract::extract_records_list_columns(list) {
+                    if let Some(cols) = ast_extract::extract_records_list_columns(list)
+                        .or_else(|| self.record_row_columns(list))
+                    {
                         return (Some(cols), LoadKind::File);
                     }
                 }
@@ -3621,9 +4711,74 @@ impl Linter {
             self.make_inferred_schema(resolved_cols.unwrap_or_default(), var_hint, current_line);
         if unresolved {
             self.unresolved_schemas.insert(schema_name.clone());
+            if let Some(base) = base_schema.filter(|_| base_unresolved) {
+                let root = self.unresolved_root_of(base);
+                self.unresolved_root.insert(schema_name.clone(), root);
+            }
         }
         self.count_typed_dataframe(&schema_name, var_hint, current_line, current_col);
         schema_name
+    }
+
+    // An edit that adds columns the checker cannot name: the frame is open from here on, but
+    // the columns it certainly has stay known.
+    fn count_open_leg(
+        &mut self,
+        base_schema: Option<&str>,
+        known: Vec<String>,
+        var_hint: &str,
+        current_line: usize,
+        current_col: usize,
+    ) -> String {
+        let schema_name =
+            self.count_mutation_leg(base_schema, None, var_hint, current_line, current_col);
+        let mut known = known;
+        for column in base_schema
+            .and_then(|b| self.partial_columns.get(b))
+            .cloned()
+            .unwrap_or_default()
+        {
+            if !known.contains(&column) {
+                known.push(column);
+            }
+        }
+        self.partial_columns.insert(schema_name.clone(), known);
+        schema_name
+    }
+
+    fn is_known_on_open_leg(&self, schema_name: &str, column: &str) -> bool {
+        self.partial_columns
+            .get(schema_name)
+            .is_some_and(|known| known.iter().any(|c| c == column))
+    }
+
+    fn unresolved_root_of(&self, schema_name: &str) -> String {
+        self.unresolved_root
+            .get(schema_name)
+            .cloned()
+            .unwrap_or_else(|| schema_name.to_string())
+    }
+
+    // Whether this is the first `unverifiable-column` for the frame `schema_name` belongs
+    // to; later ones add nothing the first did not say.
+    fn first_unverifiable_report(&self, schema_name: &str) -> bool {
+        self.reported_unverifiable
+            .borrow_mut()
+            .insert(self.unresolved_root_of(schema_name))
+    }
+
+    fn unverifiable_message(&self, col_name: &str, schema_name: &str) -> String {
+        let root = self.unresolved_root_of(schema_name);
+        let origin = inferred_schema_line(&root).map_or_else(
+            || "the frame".to_string(),
+            |line| format!("the frame from line {line}"),
+        );
+        format!(
+            "Column '{col_name}' cannot be verified: {origin} has no known column list \
+             (the checker could not derive it there); fix: give the frame its columns where it is \
+             created (`usecols=`/`columns=`, or a schema annotation; `typedframes suggest` proposes \
+             it) and every column use on it is checked. Reported once per frame."
+        )
     }
 
     // Called at the end of the `x = call(...)` origin dispatch in the Assign handler,
@@ -4077,22 +5232,55 @@ impl Linter {
                 self.schemas.get(schema).cloned()
             }
             Expr::Subscript(subscript) => {
-                self.returned_expr_columns(&subscript.value)?;
+                if let Expr::Attribute(indexer) = &*subscript.value {
+                    if matches!(indexer.attr.as_str(), "loc" | "iloc") {
+                        return self.indexer_columns(&indexer.value, &subscript.slice);
+                    }
+                }
+                // A row mask or slice keeps the columns.
+                if Self::is_row_mask(&subscript.slice) {
+                    return self.returned_expr_columns(&subscript.value);
+                }
+                // A literal list of names selects exactly those columns, whatever the
+                // frame it is taken from held.
                 ast_extract::extract_string_list(&subscript.slice)
             }
             Expr::Call(call) => {
+                if let Some(columns) = self.function_result_columns(call) {
+                    return Some(columns);
+                }
                 let Expr::Attribute(attr) = &*call.func else {
                     return None;
                 };
                 let method = attr.attr.as_str();
+                if is_load_callee(&call.func) {
+                    // A column list that isn't literal says nothing about the columns.
+                    let literal_lists = call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .filter(|k| {
+                            k.arg
+                                .as_ref()
+                                .is_some_and(|a| matches!(a.as_str(), "columns" | "usecols"))
+                        })
+                        .all(|k| ast_extract::extract_string_list(&k.value).is_some());
+                    return if literal_lists {
+                        self.extract_load_columns(method, call).0
+                    } else {
+                        None
+                    };
+                }
                 let from_sql =
                     |sql: Option<String>| match sql::columns_from_select(&sql?, self.sql_dialect) {
                         sql::SqlOutcome::Columns(cols) => Some(cols),
                         sql::SqlOutcome::Wildcard | sql::SqlOutcome::Unparsed => None,
                     };
                 if SQL_FINALIZE_METHODS.contains(&method) {
-                    let inner = ast_extract::sql_producing_call(&attr.value)?;
-                    return from_sql(self.extract_sql_literal(inner));
+                    // `to_pandas` of anything else keeps the frame's columns, below.
+                    if let Some(inner) = ast_extract::sql_producing_call(&attr.value) {
+                        return from_sql(self.extract_sql_literal(inner));
+                    }
                 }
                 if method == "fetch_pandas_all" {
                     let Expr::Name(cursor) = &*attr.value else {
@@ -4104,10 +5292,152 @@ impl Linter {
                 if keyword(call, "inplace").is_some() {
                     return None;
                 }
-                let base = self.returned_expr_columns(&attr.value)?;
+                if method == "agg" {
+                    if let Expr::Call(group) = &*attr.value {
+                        if matches!(&*group.func, Expr::Attribute(g) if g.attr.as_str() == "group_by")
+                        {
+                            let mut columns = ast_extract::group_by_keys(group)?;
+                            columns.extend(self.with_columns_outputs(call)?);
+                            return Some(columns);
+                        }
+                        // `group_by_dynamic("t", every=.., group_by=..)`: the time column, the
+                        // keys, then the aggregates.
+                        if matches!(&*group.func, Expr::Attribute(g) if g.attr.as_str() == "group_by_dynamic")
+                        {
+                            let mut columns =
+                                vec![ast_extract::extract_string_literal(
+                                    group.arguments.args.first().or_else(|| {
+                                        keyword(group, "index_column").map(|k| &k.value)
+                                    })?,
+                                )?
+                                .to_string()];
+                            if let Some(by) = keyword(group, "group_by") {
+                                columns.extend(ast_extract::literal_key_columns(&by.value)?);
+                            }
+                            columns.extend(self.with_columns_outputs(call)?);
+                            return Some(columns);
+                        }
+                    }
+                }
+                // `pl.from_pandas(frame)` carries the columns of `frame`.
+                if method == "from_pandas"
+                    && matches!(&*attr.value, Expr::Name(m) if LOAD_MODULES.contains(&m.id.as_str()))
+                {
+                    return self.returned_expr_columns(call.arguments.args.first()?);
+                }
+                if method == "select" {
+                    return Self::selected_columns(call);
+                }
+                if matches!(method, "agg" | "aggregate") {
+                    return Self::series_agg_list(call, false)
+                        .or_else(|| Self::named_agg_columns(call, false));
+                }
+                if let Some(columns) = Self::groupby_selection_aggregate(call, false) {
+                    return Some(columns);
+                }
+                // `pd.MultiIndex.from_product(.., names=[..]).to_frame()`: one column per level.
+                if method == "to_frame" && keyword(call, "name").is_none() {
+                    if let Expr::Call(build) = &*attr.value {
+                        if let Expr::Attribute(ctor) = &*build.func {
+                            if matches!(
+                                ctor.attr.as_str(),
+                                "from_product" | "from_arrays" | "from_tuples"
+                            ) && matches!(&*ctor.value, Expr::Attribute(m) if m.attr.as_str() == "MultiIndex")
+                            {
+                                return ast_extract::extract_string_list_or_single(
+                                    &keyword(build, "names")?.value,
+                                );
+                            }
+                        }
+                    }
+                }
+                if method == "to_frame" {
+                    return match call
+                        .arguments
+                        .args
+                        .first()
+                        .or_else(|| keyword(call, "name").map(|k| &k.value))
+                    {
+                        Some(name) => {
+                            Some(vec![ast_extract::extract_string_literal(name)?.to_string()])
+                        }
+                        None => {
+                            self.series_index(&attr.value)?;
+                            Some(vec![self.series_name(&attr.value)?])
+                        }
+                    };
+                }
+                // `groupby(keys)["v"].nunique().reset_index(name="n")`: the keys, then the Series
+                // under its new name.
+                if method == "reset_index" && call.arguments.args.is_empty() {
+                    if let ([kw], Expr::Call(inner)) = (&*call.arguments.keywords, &*attr.value) {
+                        if kw.arg.as_ref().is_some_and(|a| a.as_str() == "name") {
+                            let name = ast_extract::extract_string_literal(&kw.value)?;
+                            let mut columns = Self::series_groupby_reduction_keys(inner)?;
+                            columns.push(name.to_string());
+                            return Some(columns);
+                        }
+                    }
+                }
+                if method == "reset_index"
+                    && call.arguments.args.is_empty()
+                    && call.arguments.keywords.is_empty()
+                {
+                    if let Expr::Call(inner) = &*attr.value {
+                        if let Some(columns) = Self::series_agg_list(inner, true) {
+                            return Some(columns);
+                        }
+                        if let Expr::Attribute(inner_attr) = &*inner.func {
+                            match inner_attr.attr.as_str() {
+                                "agg" | "aggregate" => return Self::named_agg_columns(inner, true),
+                                _ if Self::groupby_selection_aggregate(inner, true).is_some() => {
+                                    return Self::groupby_selection_aggregate(inner, true)
+                                }
+                                "pivot_table" => return Self::pivot_table_columns(inner, true),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if method == "reset_index"
+                    && call.arguments.args.is_empty()
+                    && call.arguments.keywords.is_empty()
+                {
+                    if let Expr::Name(name) = &*attr.value {
+                        let (schema, _) = self.variables.get(name.id.as_str())?;
+                        let mut columns = self.schema_index.get(schema)?.clone();
+                        columns.extend(self.schemas.get(schema)?.iter().cloned());
+                        return Some(columns);
+                    }
+                }
+                if method == "pivot_table" {
+                    return Self::pivot_table_columns(call, false);
+                }
+                if matches!(method, "melt" | "unpivot") {
+                    return self.melted_columns(&attr.value, call);
+                }
+                // `groupby(..).tail(n)` keeps every row-wise column, keys included.
+                let receiver = match (method, &*attr.value) {
+                    ("tail" | "head", Expr::Call(inner)) => match &*inner.func {
+                        Expr::Attribute(g) if g.attr.as_str() == "groupby" => &*g.value,
+                        _ => &*attr.value,
+                    },
+                    _ => &*attr.value,
+                };
+                let base = self.returned_expr_columns(receiver)?;
                 // Without `columns=` or `axis=`, pandas reads `drop(x)` and `rename({..})` as
                 // row-label operations, which leave the columns alone.
                 match method {
+                    "set_index" if keyword(call, "inplace").is_none() => {
+                        let dropped = match keyword(call, "drop").map(|k| &k.value) {
+                            Some(Expr::BooleanLiteral(b)) if !b.value => Vec::new(),
+                            Some(_) => return None,
+                            None => ast_extract::extract_string_list_or_single(
+                                call.arguments.args.first()?,
+                            )?,
+                        };
+                        apply_edits(&base, &[ColumnEdit::Remove(dropped)])
+                    }
                     "rename" if keyword(call, "columns").is_some() => {
                         let mapping = ast_extract::extract_rename_mapping(call)?;
                         apply_edits(&base, &[ColumnEdit::Rename(mapping)])
@@ -4116,9 +5446,76 @@ impl Linter {
                         if keyword(call, "columns").is_some()
                             || keyword(call, "axis").is_some() =>
                     {
-                        let dropped = ast_extract::extract_drop_columns(call)?;
+                        let dropped = ast_extract::extract_drop_columns(call, false)?;
                         apply_edits(&base, &[ColumnEdit::Remove(dropped)])
                     }
+                    // Polars spells these positionally, which pandas reads as row labels.
+                    "rename" if self.is_polars_receiver(receiver) => {
+                        let mapping = ast_extract::extract_rename_mapping(call)?;
+                        apply_edits(&base, &[ColumnEdit::Rename(mapping)])
+                    }
+                    "drop" if self.is_polars_receiver(receiver) => {
+                        let mut dropped = Vec::new();
+                        for arg in &call.arguments.args {
+                            dropped.extend(ast_extract::extract_string_list_or_single(arg)?);
+                        }
+                        apply_edits(&base, &[ColumnEdit::Remove(dropped)])
+                    }
+                    "add_prefix" | "add_suffix" => {
+                        let affix =
+                            ast_extract::extract_string_literal(call.arguments.args.first()?)?;
+                        Some(
+                            base.iter()
+                                .map(|c| {
+                                    if method == "add_prefix" {
+                                        format!("{affix}{c}")
+                                    } else {
+                                        format!("{c}{affix}")
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }
+                    "merge" => {
+                        let right = call
+                            .arguments
+                            .args
+                            .first()
+                            .or_else(|| keyword(call, "right").map(|k| &k.value))?;
+                        let right = self.returned_expr_columns(right)?;
+                        match merged_columns(&base, &right, call) {
+                            Merged::Columns(columns) => Some(columns),
+                            Merged::Unknown => None,
+                        }
+                    }
+                    "join" if self.is_polars_receiver(receiver) => {
+                        let right = call
+                            .arguments
+                            .args
+                            .first()
+                            .or_else(|| keyword(call, "other").map(|k| &k.value))?;
+                        let right = self.returned_expr_columns(right)?;
+                        Self::polars_join(&base, &right, call).map(|join| join.columns)
+                    }
+                    "with_columns" => {
+                        let added = self.with_columns_outputs(call)?;
+                        apply_edits(&base, &[ColumnEdit::Add(added)])
+                    }
+                    // Polars: one new column, named by the first argument or `name=`.
+                    "with_row_index" => {
+                        let name = match call.arguments.args.first() {
+                            Some(arg) => ast_extract::extract_string_literal(arg)?.to_string(),
+                            None => match keyword(call, "name") {
+                                Some(k) => {
+                                    ast_extract::extract_string_literal(&k.value)?.to_string()
+                                }
+                                None => "index".to_string(),
+                            },
+                        };
+                        apply_edits(&base, &[ColumnEdit::Add(vec![name])])
+                    }
+                    // Polars: the same columns at a finer time grid.
+                    "upsample" => Some(base),
                     "rename" | "drop" => None,
                     // Keeps the old index as a column unless it is dropped.
                     "reset_index" => matches!(
@@ -4127,13 +5524,18 @@ impl Linter {
                     )
                     .then_some(base),
                     "assign" => {
-                        let added = call
-                            .arguments
-                            .keywords
-                            .iter()
-                            .map(|k| k.arg.as_ref().map(|a| a.to_string()))
-                            .collect::<Option<Vec<_>>>()?;
+                        let added = ast_extract::assign_output_names(call)?;
                         apply_edits(&base, &[ColumnEdit::Add(added)])
+                    }
+                    // Without an assignment `eval` returns a Series.
+                    "eval" if !self.is_polars_receiver(receiver) => {
+                        let text =
+                            ast_extract::extract_string_literal(call.arguments.args.first()?)?;
+                        let assigned = query_names::query_names(text)?.assigned;
+                        if assigned.is_empty() {
+                            return None;
+                        }
+                        apply_edits(&base, &[ColumnEdit::Add(assigned)])
                     }
                     _ if ROW_PASSTHROUGH_METHODS.contains(&method)
                         || SCHEMA_PRESERVING_METHODS.contains(&method) =>
@@ -4144,6 +5546,464 @@ impl Linter {
                 }
             }
             _ => None,
+        }
+    }
+
+    // `frame[<this>]` selecting rows: a comparison, a combination of masks, a mask method,
+    // or a row slice. A bare name could be a column list, so it is not one.
+    fn is_row_mask(slice: &Expr) -> bool {
+        match slice {
+            Expr::Compare(_) | Expr::Slice(_) => true,
+            Expr::UnaryOp(op) => {
+                matches!(op.op, ast::UnaryOp::Invert | ast::UnaryOp::Not)
+                    && Self::is_row_mask(&op.operand)
+                    || matches!(op.op, ast::UnaryOp::Invert)
+                        && matches!(&*op.operand, Expr::Call(_) | Expr::Subscript(_))
+            }
+            Expr::BinOp(bin) => {
+                matches!(
+                    bin.op,
+                    ast::Operator::BitAnd | ast::Operator::BitOr | ast::Operator::BitXor
+                ) && (Self::is_row_mask(&bin.left) || Self::is_row_mask(&bin.right))
+            }
+            Expr::Call(call) => matches!(&*call.func, Expr::Attribute(a) if matches!(
+                a.attr.as_str(),
+                "isin" | "notna" | "notnull" | "isna" | "isnull" | "between" | "duplicated"
+                    | "contains" | "startswith" | "endswith" | "match"
+            )),
+            _ => false,
+        }
+    }
+
+    // The columns a polars `select(...)` leaves, whatever the frame held.
+    fn selected_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
+        let mut columns = match &*call.arguments.args {
+            [list @ Expr::List(_)] => ast_extract::extract_string_list(list)?,
+            args => args
+                .iter()
+                .map(|arg| {
+                    ast_extract::extract_string_literal(arg)
+                        .map(str::to_string)
+                        .or_else(|| ast_extract::pl_expr_output_name(arg))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
+        columns.extend(ast_extract::assign_output_names(call)?);
+        Some(columns)
+    }
+
+    // The columns of the frame a call to a function or method of this file returns, when
+    // its body made them known.
+    fn function_result_columns(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        let schema = match &*call.func {
+            Expr::Name(name) => self.functions.get(name.id.as_str())?.clone(),
+            Expr::Attribute(attr) if matches!(&*attr.value, Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls")) => {
+                self.resolve_self_method(attr.attr.as_str())?
+            }
+            _ => return None,
+        };
+        if schema == OPEN_FRAME_MARKER || self.schema_is_unresolved(&schema) {
+            return None;
+        }
+        self.schemas.get(&schema).cloned()
+    }
+
+    // The schema of one operand of a merge or concat: a tracked name, or an expression whose
+    // columns follow from literal edits of a frame (`feats[["a", "b"]]`, `x.copy()`).
+    fn operand_schema(&mut self, expr: &Expr, line: usize) -> Option<String> {
+        if let Expr::Name(name) = expr {
+            return self.variables.get(name.id.as_str()).map(|(s, _)| s.clone());
+        }
+        let columns = self.returned_expr_columns(expr)?;
+        Some(self.make_inferred_schema(columns, "operand", line))
+    }
+
+    // The schema of every frame a `concat` joins, or `None` unless all of them are known:
+    // one the checker cannot see makes the result's columns unknowable.
+    fn concat_schemas(&mut self, call: &ast::ExprCall, line: usize) -> Option<Vec<String>> {
+        let objs = call
+            .arguments
+            .args
+            .first()
+            .or_else(|| keyword(call, "objs").map(|k| &k.value))?;
+        let (Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. })) =
+            objs
+        else {
+            return None;
+        };
+        if elts.len() < 2 {
+            return None;
+        }
+        elts.iter().map(|e| self.operand_schema(e, line)).collect()
+    }
+
+    // `df.groupby(keys).agg(out=("col", "fn"), ..)`: the outputs, with the keys first once
+    // they are columns (`as_index=False`, or after `reset_index()`) rather than the index.
+    fn named_agg_columns(call: &ast::ExprCall, reset_index: bool) -> Option<Vec<String>> {
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        let Expr::Call(grouped) = &*attr.value else {
+            return None;
+        };
+        let Expr::Attribute(group_attr) = &*grouped.func else {
+            return None;
+        };
+        if group_attr.attr.as_str() != "groupby" {
+            return None;
+        }
+        let mut outputs = Vec::new();
+        match &*call.arguments.args {
+            [] => {}
+            // `agg({"a": "sum", "b": "mean"})`: one function per column. A list of
+            // functions would make the columns a MultiIndex.
+            [Expr::Dict(spec)] if call.arguments.keywords.is_empty() => {
+                for item in &spec.items {
+                    let name = ast_extract::extract_string_literal(item.key.as_ref()?)?;
+                    ast_extract::extract_string_literal(&item.value)?;
+                    outputs.push(name.to_string());
+                }
+            }
+            _ => return None,
+        }
+        for kw in &call.arguments.keywords {
+            let Expr::Tuple(pair) = &kw.value else {
+                return None;
+            };
+            if pair.elts.len() != 2 {
+                return None;
+            }
+            outputs.push(kw.arg.as_ref()?.to_string());
+        }
+        if outputs.is_empty() {
+            return None;
+        }
+        let mut keys_are_columns = reset_index;
+        for kw in &grouped.arguments.keywords {
+            match kw.arg.as_ref().map(|a| a.as_str()) {
+                Some("as_index") => match &kw.value {
+                    Expr::BooleanLiteral(b) => keys_are_columns = keys_are_columns || !b.value,
+                    _ => return None,
+                },
+                Some("sort" | "dropna" | "observed" | "group_keys") => {}
+                Some("by") => {}
+                _ => return None,
+            }
+        }
+        if !keys_are_columns {
+            return Some(outputs);
+        }
+        let by = grouped
+            .arguments
+            .args
+            .first()
+            .or_else(|| keyword(grouped, "by").map(|k| &k.value))?;
+        let mut columns = ast_extract::extract_string_list_or_single(by)?;
+        columns.extend(outputs);
+        Some(columns)
+    }
+
+    // `frame.groupby(keys)[[cols]].mean()`: the group keys, the selected columns, and whether the
+    // keys are columns of the result (`as_index=False`, or after `reset_index()`).
+    fn groupby_selection_aggregate(call: &ast::ExprCall, reset_index: bool) -> Option<Vec<String>> {
+        const REDUCTIONS: &[&str] = &[
+            "mean", "sum", "median", "min", "max", "first", "last", "std", "var", "count",
+            "nunique", "size", "prod",
+        ];
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        if !REDUCTIONS.contains(&attr.attr.as_str()) {
+            return None;
+        }
+        let Expr::Subscript(selection) = &*attr.value else {
+            return None;
+        };
+        let Expr::Call(grouped) = &*selection.value else {
+            return None;
+        };
+        let Expr::Attribute(group_attr) = &*grouped.func else {
+            return None;
+        };
+        if group_attr.attr.as_str() != "groupby" {
+            return None;
+        }
+        // A single name selects a Series, which has no columns to name.
+        let selected = match &*selection.slice {
+            list @ (Expr::List(_) | Expr::Tuple(_)) => ast_extract::extract_string_list(list)?,
+            _ if reset_index => {
+                vec![ast_extract::extract_string_literal(&selection.slice)?.to_string()]
+            }
+            _ => return None,
+        };
+        let mut keys_are_columns = reset_index;
+        for kw in &grouped.arguments.keywords {
+            match kw.arg.as_ref().map(|a| a.as_str()) {
+                Some("as_index") => match &kw.value {
+                    Expr::BooleanLiteral(b) => keys_are_columns = keys_are_columns || !b.value,
+                    _ => return None,
+                },
+                Some("sort" | "dropna" | "observed" | "group_keys" | "by") => {}
+                _ => return None,
+            }
+        }
+        if !keys_are_columns {
+            return Some(selected);
+        }
+        let by = grouped
+            .arguments
+            .args
+            .first()
+            .or_else(|| keyword(grouped, "by").map(|k| &k.value))?;
+        let mut columns = ast_extract::extract_string_list_or_single(by)?;
+        for column in selected {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        Some(columns)
+    }
+
+    // `frame.groupby(keys)["v"]` with the keys as the index: the keys.
+    fn series_groupby_keys(expr: &Expr) -> Option<Vec<String>> {
+        let grouped = match expr {
+            Expr::Subscript(selection) => {
+                ast_extract::extract_string_literal(&selection.slice)?;
+                match &*selection.value {
+                    Expr::Call(grouped) => grouped,
+                    _ => return None,
+                }
+            }
+            Expr::Call(grouped) => grouped,
+            _ => return None,
+        };
+        let Expr::Attribute(group_attr) = &*grouped.func else {
+            return None;
+        };
+        if group_attr.attr.as_str() != "groupby" {
+            return None;
+        }
+        for kw in &grouped.arguments.keywords {
+            match kw.arg.as_ref().map(|a| a.as_str()) {
+                Some("sort" | "dropna" | "observed" | "group_keys" | "by") => {}
+                _ => return None,
+            }
+        }
+        let by = grouped
+            .arguments
+            .args
+            .first()
+            .or_else(|| keyword(grouped, "by").map(|k| &k.value))?;
+        ast_extract::extract_string_list_or_single(by)
+    }
+
+    // A Series per group: `groupby(keys)["v"].<reduction>()` or `groupby(keys).size()`.
+    fn series_groupby_reduction_keys(call: &ast::ExprCall) -> Option<Vec<String>> {
+        const REDUCTIONS: &[&str] = &[
+            "mean", "sum", "median", "min", "max", "first", "last", "std", "var", "count",
+            "nunique", "prod",
+        ];
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        if !call.arguments.args.is_empty() {
+            return None;
+        }
+        match (attr.attr.as_str(), &*attr.value) {
+            ("size", Expr::Call(_)) => Self::series_groupby_keys(&attr.value),
+            (m, Expr::Subscript(_)) if REDUCTIONS.contains(&m) => {
+                Self::series_groupby_keys(&attr.value)
+            }
+            _ => None,
+        }
+    }
+
+    // `groupby(keys)["v"].agg(["mean", "sum"])`: one flat column per named function, with the
+    // keys as columns once reset. On a frame (not one Series) the columns would be a MultiIndex.
+    fn series_agg_list(call: &ast::ExprCall, reset_index: bool) -> Option<Vec<String>> {
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        if !matches!(attr.attr.as_str(), "agg" | "aggregate") || !call.arguments.keywords.is_empty()
+        {
+            return None;
+        }
+        let [Expr::List(funcs)] = &*call.arguments.args else {
+            return None;
+        };
+        if !matches!(&*attr.value, Expr::Subscript(_)) {
+            return None;
+        }
+        let keys = Self::series_groupby_keys(&attr.value)?;
+        let outputs = funcs
+            .elts
+            .iter()
+            .map(|f| ast_extract::extract_string_literal(f).map(str::to_string))
+            .collect::<Option<Vec<_>>>()?;
+        if outputs.is_empty() {
+            return None;
+        }
+        if !reset_index {
+            return Some(outputs);
+        }
+        let mut columns = keys;
+        columns.extend(outputs);
+        Some(columns)
+    }
+
+    // The name a Series expression carries: `<frame-like>["v"]`, kept through a groupby or
+    // resample reduction and through elementwise methods.
+    fn series_name(&self, expr: &Expr) -> Option<String> {
+        const KEEPS_NAME: &[&str] = &[
+            "mean",
+            "sum",
+            "median",
+            "min",
+            "max",
+            "first",
+            "last",
+            "std",
+            "var",
+            "count",
+            "nunique",
+            "prod",
+            "fillna",
+            "astype",
+            "abs",
+            "round",
+            "shift",
+            "diff",
+            "cumsum",
+            "ffill",
+            "bfill",
+            "clip",
+            "dropna",
+            "sort_values",
+            "sort_index",
+            "head",
+            "tail",
+            "copy",
+        ];
+        match expr {
+            Expr::Subscript(sub) => {
+                // Only a frame or a grouping names its Series after the key; a dict does not.
+                let frame_like = match &*sub.value {
+                    Expr::Name(n) => self
+                        .variables
+                        .get(n.id.as_str())
+                        .is_some_and(|(schema, _)| !self.schema_is_unresolved(schema)),
+                    Expr::Call(c) => matches!(&*c.func, Expr::Attribute(a) if matches!(
+                        a.attr.as_str(),
+                        "groupby" | "resample" | "rolling" | "expanding"
+                    )),
+                    _ => false,
+                };
+                if !frame_like {
+                    return None;
+                }
+                Some(ast_extract::extract_string_literal(&sub.slice)?.to_string())
+            }
+            Expr::Call(call) => match &*call.func {
+                Expr::Attribute(a) if KEEPS_NAME.contains(&a.attr.as_str()) => {
+                    self.series_name(&a.value)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // The named index levels of a Series `series_name` names, when they are known: empty for
+    // a tracked frame without one.
+    fn series_index(&self, expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Subscript(sub) => match &*sub.value {
+                Expr::Name(n) => {
+                    let (schema, _) = self.variables.get(n.id.as_str())?;
+                    Some(self.schema_index.get(schema).cloned().unwrap_or_default())
+                }
+                Expr::Call(c) => {
+                    let Expr::Attribute(a) = &*c.func else {
+                        return None;
+                    };
+                    match a.attr.as_str() {
+                        "groupby" => Self::series_groupby_keys(expr),
+                        "resample" => {
+                            if let Some(on) = keyword(c, "on") {
+                                return Some(vec![
+                                    ast_extract::extract_string_literal(&on.value)?.to_string()
+                                ]);
+                            }
+                            match &*a.value {
+                                Expr::Call(_) => self.index_levels(&a.value),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            Expr::Call(call) => match &*call.func {
+                Expr::Attribute(a) => self.series_index(&a.value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // `melt`/`unpivot` keep the id columns and add the variable and value columns, whatever
+    // the melted ones are called.
+    fn melted_columns(&self, receiver: &Expr, call: &ast::ExprCall) -> Option<Vec<String>> {
+        let unpivot = matches!(&*call.func, Expr::Attribute(a) if a.attr.as_str() == "unpivot");
+        let (ids, var, value) = match (unpivot, self.is_polars_receiver(receiver)) {
+            (true, _) => ("index", "variable_name", "value_name"),
+            // The older polars spelling.
+            (false, true) => ("id_vars", "variable_name", "value_name"),
+            (false, false) => ("id_vars", "var_name", "value_name"),
+        };
+        let given = |kw: &str, default: &str| match keyword(call, kw) {
+            None => Some(default.to_string()),
+            Some(k) => ast_extract::extract_string_literal(&k.value).map(str::to_string),
+        };
+        let mut columns = match keyword(call, ids) {
+            None => Vec::new(),
+            Some(k) => ast_extract::extract_string_list_or_single(&k.value)?,
+        };
+        columns.push(given(var, "variable")?);
+        columns.push(given(value, "value")?);
+        Some(columns)
+    }
+
+    // `df.pivot_table(index=.., values=..)` with no `columns=`: the values are the columns,
+    // and the index names join them once reset.
+    fn pivot_table_columns(call: &ast::ExprCall, reset_index: bool) -> Option<Vec<String>> {
+        if keyword(call, "columns").is_some()
+            || keyword(call, "margins").is_some()
+            || !call.arguments.args.is_empty()
+        {
+            return None;
+        }
+        let values = ast_extract::extract_string_list_or_single(&keyword(call, "values")?.value)?;
+        if !reset_index {
+            return Some(values);
+        }
+        let mut columns =
+            ast_extract::extract_string_list_or_single(&keyword(call, "index")?.value)?;
+        columns.extend(values);
+        Some(columns)
+    }
+
+    // `base.loc[..]` / `base.iloc[..]`: a row filter keeps the columns, and a `[rows, [names]]`
+    // pair picks exactly those. A scalar label yields a row (a Series), not a frame.
+    fn indexer_columns(&self, base: &Expr, slice: &Expr) -> Option<Vec<String>> {
+        match slice {
+            Expr::Tuple(pair) => match pair.elts.as_slice() {
+                [_, columns] => ast_extract::extract_string_list(columns),
+                _ => None,
+            },
+            Expr::StringLiteral(_) | Expr::NumberLiteral(_) | Expr::List(_) => None,
+            _ => self.returned_expr_columns(base),
         }
     }
 
@@ -4169,55 +6029,346 @@ impl Linter {
             .is_some_and(|cols| cols.iter().any(|c| c == col))
     }
 
-    // Extract a column name from a `pl.col("name")` or `col("name")` call expression.
+    // Checks each frame a call passes against what the callee requires of that parameter.
+    // Silent when the callee can't be tied to one function or the arguments to its parameters.
     fn check_call_requirements(
         &self,
-        func_name: &str,
         call: &ast::ExprCall,
         line: usize,
         col: usize,
         errors: &mut Vec<LintError>,
     ) {
-        let Some((required, origin)) = self.param_requires.get(func_name) else {
+        let Some((contract, origin)) = self.call_contract(call) else {
             return;
         };
-        let Some(first_arg) = call.arguments.args.first() else {
-            return;
-        };
-        let Expr::Name(arg_name) = first_arg else {
-            return;
-        };
-        let Some((schema_name, _)) = self.variables.get(arg_name.id.as_str()) else {
-            return;
-        };
-        let Some(available) = self.schemas.get(schema_name) else {
-            return;
-        };
-        let missing: Vec<&String> = required.iter().filter(|c| !available.contains(c)).collect();
-        if missing.is_empty() {
+        if !contract.has_requirements() {
             return;
         }
-        let missing_str = missing
+        let Some(shape) = call_contracts::CallShape::of(call) else {
+            return;
+        };
+        let Some(bound) = contract.signature.bind(&shape) else {
+            return;
+        };
+        if !self
+            .contract_calls_checked
+            .borrow_mut()
+            .insert((self.file_display.clone(), call.range().start().to_u32()))
+        {
+            return;
+        }
+        let arguments = call
+            .arguments
+            .args
             .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let available_str = available.join(", ");
-        let required_str = required.join(", ");
-        errors.push(LintError {
-            line,
-            col,
-            code: CODE_MISSING_COLUMN.to_string(),
-            message: format!(
-                "'{}' passed to {} is missing column(s) {{{}}} — available: {{{}}}, required: {{{}}}",
-                arg_name.id.as_str(),
-                origin,
-                missing_str,
-                available_str,
-                required_str
-            ),
-            severity: "error".to_string(),
-        });
+            .chain(call.arguments.keywords.iter().map(|k| &k.value));
+        for (argument, param) in arguments.zip(bound) {
+            let Some(param) = param else {
+                continue;
+            };
+            let required = &contract.requires[param];
+            if required.is_empty() {
+                continue;
+            }
+            let (available, index_levels, arg_label) = match argument {
+                Expr::Name(arg_name) => {
+                    let Some((schema_name, _)) = self.variables.get(arg_name.id.as_str()) else {
+                        continue;
+                    };
+                    // An unresolved frame's empty column list means "unknown", not "has no columns".
+                    if self.schema_is_unresolved(schema_name) {
+                        continue;
+                    }
+                    let Some(available) = self.schemas.get(schema_name) else {
+                        continue;
+                    };
+                    (
+                        available.clone(),
+                        self.schema_index
+                            .get(schema_name)
+                            .cloned()
+                            .unwrap_or_default(),
+                        arg_name.id.to_string(),
+                    )
+                }
+                // A load or chain written in place: `f(pl.read_parquet(.., columns=[..]))`.
+                Expr::Call(_) => {
+                    let Some((available, _)) = self.expr_frame_columns(argument) else {
+                        continue;
+                    };
+                    (available, Vec::new(), "the frame".to_string())
+                }
+                _ => continue,
+            };
+            let missing: Vec<&String> = required
+                .iter()
+                .filter(|c| !available.contains(c) && !index_levels.contains(c))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let missing_str = missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let as_param = if Some(param) == contract.loose_param || param == 0 {
+                String::new()
+            } else {
+                format!(" as '{}'", contract.signature.name(param))
+            };
+            errors.push(LintError {
+                line,
+                col,
+                code: CODE_MISSING_COLUMN.to_string(),
+                message: format!(
+                    "'{}' passed to {}{} is missing column(s) {{{}}} — available: {{{}}}, required: {{{}}}",
+                    arg_label,
+                    origin,
+                    as_param,
+                    missing_str,
+                    available.join(", "),
+                    required.join(", ")
+                ),
+                severity: "error".to_string(),
+            });
+        }
+    }
+
+    // The contract of the function `call` reaches, when that is one function.
+    fn call_contract(
+        &self,
+        call: &ast::ExprCall,
+    ) -> Option<(&call_contracts::FuncContract, &String)> {
+        let found = match &*call.func {
+            Expr::Name(name) => {
+                if self.variables.contains_key(name.id.as_str()) {
+                    return None;
+                }
+                let key = self
+                    .contract_targets
+                    .get(&call.func.range().start().to_u32())?;
+                self.contracts.get(key)
+            }
+            Expr::Attribute(attr) => match &*attr.value {
+                Expr::Name(base) if base.id.as_str() == "self" => {
+                    let class = self.current_class_name.as_ref()?;
+                    let key = self.method_contract_key(class, attr.attr.as_str())?;
+                    self.contracts.get(&key)
+                }
+                Expr::Name(base) => {
+                    if self.variables.contains_key(base.id.as_str()) {
+                        return None;
+                    }
+                    if let Some(key) = self
+                        .contract_targets
+                        .get(&call.func.range().start().to_u32())
+                    {
+                        self.contracts.get(key)
+                    } else {
+                        let class = self.receiver_classes.get(base.id.as_str())?;
+                        self.receiver_method_contract(class, attr.attr.as_str())
+                    }
+                }
+                // `Loader().load(frame)`
+                Expr::Call(inner) => {
+                    let Expr::Name(class) = &*inner.func else {
+                        return None;
+                    };
+                    let key = self.method_contract_key(class.id.as_str(), attr.attr.as_str())?;
+                    self.contracts.get(&key)
+                }
+                _ => None,
+            },
+            _ => None,
+        }?;
+        Some((&found.0, &found.1))
+    }
+
+    // A call through a name annotated with (or constructed from) `class`. A protocol's own
+    // bodies never run: its method means whatever every implementor in the project agrees on.
+    fn receiver_method_contract(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<&(call_contracts::FuncContract, String)> {
+        if self.protocol_classes.contains(class) {
+            return self.method_agreement.get(method);
+        }
+        let key = self.method_contract_key(class, method)?;
+        self.contracts.get(&key)
+    }
+
+    // The contract key of the method `self.<method>` reaches in an instance of `class`: the
+    // nearest class in its chain that defines it, when every class before that one is known
+    // not to, and no subclass in this file overrides it with a different requirement.
+    fn method_contract_key(&self, class: &str, method: &str) -> Option<FnKey> {
+        let memo_key = (Some(class.to_string()), method.to_string());
+        if let Some(done) = self.method_contract_memo.borrow().get(&memo_key) {
+            return done.clone();
+        }
+        let found = self.compute_method_contract_key(class, method);
+        self.method_contract_memo
+            .borrow_mut()
+            .insert(memo_key, found.clone());
+        found
+    }
+
+    fn compute_method_contract_key(&self, class: &str, method: &str) -> Option<FnKey> {
+        if self.protocol_classes.contains(class) {
+            return None;
+        }
+        let mut owner = None;
+        for ancestor in self.class_chain(class) {
+            if self.protocol_classes.contains(&ancestor) {
+                return None;
+            }
+            let key = (Some(ancestor.clone()), method.to_string());
+            match self.class_method_names.get(&ancestor) {
+                Some(methods) if methods.contains(method) => {
+                    owner = Some(key);
+                    break;
+                }
+                Some(_) => continue,
+                // A class from another file: only its own method contracts are known.
+                None if self.contracts.contains_key(&key) => {
+                    owner = Some(key);
+                    break;
+                }
+                None => return None,
+            }
+        }
+        let owner = owner?;
+        // An instance of a subclass in another file would run that file's method instead.
+        if self
+            .overridden_elsewhere
+            .get(class)
+            .is_some_and(|methods| methods.contains(method))
+        {
+            return None;
+        }
+        let found = &self.contracts.get(&owner)?.0;
+        for other in self.subclasses.get(class).into_iter().flatten() {
+            let defines = self
+                .class_method_names
+                .get(other)
+                .is_some_and(|methods| methods.contains(method));
+            if !defines || Some(other) == owner.0.as_ref() {
+                continue;
+            }
+            let agrees = self
+                .contracts
+                .get(&(Some(other.clone()), method.to_string()))
+                .is_some_and(|(c, _)| c.agrees_with(found));
+            if !agrees {
+                return None;
+            }
+        }
+        Some(owner)
+    }
+
+    // Collects the contract of every function and method of the file, resolves the calls
+    // whose callee binds to exactly one of them, and folds in one level of forwarding.
+    fn prepare_contracts(&mut self, module: &ModModule) {
+        self.contracts.clear();
+        self.local_contracts.clear();
+        self.class_method_names.clear();
+        self.protocol_classes.clear();
+        self.method_contract_memo.borrow_mut().clear();
+        let mut collector = ContractCollector {
+            linter: self,
+            class: None,
+            contracts: HashMap::new(),
+            class_methods: HashMap::new(),
+            protocols: std::collections::HashSet::new(),
+        };
+        for stmt in &module.body {
+            collector.stmt(stmt);
+        }
+        let ContractCollector {
+            contracts: collected,
+            class_methods,
+            protocols,
+            ..
+        } = collector;
+        self.class_method_names = class_methods;
+        self.protocol_classes = protocols;
+        self.subclasses.clear();
+        for class in self.class_method_names.keys() {
+            for ancestor in self.class_chain(class).into_iter().skip(1) {
+                self.subclasses
+                    .entry(ancestor)
+                    .or_default()
+                    .push(class.clone());
+            }
+        }
+        let mut local: HashMap<FnKey, call_contracts::FuncContract> = collected
+            .into_iter()
+            .filter_map(|(key, contract)| Some((key, contract?)))
+            .collect();
+
+        if !std::mem::take(&mut self.contract_targets_ready) {
+            let analysis = static_eval::Analysis::build(module, &self.imported_modules);
+            self.contract_targets = contract_targets(&analysis, module);
+        }
+
+        for (key, contract) in &local {
+            let origin = format!("{} ({}:{})", key.1, self.file_display, contract.def_line);
+            self.contracts
+                .insert(key.clone(), (contract.clone(), origin));
+        }
+        for (key, entry) in &self.imported_contracts {
+            self.contracts
+                .entry(key.clone())
+                .or_insert_with(|| entry.clone());
+        }
+        // One level: a forwarded parameter takes on what the callee itself requires.
+        let mut pending: Vec<(FnKey, call_contracts::FuncContract)> = Vec::new();
+        for (key, contract) in local.iter_mut() {
+            let forwards = std::mem::take(&mut contract.forwards);
+            let mut unresolved = Vec::new();
+            for mut forward in forwards {
+                let target = match &forward.target {
+                    call_contracts::ForwardTarget::Call(at) => {
+                        self.contract_targets.get(at).cloned()
+                    }
+                    call_contracts::ForwardTarget::SelfMethod(method) => key
+                        .0
+                        .as_ref()
+                        .and_then(|class| self.method_contract_key(class, method)),
+                    _ => None,
+                };
+                match target.as_ref().and_then(|t| self.contracts.get(t)) {
+                    Some((callee, _)) => contract.inherit(&forward, callee),
+                    None => {
+                        // Left for the project index: a function imported from another file.
+                        let later = match target {
+                            Some((Some(slot), name)) if slot == call_contracts::IMPORTED_SLOT => {
+                                Some(call_contracts::ForwardTarget::Imported(name))
+                            }
+                            Some((Some(slot), name)) => slot.strip_prefix("module:").map(|alias| {
+                                call_contracts::ForwardTarget::Module(alias.to_string(), name)
+                            }),
+                            _ => None,
+                        };
+                        if let Some(later) = later {
+                            forward.target = later;
+                            unresolved.push(forward);
+                        }
+                    }
+                }
+            }
+            let mut finished = contract.clone();
+            finished.forwards = unresolved;
+            pending.push((key.clone(), finished));
+        }
+        for (key, contract) in pending {
+            if let Some((existing, _)) = self.contracts.get_mut(&key) {
+                existing.requires = contract.requires.clone();
+            }
+            self.local_contracts.insert(key, contract);
+        }
+        self.method_contract_memo.borrow_mut().clear();
     }
 
     // Validate any `pl.col("name")` / `col("name")` references in a call's arguments
@@ -4235,6 +6386,9 @@ impl Linter {
         else {
             return;
         };
+        if self.schema_is_unresolved(&schema_name) {
+            return;
+        }
         let Some(columns) = self.schemas.get(&schema_name).cloned() else {
             return;
         };
@@ -4285,19 +6439,8 @@ impl Linter {
             return;
         };
         if self.schema_is_unresolved(&schema_name) {
-            let schema_display = self.schema_display(&schema_name, defined_line);
-            for col_name in col_names {
-                errors.push(LintError {
-                    line,
-                    col,
-                    code: CODE_UNVERIFIABLE_COLUMN.to_string(),
-                    message: format!(
-                        "Column '{}' cannot be verified (mutation tracking): {} has no concrete column list",
-                        col_name, schema_display
-                    ),
-                    severity: "error".to_string(),
-                });
-            }
+            // A write reads nothing, so it is not itself unverifiable; the first read of
+            // the frame says so.
             // An edit attempted against an unresolved base can't be trusted to have
             // produced any particular column set either -- see `count_mutation_leg`.
             let new_schema = self.count_mutation_leg(Some(&schema_name), None, recv, line, col);
@@ -4311,19 +6454,24 @@ impl Linter {
         if missing.is_empty() {
             return;
         }
-        let schema_display = self.schema_display(&schema_name, defined_line);
         let mut new_cols = self.schemas.get(&schema_name).cloned().unwrap_or_default();
+        // Only a declared schema is a contract a write can break; a column set the
+        // checker inferred just gains the column.
+        let declared = !schema_name.starts_with("__inferred_");
+        let schema_display = self.schema_display(&schema_name, defined_line);
         for col_name in missing {
-            errors.push(LintError {
-                line,
-                col,
-                code: CODE_UNKNOWN_COLUMN.to_string(),
-                message: format!(
-                    "Column '{}' does not exist in {} (mutation tracking)",
-                    col_name, schema_display
-                ),
-                severity: "error".to_string(),
-            });
+            if declared {
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNKNOWN_COLUMN.to_string(),
+                    message: format!(
+                        "Column '{}' does not exist in {} (mutation tracking)",
+                        col_name, schema_display
+                    ),
+                    severity: "error".to_string(),
+                });
+            }
             if !new_cols.contains(col_name) {
                 new_cols.push(col_name.clone());
             }
@@ -4333,6 +6481,233 @@ impl Linter {
         let new_schema =
             self.count_mutation_leg(Some(&schema_name), Some(new_cols), recv, line, col);
         self.variables.insert(recv.to_string(), (new_schema, line));
+    }
+
+    // A write under a computed name to a frame whose columns are inferred: it may add any
+    // column, so the frame is open afterwards, keeping what it certainly has.
+    fn record_dynamic_column_write(&mut self, recv: &str, line: usize, col: usize) {
+        let Some((schema_name, _)) = self.variables.get(recv).cloned() else {
+            return;
+        };
+        if self.schema_is_unresolved(&schema_name) || !schema_name.starts_with("__inferred_") {
+            return;
+        }
+        let known = self.schemas.get(&schema_name).cloned().unwrap_or_default();
+        let new_schema = self.count_open_leg(Some(&schema_name), known, recv, line, col);
+        self.variables.insert(recv.to_string(), (new_schema, line));
+        self.record_leg_event(
+            recv,
+            line,
+            col,
+            "unresolved",
+            "a column is written under a name computed at runtime, so the columns added are unknown"
+                .to_string(),
+        );
+    }
+
+    // The names `key` takes over the iterations of the enclosing `for` loops, when each loop
+    // runs over a fixed list and every iteration yields a string.
+    fn loop_computed_names(&self, key: &Expr) -> Option<Vec<String>> {
+        if self.loop_bindings.is_empty() {
+            return None;
+        }
+        let environments = self.loop_environments()?;
+        let mut names = Vec::new();
+        for env in &environments {
+            let resolver = static_eval::LoopNames { bound: env };
+            match static_eval::Evaluator::new(&resolver).eval(key)? {
+                static_eval::Value::Str(name) if !names.contains(&name) => names.push(name),
+                static_eval::Value::Str(_) => {}
+                _ => return None,
+            }
+        }
+        (!names.is_empty()).then_some(names)
+    }
+
+    // Every combination of values the enclosing literal loops bind (one empty one outside a
+    // loop), or `None` when there are too many to enumerate.
+    fn loop_environments(&self) -> Option<Vec<HashMap<String, static_eval::Value>>> {
+        const MAX_COMBINATIONS: usize = 2_000;
+        let mut environments: Vec<HashMap<String, static_eval::Value>> = vec![HashMap::new()];
+        for binding in &self.loop_bindings {
+            let mut next = Vec::new();
+            for env in &environments {
+                for row in &binding.rows {
+                    let mut env = env.clone();
+                    env.extend(binding.names.iter().cloned().zip(row.iter().cloned()));
+                    next.push(env);
+                }
+            }
+            if next.len() > MAX_COMBINATIONS {
+                return None;
+            }
+            environments = next;
+        }
+        Some(environments)
+    }
+
+    // The output names of a polars `with_columns`/`agg` call. Beyond the literal forms, a list
+    // argument, a comprehension over a literal list, and `alias(...)`/`pl.col(...)` names
+    // computed from loop variables are evaluated for every value the loops bind.
+    fn with_columns_outputs(&self, call: &ast::ExprCall) -> Option<Vec<String>> {
+        if let Some(names) = ast_extract::with_columns_output_names(call) {
+            return Some(names);
+        }
+        let mut names = ast_extract::assign_output_names(call)?;
+        let envs = self.loop_environments()?;
+        let push = |found: Vec<String>, names: &mut Vec<String>| {
+            for name in found {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        };
+        for arg in &call.arguments.args {
+            match arg {
+                Expr::List(ast::ExprList { elts, .. })
+                | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
+                    for elt in elts {
+                        push(self.pl_outputs_over(elt, &envs)?, &mut names);
+                    }
+                }
+                Expr::ListComp(comp) => {
+                    let [generator] = comp.generators.as_slice() else {
+                        return None;
+                    };
+                    let Expr::Name(target) = &generator.target else {
+                        return None;
+                    };
+                    if !generator.ifs.is_empty() || generator.is_async {
+                        return None;
+                    }
+                    for env in &envs {
+                        let resolver = static_eval::LoopNames { bound: env };
+                        let items = static_eval::Evaluator::new(&resolver)
+                            .eval_iterable(&generator.iter)
+                            .and_then(|v| static_eval::Evaluator::iterate(&v))?;
+                        let inner: Vec<_> = items
+                            .into_iter()
+                            .map(|item| {
+                                let mut env = env.clone();
+                                env.insert(target.id.to_string(), item);
+                                env
+                            })
+                            .collect();
+                        push(self.pl_outputs_over(&comp.elt, &inner)?, &mut names);
+                    }
+                }
+                _ => push(self.pl_outputs_over(arg, &envs)?, &mut names),
+            }
+        }
+        Some(names)
+    }
+
+    fn pl_outputs_over(
+        &self,
+        expr: &Expr,
+        envs: &[HashMap<String, static_eval::Value>],
+    ) -> Option<Vec<String>> {
+        if let Some(name) = ast_extract::pl_expr_output_name(expr) {
+            return Some(vec![name]);
+        }
+        let mut names = Vec::new();
+        for env in envs {
+            let name = Self::pl_output_in_env(expr, env)?;
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        (!names.is_empty()).then_some(names)
+    }
+
+    // `pl_expr_output_name` with names bound by a loop: `alias("g_" + g)`, `pl.col(c)`.
+    fn pl_output_in_env(expr: &Expr, env: &HashMap<String, static_eval::Value>) -> Option<String> {
+        let eval_str = |e: &Expr| {
+            let resolver = static_eval::LoopNames { bound: env };
+            match static_eval::Evaluator::new(&resolver).eval(e)? {
+                // A `^...$` pattern selects many columns.
+                static_eval::Value::Str(s) if !(s.starts_with('^') && s.ends_with('$')) => Some(s),
+                _ => None,
+            }
+        };
+        if let Some(name) = ast_extract::pl_expr_output_name(expr) {
+            return Some(name);
+        }
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        match (attr.attr.as_str(), &*attr.value, &*call.arguments.args) {
+            ("alias", _, [arg]) => eval_str(arg),
+            ("col", Expr::Name(m), [arg]) if matches!(m.id.as_str(), "pl" | "polars") => {
+                eval_str(arg)
+            }
+            (_, Expr::Call(inner), _) => {
+                if matches!(&*inner.func, Expr::Attribute(a) if a.attr.as_str() == "alias") {
+                    return None;
+                }
+                Self::pl_output_in_env(&attr.value, env)
+            }
+            // A namespace (`.str`, `.dt`) keeps the name; these rename.
+            (_, Expr::Attribute(ns), _) if !matches!(ns.attr.as_str(), "name" | "struct") => {
+                Self::pl_output_in_env(&ns.value, env)
+            }
+            _ => None,
+        }
+    }
+
+    fn enter_loop(&mut self, for_stmt: &ast::StmtFor) -> bool {
+        let resolver = static_eval::LoopNames {
+            bound: &HashMap::new(),
+        };
+        let Some(items) = static_eval::Evaluator::new(&resolver)
+            .eval_iterable(&for_stmt.iter)
+            .and_then(|v| static_eval::Evaluator::iterate(&v))
+        else {
+            return false;
+        };
+        let names: Option<Vec<String>> = match &*for_stmt.target {
+            Expr::Name(n) => Some(vec![n.id.to_string()]),
+            Expr::Tuple(t) => t
+                .elts
+                .iter()
+                .map(|e| match e {
+                    Expr::Name(n) => Some(n.id.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
+        let Some(names) = names else {
+            return false;
+        };
+        let single = names.len() == 1 && matches!(&*for_stmt.target, Expr::Name(_));
+        let rows: Option<Vec<Vec<static_eval::Value>>> = items
+            .into_iter()
+            .map(|item| match (single, item) {
+                (true, item) => Some(vec![item]),
+                (false, static_eval::Value::Tuple(v) | static_eval::Value::List(v))
+                    if v.len() == names.len() =>
+                {
+                    Some(v)
+                }
+                _ => None,
+            })
+            .collect();
+        match rows {
+            Some(rows) => {
+                self.loop_bindings.push(LoopBinding { names, rows });
+                true
+            }
+            None => false,
+        }
+    }
+
+    // Whether `receiver` is a polars frame, so a method both libraries have is read the polars way.
+    fn is_polars_receiver(&self, receiver: &Expr) -> bool {
+        self.polars_only_file || crate::polars_names::is_polars_expr(receiver, &self.polars_names)
     }
 
     // Whether a call runs in place: a literal `inplace=True`, or a name that the whole
@@ -4444,6 +6819,224 @@ impl Linter {
         }
     }
 
+    // `frame.group_by(keys).agg(...)` and `frame.join(other, ...)` on resolved polars
+    // frames, when the result's columns follow from literal arguments.
+    fn polars_frame_op(
+        &self,
+        attr: &ast::ExprAttribute,
+        call: &ast::ExprCall,
+    ) -> Option<PolarsFrameOp> {
+        let columns_of = |name: &str| -> Option<(String, Vec<String>)> {
+            let (schema, _) = self.variables.get(name)?;
+            if self.schema_is_unresolved(schema) {
+                return None;
+            }
+            Some((schema.clone(), self.schemas.get(schema)?.clone()))
+        };
+        match attr.attr.as_str() {
+            "agg" => {
+                let Expr::Call(group) = &*attr.value else {
+                    return None;
+                };
+                let Expr::Attribute(group_attr) = &*group.func else {
+                    return None;
+                };
+                if group_attr.attr.as_str() != "group_by" {
+                    return None;
+                }
+                let Expr::Name(recv) = &*group_attr.value else {
+                    return None;
+                };
+                columns_of(recv.id.as_str())?;
+                let keys = ast_extract::group_by_keys(group)?;
+                let aggregated = self.with_columns_outputs(call)?;
+                let mut reads = keys.clone();
+                reads.extend(
+                    call.arguments
+                        .args
+                        .iter()
+                        .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                        .flat_map(ast_extract::collect_pl_col_names),
+                );
+                let mut columns = keys;
+                for name in aggregated {
+                    if !columns.contains(&name) {
+                        columns.push(name);
+                    }
+                }
+                Some(PolarsFrameOp {
+                    reads: vec![(recv.id.to_string(), reads)],
+                    columns,
+                })
+            }
+            "join" if self.is_polars_receiver(&attr.value) => {
+                let Expr::Name(left) = &*attr.value else {
+                    return None;
+                };
+                let right_expr = call
+                    .arguments
+                    .args
+                    .first()
+                    .or_else(|| keyword(call, "other").map(|k| &k.value))?;
+                let Expr::Name(right) = right_expr else {
+                    return None;
+                };
+                let (_, left_cols) = columns_of(left.id.as_str())?;
+                let (_, right_cols) = columns_of(right.id.as_str())?;
+                let join = Self::polars_join(&left_cols, &right_cols, call)?;
+                let reads = vec![
+                    (left.id.to_string(), join.left_keys),
+                    (right.id.to_string(), join.right_keys),
+                ];
+                Some(PolarsFrameOp {
+                    reads,
+                    columns: join.columns,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    // The keys and result columns of `left.join(right, ...)` in polars, when the arguments
+    // are literal.
+    fn polars_join(
+        left_cols: &[String],
+        right_cols: &[String],
+        call: &ast::ExprCall,
+    ) -> Option<PolarsJoin> {
+        let key =
+            |name: &str| keyword(call, name).map(|k| ast_extract::literal_key_columns(&k.value));
+        let (left_keys, right_keys) = match (key("on"), key("left_on"), key("right_on")) {
+            (Some(on), None, None) => (on.clone()?, on?),
+            (None, Some(l), Some(r)) => (l?, r?),
+            _ => return None,
+        };
+        let how = match keyword(call, "how").map(|k| &k.value) {
+            None => "inner".to_string(),
+            Some(Expr::StringLiteral(s)) => s.value.to_str().to_string(),
+            Some(_) => return None,
+        };
+        // `coalesce=` and `validate=` change which key columns survive.
+        if keyword(call, "coalesce").is_some() || call.arguments.args.len() > 1 {
+            return None;
+        }
+        let columns = match how.as_str() {
+            "semi" | "anti" => left_cols.to_vec(),
+            "inner" | "left" => {
+                let suffix = match keyword(call, "suffix").map(|k| &k.value) {
+                    None => "_right".to_string(),
+                    Some(Expr::StringLiteral(s)) => s.value.to_str().to_string(),
+                    Some(_) => return None,
+                };
+                let mut columns = left_cols.to_vec();
+                for name in right_cols.iter().filter(|c| !right_keys.contains(c)) {
+                    let out = if left_cols.contains(name) {
+                        format!("{name}{suffix}")
+                    } else {
+                        name.clone()
+                    };
+                    if columns.contains(&out) {
+                        return None;
+                    }
+                    columns.push(out);
+                }
+                columns
+            }
+            _ => return None,
+        };
+        Some(PolarsJoin {
+            left_keys,
+            right_keys,
+            columns,
+        })
+    }
+
+    fn apply_polars_frame_op(
+        &mut self,
+        assign: &ast::StmtAssign,
+        op: PolarsFrameOp,
+        line: usize,
+        col: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        for (frame, names) in &op.reads {
+            let Some((schema, defined_line)) = self.variables.get(frame).cloned() else {
+                continue;
+            };
+            if self.schema_is_unresolved(&schema) {
+                continue;
+            }
+            let available = self.schemas.get(&schema).cloned().unwrap_or_default();
+            for name in names.iter().filter(|n| !available.contains(n)) {
+                let mut message = format!(
+                    "Column '{}' does not exist in {}",
+                    name,
+                    self.schema_display(&schema, defined_line)
+                );
+                if let Some(suggestion) = find_best_match(name, &available) {
+                    message.push_str(&format!(" (did you mean '{suggestion}'?)"));
+                }
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNKNOWN_COLUMN.to_string(),
+                    message,
+                    severity: "error".to_string(),
+                });
+            }
+        }
+        let targets = Self::assign_target_names(assign);
+        let Some(var_hint) = targets.first().cloned() else {
+            return;
+        };
+        let base = op.reads.first().map(|(f, _)| f.clone()).unwrap_or_default();
+        let base_schema = self.variables.get(&base).map(|(s, _)| s.clone());
+        let schema_name = self.count_mutation_leg(
+            base_schema.as_deref(),
+            Some(op.columns),
+            &var_hint,
+            line,
+            col,
+        );
+        for name in &targets {
+            self.variables
+                .insert(name.clone(), (schema_name.clone(), line));
+        }
+    }
+
+    // The value of `expr` when it only reads `frame`'s known columns and fixed strings
+    // (`[c.lower() for c in df.columns]`).
+    fn eval_over_columns(
+        frame: &str,
+        columns: &[String],
+        expr: &Expr,
+    ) -> Option<static_eval::Value> {
+        let resolver = static_eval::FrameColumns { frame, columns };
+        static_eval::Evaluator::new(&resolver).eval(expr)
+    }
+
+    // `df.rename(columns={c: ... for c in df.columns})`: the mapping a non-literal
+    // argument evaluates to over the frame's known columns.
+    fn evaluated_rename_mapping(
+        call: &ast::ExprCall,
+        frame: &str,
+        columns: &[String],
+    ) -> Option<HashMap<String, String>> {
+        let arg = keyword(call, "columns")
+            .map(|k| &k.value)
+            .or_else(|| call.arguments.args.first())?;
+        let static_eval::Value::Dict(items) = Self::eval_over_columns(frame, columns, arg)? else {
+            return None;
+        };
+        items
+            .into_iter()
+            .map(|(k, v)| match (k, v) {
+                (static_eval::Value::Str(k), static_eval::Value::Str(v)) => Some((k, v)),
+                _ => None,
+            })
+            .collect()
+    }
+
     // `df.columns = [...]`: a literal list of strings is the new column set, anything
     // else (other than the case-fold handled with the assignment dispatch) leaves it
     // unknown.
@@ -4465,7 +7058,14 @@ impl Linter {
             if self.schema_is_unresolved(&schema_name) {
                 continue;
             }
-            let literal = ast_extract::extract_string_list(&assign.value);
+            let base_cols = self.schemas.get(&schema_name).cloned().unwrap_or_default();
+            // A comprehension over the frame's own columns, with every step fixed, is as
+            // good as a literal -- only when it keeps the column count, as pandas requires.
+            let literal = ast_extract::extract_string_list(&assign.value).or_else(|| {
+                Self::eval_over_columns(recv, &base_cols, &assign.value)?
+                    .as_string_list()
+                    .filter(|cols| cols.len() == base_cols.len())
+            });
             let is_case_fold = ast_extract::extract_columns_str_fold(&assign.value)
                 .is_some_and(|(rhs_recv, _)| rhs_recv == recv);
             if is_case_fold {
@@ -4554,6 +7154,7 @@ impl Linter {
                 .map(|name| (name, "is rebound by an assignment expression")),
         );
         for (name, why) in rebound {
+            self.open_frames.remove(&name);
             if self.variables.remove(&name).is_none() {
                 continue;
             }
@@ -4633,6 +7234,85 @@ impl Linter {
     }
 
     // Registers the schema a `BaseSchema`/ORM class declares, if it declares one.
+    // A pydantic model or dataclass: its annotated attributes (own, after those of base
+    // classes defined in this file) are the keys its `model_dump()`/`asdict()` produces.
+    fn register_record_class(&mut self, class_def: &ast::StmtClassDef) {
+        let is_model = class_def.bases().iter().any(|base| match base {
+            Expr::Name(n) => {
+                n.id.as_str() == "BaseModel" || self.record_fields.contains_key(n.id.as_str())
+            }
+            Expr::Attribute(a) => a.attr.as_str() == "BaseModel",
+            _ => false,
+        });
+        let is_dataclass = class_def.decorator_list.iter().any(|d| {
+            let target = match &d.expression {
+                Expr::Call(call) => &*call.func,
+                other => other,
+            };
+            match target {
+                Expr::Name(n) => n.id.as_str() == "dataclass",
+                Expr::Attribute(a) => a.attr.as_str() == "dataclass",
+                _ => false,
+            }
+        });
+        if !is_model && !is_dataclass {
+            return;
+        }
+        let mut fields: Vec<String> = Vec::new();
+        for base in class_def.bases() {
+            if let Expr::Name(n) = base {
+                if let Some(inherited) = self.record_fields.get(n.id.as_str()) {
+                    fields.extend(inherited.iter().cloned());
+                }
+            }
+        }
+        for stmt in &class_def.body {
+            let Stmt::AnnAssign(ann) = stmt else {
+                continue;
+            };
+            let Expr::Name(target) = &*ann.target else {
+                continue;
+            };
+            let is_class_var = match &*ann.annotation {
+                Expr::Subscript(sub) => {
+                    matches!(&*sub.value, Expr::Name(n) if n.id.as_str() == "ClassVar")
+                }
+                Expr::Name(n) => n.id.as_str() == "ClassVar",
+                _ => false,
+            };
+            let name = target.id.to_string();
+            if !is_class_var && !fields.contains(&name) {
+                fields.push(name);
+            }
+        }
+        self.record_fields
+            .insert(class_def.name.to_string(), fields);
+    }
+
+    // `[txn.model_dump()]` / `[asdict(txn)]` where `txn` is a parameter annotated with a
+    // record class of this file: the one row's columns are the class's fields.
+    fn record_row_columns(&self, list: &ast::ExprList) -> Option<Vec<String>> {
+        let [Expr::Call(call)] = list.elts.as_slice() else {
+            return None;
+        };
+        if !call.arguments.keywords.is_empty() {
+            return None;
+        }
+        let record = match (&*call.func, &call.arguments.args[..]) {
+            (Expr::Attribute(a), []) if matches!(a.attr.as_str(), "model_dump" | "dict") => {
+                &*a.value
+            }
+            (Expr::Name(f), [arg]) if f.id.as_str() == "asdict" => arg,
+            (Expr::Attribute(a), [arg]) if a.attr.as_str() == "asdict" => arg,
+            _ => return None,
+        };
+        let Expr::Name(record) = record else {
+            return None;
+        };
+        let class = self.record_params.get(record.id.as_str())?;
+        self.record_fields.get(class).cloned()
+    }
+
     fn register_schema_class(
         &mut self,
         class_def: &ast::StmtClassDef,
@@ -4835,8 +7515,28 @@ impl Linter {
     // order. Pulled out as its own method since every one of those statement kinds
     // needs exactly this loop over one or more of its own `Vec<Stmt>` fields.
     fn visit_body(&mut self, body: &[Stmt], errors: &mut Vec<LintError>) {
+        self.block_depth += 1;
         for stmt in body {
             self.visit_stmt(stmt, errors);
+        }
+        self.merge_shadowed_frames();
+        self.block_depth -= 1;
+    }
+
+    // Leaving a block that rebound an outer open frame: only what both values lack is
+    // certainly gone, and the frame is back at its outer depth.
+    fn merge_shadowed_frames(&mut self) {
+        let depth = self.block_depth;
+        let (ending, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shadowed_frames)
+            .into_iter()
+            .partition(|(d, _, _)| *d == depth);
+        self.shadowed_frames = kept;
+        for (_, name, mut outer) in ending {
+            if let Some(inner) = self.open_frames.get(&name) {
+                outer.absent.retain(|c, _| inner.absent.contains_key(c));
+                outer.written.extend(inner.written.iter().cloned());
+                self.open_frames.insert(name, outer);
+            }
         }
     }
 
@@ -4848,6 +7548,14 @@ impl Linter {
         outcome: &str,
         reason: String,
     ) {
+        // One row per name and statement: the first reason recorded is the specific one.
+        if self
+            .leg_events
+            .iter()
+            .any(|e| e.line == line && e.col == col && e.var == var && e.outcome == outcome)
+        {
+            return;
+        }
         self.leg_events.push(LegEvent {
             line,
             col,
@@ -5206,6 +7914,30 @@ impl Linter {
                         self.helper_summaries.get(&(Some(c), attr.attr.to_string()))
                     })?
                 }
+                // `loader.add(df)` on an instance of a class defined in this file.
+                Expr::Name(receiver)
+                    if !self.variables.contains_key(receiver.id.as_str())
+                        && self.receiver_classes.contains_key(receiver.id.as_str()) =>
+                {
+                    let class = self.receiver_classes.get(receiver.id.as_str())?;
+                    self.class_chain(class).into_iter().find_map(|c| {
+                        self.helper_summaries.get(&(Some(c), attr.attr.to_string()))
+                    })?
+                }
+                // `Ratios().add(df)`.
+                Expr::Call(constructed) => {
+                    let Expr::Name(class) = &*constructed.func else {
+                        return None;
+                    };
+                    if !self.class_bases.contains_key(class.id.as_str()) {
+                        return None;
+                    }
+                    self.class_chain(class.id.as_ref())
+                        .into_iter()
+                        .find_map(|c| {
+                            self.helper_summaries.get(&(Some(c), attr.attr.to_string()))
+                        })?
+                }
                 // `module.f(df)` for a module imported with `import module`.
                 Expr::Name(module) => self.helper_summaries.get(&(
                     Some(format!("module:{}", module.id.as_str())),
@@ -5266,6 +7998,23 @@ impl Linter {
             };
             match derivation {
                 Some(d) if d.root == name && d.kind == Kind::Preserves => {}
+                // Rows stacked from a frame the checker cannot see: the known columns are
+                // still there, but nothing says what else came with them, so this is not an
+                // unresolved frame (whose every read would be flagged) but an untracked one.
+                Some(d)
+                    if d.root == name
+                        && d.kind == Kind::Derived
+                        && value.is_some_and(is_concat_call) =>
+                {
+                    self.variables.remove(&name);
+                    self.record_leg_event(
+                        &name,
+                        current_line,
+                        current_col,
+                        "untracked",
+                        format!("{what} joins a frame the checker does not track"),
+                    );
+                }
                 Some(d) if d.root == name && d.kind == Kind::Derived => {
                     if value.is_some_and(|v| self.calls_later_defined_function(v)) {
                         self.variables.remove(&name);
@@ -5279,6 +8028,21 @@ impl Linter {
                             ),
                         );
                     } else if !self.schema_is_unresolved(&old.0) {
+                        let columns = value.and_then(|v| self.returned_expr_columns(v));
+                        if let Some(columns) = columns {
+                            let schema = self.count_mutation_leg(
+                                Some(&old.0),
+                                Some(columns),
+                                &name,
+                                current_line,
+                                current_col,
+                            );
+                            if let Some(v) = value {
+                                self.carry_index(v, &schema);
+                            }
+                            self.variables.insert(name.clone(), (schema, current_line));
+                            continue;
+                        }
                         let schema = self.count_mutation_leg(
                             Some(&old.0),
                             None,
@@ -5323,15 +8087,377 @@ impl Linter {
         }
         let stmt = unwrapped.as_ref().unwrap_or(stmt);
         self.untrack_rebound_names(stmt);
+        self.stmt_counter += 1;
+        let sites_before = self.untyped_sites.len();
         let rebinding = self.snapshot_rebinding_targets(stmt);
+        if let (Stmt::Assign(assign), false) = (stmt, rebinding.is_empty()) {
+            self.visit_expr(&assign.value, errors);
+            self.value_checked_early = true;
+        }
         if let Stmt::Assign(assign) = stmt {
             let (line, col) = self.source_location(assign.range().start());
             self.apply_columns_assignment(assign, line, col);
         }
+        let new_name = self.new_name_binding(stmt);
         self.visit_stmt_inner(stmt, errors);
+        self.value_checked_early = false;
         self.track_instance_binding(stmt);
         if !rebinding.is_empty() {
             self.end_stale_legs(stmt, rebinding);
+        }
+        if let Some((name, before)) = new_name {
+            self.bind_derived_new_name(stmt, &name, before);
+        }
+        self.bind_tuple_result(stmt);
+        self.update_open_frames(stmt, sites_before, errors);
+        self.note_index_names(stmt);
+        self.forget_self_frames(stmt);
+    }
+
+    // A frame given a named index (constructor `index=`, `df.index.name = ..`, an in-place
+    // `rename_axis`/`set_index`) may take that name where a column name is expected.
+    fn note_index_names(&mut self, stmt: &Stmt) {
+        let (frame, levels) = match stmt {
+            Stmt::Assign(assign) => match (assign.targets.as_slice(), &*assign.value) {
+                ([Expr::Name(target)], Expr::Call(call)) => {
+                    let Some(index) = constructor_index(call) else {
+                        return;
+                    };
+                    (target.id.as_str(), index_name_of(index))
+                }
+                ([Expr::Attribute(attr)], value) => match index_owner(&attr.value) {
+                    Some(owner) if matches!(attr.attr.as_str(), "name" | "names") => {
+                        (owner, ast_extract::extract_string_list_or_single(value))
+                    }
+                    _ => match (attr.attr.as_str(), &*attr.value) {
+                        ("index", Expr::Name(owner)) => (owner.id.as_str(), index_name_of(value)),
+                        _ => return,
+                    },
+                },
+                _ => return,
+            },
+            Stmt::Expr(expr) => {
+                let Expr::Call(call) = &*expr.value else {
+                    return;
+                };
+                let Expr::Attribute(attr) = &*call.func else {
+                    return;
+                };
+                let in_place = keyword(call, "inplace")
+                    .is_some_and(|k| !matches!(&k.value, Expr::BooleanLiteral(b) if !b.value));
+                if !in_place {
+                    return;
+                }
+                let owner = match (attr.attr.as_str(), &*attr.value) {
+                    ("rename_axis" | "set_index" | "set_axis", Expr::Name(n)) => n.id.as_str(),
+                    ("set_names" | "rename", value) => match index_owner(value) {
+                        Some(owner) => owner,
+                        None => return,
+                    },
+                    _ => return,
+                };
+                (owner, None)
+            }
+            _ => return,
+        };
+        if levels.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
+        let Some((schema, _)) = self.variables.get(frame) else {
+            return;
+        };
+        let schema = schema.clone();
+        match levels {
+            Some(levels) => {
+                self.unknown_index.remove(&schema);
+                self.schema_index.insert(schema, levels);
+            }
+            None => {
+                self.unknown_index.insert(schema);
+            }
+        }
+    }
+
+    // A call that can reach `self` may change any frame stored on it, so those frames go back
+    // to their method-entry state: open, no facts. Code can reach `self` without naming it
+    // (`super().m()`, a closure, `c = self.child; c.fill()`), so every call except frame
+    // methods, pandas/polars functions and plain builtins counts, as does aliasing `self` or
+    // storing to another object's attribute.
+    fn forget_self_frames(&mut self, stmt: &Stmt) {
+        struct ReachesSelf<'f> {
+            linter: &'f Linter,
+            reaches: bool,
+            call: bool,
+            self_name: bool,
+        }
+        impl ReachesSelf<'_> {
+            fn harmless_call(&self, func: &Expr) -> bool {
+                let mut root = match func {
+                    Expr::Name(n) => return HARMLESS_CALLEES.contains(&n.id.as_str()),
+                    Expr::Attribute(a) => &*a.value,
+                    _ => return false,
+                };
+                loop {
+                    root = match root {
+                        Expr::Attribute(a) => &a.value,
+                        Expr::Call(c) => &c.func,
+                        Expr::Subscript(s) => &s.value,
+                        Expr::StringLiteral(_) => return true,
+                        Expr::Name(n) => {
+                            let n = n.id.as_str();
+                            return n != "self"
+                                && (LOAD_MODULES.contains(&n)
+                                    || HARMLESS_MODULES.contains(&n)
+                                    || self.linter.variables.contains_key(n)
+                                    || self.linter.open_frames.contains_key(n));
+                        }
+                        _ => return false,
+                    };
+                }
+            }
+        }
+        impl<'a> Visitor<'a> for ReachesSelf<'_> {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Call(call) => {
+                        self.call = true;
+                        if !self.harmless_call(&call.func) {
+                            self.reaches = true;
+                        }
+                    }
+                    Expr::Attribute(a) if matches!(&*a.value, Expr::Name(n) if n.id.as_str() == "self") =>
+                    {
+                        self.self_name = true;
+                        return;
+                    }
+                    Expr::Name(n) if n.id.as_str() == "self" => self.reaches = true,
+                    _ => {}
+                }
+                ast_visitor::walk_expr(self, expr);
+            }
+        }
+        const HARMLESS_MODULES: &[&str] = &[
+            "np", "numpy", "math", "logging", "logger", "log", "warnings",
+        ];
+        let prefix = crate::self_frames::SELF_PREFIX;
+        if !self.open_frames.keys().any(|n| n.starts_with(prefix))
+            && !self.variables.keys().any(|n| n.starts_with(prefix))
+        {
+            return;
+        }
+        let foreign_store = match stmt {
+            Stmt::Assign(s) => s.targets.iter().any(stores_to_foreign_attribute),
+            Stmt::AugAssign(s) => stores_to_foreign_attribute(&s.target),
+            Stmt::AnnAssign(s) => stores_to_foreign_attribute(&s.target),
+            _ => false,
+        };
+        let mut reach = ReachesSelf {
+            linter: self,
+            reaches: foreign_store,
+            call: false,
+            self_name: false,
+        };
+        for expr in own_expressions(stmt) {
+            reach.visit_expr(expr);
+        }
+        if !(reach.reaches || (reach.call && reach.self_name)) {
+            return;
+        }
+        let names: Vec<String> = self
+            .open_frames
+            .keys()
+            .chain(self.variables.keys())
+            .filter(|n| n.starts_with(prefix))
+            .cloned()
+            .collect();
+        for name in names {
+            self.variables.remove(&name);
+            self.open_frames.insert(
+                name,
+                OpenFrame {
+                    depth: self.block_depth,
+                    ..OpenFrame::default()
+                },
+            );
+        }
+        self.open_reads
+            .borrow_mut()
+            .retain(|(frame, _), _| !frame.starts_with(prefix));
+    }
+
+    // `a, b = load()` where `load` returns a tuple of frames whose columns it knows.
+    fn bind_tuple_result(&mut self, stmt: &Stmt) {
+        let Stmt::Assign(assign) = stmt else {
+            return;
+        };
+        let ([Expr::Tuple(targets)], Expr::Call(call)) =
+            (assign.targets.as_slice(), &*assign.value)
+        else {
+            return;
+        };
+        let Expr::Name(callee) = &*call.func else {
+            return;
+        };
+        let Some(schemas) = self.tuple_functions.get(callee.id.as_str()) else {
+            return;
+        };
+        if schemas.len() != targets.elts.len() {
+            return;
+        }
+        let line = self.source_location(assign.range().start()).0;
+        let bound: Vec<(String, String)> = targets
+            .elts
+            .iter()
+            .zip(schemas)
+            .filter_map(|(target, schema)| match (target, schema) {
+                (Expr::Name(n), Some(schema)) => Some((n.id.to_string(), schema.clone())),
+                _ => None,
+            })
+            .collect();
+        for (name, schema) in bound {
+            self.variables.insert(name, (schema, line));
+        }
+    }
+
+    // `b = <chain on a tracked frame>`: the name being bound and what it was bound to before,
+    // for `bind_derived_new_name`. Not a rebinding of the chain's own root, which
+    // `end_stale_legs` already follows.
+    fn new_name_binding(&self, stmt: &Stmt) -> Option<(String, Option<(String, usize)>)> {
+        let Stmt::Assign(assign) = stmt else {
+            return None;
+        };
+        let [Expr::Name(target)] = assign.targets.as_slice() else {
+            return None;
+        };
+        if !matches!(&*assign.value, Expr::Call(_) | Expr::Subscript(_)) {
+            return None;
+        }
+        let name = target.id.as_str();
+        let variables = &self.variables;
+        let own_root = classify_rhs(&assign.value, &|n| variables.contains_key(n))
+            .is_some_and(|d| d.root == name);
+        (!own_root).then(|| (name.to_string(), self.variables.get(name).cloned()))
+    }
+
+    // The dispatch above models a few methods by name; any other chain whose columns follow
+    // from literal edits (`.copy()`, `.astype()`, `.loc[mask]`, `.set_index()`, ...) is
+    // resolved here, so deriving a frame under a new name does not lose its columns.
+    fn bind_derived_new_name(&mut self, stmt: &Stmt, name: &str, before: Option<(String, usize)>) {
+        let Stmt::Assign(assign) = stmt else {
+            return;
+        };
+        if self
+            .variables
+            .get(name)
+            .is_some_and(|now| Some(now) != before.as_ref())
+        {
+            return;
+        }
+        let (line, col) = self.source_location(assign.range().start());
+        let Some(columns) = self.returned_expr_columns(&assign.value) else {
+            let variables = &self.variables;
+            let derived = classify_rhs(&assign.value, &|n| variables.contains_key(n));
+            if derived.is_some_and(|d| d.root != name && d.kind == Kind::Derived) {
+                self.note_unmodelled_derivation(name, &assign.value, line, col);
+            }
+            return;
+        };
+        let schema = self.make_inferred_schema(columns, name, line);
+        self.carry_index(&assign.value, &schema);
+        self.variables.insert(name.to_string(), (schema, line));
+    }
+
+    // The index a derived frame has: a new one from `index_levels`, else its source's
+    // (`df.copy()`, `df[mask]`) unless the chain turns the index into columns.
+    fn carry_index(&mut self, value: &Expr, schema: &str) {
+        if let Some(levels) = self.index_levels(value) {
+            self.schema_index.insert(schema.to_string(), levels);
+            return;
+        }
+        let mut expr = value;
+        let root = loop {
+            expr = match expr {
+                Expr::Call(call) => match &*call.func {
+                    Expr::Attribute(a)
+                        if !matches!(a.attr.as_str(), "reset_index" | "to_frame" | "set_index") =>
+                    {
+                        &a.value
+                    }
+                    _ => return,
+                },
+                Expr::Attribute(a) if a.attr.as_str() != "T" => &a.value,
+                Expr::Subscript(sub) => &sub.value,
+                Expr::Name(n) => break n.id.as_str(),
+                _ => return,
+            };
+        };
+        let Some((source, _)) = self.variables.get(root) else {
+            return;
+        };
+        if source == schema {
+            return;
+        }
+        let source = source.clone();
+        if let Some(levels) = self.schema_index.get(&source).cloned() {
+            self.schema_index.insert(schema.to_string(), levels);
+        } else if self.unknown_index.contains(&source) {
+            self.unknown_index.insert(schema.to_string());
+        }
+    }
+
+    // The named index a `groupby(..).agg(out=..)` or `pivot_table(index=..)` result carries.
+    fn index_levels(&self, expr: &Expr) -> Option<Vec<String>> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        match attr.attr.as_str() {
+            "pivot_table" => {
+                ast_extract::extract_string_list_or_single(&keyword(call, "index")?.value)
+            }
+            _ if Self::groupby_selection_aggregate(call, false).is_some() => {
+                let Expr::Subscript(selection) = &*attr.value else {
+                    return None;
+                };
+                let Expr::Call(grouped) = &*selection.value else {
+                    return None;
+                };
+                if keyword(grouped, "as_index").is_some() {
+                    return None;
+                }
+                let by = grouped
+                    .arguments
+                    .args
+                    .first()
+                    .or_else(|| keyword(grouped, "by").map(|k| &k.value))?;
+                ast_extract::extract_string_list_or_single(by)
+            }
+            "set_index" if keyword(call, "inplace").is_none() => {
+                let keys = call
+                    .arguments
+                    .args
+                    .first()
+                    .or_else(|| keyword(call, "keys").map(|k| &k.value))?;
+                ast_extract::extract_string_list_or_single(keys)
+            }
+            "agg" | "aggregate" if Self::series_agg_list(call, false).is_some() => {
+                Self::series_groupby_keys(&attr.value)
+            }
+            "to_frame" => self.series_index(&attr.value).filter(|l| !l.is_empty()),
+            "agg" | "aggregate" => {
+                let Expr::Call(grouped) = &*attr.value else {
+                    return None;
+                };
+                if keyword(grouped, "as_index").is_some() {
+                    return None;
+                }
+                let with_keys = Self::named_agg_columns(call, true)?;
+                let outputs = Self::named_agg_columns(call, false)?;
+                Some(with_keys[..with_keys.len() - outputs.len()].to_vec())
+            }
+            _ => None,
         }
     }
 
@@ -5349,6 +8475,7 @@ impl Linter {
         match stmt {
             Stmt::ClassDef(class_def) => {
                 self.register_schema_class(class_def, errors);
+                self.register_record_class(class_def);
 
                 // Pre-scan this class's own __init__ for self.<attr> origins (see
                 // current_self_attrs' doc comment) BEFORE visiting the body, so calls
@@ -5360,7 +8487,11 @@ impl Linter {
                 for body_stmt in &class_def.body {
                     if let Stmt::FunctionDef(func_def) = body_stmt {
                         if func_def.name.as_str() == "__init__" {
-                            collect_self_attr_origins(&func_def.body, &mut self_attrs);
+                            collect_self_attr_origins(
+                                &func_def.body,
+                                &annotated_param_origins(func_def),
+                                &mut self_attrs,
+                            );
                         }
                     }
                 }
@@ -5497,6 +8628,27 @@ impl Linter {
                 receiver_classes_init.extend(annotated_params);
                 let outer_receiver_classes =
                     std::mem::replace(&mut self.receiver_classes, receiver_classes_init);
+                let mut record_params_init = self.record_params.clone();
+                for p in parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(parameters.args.iter())
+                    .chain(parameters.kwonlyargs.iter())
+                {
+                    let name = p.parameter.name.id.to_string();
+                    match p.parameter.annotation.as_deref() {
+                        Some(Expr::Name(class))
+                            if self.record_fields.contains_key(class.id.as_str()) =>
+                        {
+                            record_params_init.insert(name, class.id.to_string());
+                        }
+                        _ => {
+                            record_params_init.remove(&name);
+                        }
+                    }
+                }
+                let outer_record_params =
+                    std::mem::replace(&mut self.record_params, record_params_init);
                 for name in parameters
                     .posonlyargs
                     .iter()
@@ -5565,7 +8717,48 @@ impl Linter {
                     }
                 }
 
+                let outer_open_frames = std::mem::take(&mut self.open_frames);
+                let outer_open_reads = self.open_reads.take();
+                for p in func_def
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(func_def.parameters.args.iter())
+                    .chain(func_def.parameters.kwonlyargs.iter())
+                {
+                    let is_frame = p
+                        .parameter
+                        .annotation
+                        .as_deref()
+                        .is_some_and(ast_extract::extract_frame_parameter_type);
+                    if is_frame && !self.variables.contains_key(p.parameter.name.id.as_str()) {
+                        self.open_frames.insert(
+                            p.parameter.name.id.to_string(),
+                            OpenFrame {
+                                depth: self.block_depth + 1,
+                                ..OpenFrame::default()
+                            },
+                        );
+                    }
+                }
+                for name in self
+                    .method_frames
+                    .get(&func_def.range().start())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    self.variables.remove(&name);
+                    self.open_frames.insert(
+                        name,
+                        OpenFrame {
+                            depth: self.block_depth + 1,
+                            ..OpenFrame::default()
+                        },
+                    );
+                }
                 self.visit_body(&func_def.body, errors);
+                self.open_frames = outer_open_frames;
+                self.open_reads.replace(outer_open_reads);
                 // Detect a parameter feeding a Feast features= call whose result is
                 // subscripted in this same body — see ParamGovernedTemplate's doc
                 // comment and resolve_param_governed_call_sites. Whether the
@@ -5700,6 +8893,23 @@ impl Linter {
                         }
                     }
                 }
+                // `return a, b` of frames whose columns are known here, for `x, y = f()`.
+                self.tuple_functions.remove(func_def.name.as_str());
+                if let Some(Expr::Tuple(tuple)) = only_returned_expr(&func_def.body) {
+                    let line = self.source_location(tuple.range().start()).0;
+                    let schemas: Vec<Option<String>> = tuple
+                        .elts
+                        .iter()
+                        .map(|e| {
+                            let cols = self.returned_expr_columns(e)?;
+                            Some(self.make_inferred_schema(cols, func_def.name.as_str(), line))
+                        })
+                        .collect();
+                    if schemas.iter().any(Option::is_some) {
+                        self.tuple_functions
+                            .insert(func_def.name.to_string(), schemas);
+                    }
+                }
                 // Lowest-priority fallback: a bare `-> pd.DataFrame`/`-> pl.DataFrame`
                 // return annotation with nothing more specific found above (no named
                 // Schema, no body-inferred one either -- e.g. the function's real
@@ -5712,6 +8922,7 @@ impl Linter {
                         .insert(func_def.name.to_string(), OPEN_FRAME_MARKER.to_string());
                 }
                 self.receiver_classes = outer_receiver_classes;
+                self.record_params = outer_record_params;
                 let mut function_variables =
                     std::mem::replace(&mut self.variables, outer_variables);
                 for name in global_names(&func_def.body) {
@@ -5791,29 +9002,21 @@ impl Linter {
                         required = cols;
                     }
 
+                    let created = contract::created_names(&func_def.body);
+                    required.retain(|column| !created.contains(column));
                     required.sort();
                     required.dedup();
                     delegates.sort();
                     delegates.dedup();
                     if !required.is_empty() || !delegates.is_empty() {
+                        if call_contracts::is_straight_line(&func_def.body) {
+                            self.straight_line_functions
+                                .insert(func_def.name.to_string());
+                        }
                         self.requires
                             .insert(func_def.name.to_string(), (required.clone(), fn_def_line));
                         if !delegates.is_empty() {
                             self.delegates.insert(func_def.name.to_string(), delegates);
-                        }
-                        // Local (same-file) callers only ever see the *direct* set here —
-                        // the transitive union (via delegates) is resolved once, project-wide,
-                        // in build_index_internal, and reaches other files' callers through
-                        // the cross-file entry (see load_cross_file_symbols).
-                        if !required.is_empty() {
-                            let origin = format!(
-                                "{} ({}:{})",
-                                func_def.name.as_str(),
-                                self.file_display,
-                                fn_def_line
-                            );
-                            self.param_requires
-                                .insert(func_def.name.to_string(), (required, origin));
                         }
                     }
                 }
@@ -5826,6 +9029,29 @@ impl Linter {
                 for target in &assign.targets {
                     if let Some((recv, cols)) = column_write_target(target) {
                         self.record_column_writes(&recv, &cols, current_line, current_col, errors);
+                    } else if let Some(recv) = row_insert_receiver(target) {
+                        // `frame.loc[0] = {..}` on a frame with no columns yet makes them.
+                        let empty = self
+                            .variables
+                            .get(&recv)
+                            .and_then(|(schema, _)| self.schemas.get(schema))
+                            .is_some_and(|columns| columns.is_empty());
+                        if empty {
+                            self.record_dynamic_column_write(&recv, current_line, current_col);
+                        }
+                    } else if let Some((recv, key)) = dynamic_column_write_receiver(target) {
+                        match self.loop_computed_names(key) {
+                            Some(cols) => self.record_column_writes(
+                                &recv,
+                                &cols,
+                                current_line,
+                                current_col,
+                                errors,
+                            ),
+                            None => {
+                                self.record_dynamic_column_write(&recv, current_line, current_col)
+                            }
+                        }
                     }
                 }
 
@@ -5873,30 +9099,6 @@ impl Linter {
                         let base_str = base_name.id.as_str();
                         match ast_extract::extract_string_list(&sub.slice) {
                             Some(cols) => {
-                                let base_info =
-                                    self.variables.get(base_str).map(|(s, l)| (s.clone(), *l));
-                                if let Some((base_schema, base_def_line)) = &base_info {
-                                    let base_cols =
-                                        self.schemas.get(base_schema).cloned().unwrap_or_default();
-                                    if !base_cols.is_empty() {
-                                        for col in &cols {
-                                            if !base_cols.contains(col) {
-                                                let schema_display = self
-                                                    .schema_display(base_schema, *base_def_line);
-                                                errors.push(LintError {
-                                                    line: current_line,
-                                                    col: current_col,
-                                                    code: CODE_UNKNOWN_COLUMN.to_string(),
-                                                    message: format!(
-                                                        "Column '{}' does not exist in {}",
-                                                        col, schema_display
-                                                    ),
-                                                    severity: "error".to_string(),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
                                 let target_names: Vec<String> = assign
                                     .targets
                                     .iter()
@@ -6057,7 +9259,8 @@ impl Linter {
                     }
 
                     let mut is_merge_or_concat = false;
-                    let mut merge_schema = None;
+                    let mut merge_schema: Option<Vec<String>> = None;
+                    let mut merge_call: Option<&ast::ExprCall> = None;
 
                     match &*call.func {
                         Expr::Attribute(attr) => {
@@ -6152,46 +9355,31 @@ impl Linter {
                                 }
                             }
 
-                            if func_name == "merge" {
-                                if let Expr::Name(left_name) = &*attr.value {
-                                    if let Some((left_schema, _)) =
-                                        self.variables.get(left_name.id.as_str())
+                            if matches!(func_name, "merge" | "merge_asof" | "merge_ordered") {
+                                let operands: Vec<&Expr> = match &*attr.value {
+                                    Expr::Name(module)
+                                        if !self.variables.contains_key(module.id.as_str()) =>
                                     {
-                                        if !call.arguments.args.is_empty() {
-                                            if let Expr::Name(right_name) = &call.arguments.args[0]
-                                            {
-                                                if let Some((right_schema, _)) =
-                                                    self.variables.get(right_name.id.as_str())
-                                                {
-                                                    is_merge_or_concat = true;
-                                                    merge_schema = Some((
-                                                        left_schema.clone(),
-                                                        right_schema.clone(),
-                                                    ));
-                                                }
-                                            }
-                                        }
+                                        call.arguments.args.iter().take(2).collect()
+                                    }
+                                    receiver => std::iter::once(receiver)
+                                        .chain(call.arguments.args.first())
+                                        .collect(),
+                                };
+                                if let [left, right] = operands.as_slice() {
+                                    if let (Some(left), Some(right)) = (
+                                        self.operand_schema(left, current_line),
+                                        self.operand_schema(right, current_line),
+                                    ) {
+                                        is_merge_or_concat = true;
+                                        merge_schema = Some(vec![left, right]);
+                                        merge_call = Some(call);
                                     }
                                 }
                             } else if func_name == "concat" {
-                                if !call.arguments.args.is_empty() {
-                                    if let Expr::List(list) = &call.arguments.args[0] {
-                                        let mut schemas = Vec::new();
-                                        for el in &list.elts {
-                                            if let Expr::Name(n) = el {
-                                                if let Some((s, _)) =
-                                                    self.variables.get(n.id.as_str())
-                                                {
-                                                    schemas.push(s.clone());
-                                                }
-                                            }
-                                        }
-                                        if schemas.len() >= 2 {
-                                            is_merge_or_concat = true;
-                                            merge_schema =
-                                                Some((schemas[0].clone(), schemas[1].clone()));
-                                        }
-                                    }
+                                if let Some(schemas) = self.concat_schemas(call, current_line) {
+                                    is_merge_or_concat = true;
+                                    merge_schema = Some(schemas);
                                 }
                             } else if func_name == "from_pandas"
                                 || func_name == "from_polars"
@@ -6515,7 +9703,24 @@ impl Linter {
                                     if let Some((base_schema, _)) =
                                         self.variables.get(recv.id.as_str())
                                     {
-                                        let base_schema = base_schema.clone();
+                                        let mut base_schema = base_schema.clone();
+                                        // `reset_index()` of a frame with a known named index
+                                        // brings the levels back as columns.
+                                        if func_name == "reset_index"
+                                            && self.schema_index.contains_key(&base_schema)
+                                        {
+                                            if let Some(cols) =
+                                                self.returned_expr_columns(&assign.value)
+                                            {
+                                                base_schema = self.count_mutation_leg(
+                                                    Some(&base_schema),
+                                                    Some(cols),
+                                                    recv.id.as_str(),
+                                                    current_line,
+                                                    current_col,
+                                                );
+                                            }
+                                        }
                                         for target in &assign.targets {
                                             if let Expr::Name(target_name) = target {
                                                 self.variables.insert(
@@ -6533,6 +9738,7 @@ impl Linter {
                                         self.variables.get(recv_str).map(|(s, l)| (s.clone(), *l));
                                     let base_cols = base_info
                                         .as_ref()
+                                        .filter(|(s, _)| !self.schema_is_unresolved(s))
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
                                     let selected_cols =
                                         ast_extract::extract_select_args_columns(call);
@@ -6788,7 +9994,10 @@ impl Linter {
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
-                                    let dropped = ast_extract::extract_drop_columns(call);
+                                    let dropped = ast_extract::extract_drop_columns(
+                                        call,
+                                        self.is_polars_receiver(&attr.value),
+                                    );
                                     let target_names: Vec<String> = assign
                                         .targets
                                         .iter()
@@ -6891,7 +10100,17 @@ impl Linter {
                                     let base_cols = base_info
                                         .as_ref()
                                         .and_then(|(s, _)| self.schemas.get(s).cloned());
-                                    let mapping = ast_extract::extract_rename_mapping(call);
+                                    let mapping = ast_extract::extract_rename_mapping(call)
+                                        .or_else(|| {
+                                            let cols = base_cols.as_ref()?;
+                                            if base_info
+                                                .as_ref()
+                                                .is_some_and(|(s, _)| self.schema_is_unresolved(s))
+                                            {
+                                                return None;
+                                            }
+                                            Self::evaluated_rename_mapping(call, recv_str, cols)
+                                        });
                                     let case_fold = if mapping.is_none() {
                                         ast_extract::extract_rename_case_fold(call)
                                     } else {
@@ -7005,24 +10224,77 @@ impl Linter {
                                         _ => {}
                                     }
                                 }
-                            } else if func_name == "assign" {
+                            } else if let Some(op) = self.polars_frame_op(attr, call) {
+                                self.apply_polars_frame_op(
+                                    assign,
+                                    op,
+                                    current_line,
+                                    current_col,
+                                    errors,
+                                );
+                            } else if func_name == "assign"
+                                // `with_columns` is a common method name: only a receiver
+                                // already tracked as a frame makes it the polars one.
+                                || (func_name == "with_columns"
+                                    && matches!(&*attr.value, Expr::Name(r)
+                                        if self.variables.contains_key(r.id.as_str())))
+                            {
                                 if let Expr::Name(recv) = &*attr.value {
                                     let recv_str = recv.id.as_str();
                                     let base_info =
                                         self.variables.get(recv_str).map(|(s, _)| s.clone());
-                                    let mut new_cols: Vec<String> = base_info
-                                        .as_ref()
-                                        .and_then(|s| self.schemas.get(s).cloned())
-                                        .unwrap_or_default();
-                                    for keyword in &call.arguments.keywords {
-                                        if let Some(kw_name) =
-                                            keyword.arg.as_ref().map(|s| s.as_str())
-                                        {
-                                            if !new_cols.contains(&kw_name.to_string()) {
-                                                new_cols.push(kw_name.to_string());
+                                    // `.assign()` keeps the receiver's columns, so an untracked
+                                    // receiver must not yield a frame of only the new ones.
+                                    if base_info.is_none() {
+                                        for target in &assign.targets {
+                                            if let Expr::Name(n) = target {
+                                                self.variables.remove(n.id.as_str());
                                             }
                                         }
                                     }
+                                    let mut base_cols: Vec<String> = base_info
+                                        .as_ref()
+                                        .and_then(|s| self.schemas.get(s).cloned())
+                                        .unwrap_or_default();
+                                    // An expression whose output name can't be read leaves the
+                                    // result's columns unknown rather than guessed.
+                                    let added = if func_name == "with_columns" {
+                                        self.with_columns_outputs(call)
+                                    } else {
+                                        ast_extract::assign_output_names(call)
+                                    };
+                                    // `pl.col("x").cast(..)` on a closed frame without `x` raises
+                                    // (reported below); the fixed code won't output `x`, so
+                                    // keeping it would hide later typos of the same name.
+                                    let base_closed = base_info
+                                        .as_deref()
+                                        .is_some_and(|s| !self.schema_is_unresolved(s));
+                                    let added = match added {
+                                        Some(names)
+                                            if func_name == "with_columns" && base_closed =>
+                                        {
+                                            let unaliased =
+                                                ast_extract::with_columns_unaliased_outputs(call);
+                                            Some(
+                                                names
+                                                    .into_iter()
+                                                    .filter(|n| {
+                                                        base_cols.contains(n)
+                                                            || !unaliased.contains(n)
+                                                    })
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        }
+                                        other => other,
+                                    };
+                                    let new_cols = added.map(|names| {
+                                        for name in names {
+                                            if !base_cols.contains(&name) {
+                                                base_cols.push(name);
+                                            }
+                                        }
+                                        base_cols
+                                    });
                                     let target_names: Vec<String> = assign
                                         .targets
                                         .iter()
@@ -7038,18 +10310,49 @@ impl Linter {
                                         .first()
                                         .cloned()
                                         .unwrap_or_else(|| recv_str.to_string());
-                                    let schema_name = self.count_mutation_leg(
-                                        base_info.as_deref(),
-                                        Some(new_cols),
-                                        &var_hint,
-                                        current_line,
-                                        current_col,
-                                    );
-                                    for name in &target_names {
-                                        self.variables.insert(
-                                            name.clone(),
-                                            (schema_name.clone(), current_line),
-                                        );
+                                    if base_info.is_some() {
+                                        let base_resolved = base_info
+                                            .as_deref()
+                                            .is_some_and(|s| !self.schema_is_unresolved(s));
+                                        let schema_name = match new_cols {
+                                            None if base_resolved => {
+                                                let known = self
+                                                    .schemas
+                                                    .get(base_info.as_deref().unwrap_or_default())
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                self.record_leg_event(
+                                                    &var_hint,
+                                                    current_line,
+                                                    current_col,
+                                                    "unresolved",
+                                                    format!(
+                                                        "`.{func_name}()` adds columns whose names cannot be read ({}), so only the columns `{recv_str}` had are known",
+                                                        unnamed_argument_hint(call)
+                                                    ),
+                                                );
+                                                self.count_open_leg(
+                                                    base_info.as_deref(),
+                                                    known,
+                                                    &var_hint,
+                                                    current_line,
+                                                    current_col,
+                                                )
+                                            }
+                                            new_cols => self.count_mutation_leg(
+                                                base_info.as_deref(),
+                                                new_cols,
+                                                &var_hint,
+                                                current_line,
+                                                current_col,
+                                            ),
+                                        };
+                                        for name in &target_names {
+                                            self.variables.insert(
+                                                name.clone(),
+                                                (schema_name.clone(), current_line),
+                                            );
+                                        }
                                     }
                                 }
                             } else if func_name == "pop" {
@@ -7103,54 +10406,18 @@ impl Linter {
                             }
                         }
                         Expr::Name(name) if name.id.as_str() == "concat" => {
-                            if !call.arguments.args.is_empty() {
-                                if let Expr::List(list) = &call.arguments.args[0] {
-                                    let mut schemas = Vec::new();
-                                    for el in &list.elts {
-                                        if let Expr::Name(n) = el {
-                                            if let Some((s, _)) = self.variables.get(n.id.as_str())
-                                            {
-                                                schemas.push(s.clone());
-                                            }
-                                        }
-                                    }
-                                    if schemas.len() >= 2 {
-                                        is_merge_or_concat = true;
-                                        merge_schema =
-                                            Some((schemas[0].clone(), schemas[1].clone()));
-                                    }
-                                }
-                            } else if let Some(keyword) = call
-                                .arguments
-                                .keywords
-                                .iter()
-                                .find(|k| k.arg.as_ref().map(|s| s.as_str()) == Some("objs"))
-                            {
-                                if let Expr::List(list) = &keyword.value {
-                                    let mut schemas = Vec::new();
-                                    for el in &list.elts {
-                                        if let Expr::Name(n) = el {
-                                            if let Some((s, _)) = self.variables.get(n.id.as_str())
-                                            {
-                                                schemas.push(s.clone());
-                                            }
-                                        }
-                                    }
-                                    if schemas.len() >= 2 {
-                                        is_merge_or_concat = true;
-                                        merge_schema =
-                                            Some((schemas[0].clone(), schemas[1].clone()));
-                                    }
-                                }
+                            if let Some(schemas) = self.concat_schemas(call, current_line) {
+                                is_merge_or_concat = true;
+                                merge_schema = Some(schemas);
                             }
                         }
                         _ => {}
                     }
 
                     if is_merge_or_concat {
-                        if let Some((s1, s2)) = merge_schema {
+                        if let Some(operands) = merge_schema {
                             // The merged/concatenated result is a new DataFrame origin in
-                            // its own right -- both inputs were already tracked frames --
+                            // its own right -- every input was already a tracked frame --
                             // so it's always recognized (dataframes_total). Whether it
                             // counts as TYPED depends on the inputs: an unresolved input
                             // keeps the result unresolved (see below), which is why the
@@ -7158,32 +10425,54 @@ impl Linter {
                             // has been updated.
                             self.dataframes_total += 1;
 
-                            // Union semantics: the result of merge/concat contains every
-                            // column from both inputs.  Sort + dedup gives a stable,
-                            // canonical column order and eliminates duplicates that arise
-                            // when both DataFrames share key columns (e.g. a join key).
+                            // A concat holds every column of every operand. A merge holds
+                            // both sides' columns with pandas' suffixes on the overlap, so
+                            // the bare name of a collided column is gone.
+                            let column_sets: Vec<Vec<String>> = operands
+                                .iter()
+                                .map(|s| self.schemas.get(s).cloned().unwrap_or_default())
+                                .collect();
                             let mut combined_cols = Vec::new();
-                            if let Some(cols1) = self.schemas.get(&s1) {
-                                combined_cols.extend(cols1.clone());
-                            }
-                            if let Some(cols2) = self.schemas.get(&s2) {
-                                combined_cols.extend(cols2.clone());
+                            let mut suffixes_unknown = false;
+                            match merge_call {
+                                Some(call) => {
+                                    match merged_columns(&column_sets[0], &column_sets[1], call) {
+                                        Merged::Columns(columns) => combined_cols = columns,
+                                        Merged::Unknown => suffixes_unknown = true,
+                                    }
+                                }
+                                None => combined_cols.extend(column_sets.into_iter().flatten()),
                             }
                             combined_cols.sort();
                             combined_cols.dedup();
 
-                            let combined_schema_name = format!("{}_{}", s1, s2);
+                            let var_hint = assign_var_hint(assign, "df");
+                            // Named schemas keep the name of what they combine, which is
+                            // what the diagnostic then shows.
+                            let joined_name = operands.join("_");
+                            let combined_schema_name = if operands
+                                .iter()
+                                .all(|s| !s.starts_with("__inferred_"))
+                                && self
+                                    .schemas
+                                    .get(&joined_name)
+                                    .is_none_or(|existing| *existing == combined_cols)
+                            {
+                                self.schemas.insert(joined_name.clone(), combined_cols);
+                                joined_name
+                            } else {
+                                self.make_inferred_schema(combined_cols, &var_hint, current_line)
+                            };
                             // An unresolved schema (see `register_feast_dataframe`,
                             // `resolve_open_or_named_schema`) stays unresolved after a
                             // merge/concat: its column list was already known to be
                             // incomplete before the join, and combining it with another
                             // frame's columns doesn't make it any more complete.
-                            if self.schema_is_unresolved(&s1) || self.schema_is_unresolved(&s2) {
+                            if suffixes_unknown
+                                || operands.iter().any(|s| self.schema_is_unresolved(s))
+                            {
                                 self.unresolved_schemas.insert(combined_schema_name.clone());
                             }
-                            self.schemas
-                                .insert(combined_schema_name.clone(), combined_cols);
-                            let var_hint = assign_var_hint(assign, "df");
                             self.count_typed_dataframe(
                                 &combined_schema_name,
                                 &var_hint,
@@ -7252,6 +10541,21 @@ impl Linter {
                                             );
                                         }
                                     }
+                                } else if self.class_bases.contains_key(schema_name.id.as_str()) {
+                                    // `Ratios().add(frame)`: a method of a class of this file.
+                                    let targets = Self::assign_target_names(assign);
+                                    self.apply_helper_call(
+                                        &assign.value,
+                                        &targets,
+                                        current_line,
+                                        current_col,
+                                    );
+                                    self.check_call_requirements(
+                                        call,
+                                        current_line,
+                                        current_col,
+                                        errors,
+                                    );
                                 }
                             }
                         } else if let Expr::Name(base) = current_expr {
@@ -7281,7 +10585,6 @@ impl Linter {
                                     );
                                 }
                                 self.check_call_requirements(
-                                    attr.attr.as_str(),
                                     call,
                                     current_line,
                                     current_col,
@@ -7317,13 +10620,7 @@ impl Linter {
                         }
                         // Validate the call's first argument against the callee's
                         // parameter contract, e.g. `trimmed = trim_customers(customers)`.
-                        self.check_call_requirements(
-                            func_name.id.as_str(),
-                            call,
-                            current_line,
-                            current_col,
-                            errors,
-                        );
+                        self.check_call_requirements(call, current_line, current_col, errors);
                     }
 
                     self.maybe_record_unresolved_dataframe_shaped_call(
@@ -7346,7 +10643,9 @@ impl Linter {
                         self.visit_expr(rows, errors);
                     }
                 }
-                self.visit_expr(&assign.value, errors);
+                if !self.value_checked_early {
+                    self.visit_expr(&assign.value, errors);
+                }
             }
             Stmt::AnnAssign(ann_assign) => {
                 let (current_line, current_col) = self.source_location(ann_assign.range().start());
@@ -7587,23 +10886,27 @@ impl Linter {
                             // not being a tracked DataFrame variable so a genuine method
                             // call is never treated as a call to a same-named delegate.
                             if !self.variables.contains_key(recv.id.as_str()) {
-                                self.check_call_requirements(func_name, call, line, col, errors);
+                                self.check_call_requirements(call, line, col, errors);
                             }
                         }
-                    } else if let Expr::Name(func_name) = &*call.func {
+                    } else if matches!(&*call.func, Expr::Name(_)) {
                         // Bare call statement, e.g. `trim_customers(customers)` with no
                         // assignment — still validate against the callee's parameter contract.
                         let (line, col) = self.source_location(call.range().start());
-                        self.check_call_requirements(
-                            func_name.id.as_str(),
-                            call,
-                            line,
-                            col,
-                            errors,
-                        );
+                        self.check_call_requirements(call, line, col, errors);
                     }
                 }
                 self.visit_expr(&expr_stmt.value, errors);
+            }
+            Stmt::Assert(assert) => {
+                self.visit_expr(&assert.test, errors);
+                if let Some(msg) = &assert.msg {
+                    self.visit_expr(msg, errors);
+                }
+            }
+            Stmt::AugAssign(aug) => {
+                self.visit_expr(&aug.target, errors);
+                self.visit_expr(&aug.value, errors);
             }
             Stmt::Delete(delete) => {
                 for target in &delete.targets {
@@ -7654,7 +10957,11 @@ impl Linter {
             }
             Stmt::For(for_stmt) => {
                 self.visit_expr(&for_stmt.iter, errors);
+                let entered = self.enter_loop(for_stmt);
                 self.visit_body(&for_stmt.body, errors);
+                if entered {
+                    self.loop_bindings.pop();
+                }
                 self.visit_body(&for_stmt.orelse, errors);
             }
             Stmt::While(while_stmt) => {
@@ -7752,6 +11059,1492 @@ impl Linter {
     //
     // Typo suggestions are added via find_best_match when the edit distance to the
     // closest known column name is ≤ 2.
+    // Whether `name` is tracked with a concrete column list, which the closed-set checks own.
+    fn is_closed_frame(&self, name: &str) -> bool {
+        self.variables
+            .get(name)
+            .is_some_and(|(schema, _)| !self.schema_is_unresolved(schema))
+    }
+
+    // A read of `column` off a frame the checker knows only by name: an error if the frame
+    // certainly lost it, otherwise noted for `column-read-before-assignment`.
+    fn check_open_frame_read(
+        &self,
+        frame: &str,
+        column: &str,
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        if self.is_closed_frame(frame) {
+            return;
+        }
+        let Some(open) = self.open_frames.get(frame) else {
+            return;
+        };
+        let (line, col) = self.source_location(at);
+        if let Some((why, _)) = open.absent.get(column) {
+            errors.push(LintError {
+                line,
+                col,
+                code: CODE_UNKNOWN_COLUMN.to_string(),
+                message: format!(
+                    "Column '{column}' does not exist in `{frame}`: it was {why} (the frame's other columns are unknown)"
+                ),
+                severity: "error".to_string(),
+            });
+        } else if !open.written.contains(column) {
+            self.unknown_frame_reads
+                .borrow_mut()
+                .push((line, col, column.to_string()));
+            self.open_reads
+                .borrow_mut()
+                .entry((frame.to_string(), column.to_string()))
+                .or_insert((self.stmt_counter, line, col));
+        }
+    }
+
+    // `frame[["a", "b"]]` on a frame whose columns are unknown, for `likely-column-typo`.
+    fn note_unknown_list_reads(&self, frame: &str, list: &Expr) {
+        let unknown = match self.variables.get(frame) {
+            Some((schema, _)) => self.schema_is_unresolved(schema),
+            None => self.open_frames.contains_key(frame),
+        };
+        if !unknown {
+            return;
+        }
+        let written = self.open_frames.get(frame).map(|o| &o.written);
+        let Expr::List(items) = list else {
+            return;
+        };
+        for item in &items.elts {
+            let Some(column) = ast_extract::extract_string_literal(item) else {
+                continue;
+            };
+            if written.is_some_and(|w| w.contains(column)) {
+                continue;
+            }
+            let (line, col) = self.source_location(item.range().start());
+            self.unknown_frame_reads
+                .borrow_mut()
+                .push((line, col, column.to_string()));
+        }
+    }
+
+    // The frame `expr` evaluates to when it derives from a frame known only by name through
+    // edits whose arguments are literal; `None` as soon as a step could bring a column back.
+    fn open_after(&self, expr: &Expr, line: usize) -> Option<OpenFrame> {
+        match expr {
+            Expr::Name(name) if !self.is_closed_frame(name.id.as_str()) => {
+                self.open_frames.get(name.id.as_str()).cloned()
+            }
+            // `frame[mask]` / `frame.loc[mask]`: the same columns, fewer rows.
+            Expr::Subscript(sub) => {
+                let (base, slice) = match &*sub.value {
+                    Expr::Attribute(a) if matches!(a.attr.as_str(), "loc" | "iloc") => {
+                        (&*a.value, &*sub.slice)
+                    }
+                    other => (other, &*sub.slice),
+                };
+                let is_row_mask = matches!(
+                    slice,
+                    Expr::Compare(_)
+                        | Expr::BoolOp(_)
+                        | Expr::UnaryOp(_)
+                        | Expr::BinOp(_)
+                        | Expr::Slice(_)
+                ) || is_series_method_chain(slice);
+                if !is_row_mask {
+                    return None;
+                }
+                self.open_after(base, line)
+            }
+            Expr::Call(call) => {
+                let callee = match &*call.func {
+                    Expr::Name(n) => n.id.as_str(),
+                    Expr::Attribute(a) => a.attr.as_str(),
+                    _ => return None,
+                };
+                // `self.repo.load()`: a method the attribute's class (a Protocol's
+                // implementors included) declares to return a frame.
+                if let Expr::Attribute(method) = &*call.func {
+                    if let Expr::Attribute(recv) = &*method.value {
+                        if matches!(&*recv.value, Expr::Name(n) if n.id.as_str() == "self") {
+                            let returns_frame = self
+                                .current_self_attrs
+                                .get(recv.attr.as_str())
+                                .and_then(|origin| {
+                                    self.resolve_method_on_class(
+                                        &origin.class_name,
+                                        method.attr.as_str(),
+                                    )
+                                })
+                                .is_some();
+                            if returns_frame {
+                                return Some(OpenFrame {
+                                    depth: self.block_depth,
+                                    ..OpenFrame::default()
+                                });
+                            }
+                        }
+                    }
+                }
+                // A helper annotated to return a bare DataFrame: certainly a frame.
+                if matches!(&*call.func, Expr::Name(_))
+                    && self
+                        .functions
+                        .get(callee)
+                        .is_some_and(|s| s == OPEN_FRAME_MARKER)
+                {
+                    return Some(OpenFrame {
+                        depth: self.block_depth,
+                        ..OpenFrame::default()
+                    });
+                }
+                // `pd.merge(a, b)`, `pd.merge_asof(a, b, ..)`: certainly a frame, with columns of
+                // the operands nothing here says anything about.
+                if let Expr::Attribute(module_call) = &*call.func {
+                    if matches!(&*module_call.value, Expr::Name(m) if LOAD_MODULES.contains(&m.id.as_str()))
+                        && matches!(callee, "merge" | "merge_asof" | "merge_ordered")
+                    {
+                        return Some(OpenFrame {
+                            depth: self.block_depth,
+                            ..OpenFrame::default()
+                        });
+                    }
+                }
+                // `pl.from_pandas(frame)`: the same columns in another library.
+                if callee == "from_pandas"
+                    && matches!(&*call.func, Expr::Attribute(a)
+                    if matches!(&*a.value, Expr::Name(m) if matches!(m.id.as_str(), "pl" | "polars")))
+                {
+                    return self.open_after(call.arguments.args.first()?, line);
+                }
+                if callee == "get_dummies" {
+                    let mut replaced = ast_extract::extract_string_list_or_single(
+                        &keyword(call, "columns")?.value,
+                    )?;
+                    // With `prefix=`/`prefix_sep=` a dummy may take the column's own name.
+                    if keyword(call, "prefix").is_some() || keyword(call, "prefix_sep").is_some() {
+                        replaced.clear();
+                    }
+                    return Some(OpenFrame {
+                        depth: self.block_depth,
+                        absent: replaced
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c,
+                                    (format!("replaced by dummy columns at line {line}"), line),
+                                )
+                            })
+                            .collect(),
+                        written: Default::default(),
+                    });
+                }
+                let Expr::Attribute(attr) = &*call.func else {
+                    return None;
+                };
+                // Pivoted column names come from the data, so even a known frame pivots to an
+                // open one.
+                if matches!(attr.attr.as_str(), "pivot" | "pivot_table")
+                    && self.expr_frame_columns(&attr.value).is_some()
+                {
+                    return Some(OpenFrame {
+                        depth: self.block_depth,
+                        ..OpenFrame::default()
+                    });
+                }
+                // Only a frame has `drop(columns=)` / `rename(columns=)`, whatever produced it.
+                let columns_edit = matches!(attr.attr.as_str(), "drop" | "rename")
+                    && keyword(call, "columns").is_some()
+                    && self.expr_frame_columns(&attr.value).is_none();
+                let mut open = match self.open_after(&attr.value, line) {
+                    Some(open) => open,
+                    None if columns_edit => OpenFrame {
+                        depth: self.block_depth,
+                        ..OpenFrame::default()
+                    },
+                    None => return None,
+                };
+                if keyword(call, "inplace").is_some() {
+                    return None;
+                }
+                let method = attr.attr.as_str();
+                match method {
+                    "drop" => {
+                        if let Some(dropped) = ast_extract::extract_drop_columns(
+                            call,
+                            self.is_polars_receiver(&attr.value),
+                        ) {
+                            for column in dropped {
+                                open.absent
+                                    .insert(column, (format!("dropped at line {line}"), line));
+                            }
+                        }
+                    }
+                    "rename" => {
+                        let mapping = ast_extract::extract_rename_mapping(call)?;
+                        for new in mapping.values() {
+                            open.absent.remove(new);
+                            open.written.insert(new.clone());
+                        }
+                        for (old, new) in mapping.iter().filter(|(o, n)| o != n) {
+                            open.absent.insert(
+                                old.clone(),
+                                (format!("renamed to '{new}' at line {line}"), line),
+                            );
+                        }
+                    }
+                    "assign" => match ast_extract::assign_output_names(call) {
+                        Some(names) => {
+                            for name in names {
+                                open.absent.remove(name.as_str());
+                                open.written.insert(name);
+                            }
+                        }
+                        None => open.absent.clear(),
+                    },
+                    "with_columns" => match self.with_columns_outputs(call) {
+                        Some(names) => {
+                            for name in names {
+                                open.absent.remove(name.as_str());
+                                open.written.insert(name);
+                            }
+                        }
+                        // Any column may have been added back.
+                        None => open.absent.clear(),
+                    },
+                    // The index (whatever its names) comes back as columns.
+                    "reset_index" if !resets_index_dropping(call) => open.absent.clear(),
+                    _ if ROW_PASSTHROUGH_METHODS.contains(&method)
+                        || SCHEMA_PRESERVING_METHODS.contains(&method) => {}
+                    // The result keeps the left frame's columns; a dropped one stays gone unless
+                    // the right frame is known to bring it back.
+                    "join" | "merge" => {
+                        let right = call
+                            .arguments
+                            .args
+                            .first()
+                            .or_else(|| keyword(call, "other").map(|k| &k.value))
+                            .or_else(|| keyword(call, "right").map(|k| &k.value));
+                        match right.and_then(|r| self.expr_frame_columns(r)) {
+                            Some((columns, _)) => {
+                                open.absent.retain(|c, _| !columns.contains(c));
+                                open.written.extend(columns);
+                            }
+                            None => open.absent.clear(),
+                        }
+                    }
+                    // Certainly a frame again, with columns nothing here says anything about.
+                    _ if is_reshaping_call(expr) => {
+                        open = OpenFrame {
+                            depth: self.block_depth,
+                            ..OpenFrame::default()
+                        };
+                    }
+                    _ => return None,
+                }
+                Some(open)
+            }
+            _ => None,
+        }
+    }
+
+    // Keeps `open_frames` in step with the statement just visited: a new name for a frame
+    // the checker could only recognise, a derived one, edits that remove columns, and the
+    // writes that bring them back (or give the frame a column a read ran ahead of).
+    fn update_open_frames(
+        &mut self,
+        stmt: &Stmt,
+        sites_before: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let (line, stmt_col) = self.source_location(stmt.range().start());
+        let depth = self.block_depth;
+        match stmt {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    self.note_open_frame_write(target, &assign.value, line, errors);
+                }
+                let [Expr::Name(target)] = assign.targets.as_slice() else {
+                    for target in &assign.targets {
+                        let mut names = Vec::new();
+                        collect_name_targets(target, "", &mut names);
+                        for (name, _) in names {
+                            self.open_frames.remove(&name);
+                        }
+                    }
+                    return;
+                };
+                self.note_merge_after_read(target.id.as_str(), &assign.value, line, errors);
+                self.note_derived_write_after_read(target.id.as_str(), &assign.value, line, errors);
+                self.rebind_open_frame(
+                    target.id.as_str(),
+                    &assign.value,
+                    sites_before,
+                    (line, stmt_col),
+                );
+            }
+            Stmt::AnnAssign(ann) => {
+                if let (Expr::Name(target), Some(value)) = (&*ann.target, ann.value.as_deref()) {
+                    self.rebind_open_frame(
+                        target.id.as_str(),
+                        value,
+                        sites_before,
+                        (line, stmt_col),
+                    );
+                }
+            }
+            Stmt::Delete(delete) => {
+                for target in &delete.targets {
+                    if let Expr::Subscript(sub) = target {
+                        if let (Expr::Name(frame), Some(column)) =
+                            (&*sub.value, ast_extract::extract_string_literal(&sub.slice))
+                        {
+                            if let Some(open) = self.open_frames.get_mut(frame.id.as_str()) {
+                                if open.depth == depth {
+                                    open.absent.insert(
+                                        column.to_string(),
+                                        (format!("deleted at line {line}"), line),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::Expr(expr_stmt) => {
+                if let Expr::Call(call) = &*expr_stmt.value {
+                    self.apply_call_to_open_frames(call, line);
+                }
+            }
+            _ => {}
+        }
+        self.forget_frames_handed_to_helpers(stmt);
+    }
+
+    // `df = df.merge(right, on=..)` with `right` bringing a non-key column `df` was read for
+    // earlier: had `df` held it already, the merge would have suffixed both copies.
+    fn note_merge_after_read(
+        &mut self,
+        target: &str,
+        value: &Expr,
+        line: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Expr::Call(call) = value else {
+            return;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return;
+        };
+        let polars_join = attr.attr.as_str() == "join" && self.is_polars_receiver(&attr.value);
+        if !(attr.attr.as_str() == "merge" || polars_join)
+            || !matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == target)
+            || keyword(call, "suffixes").is_some()
+            || keyword(call, "suffix").is_some()
+        {
+            return;
+        }
+        let Some(keys) =
+            keyword(call, "on").and_then(|k| ast_extract::literal_key_columns(&k.value))
+        else {
+            return;
+        };
+        let Some(open) = self.open_frames.get(target) else {
+            return;
+        };
+        if open.depth != self.block_depth {
+            return;
+        }
+        let Some(right) = call
+            .arguments
+            .args
+            .first()
+            .or_else(|| keyword(call, "right").map(|k| &k.value))
+            .or_else(|| keyword(call, "other").map(|k| &k.value))
+        else {
+            return;
+        };
+        let Some((columns, _)) = self.expr_frame_columns(right) else {
+            return;
+        };
+        let method = attr.attr.as_str();
+        for column in columns {
+            if keys.contains(&column) || open.written.contains(&column) {
+                continue;
+            }
+            let early_read = self
+                .open_reads
+                .borrow()
+                .get(&(target.to_string(), column.clone()))
+                .copied();
+            if let Some((stmt, read_line, read_col)) = early_read {
+                if stmt < self.stmt_counter {
+                    errors.push(LintError {
+                        line: read_line,
+                        col: read_col,
+                        code: CODE_READ_BEFORE_ASSIGNMENT.to_string(),
+                        message: format!(
+                            "Column '{column}' is read here, but `{target}` only gets it from the `.{method}()` at line {line}; had it been there already, the {method} would have suffixed it"
+                        ),
+                        severity: "warning".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // `df = df.with_columns(..alias("c"))` / `df = df.assign(c=..)` after a read of `c` on `df`:
+    // the same read-before-assignment as `df["c"] = ..`, unless the call itself reads `c`.
+    fn note_derived_write_after_read(
+        &mut self,
+        target: &str,
+        value: &Expr,
+        line: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Expr::Call(call) = value else {
+            return;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return;
+        };
+        if !matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == target) {
+            return;
+        }
+        let names = match attr.attr.as_str() {
+            "with_columns" => self.with_columns_outputs(call),
+            "assign" => ast_extract::assign_output_names(call),
+            _ => None,
+        };
+        let Some(names) = names else {
+            return;
+        };
+        let Some(open) = self.open_frames.get(target) else {
+            return;
+        };
+        if open.depth != self.block_depth {
+            return;
+        }
+        // String literals of the call outside `.alias(..)`: names it may read.
+        struct Mentions(Vec<String>);
+        impl<'a> Visitor<'a> for Mentions {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Call(c) if matches!(&*c.func, Expr::Attribute(a) if a.attr.as_str() == "alias") =>
+                    {
+                        self.visit_expr(&c.func);
+                        return;
+                    }
+                    Expr::StringLiteral(lit) => self.0.push(lit.value.to_str().to_string()),
+                    _ => {}
+                }
+                ast_visitor::walk_expr(self, expr);
+            }
+        }
+        let mut mentions = Mentions(Vec::new());
+        for arg in &call.arguments.args {
+            mentions.visit_expr(arg);
+        }
+        for kw in &call.arguments.keywords {
+            mentions.visit_expr(&kw.value);
+        }
+        let method = attr.attr.as_str();
+        for column in names {
+            if open.written.contains(&column) || mentions.0.contains(&column) {
+                continue;
+            }
+            let early_read = self
+                .open_reads
+                .borrow()
+                .get(&(target.to_string(), column.clone()))
+                .copied();
+            if let Some((stmt, read_line, read_col)) = early_read {
+                if stmt < self.stmt_counter {
+                    errors.push(LintError {
+                        line: read_line,
+                        col: read_col,
+                        code: CODE_READ_BEFORE_ASSIGNMENT.to_string(),
+                        message: format!(
+                            "Column '{column}' is read here, but `{target}` only gets it from the `.{method}()` at line {line}; unless the data already has it, this raises an error"
+                        ),
+                        severity: "warning".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // A new name for a frame the checker follows, bound to something it cannot model: say so,
+    // so `--coverage-detail=explain` can answer where the frame went.
+    fn note_unmodelled_derivation(&mut self, name: &str, value: &Expr, line: usize, col: usize) {
+        // Name the step that loses the columns, not a column-preserving call after it.
+        let mut value = value;
+        while let Expr::Call(call) = value {
+            match &*call.func {
+                Expr::Attribute(a)
+                    if (ROW_PASSTHROUGH_METHODS.contains(&a.attr.as_str())
+                        || SCHEMA_PRESERVING_METHODS.contains(&a.attr.as_str()))
+                        && matches!(&*a.value, Expr::Call(_)) =>
+                {
+                    value = &a.value;
+                }
+                _ => break,
+            }
+        }
+        let what = describe_rhs(value);
+        if Self::is_series_eval(value) {
+            return;
+        }
+        let (unknown_left, unknown_right) = match value {
+            Expr::Call(call) => match &*call.func {
+                Expr::Attribute(attr) if matches!(attr.attr.as_str(), "join" | "merge") => {
+                    let right = call.arguments.args.first().or_else(|| {
+                        keyword(call, "right")
+                            .or(keyword(call, "other"))
+                            .map(|k| &k.value)
+                    });
+                    (
+                        self.expr_frame_columns(&attr.value).is_none(),
+                        right.is_some_and(|r| self.expr_frame_columns(r).is_none()),
+                    )
+                }
+                _ => (false, false),
+            },
+            _ => (false, false),
+        };
+        let pivot = matches!(value, Expr::Call(call) if matches!(&*call.func,
+            Expr::Attribute(a) if matches!(a.attr.as_str(), "pivot" | "pivot_table")));
+        // `agg(["sum"])` on a frame, or `agg({"v": ["min", "max"]})`: one column level per
+        // function.
+        let grouping = |e: &Expr| {
+            let e = match e {
+                Expr::Subscript(sub) => &*sub.value,
+                other => other,
+            };
+            matches!(e, Expr::Call(g) if matches!(&*g.func,
+                Expr::Attribute(ga) if matches!(ga.attr.as_str(), "groupby" | "resample")))
+        };
+        let multi_index = matches!(value, Expr::Call(call) if matches!(&*call.func,
+        Expr::Attribute(a) if matches!(a.attr.as_str(), "agg" | "aggregate") && grouping(&a.value))
+        && call.arguments.args.first().is_some_and(|arg| match arg {
+            Expr::List(_) => true,
+            Expr::Dict(d) => d.items.iter().any(|i| matches!(i.value, Expr::List(_) | Expr::Tuple(_))),
+            _ => false,
+        }));
+        let reason = if multi_index {
+            format!("{what} gives MultiIndex columns (one level per function), which are not modelled, so the columns of `{name}` are unknown")
+        } else if pivot {
+            format!("{what} takes its new column names from the data, so the columns of `{name}` are unknown")
+        } else if unknown_left {
+            format!("the left side of {what} has unknown columns, so the columns of `{name}` are unknown")
+        } else if unknown_right {
+            format!("the right side of {what} has unknown columns, so the columns of `{name}` are unknown")
+        } else {
+            format!("{what} is not modelled, so the columns of `{name}` are unknown")
+        };
+        self.record_leg_event(name, line, col, "untracked", reason);
+    }
+
+    // `frame.eval("a + b")`: no assignment, so the result is a Series, not a frame.
+    fn is_series_eval(value: &Expr) -> bool {
+        let Expr::Call(call) = value else {
+            return false;
+        };
+        matches!(&*call.func, Expr::Attribute(a) if a.attr.as_str() == "eval")
+            && call
+                .arguments
+                .args
+                .first()
+                .and_then(ast_extract::extract_string_literal)
+                .and_then(query_names::query_names)
+                .is_some_and(|names| names.assigned.is_empty())
+    }
+
+    fn rebind_open_frame(
+        &mut self,
+        name: &str,
+        value: &Expr,
+        sites_before: usize,
+        (line, col): (usize, usize),
+    ) {
+        let unresolved = self.variables.contains_key(name) && !self.is_closed_frame(name);
+        if self.is_closed_frame(name) {
+            self.open_frames.remove(name);
+            return;
+        }
+        let fresh = || OpenFrame {
+            depth: self.block_depth,
+            ..OpenFrame::default()
+        };
+        // A rebinding under a branch leaves the name with either value afterwards.
+        let conditional_rebind = self
+            .open_frames
+            .get(name)
+            .is_some_and(|open| open.depth < self.block_depth);
+        let derived = self.open_after(value, line);
+        // Reads of an earlier frame bound to this name say nothing about the new one.
+        if derived.is_none() {
+            self.open_reads
+                .borrow_mut()
+                .retain(|(frame, _), _| frame != name);
+        }
+        // A new untyped site is an origin unless the frame was derived from one already known.
+        if derived.is_none() && self.untyped_sites.len() > sites_before {
+            self.open_frames.insert(name.to_string(), fresh());
+            return;
+        }
+        match derived {
+            Some(mut open) if !conditional_rebind => {
+                open.depth = self.block_depth;
+                if open.absent.is_empty() && open.written.is_empty() && is_reshaping_call(value) {
+                    self.note_unmodelled_derivation(name, value, line, col);
+                }
+                self.open_frames.insert(name.to_string(), open);
+            }
+            // The new value holds for the rest of this block; leaving it, either value may
+            // reach what follows (see `merge_shadowed_frames`).
+            Some(mut new) => {
+                let depth = self.block_depth;
+                if let Some(old) = self.open_frames.get(name).cloned() {
+                    if !self
+                        .shadowed_frames
+                        .iter()
+                        .any(|(d, n, _)| *d == depth && n == name)
+                    {
+                        self.shadowed_frames.push((depth, name.to_string(), old));
+                    }
+                }
+                new.depth = depth;
+                self.open_frames.insert(name.to_string(), new);
+            }
+            // A frame the checker holds as unresolved is a frame whatever produced it.
+            _ if unresolved => {
+                self.open_frames.insert(name.to_string(), fresh());
+            }
+            other => {
+                self.open_frames.remove(name);
+                if other.is_none() && !self.variables.contains_key(name) {
+                    let frames = &self.open_frames;
+                    let derived = classify_rhs(value, &|n| frames.contains_key(n));
+                    if derived.is_some_and(|d| d.root != name && d.kind == Kind::Derived) {
+                        self.note_unmodelled_derivation(name, value, line, col);
+                    }
+                }
+            }
+        }
+    }
+
+    // `frame["c"] = ...`, `frame[["a", "b"]] = ...`, `frame.loc[:, "c"] = ...` and
+    // `frame.columns = ...` on a frame known only by name.
+    fn note_open_frame_write(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        line: usize,
+        errors: &mut Vec<LintError>,
+    ) {
+        if let Expr::Attribute(attr) = target {
+            if let Expr::Name(frame) = &*attr.value {
+                if attr.attr.as_str() == "columns" {
+                    // Every earlier name may have been renamed, but a drop or rename made after
+                    // the assignment is certain again.
+                    if let Some(open) = self.open_frames.get_mut(frame.id.as_str()) {
+                        open.absent.clear();
+                    }
+                } else if let Some(open) = self.open_frames.get_mut(frame.id.as_str()) {
+                    open.absent.remove(attr.attr.as_str());
+                    open.written.insert(attr.attr.to_string());
+                }
+            }
+            return;
+        }
+        let Expr::Subscript(sub) = target else {
+            return;
+        };
+        let frame_name = match &*sub.value {
+            Expr::Name(n) => n.id.to_string(),
+            Expr::Attribute(a) => match &*a.value {
+                Expr::Name(n) => n.id.to_string(),
+                _ => return,
+            },
+            _ => return,
+        };
+        if !self.open_frames.contains_key(&frame_name) {
+            return;
+        }
+        let Some((_, columns)) = column_write_target(target) else {
+            if let Some(open) = self.open_frames.get_mut(&frame_name) {
+                open.absent.clear();
+            }
+            return;
+        };
+        let reads_itself = |column: &str| {
+            struct Reads<'c> {
+                frame: &'c str,
+                column: &'c str,
+                found: bool,
+            }
+            impl<'a> Visitor<'a> for Reads<'_> {
+                fn visit_expr(&mut self, expr: &'a Expr) {
+                    if let Expr::Subscript(sub) = expr {
+                        if matches!(&*sub.value, Expr::Name(n) if n.id.as_str() == self.frame)
+                            && ast_extract::extract_string_literal(&sub.slice) == Some(self.column)
+                        {
+                            self.found = true;
+                        }
+                    }
+                    ast_visitor::walk_expr(self, expr);
+                }
+            }
+            let mut reads = Reads {
+                frame: &frame_name,
+                column,
+                found: false,
+            };
+            reads.visit_expr(value);
+            reads.found
+        };
+        for column in columns {
+            let early_read = self
+                .open_reads
+                .borrow()
+                .get(&(frame_name.clone(), column.clone()))
+                .copied();
+            let self_read = reads_itself(&column);
+            let at_frame_depth = self
+                .open_frames
+                .get(&frame_name)
+                .is_some_and(|open| open.depth == self.block_depth);
+            let Some(open) = self.open_frames.get_mut(&frame_name) else {
+                return;
+            };
+            open.absent.remove(&column);
+            let first_mention = open.written.insert(column.clone());
+            if let (true, true, false, Some((stmt, read_line, read_col))) =
+                (first_mention, at_frame_depth, self_read, early_read)
+            {
+                if stmt < self.stmt_counter {
+                    errors.push(LintError {
+                        line: read_line,
+                        col: read_col,
+                        code: CODE_READ_BEFORE_ASSIGNMENT.to_string(),
+                        message: format!(
+                            "Column '{column}' is read here, but `{frame_name}` only gets it at line {line}; unless the data already has it, this raises KeyError"
+                        ),
+                        severity: "warning".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // `frame.drop(columns=[..], inplace=True)`, `frame.rename(.., inplace=True)`,
+    // `frame.pop("c")`, `frame.insert(i, "c", ..)` as statements.
+    fn apply_call_to_open_frames(&mut self, call: &ast::ExprCall, line: usize) {
+        let Expr::Attribute(attr) = &*call.func else {
+            return;
+        };
+        let Expr::Name(frame) = &*attr.value else {
+            return;
+        };
+        let name = frame.id.as_str();
+        let depth = self.block_depth;
+        let Some(open) = self.open_frames.get_mut(name) else {
+            return;
+        };
+        let certain = open.depth == depth;
+        match attr.attr.as_str() {
+            "drop" if inplace_literal(call) == Some(true) => {
+                if let (true, InplaceColumns::Edit(dropped)) = (certain, inplace_drop_columns(call))
+                {
+                    for column in dropped {
+                        open.absent
+                            .insert(column, (format!("dropped at line {line}"), line));
+                    }
+                }
+            }
+            "rename" if inplace_literal(call) == Some(true) => match inplace_rename_mapping(call) {
+                InplaceColumns::Edit(mapping) => {
+                    for new in mapping.values() {
+                        open.absent.remove(new);
+                    }
+                    if certain {
+                        for (old, new) in mapping.iter().filter(|(o, n)| o != n) {
+                            open.absent.insert(
+                                old.clone(),
+                                (format!("renamed to '{new}' at line {line}"), line),
+                            );
+                        }
+                    }
+                }
+                InplaceColumns::Unchanged => {}
+                InplaceColumns::Unknown => {
+                    self.open_frames.remove(name);
+                }
+            },
+            "pop" => {
+                if let (true, Some(column)) = (
+                    certain,
+                    call.arguments
+                        .args
+                        .first()
+                        .and_then(ast_extract::extract_string_literal),
+                ) {
+                    open.absent
+                        .insert(column.to_string(), (format!("popped at line {line}"), line));
+                }
+            }
+            "insert" => {
+                match call
+                    .arguments
+                    .args
+                    .get(1)
+                    .and_then(ast_extract::extract_string_literal)
+                {
+                    Some(column) => {
+                        open.absent.remove(column);
+                        open.written.insert(column.to_string());
+                    }
+                    None => open.absent.clear(),
+                }
+            }
+            // Row-wise in-place edits leave the columns alone (an index reset may add one).
+            method
+                if keyword(call, "inplace")
+                    .is_some_and(|k| !matches!(&k.value, Expr::BooleanLiteral(b) if !b.value))
+                    && (ROW_PASSTHROUGH_METHODS.contains(&method)
+                        || SCHEMA_PRESERVING_METHODS.contains(&method)) =>
+            {
+                let keep_absent = method != "reset_index" || resets_index_dropping(call);
+                open.absent.retain(|_, _| keep_absent);
+            }
+            _ if keyword(call, "inplace")
+                .is_some_and(|k| !matches!(&k.value, Expr::BooleanLiteral(b) if !b.value)) =>
+            {
+                self.open_frames.remove(name);
+            }
+            _ => {}
+        }
+    }
+
+    // A frame handed to a function the checker cannot see into may come back with columns
+    // the frame had lost.
+    fn forget_frames_handed_to_helpers(&mut self, stmt: &Stmt) {
+        if self.open_frames.is_empty() {
+            return;
+        }
+        struct Handed<'f> {
+            frames: &'f HashMap<String, OpenFrame>,
+            file_methods: &'f std::collections::HashSet<String>,
+            handed: Vec<String>,
+        }
+        impl<'a> Visitor<'a> for Handed<'_> {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                if let Expr::Call(call) = expr {
+                    let reaches_a_helper = match &*call.func {
+                        Expr::Name(n) => !HARMLESS_CALLEES.contains(&n.id.as_str()),
+                        Expr::Attribute(a) => {
+                            self.file_methods.contains(a.attr.as_str())
+                                || matches!(&*a.value, Expr::Name(n) if n.id.as_str() == "self")
+                        }
+                        _ => true,
+                    };
+                    if reaches_a_helper {
+                        for arg in call
+                            .arguments
+                            .args
+                            .iter()
+                            .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                        {
+                            if let Expr::Name(n) = arg {
+                                if self.frames.contains_key(n.id.as_str()) {
+                                    self.handed.push(n.id.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                ast_visitor::walk_expr(self, expr);
+            }
+        }
+        let mut handed = Handed {
+            frames: &self.open_frames,
+            file_methods: &self.file_function_names,
+            handed: Vec::new(),
+        };
+        for expr in own_expressions(stmt) {
+            handed.visit_expr(expr);
+        }
+        let handed = handed.handed;
+        for name in handed {
+            if let Some(open) = self.open_frames.get_mut(&name) {
+                open.absent.clear();
+            }
+        }
+    }
+
+    // The columns of an expression that evaluates to a frame, and how to describe it in a
+    // message: a tracked name, or a chain whose columns follow from literal edits.
+    fn expr_frame_columns(&self, expr: &Expr) -> Option<(Vec<String>, String)> {
+        if let Expr::Name(name) = expr {
+            let (schema, line) = self.variables.get(name.id.as_str())?;
+            if self.schema_is_unresolved(schema) {
+                return None;
+            }
+            return Some((
+                self.schemas.get(schema)?.clone(),
+                self.schema_display(schema, *line),
+            ));
+        }
+        let columns = self.returned_expr_columns(expr)?;
+        let (line, _) = self.source_location(expr.range().start());
+        let display = format!(
+            "inferred column set {{{}}} (defined at line {line})",
+            columns.join(", ")
+        );
+        Some((columns, display))
+    }
+
+    fn report_unknown_column(
+        &self,
+        name: &str,
+        columns: &[String],
+        display: &str,
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let (line, col) = self.source_location(at);
+        let mut message = format!("Column '{name}' does not exist in {display}");
+        if let Some(suggestion) = find_best_match(name, columns) {
+            message.push_str(&format!(" (did you mean '{suggestion}'?)"));
+        }
+        errors.push(LintError {
+            line,
+            col,
+            code: CODE_UNKNOWN_COLUMN.to_string(),
+            message,
+            severity: "error".to_string(),
+        });
+    }
+
+    // Each of `names` must be a column of the frame `frame` evaluates to. A frame whose
+    // columns are not known is left alone: selecting columns off it is how it gets narrowed.
+    fn check_names_against(
+        &self,
+        frame: &Expr,
+        names: &[String],
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Some((columns, display)) = self.expr_frame_columns(frame) else {
+            return;
+        };
+        for name in names.iter().filter(|n| !columns.contains(n)) {
+            self.report_unknown_column(name, &columns, &display, at, errors);
+        }
+    }
+
+    // Column names handed to a frame method as arguments, and rows of a lambda a method
+    // calls with the frame, checked against the frame the method is called on.
+    fn check_frame_method_arguments(&self, call: &ast::ExprCall, errors: &mut Vec<LintError>) {
+        let Expr::Attribute(attr) = &*call.func else {
+            return;
+        };
+        let receiver = &*attr.value;
+        let at = call.range().start();
+        let named = |kw: &str| {
+            keyword(call, kw).and_then(|k| ast_extract::extract_string_list_or_single(&k.value))
+        };
+        match attr.attr.as_str() {
+            "pivot_table" | "pivot" => {
+                let names: Vec<String> = ["index", "columns", "values"]
+                    .iter()
+                    .filter_map(|kw| named(kw))
+                    .flatten()
+                    .collect();
+                self.check_names_against_closed(receiver, &names, at, errors);
+            }
+            "melt" => {
+                let names: Vec<String> = ["id_vars", "value_vars"]
+                    .iter()
+                    .filter_map(|kw| named(kw))
+                    .flatten()
+                    .collect();
+                self.check_names_against_closed(receiver, &names, at, errors);
+            }
+            "agg" | "aggregate" => {
+                let Expr::Call(grouped) = receiver else {
+                    return;
+                };
+                let Expr::Attribute(group_attr) = &*grouped.func else {
+                    return;
+                };
+                if group_attr.attr.as_str() == "group_by" {
+                    let names: Vec<String> = call
+                        .arguments
+                        .args
+                        .iter()
+                        .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                        .flat_map(ast_extract::collect_pl_col_names)
+                        .collect();
+                    self.check_names_against(&group_attr.value, &names, at, errors);
+                    self.check_names_against_open(&group_attr.value, &names, at, errors);
+                    return;
+                }
+                if group_attr.attr.as_str() != "groupby" {
+                    return;
+                }
+                let sources: Vec<String> = call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .filter_map(|k| match &k.value {
+                        Expr::Tuple(pair) => match pair.elts.first() {
+                            Some(Expr::StringLiteral(s)) => Some(s.value.to_str().to_string()),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                self.check_names_against_closed(&group_attr.value, &sources, at, errors);
+            }
+            "select" | "with_columns" | "filter" => {
+                let literal = attr.attr.as_str() == "select";
+                // Each argument reports at its own position, so a long chain points at the
+                // expression that reads the missing name.
+                for arg in call
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                {
+                    let mut names = ast_extract::collect_pl_col_names(arg);
+                    if literal {
+                        names.extend(
+                            ast_extract::extract_string_list_or_single(arg).unwrap_or_default(),
+                        );
+                    }
+                    let at = arg.range().start();
+                    self.check_names_against(receiver, &names, at, errors);
+                    self.check_names_against_open(receiver, &names, at, errors);
+                }
+                if attr.attr.as_str() == "with_columns"
+                    && self.expr_frame_columns(receiver).is_none()
+                {
+                    self.check_sibling_reads(receiver, call, errors);
+                }
+            }
+            "group_by" => {
+                let keys = ast_extract::group_by_keys(call).unwrap_or_default();
+                self.check_names_against(receiver, &keys, at, errors);
+                self.check_names_against_open(receiver, &keys, at, errors);
+            }
+            "rename" if self.is_polars_receiver(receiver) => {
+                if let Some(mapping) = ast_extract::extract_rename_mapping(call) {
+                    let keys: Vec<String> = mapping.keys().cloned().collect();
+                    self.check_names_against(receiver, &keys, at, errors);
+                    self.check_names_against_open(receiver, &keys, at, errors);
+                }
+            }
+            "join" if self.is_polars_receiver(receiver) => {
+                let Some(right) = call
+                    .arguments
+                    .args
+                    .first()
+                    .or_else(|| keyword(call, "other").map(|k| &k.value))
+                else {
+                    return;
+                };
+                let keys = |kw: &str| {
+                    keyword(call, kw)
+                        .and_then(|k| ast_extract::literal_key_columns(&k.value))
+                        .unwrap_or_default()
+                };
+                let on = keys("on");
+                self.check_names_against(
+                    receiver,
+                    &[on.clone(), keys("left_on")].concat(),
+                    at,
+                    errors,
+                );
+                self.check_names_against(right, &[on, keys("right_on")].concat(), at, errors);
+            }
+            "merge" => {
+                let (left, right) = match (receiver, &*call.arguments.args) {
+                    (Expr::Name(module), [left, right, ..])
+                        if !self.variables.contains_key(module.id.as_str())
+                            && !matches!(right, Expr::StringLiteral(_)) =>
+                    {
+                        (left, Some(right))
+                    }
+                    (_, [right, ..]) => (receiver, Some(right)),
+                    _ => (receiver, keyword(call, "right").map(|k| &k.value)),
+                };
+                let on = named("on").unwrap_or_default();
+                let left_on = named("left_on").unwrap_or_default();
+                let right_on = named("right_on").unwrap_or_default();
+                self.check_column_args(left, &[on.clone(), left_on].concat(), at, errors);
+                if let Some(right) = right {
+                    self.check_column_args(right, &[on, right_on].concat(), at, errors);
+                }
+            }
+            "sort_values" => {
+                let by = call
+                    .arguments
+                    .args
+                    .first()
+                    .and_then(ast_extract::extract_string_list_or_single)
+                    .or_else(|| named("by"));
+                self.check_column_args(receiver, &by.unwrap_or_default(), at, errors);
+            }
+            "drop_duplicates" | "unique" => {
+                let subset = named("subset").or_else(|| {
+                    call.arguments
+                        .args
+                        .first()
+                        .and_then(ast_extract::extract_string_list_or_single)
+                });
+                self.check_column_args(receiver, &subset.unwrap_or_default(), at, errors);
+            }
+            "groupby" => {
+                let by = call
+                    .arguments
+                    .args
+                    .first()
+                    .and_then(ast_extract::extract_string_list_or_single)
+                    .or_else(|| named("by"));
+                self.check_column_args(receiver, &by.unwrap_or_default(), at, errors);
+            }
+            "sort" => {
+                let mut names: Vec<String> = call
+                    .arguments
+                    .args
+                    .iter()
+                    .filter_map(ast_extract::extract_string_list_or_single)
+                    .flatten()
+                    .collect();
+                names.extend(named("by").unwrap_or_default());
+                self.check_column_args(receiver, &names, at, errors);
+            }
+            "explode" => {
+                let mut names: Vec<String> = call
+                    .arguments
+                    .args
+                    .iter()
+                    .filter_map(ast_extract::extract_string_list_or_single)
+                    .flatten()
+                    .collect();
+                names.extend(named("column").unwrap_or_default());
+                names.extend(named("columns").unwrap_or_default());
+                self.check_column_args(receiver, &names, at, errors);
+            }
+            "assign" => {
+                let Some((mut columns, display)) = self.expr_frame_columns(receiver) else {
+                    return;
+                };
+                // A keyword may read the columns added by the ones before it.
+                for kw in &call.arguments.keywords {
+                    if let Expr::Lambda(lambda) = &kw.value {
+                        self.check_lambda_rows(lambda, &columns, &display, errors);
+                    }
+                    if let Some(name) = &kw.arg {
+                        columns.push(name.to_string());
+                    }
+                }
+            }
+            "pipe" => {
+                if let Some(Expr::Lambda(lambda)) = call.arguments.args.first() {
+                    if let Some((columns, display)) = self.expr_frame_columns(receiver) {
+                        self.check_lambda_rows(lambda, &columns, &display, errors);
+                    }
+                }
+            }
+            "apply" => {
+                let by_row = matches!(
+                    keyword(call, "axis").map(|k| &k.value),
+                    Some(Expr::NumberLiteral(n)) if matches!(&n.value, ast::Number::Int(i) if i.as_u64() == Some(1))
+                ) || matches!(
+                    keyword(call, "axis").map(|k| &k.value),
+                    Some(Expr::StringLiteral(s)) if s.value.to_str() == "columns"
+                );
+                if let (true, Some(Expr::Lambda(lambda))) = (by_row, call.arguments.args.first()) {
+                    if let Some((columns, display)) = self.expr_frame_columns(receiver) {
+                        self.check_lambda_rows(lambda, &columns, &display, errors);
+                    }
+                }
+            }
+            // Bare names in the expression string are columns (or index levels, which
+            // `check_column_args` steps around); extra resolvers make any name possible.
+            "query" | "eval" if !self.is_polars_receiver(receiver) => {
+                if ["local_dict", "global_dict", "resolvers"]
+                    .iter()
+                    .any(|kw| keyword(call, kw).is_some())
+                {
+                    return;
+                }
+                let Some(arg) = call
+                    .arguments
+                    .args
+                    .first()
+                    .or_else(|| keyword(call, "expr").map(|k| &k.value))
+                else {
+                    return;
+                };
+                let Some(names) =
+                    ast_extract::extract_string_literal(arg).and_then(query_names::query_names)
+                else {
+                    return;
+                };
+                self.check_column_args(receiver, &names.reads, arg.range().start(), errors);
+            }
+            _ => {}
+        }
+    }
+
+    // Column names an index-aware pandas method takes as arguments (`merge(on=)`,
+    // `sort_values`, `groupby`, ...) checked against the frame, whether it is closed or only
+    // known by name. A name may also be an index level, so frames that carry one are skipped.
+    fn check_column_args(
+        &self,
+        frame: &Expr,
+        names: &[String],
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        if names.is_empty() || self.may_carry_index_levels(frame) {
+            return;
+        }
+        self.check_names_against(frame, names, at, errors);
+        if let Expr::Name(root) = frame {
+            for name in names {
+                self.check_open_frame_read(root.id.as_str(), name, at, errors);
+            }
+        }
+        self.check_names_against_open_chain(frame, names, at, errors);
+    }
+
+    // `with_columns(expr.alias("a"), pl.col("a") * 2)`: polars evaluates the expressions against
+    // the frame it was given, so a sibling's output is not there to read. On a frame whose
+    // columns are unknown the input may already have the name, hence a warning.
+    fn check_sibling_reads(
+        &self,
+        receiver: &Expr,
+        call: &ast::ExprCall,
+        errors: &mut Vec<LintError>,
+    ) {
+        let already_has = |name: &str| match receiver {
+            Expr::Name(root) => self
+                .open_frames
+                .get(root.id.as_str())
+                .is_some_and(|open| open.written.contains(name)),
+            _ => false,
+        };
+        let arguments: Vec<(&Expr, Option<String>)> = call
+            .arguments
+            .args
+            .iter()
+            .map(|a| (a, ast_extract::pl_expr_output_name(a)))
+            .chain(
+                call.arguments
+                    .keywords
+                    .iter()
+                    .map(|k| (&k.value, k.arg.as_ref().map(|a| a.to_string()))),
+            )
+            .collect();
+        for (i, (expr, _)) in arguments.iter().enumerate() {
+            for name in ast_extract::collect_pl_col_names(expr) {
+                // A sibling that overwrites `name` from `name` itself proves the input has it.
+                let overwritten_in_place = arguments.iter().any(|(e, output)| {
+                    output.as_deref() == Some(name.as_str())
+                        && ast_extract::collect_pl_col_names(e).contains(&name)
+                });
+                let created_by_sibling = !overwritten_in_place
+                    && !already_has(&name)
+                    && arguments
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (_, output))| j != i && output.as_deref() == Some(name.as_str()));
+                let created_by_itself = arguments[i].1.as_deref() == Some(name.as_str());
+                if !created_by_sibling || created_by_itself {
+                    continue;
+                }
+                let (line, col) = self.source_location(expr.range().start());
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_READ_BEFORE_ASSIGNMENT.to_string(),
+                    message: format!(
+                        "Column '{name}' is read here, but a sibling expression of the same `with_columns` creates it; polars evaluates every expression against the frame it was called on, so this raises ColumnNotFoundError unless that frame already has '{name}'"
+                    ),
+                    severity: "warning".to_string(),
+                });
+            }
+        }
+    }
+
+    // Names read off a frame known only by name, whether it is the name itself or a chain of
+    // edits on it.
+    fn check_names_against_open(
+        &self,
+        frame: &Expr,
+        names: &[String],
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        if let Expr::Name(root) = frame {
+            for name in names {
+                self.check_open_frame_read(root.id.as_str(), name, at, errors);
+            }
+        }
+        self.check_names_against_open_chain(frame, names, at, errors);
+    }
+
+    // `frame.drop("a").select("a")` on a frame known only by name: `a` is certainly gone.
+    fn check_names_against_open_chain(
+        &self,
+        chain: &Expr,
+        names: &[String],
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        if matches!(chain, Expr::Name(_)) {
+            return;
+        }
+        let (line, col) = self.source_location(at);
+        let Some(open) = self.open_after(chain, line) else {
+            return;
+        };
+        for name in names {
+            if let Some((why, _)) = open.absent.get(name) {
+                errors.push(LintError {
+                    line,
+                    col,
+                    code: CODE_UNKNOWN_COLUMN.to_string(),
+                    message: format!(
+                        "Column '{name}' does not exist in the frame this chain returns: it was {why} (the frame's other columns are unknown)"
+                    ),
+                    severity: "error".to_string(),
+                });
+            }
+        }
+    }
+
+    fn may_carry_index_levels(&self, frame: &Expr) -> bool {
+        match frame {
+            Expr::Name(name) => self
+                .variables
+                .get(name.id.as_str())
+                .is_some_and(|(schema, _)| {
+                    self.schema_index.contains_key(schema) || self.unknown_index.contains(schema)
+                }),
+            Expr::Call(call) => match &*call.func {
+                // A polars `group_by(..).agg(..)`: polars frames have no index.
+                Expr::Attribute(attr)
+                    if matches!(attr.attr.as_str(), "agg" | "aggregate")
+                        && matches!(&*attr.value, Expr::Call(g) if matches!(&*g.func,
+                            Expr::Attribute(ga) if matches!(ga.attr.as_str(), "group_by" | "group_by_dynamic"))) =>
+                {
+                    false
+                }
+                Expr::Attribute(attr) => {
+                    matches!(
+                        attr.attr.as_str(),
+                        "set_index"
+                            | "agg"
+                            | "aggregate"
+                            | "pivot_table"
+                            | "unstack"
+                            | "stack"
+                            | "rename_axis"
+                            | "set_axis"
+                    ) || self.may_carry_index_levels(&attr.value)
+                }
+                _ => false,
+            },
+            Expr::Attribute(attr) => self.may_carry_index_levels(&attr.value),
+            Expr::Subscript(sub) => self.may_carry_index_levels(&sub.value),
+            _ => false,
+        }
+    }
+
+    // As `check_names_against`, for arguments that only mean columns when the frame's
+    // columns are all known: an unresolved frame is reported by its first column read.
+    fn check_names_against_closed(
+        &self,
+        frame: &Expr,
+        names: &[String],
+        at: ruff_text_size::TextSize,
+        errors: &mut Vec<LintError>,
+    ) {
+        if names.is_empty() {
+            return;
+        }
+        if let Some((columns, display)) = self.expr_frame_columns(frame) {
+            for name in names.iter().filter(|n| !columns.contains(n)) {
+                self.report_unknown_column(name, &columns, &display, at, errors);
+            }
+        }
+    }
+
+    // The columns `lambda d: ...` reads off its single parameter, which is bound to a
+    // frame (or, under `apply(axis=1)`, to one of its rows).
+    fn check_lambda_rows(
+        &self,
+        lambda: &ast::ExprLambda,
+        columns: &[String],
+        display: &str,
+        errors: &mut Vec<LintError>,
+    ) {
+        let Some(parameters) = &lambda.parameters else {
+            return;
+        };
+        let [parameter] = parameters.args.as_slice() else {
+            return;
+        };
+        if !parameters.posonlyargs.is_empty()
+            || !parameters.kwonlyargs.is_empty()
+            || parameters.vararg.is_some()
+            || parameters.kwarg.is_some()
+        {
+            return;
+        }
+        struct Reads<'p> {
+            param: &'p str,
+            found: Vec<(String, ruff_text_size::TextSize)>,
+        }
+        impl<'a> Visitor<'a> for Reads<'_> {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    // A nested lambda or comprehension may rebind the name.
+                    Expr::Lambda(_)
+                    | Expr::ListComp(_)
+                    | Expr::SetComp(_)
+                    | Expr::DictComp(_)
+                    | Expr::Generator(_) => return,
+                    Expr::Subscript(sub) => {
+                        if matches!(&*sub.value, Expr::Name(n) if n.id.as_str() == self.param) {
+                            if let Some(name) = ast_extract::extract_string_literal(&sub.slice) {
+                                self.found.push((name.to_string(), sub.range().start()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                ast_visitor::walk_expr(self, expr);
+            }
+        }
+        let mut reads = Reads {
+            param: parameter.parameter.name.id.as_str(),
+            found: Vec::new(),
+        };
+        reads.visit_expr(&lambda.body);
+        for (name, at) in reads.found.iter().filter(|(n, _)| !columns.contains(n)) {
+            self.report_unknown_column(name, columns, display, *at, errors);
+        }
+    }
+
     fn visit_expr(&self, expr: &Expr, errors: &mut Vec<LintError>) {
         match expr {
             Expr::Attribute(attr) => {
@@ -7762,18 +12555,17 @@ impl Linter {
                         if !RESERVED_METHODS.contains(&attr_name) {
                             if self.schema_is_unresolved(schema_name) {
                                 let (line, col) = self.source_location(attr.range().start());
-                                let schema_display =
-                                    self.schema_display(schema_name, *defined_line);
-                                errors.push(LintError {
-                                    line,
-                                    col,
-                                    code: CODE_UNVERIFIABLE_COLUMN.to_string(),
-                                    message: format!(
-                                        "Column '{}' cannot be verified: {} has no concrete column list",
-                                        attr_name, schema_display
-                                    ),
-                                    severity: "error".to_string(),
-                                });
+                                if !self.is_known_on_open_leg(schema_name, attr_name)
+                                    && self.first_unverifiable_report(schema_name)
+                                {
+                                    errors.push(LintError {
+                                        line,
+                                        col,
+                                        code: CODE_UNVERIFIABLE_COLUMN.to_string(),
+                                        message: self.unverifiable_message(attr_name, schema_name),
+                                        severity: "warning".to_string(),
+                                    });
+                                }
                             } else if let Some(columns) = self.schemas.get(schema_name) {
                                 if !self.schema_has_column(schema_name, attr_name) {
                                     let (line, col) = self.source_location(attr.range().start());
@@ -7804,6 +12596,25 @@ impl Linter {
                 self.visit_expr(&attr.value, errors);
             }
             Expr::Subscript(subscript) => {
+                // `frame.groupby(keys)["col"]` / `[["a", "b"]]`: the selection is read off the frame.
+                if let Expr::Call(grouped) = &*subscript.value {
+                    if let Expr::Attribute(group_attr) = &*grouped.func {
+                        if group_attr.attr.as_str() == "groupby" {
+                            if let Some(names) =
+                                ast_extract::extract_string_list_or_single(&subscript.slice)
+                            {
+                                let at = subscript.range().start();
+                                self.check_names_against(&group_attr.value, &names, at, errors);
+                                self.check_names_against_open(
+                                    &group_attr.value,
+                                    &names,
+                                    at,
+                                    errors,
+                                );
+                            }
+                        }
+                    }
+                }
                 if let Expr::Name(name) = &*subscript.value {
                     if let Some((schema_name, defined_line)) = self.variables.get(name.id.as_str())
                     {
@@ -7812,18 +12623,24 @@ impl Linter {
                         {
                             if self.schema_is_unresolved(schema_name) {
                                 let (line, col) = self.source_location(subscript.range().start());
-                                let schema_display =
-                                    self.schema_display(schema_name, *defined_line);
-                                errors.push(LintError {
-                                    line,
-                                    col,
-                                    code: CODE_UNVERIFIABLE_COLUMN.to_string(),
-                                    message: format!(
-                                        "Column '{}' cannot be verified: {} has no concrete column list",
-                                        col_name, schema_display
-                                    ),
-                                    severity: "error".to_string(),
-                                });
+                                if !self.is_known_on_open_leg(schema_name, col_name) {
+                                    self.unknown_frame_reads.borrow_mut().push((
+                                        line,
+                                        col,
+                                        col_name.to_string(),
+                                    ));
+                                }
+                                if !self.is_known_on_open_leg(schema_name, col_name)
+                                    && self.first_unverifiable_report(schema_name)
+                                {
+                                    errors.push(LintError {
+                                        line,
+                                        col,
+                                        code: CODE_UNVERIFIABLE_COLUMN.to_string(),
+                                        message: self.unverifiable_message(col_name, schema_name),
+                                        severity: "warning".to_string(),
+                                    });
+                                }
                             } else if let Some(columns) = self.schemas.get(schema_name) {
                                 if !self.schema_has_column(schema_name, col_name) {
                                     let (line, col) =
@@ -7852,10 +12669,81 @@ impl Linter {
                         }
                     }
                 }
+                if let (Expr::Name(name), Some(column), ast::ExprContext::Load) = (
+                    &*subscript.value,
+                    ast_extract::extract_string_literal(&subscript.slice),
+                    subscript.ctx,
+                ) {
+                    self.check_open_frame_read(
+                        name.id.as_str(),
+                        column,
+                        subscript.range().start(),
+                        errors,
+                    );
+                }
+                if let (Expr::Name(name), Expr::List(_), ast::ExprContext::Load) =
+                    (&*subscript.value, &*subscript.slice, subscript.ctx)
+                {
+                    self.note_unknown_list_reads(name.id.as_str(), &subscript.slice);
+                }
+                if let (Expr::Attribute(indexer), Expr::Tuple(pair), ast::ExprContext::Load) =
+                    (&*subscript.value, &*subscript.slice, subscript.ctx)
+                {
+                    if let (true, Expr::Name(frame), [_, columns]) = (
+                        indexer.attr.as_str() == "loc",
+                        &*indexer.value,
+                        pair.elts.as_slice(),
+                    ) {
+                        if let Some(names) = ast_extract::extract_string_list_or_single(columns) {
+                            for name in &names {
+                                self.check_open_frame_read(
+                                    frame.id.as_str(),
+                                    name,
+                                    subscript.range().start(),
+                                    errors,
+                                );
+                            }
+                            self.check_names_against(
+                                &indexer.value,
+                                &names,
+                                subscript.range().start(),
+                                errors,
+                            );
+                        }
+                    }
+                }
+                if let Some(names) = ast_extract::extract_string_list(&subscript.slice) {
+                    let is_row_indexer = matches!(
+                        &*subscript.value,
+                        Expr::Attribute(a) if matches!(a.attr.as_str(), "loc" | "iloc")
+                    );
+                    if !is_row_indexer {
+                        self.check_names_against(
+                            &subscript.value,
+                            &names,
+                            subscript.range().start(),
+                            errors,
+                        );
+                        if subscript.ctx == ast::ExprContext::Load {
+                            self.check_names_against_open(
+                                &subscript.value,
+                                &names,
+                                subscript.range().start(),
+                                errors,
+                            );
+                        }
+                    }
+                }
                 self.visit_expr(&subscript.value, errors);
                 self.visit_expr(&subscript.slice, errors);
             }
             Expr::Call(call) => {
+                self.check_frame_method_arguments(call, errors);
+                // `print(f(frame).shape)`: a contract call nested in another expression.
+                if !self.contracts.is_empty() || !self.method_agreement.is_empty() {
+                    let (line, col) = self.source_location(call.range().start());
+                    self.check_call_requirements(call, line, col, errors);
+                }
                 for arg in call.arguments.args.iter() {
                     self.visit_expr(arg, errors);
                 }
@@ -7907,13 +12795,110 @@ impl Linter {
                     self.visit_expr(el, errors);
                 }
             }
+            Expr::Set(set) => {
+                for el in &set.elts {
+                    self.visit_expr(el, errors);
+                }
+            }
+            Expr::Dict(dict) => {
+                for item in &dict.items {
+                    if let Some(key) = &item.key {
+                        self.visit_expr(key, errors);
+                    }
+                    self.visit_expr(&item.value, errors);
+                }
+            }
+            Expr::If(ternary) => {
+                self.visit_expr(&ternary.test, errors);
+                self.visit_expr(&ternary.body, errors);
+                self.visit_expr(&ternary.orelse, errors);
+            }
+            Expr::FString(fstring) => {
+                for element in fstring.value.elements() {
+                    if let ast::InterpolatedStringElement::Interpolation(interp) = element {
+                        self.visit_expr(&interp.expression, errors);
+                    }
+                }
+            }
+            Expr::Await(inner) => self.visit_expr(&inner.value, errors),
+            Expr::Starred(inner) => self.visit_expr(&inner.value, errors),
+            Expr::Named(inner) => self.visit_expr(&inner.value, errors),
+            Expr::YieldFrom(inner) => self.visit_expr(&inner.value, errors),
+            Expr::Yield(inner) => {
+                if let Some(value) = &inner.value {
+                    self.visit_expr(value, errors);
+                }
+            }
+            Expr::Lambda(lambda) => {
+                let mut bound = Vec::new();
+                if let Some(parameters) = &lambda.parameters {
+                    for p in parameters.iter() {
+                        bound.push((p.name().to_string(), ""));
+                    }
+                }
+                if !self.shadows_a_frame(&bound) {
+                    self.visit_expr(&lambda.body, errors);
+                }
+            }
+            Expr::ListComp(comp) => {
+                self.visit_comprehension(&comp.generators, &[&comp.elt], errors)
+            }
+            Expr::SetComp(comp) => self.visit_comprehension(&comp.generators, &[&comp.elt], errors),
+            Expr::Generator(comp) => {
+                self.visit_comprehension(&comp.generators, &[&comp.elt], errors)
+            }
+            Expr::DictComp(comp) => {
+                let mut bodies: Vec<&Expr> = comp.key.iter().map(|key| &**key).collect();
+                bodies.push(&comp.value);
+                self.visit_comprehension(&comp.generators, &bodies, errors)
+            }
             _ => {}
+        }
+    }
+
+    // Whether any of `bound` (names a lambda or comprehension binds) hides a tracked frame.
+    fn shadows_a_frame(&self, bound: &[(String, &'static str)]) -> bool {
+        bound
+            .iter()
+            .any(|(name, _)| self.variables.contains_key(name))
+    }
+
+    // The first iterable is evaluated in the enclosing scope; the rest runs with the loop
+    // targets bound, so it is skipped whenever one of them hides a tracked frame.
+    fn visit_comprehension(
+        &self,
+        generators: &[ast::Comprehension],
+        bodies: &[&Expr],
+        errors: &mut Vec<LintError>,
+    ) {
+        let Some(first) = generators.first() else {
+            return;
+        };
+        self.visit_expr(&first.iter, errors);
+        let mut bound = Vec::new();
+        for generator in generators {
+            collect_name_targets(&generator.target, "", &mut bound);
+        }
+        if self.shadows_a_frame(&bound) {
+            return;
+        }
+        for (index, generator) in generators.iter().enumerate() {
+            if index > 0 {
+                self.visit_expr(&generator.iter, errors);
+            }
+            for condition in &generator.ifs {
+                self.visit_expr(condition, errors);
+            }
+        }
+        for body in bodies {
+            self.visit_expr(body, errors);
         }
     }
 }
 
 // Every project module `module` imports that exports statically known constants or
-// functions, keyed as written (`(leading dots, dotted name)`).
+// functions, keyed as written (`(leading dots, dotted name)`). `from a import b` also tries
+// `a.b`, in case `b` is a submodule.
 fn collect_imported_modules(
     index: &ProjectIndex,
     module: &ModModule,
@@ -7931,6 +12916,14 @@ fn collect_imported_modules(
                 }
                 Stmt::ImportFrom(i) => {
                     let name = i.module.as_ref().map(|m| m.to_string()).unwrap_or_default();
+                    for alias in &i.names {
+                        if alias.name.as_str() != "*" {
+                            self.0.push((
+                                i.level,
+                                crate::index::join_module(&name, alias.name.as_str()),
+                            ));
+                        }
+                    }
                     self.0.push((i.level, name));
                 }
                 _ => {}
@@ -7951,34 +12944,119 @@ fn collect_imported_modules(
         }
     });
     let mut found = static_eval::ImportedModules::new();
+    let own_root = std::cell::OnceCell::new();
     for (level, name) in imports.0 {
         if found.contains_key(&(level, name.clone())) {
             continue;
         }
-        let target = if level == 0 {
-            resolve_module_file(&name, project_root, &index.files).or_else(|| {
-                let path = name.replace('.', "/");
-                [
-                    project_root.join(&path).join("__init__.py"),
-                    project_root.join("src").join(&path).join("__init__.py"),
-                ]
-                .iter()
-                .filter_map(|p| p.to_str())
-                .find(|p| index.files.contains_key(*p))
-                .map(str::to_string)
-            })
-        } else {
-            importer
-                .as_deref()
-                .and_then(|file| resolve_relative_module(file, level, &name, &index.files))
-        };
-        if let Some(entry) = target.and_then(|t| index.files.get(&t)) {
-            if !entry.eval.is_empty() {
-                found.insert((level, name), Arc::new(entry.eval.clone()));
+        let target = resolve_import(
+            index,
+            level,
+            &name,
+            importer.as_deref(),
+            &own_root,
+            project_root,
+        );
+        if let Some(exports) = target.and_then(|t| module_exports(index, &t, project_root, 0)) {
+            if !exports.is_empty() {
+                found.insert((level, name), exports);
             }
         }
     }
     found
+}
+
+// The indexed file `from <dots><name> import ...` in `importer` (or a notebook) loads.
+fn resolve_import(
+    index: &ProjectIndex,
+    level: u32,
+    name: &str,
+    importer: Option<&Path>,
+    own_root: &std::cell::OnceCell<PathBuf>,
+    project_root: &Path,
+) -> Option<String> {
+    if level == 0 {
+        if name.is_empty() {
+            return None;
+        }
+        resolve_module_file_with_root(
+            name,
+            project_root,
+            importer,
+            own_root,
+            &index.package_roots,
+            &index.files,
+        )
+    } else {
+        resolve_relative_module(importer?, level, name, &index.files)
+    }
+}
+
+// What `file` exports to an importer, with the names it re-exports (`from .cols import Col`
+// in a package `__init__.py`) resolved to their values in the modules they come from.
+fn module_exports(
+    index: &ProjectIndex,
+    file: &str,
+    project_root: &Path,
+    depth: usize,
+) -> Option<Arc<static_eval::ModuleExports>> {
+    let key = (file.to_string(), depth, project_root.to_path_buf());
+    if let Some(done) = index.exports_memo.get(&key) {
+        return done;
+    }
+    let result = compute_module_exports(index, file, project_root, depth).map(Arc::new);
+    index.exports_memo.insert(key, result.clone());
+    result
+}
+
+fn compute_module_exports(
+    index: &ProjectIndex,
+    file: &str,
+    project_root: &Path,
+    depth: usize,
+) -> Option<static_eval::ModuleExports> {
+    const MAX_REEXPORT_DEPTH: usize = 4;
+    let entry = index.files.get(file)?;
+    let mut exports = entry.eval.clone();
+    if depth >= MAX_REEXPORT_DEPTH {
+        return Some(exports);
+    }
+    let own_root = std::cell::OnceCell::new();
+    for (local, (level, module, name)) in &entry.eval.reexports {
+        let Some(source) = resolve_import(
+            index,
+            *level,
+            module,
+            Some(Path::new(file)),
+            &own_root,
+            project_root,
+        )
+        .and_then(|t| module_exports(index, &t, project_root, depth + 1)) else {
+            continue;
+        };
+        if let Some(value) = source.constants.get(name) {
+            exports
+                .constants
+                .entry(local.clone())
+                .or_insert_with(|| value.clone());
+        }
+        let prefix = format!("{name}.");
+        for (key, value) in &source.constants {
+            if let Some(attr) = key.strip_prefix(&prefix) {
+                exports
+                    .constants
+                    .entry(format!("{local}.{attr}"))
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        if let Some(members) = source.enums.get(name) {
+            exports
+                .enums
+                .entry(local.clone())
+                .or_insert_with(|| members.clone());
+        }
+    }
+    Some(exports)
 }
 
 fn resolve_relative_module(
@@ -8380,10 +13458,13 @@ df["a"] = 1
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        // assert: unverifiable, not a false unknown-column.
-        assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
-        assert_eq!(linter.dataframes_total, 2);
+        // assert: the write reads nothing, so there is nothing to call unverifiable, and
+        // certainly no false unknown-column.
+        assert!(
+            errors.iter().all(|e| e.code == CODE_UNTRACKED_DATAFRAME),
+            "errors: {errors:?}"
+        );
+        assert_eq!(linter.dataframes_total, 3);
         assert_eq!(linter.dataframes_typed, 0);
     }
 
@@ -8454,10 +13535,296 @@ print(df["b"])
 
         // assert: only the expected unverifiable-column on the later access, no false
         // unknown-column from pop() itself.
+        let unverifiable = errors
+            .iter()
+            .filter(|e| e.code == CODE_UNVERIFIABLE_COLUMN)
+            .count();
+        assert_eq!(unverifiable, 1, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN));
+        assert_eq!(linter.dataframes_total, 3);
+        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    fn lint_polars(body: &str) -> Vec<LintError> {
+        let source = format!(
+            "import polars as pl\ndf = pl.read_csv(\"x.csv\", columns=[\"a\", \"b\"])\n{body}"
+        );
+        Linter::new()
+            .check_file_internal(&source, Path::new("test.py"))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_should_track_columns_added_by_polars_with_columns() {
+        // arrange / act
+        let errors = lint_polars(
+            "x = df.with_columns((pl.col(\"b\") + 1).alias(\"d\"), c=pl.col(\"a\") * 2)\n\
+             print(x[\"c\"], x[\"d\"], x[\"a\"])\nprint(x[\"zzz\"])\n",
+        );
+
+        // assert: only the column nothing created is an error
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'zzz'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_guess_columns_for_an_unnamed_with_columns_expression() {
+        // arrange / act: `pl.all() * 2` has no readable output name
+        let errors = lint_polars("x = df.with_columns(pl.all() * 2)\nprint(x[\"zzz\"])\n");
+
+        // assert: unverifiable, not a fabricated unknown-column
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_treat_pandas_dtype_keys_as_the_complete_column_set() {
+        // arrange / act: `dtype=` overrides one column's type; `b` still exists in the file.
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.read_csv(\"x.csv\", dtype={\"a\": \"int64\"})\nprint(df[\"b\"])\n",
+        );
+
+        // assert: untracked-dataframe at most, never a fabricated unknown-column
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_treat_polars_schema_keys_as_the_complete_column_set() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\ndf = pl.read_csv(\"x.csv\", schema={\"a\": pl.Int64})\nprint(df[\"b\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_follow_a_dict_comprehension_rename_over_known_columns() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.read_csv(\"x.csv\", usecols=[\"Card ID\", \"Amount\"])\ndf = df.rename(columns={c: c.lower().replace(\" \", \"_\") for c in df.columns})\nprint(df[\"card_id\"], df[\"amount\"])\nprint(df[\"Amount\"])\n",
+        );
+
+        // assert: the renamed names resolve; the old one is gone
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'Amount'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_follow_a_list_comprehension_columns_assignment() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.read_csv(\"x.csv\", usecols=[\"Card ID\", \"Amount\"])\ndf.columns = [c.lower().replace(\" \", \"_\") for c in df.columns]\nprint(df[\"card_id\"])\nprint(df[\"zzz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'zzz'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_guess_a_rename_whose_mapping_calls_an_unknown_function() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.read_csv(\"x.csv\", usecols=[\"Card ID\"])\ndf = df.rename(columns={c: fix(c) for c in df.columns})\nprint(df[\"anything\"])\n",
+        );
+
+        // assert: unverifiable, never a fabricated unknown-column
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    fn lint_polars_two_frames(body: &str) -> Vec<LintError> {
+        let source = format!(
+            "import polars as pl\ntxn = pl.read_csv(\"t.csv\", columns=[\"id\", \"amount\", \"card\"])\ncards = pl.read_csv(\"c.csv\", columns=[\"card\", \"amount\", \"limit\"])\n{body}"
+        );
+        Linter::new()
+            .check_file_internal(&source, Path::new("test.py"))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_should_track_the_columns_of_a_polars_group_by_agg() {
+        // arrange / act
+        let errors = lint_polars_two_frames(
+            "g = txn.group_by(\"card\").agg(pl.col(\"id\").count(), total=pl.col(\"amount\").sum())\nprint(g[\"card\"], g[\"total\"], g[\"id\"])\nprint(g[\"amount\"])\n",
+        );
+
+        // assert: keys and aggregates survive, the aggregated source column does not
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'amount'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_group_by_keys_and_agg_columns_against_the_frame() {
+        // arrange / act
+        let errors = lint_polars_two_frames(
+            "g = txn.group_by(\"cardd\").agg(total=pl.col(\"amoun\").sum())\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.code == CODE_UNKNOWN_COLUMN));
+    }
+
+    #[test]
+    fn test_should_not_guess_the_columns_of_an_agg_with_an_unnamed_expression() {
+        // arrange / act
+        let errors = lint_polars_two_frames(
+            "g = txn.group_by(\"card\").agg(pl.all().sum())\nprint(g[\"whatever\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_track_the_columns_of_a_polars_join() {
+        // arrange / act
+        let errors = lint_polars_two_frames(
+            "j = txn.join(cards, on=\"card\")\nprint(j[\"id\"], j[\"limit\"], j[\"amount_right\"], j[\"card\"])\nprint(j[\"nope\"])\n",
+        );
+
+        // assert: the overlapping non-key column gets polars' default suffix
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'nope'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_polars_join_keys_and_keep_left_columns_for_a_semi_join() {
+        // arrange / act
+        let errors = lint_polars_two_frames(
+            "j = txn.join(cards, left_on=\"card\", right_on=\"cardd\", how=\"semi\")\nprint(j[\"id\"])\nprint(j[\"limit\"])\n",
+        );
+
+        // assert: the bad right key and the right-only column are both caught
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'cardd'"), "{errors:?}");
+        assert!(errors[1].message.contains("'limit'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_leave_a_pandas_join_untracked() {
+        // arrange / act: pandas joins on the index, so its columns aren't derived from `on=`
+        let (_, errors) = lint_source(
+            "import pandas as pd\na = pd.read_csv(\"a.csv\", usecols=[\"k\", \"x\"])\nb = pd.read_csv(\"b.csv\", usecols=[\"y\"])\nj = a.join(b, on=\"k\")\nprint(j[\"y\"], j[\"k\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_suggest_narrowing_inside_a_test_function() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef test_total():\n    df = pd.read_json(\"x.json\")\n    assert df[\"a\"].sum() > 0\n\n\ndef total():\n    df = pd.read_json(\"x.json\")\n    return df[\"a\"].sum()\n";
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test_mod.py"))
+            .unwrap();
+
+        // assert: only the non-test function is narrowed
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.suggestions);
+        assert_eq!(linter.suggestions[0].line, 10);
+        assert!(
+            linter
+                .withheld
+                .iter()
+                .any(|w| w.line == 5 && w.reason.contains("inside a test")),
+            "{:?}",
+            linter.withheld
+        );
+    }
+
+    #[test]
+    fn test_should_take_a_models_fields_as_the_columns_of_a_one_row_frame() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom pydantic import BaseModel\n\n\nclass Txn(BaseModel):\n    card_id: int\n    amount: float = 0.0\n\n\ndef score(txn: Txn):\n    frame = pd.DataFrame([txn.model_dump()])\n    print(frame[\"amount\"])\n    print(frame[\"amout\"])\n",
+        );
+
+        // assert: no untracked-dataframe noise, and the typo is caught
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+    }
+
+    #[test]
+    fn test_should_keep_warning_for_a_one_row_frame_from_a_plain_dict_parameter() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef score(payload: dict):\n    row = pd.DataFrame([payload])\n    return row\n",
+        );
+
+        // assert: a dict's keys are not known, so the warning stays
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNTRACKED_DATAFRAME),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_resolve_a_call_through_a_protocol_typed_constructor_parameter() {
+        // arrange: `self.store` is only known through the `Store` annotation on `__init__`
+        let source = r#"
+from typing import Protocol
+
+import pandas as pd
+
+
+class Store(Protocol):
+    def read(self) -> pd.DataFrame: ...
+
+
+class UseCase:
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+    def run(self) -> float:
+        frame = self.store.read()
+        return frame["qty"].mean()
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the frame is recognised (counted, unresolved), so reading it says so
+        assert_eq!(linter.dataframes_total, 1);
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
-        assert_eq!(linter.dataframes_total, 2);
-        assert_eq!(linter.dataframes_typed, 0);
+    }
+
+    #[test]
+    fn test_should_suggest_for_a_frame_from_an_injected_dependency() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass Reader:\n    def read(self) -> pd.DataFrame:\n        return pd.read_csv(\"x.csv\")\n\n\nclass UseCase:\n    def __init__(self, reader: Reader) -> None:\n        self.reader = reader\n\n    def run(self):\n        frame = self.reader.read()\n        return frame[\"qty\"].sum()\n";
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("m.py"))
+            .unwrap();
+
+        // assert: the library is read from the injected class, so a pandas selection is made
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert!(linter.suggestions[0].diff.contains("[[\"qty\"]]"));
     }
 
     fn lint_for_leg_tests(body: &str) -> (Linter, Vec<LintError>) {
@@ -8469,6 +13836,53 @@ print(df["b"])
             .check_file_internal(&source, Path::new("test.py"))
             .unwrap();
         (linter, errors)
+    }
+
+    #[test]
+    fn test_should_not_report_a_column_missing_after_assign_on_an_untracked_parameter() {
+        // arrange: `inst` is a parameter nothing is known about, so `.assign()` keeps
+        // its unknown columns plus the new one; `C` is not a bug.
+        let source = r#"
+import pandas as pd
+
+
+def f(inst: pd.DataFrame) -> pd.DataFrame:
+    work = inst.assign(DPD=inst["A"] - inst["B"])
+    return work[work["C"] > 0]
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_report_columns_read_inside_an_assign_that_rebinds_an_untracked_frame() {
+        // arrange: the reads in the keyword values run before the rebinding.
+        let source = r#"
+import pandas as pd
+
+app = pd.read_csv("a.csv")
+app = app.assign(P=app.INCOME / (1 + app.KIDS), G=lambda d: d.CREDIT - d.GOODS)
+print(app["P"])
+"#;
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: only the untracked-dataframe warning for the bare read.
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
     }
 
     #[test]
@@ -8962,11 +14376,10 @@ print(df["b"])
         let (linter, errors) =
             lint_for_leg_tests("df[[\"c\", \"d\"]] = other\nprint(df[\"c\"])\nprint(df[\"d\"])\n");
 
-        // assert: each new column is reported once at the write, none at the reads, and
-        // the write is a single new leg.
+        // assert: the write adds both columns, so neither the write nor the reads are
+        // errors, and the write is a single new leg.
         assert_eq!(linter.dataframes_total, 2);
-        assert_eq!(errors.len(), 2, "errors: {errors:?}");
-        assert!(errors.iter().all(|e| e.line == 3));
+        assert!(errors.is_empty(), "errors: {errors:?}");
     }
 
     #[test]
@@ -8975,10 +14388,8 @@ print(df["b"])
         let (_, errors) =
             lint_for_leg_tests("df.loc[df[\"a\"] > 1, \"flag\"] = True\nprint(df[\"flag\"])\n");
 
-        // assert
-        assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert_eq!(errors[0].line, 3);
-        assert!(errors[0].message.contains("'flag'"));
+        // assert: writing a new column to an inferred frame adds it.
+        assert!(errors.is_empty(), "errors: {errors:?}");
     }
 
     #[test]
@@ -8993,14 +14404,56 @@ print(df["b"])
     }
 
     #[test]
-    fn test_should_report_a_column_write_to_an_unresolved_frame_as_unverifiable() {
+    fn test_should_report_an_unresolved_frame_once_across_writes_and_reads() {
         // arrange / act
-        let (_, errors) =
-            lint_for_leg_tests("df = df.some_unknown()\ndf[[\"c\", \"d\"]] = other\n");
+        let (_, errors) = lint_for_leg_tests(
+            "df = df.some_unknown()\ndf[[\"c\", \"d\"]] = other\ndf[\"e\"] = 1\nprint(df[\"c\"], df[\"e\"])\nprint(df.d)\n",
+        );
+
+        // assert: one report, on the first read, carrying the fix
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        assert!(errors[0].message.contains("fix:"), "{}", errors[0].message);
+        assert_eq!(errors[0].line, 6);
+    }
+
+    #[test]
+    fn test_should_add_a_new_column_to_an_inferred_frame_on_write() {
+        // arrange / act
+        let (_, errors) = lint_for_leg_tests(
+            "df[\"new\"] = df[\"a\"] * 2\ndf[[\"p\", \"q\"]] = 0\nprint(df[\"new\"], df[\"p\"])\nprint(df[\"nope\"])\n",
+        );
+
+        // assert: only the column nothing wrote or loaded is an error
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'nope'"));
+    }
+
+    #[test]
+    fn test_should_add_a_new_column_to_a_dict_literal_frame_on_write() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.DataFrame({\"a\": [1]})\ndf[\"x\"] = 1\nprint(df[\"x\"])\n",
+        );
 
         // assert
-        assert_eq!(errors.len(), 2, "errors: {errors:?}");
-        assert!(errors.iter().all(|e| e.code == CODE_UNVERIFIABLE_COLUMN));
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_report_missing_column_for_an_unresolved_frame_passed_to_a_helper() {
+        // arrange / act: the write targets an unresolved frame, so it is unverifiable;
+        // the frame it leaves behind has no column list, which is not "no columns".
+        let (_, errors) = lint_for_leg_tests(
+            "def need(f):\n    return f[\"c\"]\ndf = df.some_unknown()\ndf[\"new\"] = need(df)\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_MISSING_COLUMN),
+            "errors: {errors:?}"
+        );
     }
 
     #[test]
@@ -9145,11 +14598,10 @@ print(df["b"])
         // arrange / act
         let (_, errors) = lint_for_leg_tests("df.loc[df[\"zz\"] > 1, \"flag\"] = True\n");
 
-        // assert: the misspelled mask column and the new written column are both reported.
+        // assert: only the misspelled mask column; the written column is added.
         let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
-        assert_eq!(errors.len(), 2, "errors: {messages:?}");
-        assert!(messages.iter().any(|m| m.contains("'zz'")));
-        assert!(messages.iter().any(|m| m.contains("'flag'")));
+        assert_eq!(errors.len(), 1, "errors: {messages:?}");
+        assert!(messages[0].contains("'zz'"));
     }
 
     #[test]
@@ -11914,11 +17366,11 @@ df = pd.read_csv("data.csv", usecols=["a", "b"])
 
     #[test]
     fn test_should_scan_dataframe_shaped_calls_regardless_of_syntactic_position() {
-        // arrange: none of these three load calls is the direct RHS of a plain
-        // `x = ...` assignment -- a bare return, a `.append(...)` argument, and a
-        // call argument -- so the targeted counting logic recognizes none of them.
-        // The position-independent scan must still find all three, each labelled
-        // with where it was actually found.
+        // arrange: the returned load counts like the two-line form (see
+        // `returned_loads`); the `.append(...)` argument and the call argument are
+        // not the direct RHS of a plain `x = ...` assignment, so the targeted
+        // counting logic recognizes neither. The position-independent scan must
+        // still find all three, each labelled with where it was actually found.
         let source = r#"
 import pandas as pd
 
@@ -11939,9 +17391,9 @@ def build():
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        // assert: the targeted counting logic sees none of them.
-        assert_eq!(linter.dataframes_total, 0);
-        assert!(linter.typed_sites.is_empty());
+        // assert: only the returned load is counted.
+        assert_eq!(linter.dataframes_total, 1);
+        assert_eq!(linter.typed_sites.len(), 1);
         assert!(linter.untyped_sites.is_empty());
 
         // assert: the scan finds all three anyway, correctly labelled.
@@ -11952,7 +17404,9 @@ def build():
             .map(|s| s.label.as_str())
             .collect();
         assert_eq!(labels, vec!["pd.read_csv", "pd.read_csv", "pd.DataFrame"]);
-        assert!(linter.all_dataframe_calls[0].context.contains("return"));
+        assert!(linter.all_dataframe_calls[0]
+            .context
+            .contains("plain `x = ...`"));
         assert!(linter.all_dataframe_calls[1]
             .context
             .contains("call argument"));
@@ -12118,9 +17572,11 @@ class Pipeline:
             .unwrap();
 
         // assert
-        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
-        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
-        assert_eq!(linter.dataframes_total, 1);
+        let unverifiable = errors
+            .iter()
+            .filter(|e| e.code == CODE_UNVERIFIABLE_COLUMN)
+            .count();
+        assert_eq!(unverifiable, 1, "errors: {errors:#?}");
         assert_eq!(linter.dataframes_typed, 0);
     }
 
@@ -13146,7 +18602,12 @@ class PolarsService:
         let linter = suggest_for(&source);
 
         assert!(linter.suggestions.is_empty());
-        let reason = &linter.withheld[0].reason;
+        let reason = &linter
+            .withheld
+            .iter()
+            .find(|w| w.var == "frame")
+            .unwrap()
+            .reason;
         assert!(reason.contains("can't tell whether it is pandas or polars"));
         assert!(
             reason.contains("`predict` is annotated to return a DataFrame in a class of this file"),
@@ -13278,7 +18739,8 @@ class PolarsService:
         let linter = suggest_for(&source);
 
         assert!(linter.suggestions.is_empty());
-        assert!(linter.withheld[0]
+        let caller = linter.withheld.iter().find(|w| w.var == "frame").unwrap();
+        assert!(caller
             .reason
             .contains("can't tell whether it is pandas or polars"));
     }
@@ -15724,8 +21186,12 @@ print(df["aa"])
 
         // assert: no false unknown-column for 'a' -- only the real, expected
         // unverifiable-column for accessing an unresolved result.
-        assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert_eq!(errors[0].code, CODE_UNVERIFIABLE_COLUMN);
+        let unverifiable = errors
+            .iter()
+            .filter(|e| e.code == CODE_UNVERIFIABLE_COLUMN)
+            .count();
+        assert_eq!(unverifiable, 1, "errors: {errors:?}");
+        assert!(errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN));
         assert_eq!(linter.dataframes_typed, 0);
     }
 
@@ -16122,8 +21588,8 @@ df = pd.read_sql(select(Order), engine)
 
     #[test]
     fn test_feast_chained_form_with_unresolved_entity_df_is_unverifiable() {
-        // entity_df is an undefined name here, so it never resolves -- both the known
-        // feature name and the join key raise unverifiable-column, no partial credit.
+        // entity_df is an undefined name here, so it never resolves -- the frame is
+        // reported unverifiable once, on its first column use, no partial credit.
         let source = r#"
 df = store.get_historical_features(
     entity_df=entity_df,
@@ -16137,7 +21603,7 @@ print(df["driver_id"])
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors.iter().all(|e| e.code == CODE_UNVERIFIABLE_COLUMN));
         let schema_name = &linter.variables.get("df").unwrap().0;
         assert!(linter.unresolved_schemas.contains(schema_name));
@@ -16316,9 +21782,9 @@ unresolved = pd.read_csv("b.csv")
 
     #[test]
     fn test_feast_split_form_job_not_treated_as_dataframe_before_to_df() {
-        // entity_df is unresolved here (an undefined name), so both accesses below
-        // raise unverifiable-column once `df` is materialized -- the point of this
-        // test is the `job` assertion, which holds regardless.
+        // entity_df is unresolved here (an undefined name), so `df` is reported
+        // unverifiable once it is materialized -- the point of this test is the `job`
+        // assertion, which holds regardless.
         let source = r#"
 job = store.get_historical_features(
     entity_df=entity_df,
@@ -16333,7 +21799,7 @@ print(df["driver_id"])
             .check_file_internal(source, Path::new("test.py"))
             .unwrap();
 
-        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors.iter().all(|e| e.code == CODE_UNVERIFIABLE_COLUMN));
         assert!(
             !linter.variables.contains_key("job"),
@@ -16852,18 +22318,16 @@ bad = df.select(col("cost"))
     }
 
     #[test]
-    fn test_should_leave_a_single_indexer_loc_read_untracked() {
-        // arrange: `.loc[mask]` (one indexer, a row mask) is a different shape this
-        // change doesn't touch -- a fresh target from it is untracked before and after
-        // (a separate, pre-existing gap: the general same-name-rebind reclassification
-        // this checker has elsewhere doesn't extend to a brand-new target name here).
-        // Confirms this PR doesn't regress it into a false claim either way.
+    fn test_should_keep_the_columns_of_a_single_indexer_loc_row_mask_under_a_new_name() {
+        // arrange: `.loc[mask]` (one indexer, a row mask) keeps every column, so a new
+        // name bound from it is checked against the base frame's columns.
         let (linter, errors) =
             lint_for_leg_tests("mask = df[\"a\"] > 1\nout = df.loc[mask]\nprint(out[\"zzz\"])\n");
 
         // assert
-        assert!(errors.is_empty(), "errors: {errors:?}");
-        assert!(!linter.variables.contains_key("out"));
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'zzz'"));
+        assert!(linter.variables.contains_key("out"));
     }
 
     #[test]
@@ -17320,5 +22784,2322 @@ def process(path: str) -> None:
             Some(7)
         );
         assert_eq!(inferred_schema_line("UserSchema"), None);
+    }
+
+    fn codes_of(errors: &[LintError]) -> Vec<(&str, usize)> {
+        errors.iter().map(|e| (e.code.as_str(), e.line)).collect()
+    }
+
+    #[test]
+    fn test_should_apply_explicit_merge_suffixes_to_the_result_columns() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\nusers = pd.DataFrame({\"user_id\": [1], \"segment\": [\"a\"], \"ctr\": [0.1]})\nseg = pd.DataFrame({\"segment\": [\"a\"], \"ctr\": [0.2]})\ndf = users.merge(seg, on=\"segment\", suffixes=(\"\", \"_seg\"))\nprint(df[\"ctr\"] - df[\"ctr_seg\"])\ndf2 = users.merge(seg, on=\"segment\")\nprint(df2[\"ctr_x\"], df2[\"ctr_y\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_report_a_bare_overlapping_name_after_a_default_merge() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\nusers = pd.DataFrame({\"user_id\": [1], \"segment\": [\"a\"], \"ctr\": [0.1]})\nseg = pd.DataFrame({\"segment\": [\"a\"], \"ctr\": [0.2]})\ndf = users.merge(seg, on=\"segment\", how=\"left\")\nprint(df[\"ctr\"].mean())\nprint(df[\"segment\"])\n",
+        );
+
+        // assert: only the collided name, never the join key
+        assert_eq!(codes_of(&errors), [("unknown-column", 6)], "{errors:#?}");
+        assert!(errors[0].message.contains("'ctr'"));
+    }
+
+    #[test]
+    fn test_should_merge_a_literal_selection_receiver_with_a_derived_operand() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef drift(feats: pd.DataFrame) -> pd.DataFrame:\n    last = feats.groupby(\"item_id\").tail(1)[[\"item_id\", \"i_ctr\"]]\n    d = feats[[\"item_id\", \"i_ctr\"]].merge(last, on=\"item_id\", how=\"left\")\n    d[\"delta\"] = d[\"i_ctr_x\"] - d[\"i_ctr_y\"]\n    d[\"bad\"] = d[\"i_ctr_last\"]\n    return d\n",
+        );
+
+        // assert
+        assert_eq!(codes_of(&errors), [("unknown-column", 8)], "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_not_track_a_concat_with_an_untracked_operand_as_unresolved() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\nimp = pd.DataFrame({\"x\": [1], \"click\": [0]})\nlate = load_late()\nimp = pd.concat([imp, late])\nprint(imp.click.mean())\nprint(imp[\"click\"])\n",
+        );
+
+        // assert: no claim about an empty column set after tracking was given up
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert!(linter.variables.get("imp").is_none());
+    }
+
+    #[test]
+    fn test_should_union_every_operand_of_a_concat() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\na = pd.DataFrame({\"x\": [1]})\nb = pd.DataFrame({\"y\": [1]})\nc = pd.DataFrame({\"z\": [1]})\nall_ = pd.concat([a, b, c])\nprint(all_[\"z\"], all_[\"w\"])\n",
+        );
+
+        // assert: `z` comes from the third operand
+        assert_eq!(codes_of(&errors), [("unknown-column", 7)], "{errors:#?}");
+        assert!(errors[0].message.contains("'w'"));
+    }
+
+    #[test]
+    fn test_should_keep_tracking_a_frame_derived_under_a_new_name() {
+        // arrange
+        let derivations = [
+            "a.copy()",
+            "a[[\"x\"]].copy()",
+            "a.astype(int)",
+            "a.drop_duplicates(\"x\")",
+            "a.groupby(\"x\").tail(1)",
+            "a.loc[a[\"x\"] > 0]",
+            "a.iloc[:2]",
+            "a.set_index(\"x\", drop=False)",
+            "a.sort_values(\"x\").reset_index(drop=True)",
+            "a.query(\"x > 1\")",
+        ];
+        for derivation in derivations {
+            // act
+            let (_, errors) = lint_source(&format!(
+                "import pandas as pd\n\na = pd.DataFrame({{\"x\": [1], \"y\": [2]}})\nb = {derivation}\nz = b[\"zz\"]\n"
+            ));
+
+            // assert
+            assert_eq!(
+                codes_of(&errors),
+                [("unknown-column", 5)],
+                "{derivation}: {errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_drop_the_index_column_on_set_index_under_a_new_name() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\na = pd.DataFrame({\"x\": [1], \"y\": [2]})\nb = a.set_index(\"x\")\nprint(b[\"y\"], b[\"x\"])\n",
+        );
+
+        // assert
+        assert_eq!(codes_of(&errors), [("unknown-column", 5)], "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_resolve_a_helper_returning_a_copied_literal_selection() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef pick(frame: pd.DataFrame) -> pd.DataFrame:\n    out = frame[[\"user_id\", \"u_prior_ctr\"]].copy()\n    return out\n\n\nraw = pd.read_parquet(\"f.parquet\")\nhist = pick(raw)\nprint(hist[\"u_prior_ctr\"], hist[\"u_gap_min\"])\n",
+        );
+
+        // assert: the selection is closed whatever the argument was
+        assert_eq!(
+            codes_of(&errors),
+            [("untracked-dataframe", 9), ("unknown-column", 11)],
+            "{errors:#?}"
+        );
+    }
+
+    const CLOSED: &str = "import pandas as pd\n\ndf = pd.DataFrame({\"position\": [1], \"hour\": [2], \"click\": [0]})\n";
+
+    fn closed_frame_errors(body: &str) -> Vec<LintError> {
+        lint_source(&format!("{CLOSED}{body}")).1
+    }
+
+    #[test]
+    fn test_should_check_a_column_list_selection_inside_a_call_argument() {
+        // arrange / act
+        let errors = closed_frame_errors(
+            "COLS = [\"position\", \"hr\"]\nprint(df[[\"position\", \"hr\"]])\nprint(df[COLS])\ny = df[COLS]\nprint(df[[\"position\", \"hour\"]])\n",
+        );
+
+        // assert: each bad list is reported once, the good one never
+        assert_eq!(
+            codes_of(&errors),
+            [
+                ("unknown-column", 5),
+                ("unknown-column", 6),
+                ("unknown-column", 7)
+            ],
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_columns_read_in_an_assign_lambda() {
+        // arrange / act
+        let errors = closed_frame_errors(
+            "out = df.assign(ratio=lambda d: d[\"click\"] / d[\"hr\"], again=lambda d: d[\"ratio\"])\nout2 = df.query(\"click > 0\").assign(z=lambda d: d[\"nope\"])\n",
+        );
+
+        // assert: `ratio` comes from the same call, `hr` and `nope` are typos
+        assert_eq!(
+            codes_of(&errors),
+            [("unknown-column", 4), ("unknown-column", 5)],
+            "{errors:#?}"
+        );
+        assert!(errors[0].message.contains("'hr'"));
+    }
+
+    #[test]
+    fn test_should_check_columns_read_in_a_row_apply_and_pipe_lambda() {
+        // arrange / act
+        let errors = closed_frame_errors(
+            "a = df.apply(lambda r: r[\"click\"] + r[\"clik\"], axis=1)\nb = df.pipe(lambda d: d[\"hr\"])\nc = df.apply(lambda col: col.max())\n",
+        );
+
+        // assert: only the typos, and a column-wise apply binds no row
+        assert_eq!(
+            codes_of(&errors),
+            [("unknown-column", 4), ("unknown-column", 5)],
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_named_aggregation_sources_and_track_its_outputs() {
+        // arrange / act
+        let errors = closed_frame_errors(
+            "seg = df.groupby(\"hour\", as_index=False).agg(n=(\"click\", \"sum\"), bad=(\"clik\", \"mean\"))\nprint(seg[\"n\"], seg[\"hour\"], seg[\"clik\"])\nidx = df.groupby(\"hour\").agg(n=(\"click\", \"sum\"))\nprint(idx[\"hour\"])\nprint(idx.reset_index()[\"hour\"])\n",
+        );
+
+        // assert: the source typo, the missing output, and the key that became the index
+        assert_eq!(
+            codes_of(&errors),
+            [
+                ("unknown-column", 4),
+                ("unknown-column", 5),
+                ("unknown-column", 7)
+            ],
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_pivot_table_and_melt_arguments_on_a_closed_frame() {
+        // arrange / act
+        let errors = closed_frame_errors(
+            "rep = df.pivot_table(index=\"position\", values=[\"click\"], aggfunc=\"mean\")\nlong = rep.reset_index().melt(id_vars=\"postion\")\nbad = df.pivot_table(index=\"postion\", values=\"click\")\nok = df.melt(id_vars=[\"position\"], value_vars=[\"click\", \"hour\"])\nbad2 = df.melt(id_vars=[\"position\"], value_vars=[\"clik\"])\n",
+        );
+
+        // assert
+        assert_eq!(
+            codes_of(&errors),
+            [
+                ("unknown-column", 5),
+                ("unknown-column", 6),
+                ("unknown-column", 8)
+            ],
+            "{errors:#?}"
+        );
+        assert!(errors[0].message.contains("'postion'"));
+    }
+
+    const OPEN: &str = "import pandas as pd\n\nitems = pd.read_parquet(\"items.parquet\")\n";
+
+    fn open_frame_errors(body: &str) -> Vec<LintError> {
+        lint_source(&format!("{OPEN}{body}")).1
+    }
+
+    fn without_untracked(errors: Vec<LintError>) -> Vec<LintError> {
+        errors
+            .into_iter()
+            .filter(|e| e.code != "untracked-dataframe")
+            .collect()
+    }
+
+    #[test]
+    fn test_should_report_a_read_after_an_inplace_drop_on_an_open_frame() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "items.drop(columns=[\"created_at\"], inplace=True)\nprint(items[\"created_at\"].min(), items[\"price\"].max())\n",
+        ));
+
+        // assert: only the dropped name, the rest of the frame is unknown
+        assert_eq!(codes_of(&errors), [("unknown-column", 5)], "{errors:#?}");
+        assert!(errors[0].message.contains("dropped at line 4"));
+    }
+
+    #[test]
+    fn test_should_report_a_read_after_a_rebinding_drop_and_a_copy_chain() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "slim = items.copy().drop(columns=[\"a\"])\nitems = items.drop(columns=[\"b\"])\nprint(slim[\"a\"], items[\"b\"], items[\"a\"])\n",
+        ));
+
+        // assert: `a` is only gone from `slim`
+        assert_eq!(
+            codes_of(&errors),
+            [("unknown-column", 6), ("unknown-column", 6)],
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn test_should_report_the_old_name_after_a_rename_on_an_open_frame() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "items = items.rename(columns={\"quality_score\": \"qscore\"})\nitems[\"q_rank\"] = items[\"quality_score\"].rank()\nprint(items[\"qscore\"])\n",
+        ));
+
+        // assert
+        assert_eq!(codes_of(&errors), [("unknown-column", 5)], "{errors:#?}");
+        assert!(errors[0].message.contains("renamed to 'qscore'"));
+    }
+
+    #[test]
+    fn test_should_stop_reporting_a_dropped_name_once_it_is_assigned_again() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "items.drop(columns=[\"a\"], inplace=True)\nitems[\"a\"] = 1\nprint(items[\"a\"])\n",
+        ));
+
+        // assert
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_not_claim_a_drop_that_only_happens_on_some_paths() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "if FLAG:\n    items.drop(columns=[\"a\"], inplace=True)\nprint(items[\"a\"])\n",
+        ));
+
+        // assert
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_not_claim_a_dropped_name_after_the_frame_is_rebuilt() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "items.drop(columns=[\"a\"], inplace=True)\nitems = items.merge(other)\nprint(items[\"a\"])\nitems.drop(columns=[\"b\"], inplace=True)\nrestore(items)\nprint(items[\"b\"])\n",
+        ));
+
+        // assert: a merge or a helper may bring the column back
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_report_a_dropped_name_on_a_dataframe_annotated_parameter() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef f(frame: pd.DataFrame) -> pd.DataFrame:\n    out = frame.copy().drop(columns=[\"signup_date\"])\n    out[\"x\"] = out[\"signup_date\"].dt.year\n    return out\n",
+        );
+
+        // assert
+        assert_eq!(codes_of(&errors), [("unknown-column", 6)], "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_warn_about_a_read_before_the_only_later_assignment() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "items[\"blend\"] = items[\"prior\"] * items[\"ctr\"]\nitems[\"prior\"] = items[\"clicks\"] / items[\"views\"]\nitems[\"ctr\"] = items[\"ctr\"].fillna(0)\n",
+        ));
+
+        // assert: `ctr` reads itself when it is written, so it was there already
+        assert_eq!(
+            codes_of(&errors),
+            [("column-read-before-assignment", 4)],
+            "{errors:#?}"
+        );
+        assert_eq!(errors[0].severity, "warning");
+        assert!(errors[0].message.contains("line 5"));
+    }
+
+    #[test]
+    fn test_should_drop_columns_replaced_by_get_dummies() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\ndf = pd.DataFrame({\"user_id\": [1], \"category\": [\"a\"]})\nboth = pd.get_dummies(df, columns=[\"category\"], dtype=int)\nprint(both[\"category\"], both[\"category_a\"], both[\"user_id\"], df[\"category\"])\n",
+        );
+
+        // assert: only the replaced column; the dummies are not enumerable
+        assert_eq!(codes_of(&errors), [("unknown-column", 5)], "{errors:#?}");
+    }
+
+    #[test]
+    fn test_should_check_a_column_list_constant_imported_from_another_file() {
+        // arrange / act
+        let (_, errors) = check_in_project(
+            &[("cfg.py", "NUMERIC = [\"position\", \"hour\", \"quality_score\"]\n")],
+            "import pandas as pd\n\nfrom cfg import NUMERIC\n\ndf = pd.DataFrame({\"position\": [1], \"hour\": [2], \"qscore\": [3.0]})\nx = df[NUMERIC]\n",
+        );
+
+        // assert
+        assert_eq!(codes_of(&errors), [("unknown-column", 6)], "{errors:#?}");
+        assert!(errors[0].message.contains("'quality_score'"));
+    }
+
+    #[test]
+    fn test_should_withhold_a_frame_once_however_many_columns_are_assigned_to_it() {
+        // arrange
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+        let source = "import pandas as pd\n\n\ndef norm(frame: pd.DataFrame) -> pd.DataFrame:\n    return frame.copy()\n\n\ndef clean(raw: pd.DataFrame) -> pd.DataFrame:\n    items = norm(raw)\n    items[\"a\"] = items[\"a\"].str.lower()\n    items[\"b\"] = items[\"b\"].fillna(0)\n    items[\"c\"] = items[\"a\"] + items[\"b\"].astype(str)\n    return items\n";
+
+        // act
+        linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: one row for `items`, and never the made-up "not a plain assignment" reason
+        let items: Vec<_> = linter
+            .withheld
+            .iter()
+            .filter(|w| w.var == "items")
+            .collect();
+        assert_eq!(items.len(), 1, "{:#?}", linter.withheld);
+        assert!(
+            !items[0].reason.contains("plain `name"),
+            "{}",
+            items[0].reason
+        );
+    }
+
+    #[test]
+    fn test_should_only_advise_final_for_a_constant_that_can_name_a_column() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass B:\n    SMOOTH = 20\n    KEY = \"user_id\"\n\n    def add(self, out: pd.DataFrame) -> pd.DataFrame:\n        out[\"a\"] = out[\"clicks\"] / (out[\"imps\"] + self.SMOOTH)\n        out[\"b\"] = out[self.KEY]\n        return out\n";
+        let mut linter = Linter::new();
+
+        // act
+        let errors = linter
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap();
+
+        // assert: the numeric tuning constant is not worth a notice, the key is
+        let advised: Vec<_> = errors
+            .iter()
+            .filter(|e| e.code == "assumed-constant")
+            .collect();
+        assert_eq!(advised.len(), 1, "{advised:#?}");
+        assert!(advised[0].message.contains("KEY"));
+    }
+
+    #[test]
+    fn test_should_name_the_origin_line_of_an_unresolved_frame_not_its_first_write() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef normalise(frame: pd.DataFrame) -> pd.DataFrame:\n    return frame.copy()\n\n\ndef clean(raw):\n    items = normalise(raw)\n    items[\"status\"] = items[\"status\"].str.lower()\n    return items\n";
+
+        // act
+        let (_, errors) = lint_source(source);
+
+        // assert: the frame comes from line 9; nothing was "inferred", and no empty set is shown
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(
+            errors[0].message.contains("the frame from line 9"),
+            "{}",
+            errors[0].message
+        );
+        assert!(
+            !errors[0].message.contains("inferred column set"),
+            "{}",
+            errors[0].message
+        );
+        // not knowing is not the same as being wrong: it must not fail a plain `check`
+        assert_eq!(errors[0].severity, "warning");
+    }
+
+    #[test]
+    fn test_should_record_where_a_derived_frame_stopped_being_tracked() {
+        // arrange / act
+        let (linter, _) = lint_source(
+            "import pandas as pd\n\nimp = pd.read_parquet(\"i.parquet\")\nusers = pd.read_csv(\"u.csv\")\ndf = imp.merge(users, on=\"user_id\")\nclosed = pd.DataFrame({\"a\": [1]})\nwide = closed.pivot(columns=\"a\")\n",
+        );
+
+        // assert: both names appear in `--coverage-detail=explain`'s "tracking ended" rows
+        let ended: Vec<_> = linter.leg_events.iter().map(|e| e.var.as_str()).collect();
+        assert!(
+            ended.contains(&"df") && ended.contains(&"wide"),
+            "{:#?}",
+            linter.leg_events
+        );
+    }
+
+    #[test]
+    fn test_should_follow_an_open_frame_through_inplace_row_edits_and_row_masks() {
+        // arrange / act
+        let errors = without_untracked(open_frame_errors(
+            "items.sort_values(\"a\", inplace=True)\nitems.reset_index(drop=True, inplace=True)\nboth = pd.get_dummies(items, columns=[\"cat\"])\nva = both[both[\"split\"] == \"va\"].drop(columns=\"split\")\nprint(va.loc[:, \"cat\"], va[\"split\"], va[\"cat_x\"])\n",
+        ));
+
+        // assert: `cat` was replaced by dummies, `split` dropped; `cat_x` is anyone's guess
+        assert_eq!(
+            codes_of(&errors),
+            [("unknown-column", 8), ("unknown-column", 8)],
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn test_should_treat_a_bare_dataframe_helper_result_as_an_open_frame() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef normalise(frame: pd.DataFrame) -> pd.DataFrame:\n    return frame.copy()\n\n\ndef clean(raw: pd.DataFrame) -> pd.DataFrame:\n    imp = normalise(raw).drop_duplicates(\"id\")\n    imp[\"weekend\"] = imp[\"dow\"] >= 5\n    imp[\"dow\"] = imp[\"event_time\"].dt.day_of_week\n    return imp\n",
+        );
+
+        // assert: the read of `dow` on line 10 runs ahead of its only assignment
+        let warned: Vec<_> = errors
+            .iter()
+            .filter(|e| e.code == "column-read-before-assignment")
+            .collect();
+        assert_eq!(warned.len(), 1, "{errors:#?}");
+        assert_eq!(warned[0].line, 10);
+    }
+    // Messages of the unknown-column errors, in line order.
+    fn unknown_columns(source: &str) -> Vec<(usize, String)> {
+        let (_, errors) = lint_source(source);
+        errors
+            .into_iter()
+            .filter(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .map(|e| (e.line, e.message))
+            .collect()
+    }
+
+    const FRAME: &str = "import pandas as pd\n\nf = pd.DataFrame({\"a\": [1], \"b\": [2]})\n";
+
+    #[test]
+    fn test_should_check_column_reads_in_every_expression_context() {
+        // arrange: one typo per context, each on its own line
+        let contexts = [
+            "assert f[\"zz\"].sum() == 1\n",
+            "assert f[\"a\"].sum() == 1, f[\"zz\"]\n",
+            "z = 0\nz += f[\"zz\"].sum()\n",
+            "d = {\"k\": f[\"zz\"]}\n",
+            "y = f[\"zz\"] if True else 0\n",
+            "h = lambda: f[\"zz\"]\n",
+            "xs = [f[\"zz\"] for _ in range(2)]\n",
+            "s = f\"{f['zz'].sum()}\"\n",
+            "def g():\n    yield f[\"zz\"]\n",
+        ];
+
+        for context in contexts {
+            // act
+            let found = unknown_columns(&format!("{FRAME}{context}"));
+
+            // assert
+            assert_eq!(found.len(), 1, "{context:?}: {found:?}");
+            assert!(found[0].1.contains("Column 'zz'"), "{context:?}");
+        }
+    }
+
+    #[test]
+    fn test_should_not_check_a_lambda_or_comprehension_that_rebinds_the_frame_name() {
+        // arrange / act
+        let found = unknown_columns(&format!(
+            "{FRAME}h = lambda f: f[\"zz\"]\nxs = [f[\"zz\"] for f in [1]]\n"
+        ));
+
+        // assert
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn test_should_check_merge_keys_against_both_operands() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\nf = pd.DataFrame({\"k\": [1], \"a\": [1]})\ng = pd.DataFrame({\"K\": [1], \"b\": [1]})\nm = f.merge(g, on=\"zz\")\nm2 = f.merge(g, left_on=\"k\", right_on=\"nope\")\nm3 = pd.merge(f, g, left_on=\"k\", right_on=\"K\")\n",
+        );
+
+        // assert: `on` is checked on both sides, `right_on` only on the right
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.iter().all(|(line, _)| *line == 5 || *line == 6));
+        assert!(found.iter().any(|(_, m)| m.contains("'nope'")));
+    }
+
+    #[test]
+    fn test_should_check_sort_dedupe_and_group_columns() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\nimport polars as pl\n\np = pd.DataFrame({\"a\": [1], \"b\": [2]})\nx = p.sort_values([\"a\", \"bb\"])\ny = p.drop_duplicates(subset=\"aa\")\nz = p.groupby(\"cc\")[\"a\"].count()\nq = pl.DataFrame({\"a\": [1], \"b\": [2]})\nu = q.sort([\"a\", \"bb\"])\nv = q.unique(subset=[\"aa\"])\n",
+        );
+
+        // assert
+        let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [5, 6, 7, 9, 10], "{found:?}");
+    }
+
+    #[test]
+    fn test_should_not_read_an_index_level_as_a_missing_column() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\nf = pd.DataFrame({\"k\": [1], \"a\": [1]})\ng = f.set_index(\"k\")\nm = g.merge(f, on=\"k\")\ns = g.sort_values(\"k\")\nt = f.set_index(\"k\").groupby(\"k\")[\"a\"].sum()\n",
+        );
+
+        // assert
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn test_should_check_the_arguments_of_a_rebinding_assignment_against_the_frame_before_it() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\nacc = pd.DataFrame({\"plan\": [1], \"seats\": [2]})\ncat = pd.DataFrame({\"plan\": [1], \"price\": [1.0]})\nacc = acc.merge(cat, on=\"Plan\", how=\"left\")\n",
+        );
+
+        // assert: named the operands as they were, not the merged result
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found.iter().all(|(_, m)| !m.contains("plan_x")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_a_polars_chain_that_drops_or_renames_before_selecting() {
+        // arrange / act
+        let found = unknown_columns(
+            "import polars as pl\n\nd = pl.DataFrame({\"policy_id\": [1], \"driver_age\": [2]})\na = d.rename({\"driver_age\": \"main_age\"}).select(\"policy_id\", \"driver_age\")\nb = d.filter(pl.col(\"driver_age\") > 1).drop(\"driver_age\").select(\"driver_age\")\n",
+        );
+
+        // assert
+        let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [4, 5], "{found:?}");
+    }
+
+    #[test]
+    fn test_should_check_a_polars_select_in_return_position_against_a_class_constant() {
+        // arrange / act
+        let found = unknown_columns(
+            "import polars as pl\n\n\nclass B:\n    KEEP = [\"policy_id\", \"driver_age\"]\n\n    def main(self) -> pl.DataFrame:\n        d = pl.read_csv(\"d.csv\", columns=[\"policy_id\", \"main_age\"])\n        return d.select(self.KEEP)\n",
+        );
+
+        // assert
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("'driver_age'"));
+    }
+
+    #[test]
+    fn test_should_follow_a_load_call_and_a_merge_inside_a_chain() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\npm = pd.read_csv(\"p.csv\", usecols=[\"policy_id\", \"expiry_date\"])\npm = pm.drop(columns=[\"expiry_date\"])\ndf = pd.read_csv(\"c.csv\", usecols=[\"policy_id\", \"loss_date\"]).merge(pm, on=\"policy_id\")\ndf[\"d\"] = df[\"expiry_date\"] - df[\"loss_date\"]\n",
+        );
+
+        // assert
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("'expiry_date'"));
+    }
+
+    #[test]
+    fn test_should_not_treat_a_helper_result_of_unknown_columns_as_empty_in_polars() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\n\n\ndef load() -> pl.DataFrame:\n    return pl.read_parquet(\"a.parquet\")\n\n\ndef use() -> pl.DataFrame:\n    scored = load()\n    return scored.select(\"a\", pl.col(\"b\")).with_columns(c=pl.col(\"a\"))\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_derive_a_helper_result_from_its_argument_in_polars() {
+        // arrange / act
+        let found = unknown_columns(
+            "import polars as pl\n\n\ndef add_final(frame: pl.DataFrame) -> pl.DataFrame:\n    return frame.with_columns(p_final=pl.lit(1.0))\n\n\nclaims = pl.DataFrame({\"a\": [1]})\nscored = add_final(claims)\nok = scored.select(\"a\", \"p_final\")\nout = scored.select(\"a\", \"p_fnal\")\n",
+        );
+
+        // assert: `p_final` is derived from the body, the typo is the one error
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("'p_fnal'") && found[0].1.contains("did you mean 'p_final'"));
+    }
+
+    #[test]
+    fn test_should_check_a_pandas_helper_that_returns_an_assign_chain() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\n\ndef add(frame: pd.DataFrame) -> pd.DataFrame:\n    return frame.assign(p=1).drop(columns=[\"b\"])\n\n\nf = pd.DataFrame({\"a\": [1], \"b\": [2]})\ng = add(f)\ny = g[\"b\"]\nz = g[\"p\"]\n",
+        );
+
+        // assert: `b` was dropped by the helper, `p` added
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("'b'"));
+    }
+
+    #[test]
+    fn test_should_check_chains_on_an_annotated_polars_parameter() {
+        // arrange / act
+        let found = unknown_columns(
+            "import polars as pl\n\n\ndef a(frame: pl.DataFrame) -> pl.DataFrame:\n    return frame.drop(\"x\").sort([\"id\", \"x\"])\n\n\ndef b(frame: pl.DataFrame) -> pl.DataFrame:\n    return frame.rename({\"x\": \"y\"}).select(\"x\", \"id\")\n",
+        );
+
+        // assert
+        let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [5, 9], "{found:?}");
+    }
+
+    #[test]
+    fn test_should_check_polars_join_keys_against_a_method_result() {
+        // arrange / act
+        let found = unknown_columns(
+            "import polars as pl\n\n\nclass B:\n    def agg(self, e: pl.DataFrame) -> pl.DataFrame:\n        return e.group_by(\"policy_id\").agg(n=pl.len())\n\n    def build(self, p: pl.DataFrame, e: pl.DataFrame) -> pl.DataFrame:\n        return p.join(self.agg(e), on=\"polcy_id\", how=\"left\")\n",
+        );
+
+        // assert
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("'polcy_id'"));
+    }
+
+    #[test]
+    fn test_should_follow_melt_and_a_polars_agg_join_suffix() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\nf = pd.DataFrame({\"k\": [1], \"a\": [1]})\nf = f.melt(id_vars=\"k\")\nz = f[\"value\"] + f[\"a\"]\n",
+        );
+
+        // assert: the melted column is gone, `value` and `variable` exist
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("'a'"));
+    }
+
+    #[test]
+    fn test_should_take_the_columns_of_a_polars_schema_list_in_return_position() {
+        // arrange / act
+        let found = unknown_columns(
+            "from typing import Any\n\nimport polars as pl\n\n\nclass Repo:\n    def __init__(self, conn: Any) -> None:\n        self.conn = conn\n\n    def read(self) -> pl.DataFrame:\n        rows = self.conn.cursor().fetchall()\n        return pl.DataFrame(rows, schema=[\"policy_id\", \"region\"], orient=\"row\")\n\n    def use(self) -> pl.DataFrame:\n        df = self.read()\n        return df.select(\"policy_id\", \"regoin\")\n",
+        );
+
+        // assert
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn test_should_not_carry_an_early_read_across_functions_into_a_read_before_assignment_warning()
+    {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef a(frame: pd.DataFrame) -> pd.DataFrame:\n    out = frame.copy()\n    out[\"y\"] = out[\"tenure\"] * 2\n    return out\n\n\ndef b(panel: pd.DataFrame) -> pd.DataFrame:\n    out = panel.copy()\n    out[\"tenure\"] = 1\n    return out\n",
+        );
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.code != "column-read-before-assignment"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_report_the_same_read_once_with_the_spelling_suggestion() {
+        // arrange / act
+        let found = unknown_columns(
+            "import polars as pl\n\nd = pl.DataFrame({\"policy_id\": [1]})\nout = d.select(\"policy_idd\")\n",
+        );
+
+        // assert
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("did you mean 'policy_id'"));
+    }
+    #[test]
+    fn test_should_follow_a_dict_aggregation_and_an_added_prefix() {
+        // arrange / act
+        let found = unknown_columns(
+            "import pandas as pd\n\nf = pd.DataFrame({\"k\": [1], \"a\": [1], \"b\": [2]})\nr = f.groupby(\"k\").agg({\"a\": \"sum\", \"b\": \"mean\"})\ny = r[\"zz\"] + r[\"a\"]\np = f.add_prefix(\"p_\")\nz = p[\"a\"] + p[\"p_a\"]\n",
+        );
+
+        // assert
+        let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [5, 7], "{found:?}");
+    }
+
+    // ── iteration-3 fixes: names computed at runtime open a frame instead of closing it ──
+
+    #[test]
+    fn test_should_know_columns_written_under_a_loop_variable_name() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\
+             df = pd.read_csv(\"a.csv\", usecols=[\"a\", \"b\"])\n\
+             for c in [\"a\", \"b\"]:\n    df[f\"{c}_log\"] = df[c]\n\
+             print(df[\"a_log\"])\nprint(df[\"c_log\"])\n",
+        );
+
+        // assert: both loop-made names exist, a name no iteration makes does not
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'c_log'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_know_columns_written_under_an_enumerate_index_name() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nKW = [\"x\", \"y\"]\n\
+             df = pd.read_csv(\"a.csv\", usecols=[\"d\"])\n\
+             for i, k in enumerate(KW):\n    df[f\"kw_{i}\"] = df[\"d\"]\n\
+             print(df[\"kw_1\"])\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_open_a_frame_written_under_a_name_nothing_can_resolve() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\
+             df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n\
+             for c in get_cols():\n    df[f\"{c}_log\"] = df[\"a\"]\n\
+             print(df[\"a\"])\nprint(df[\"x_log\"])\n",
+        );
+
+        // assert: never an error; the known column stays quiet, the other is unverifiable once
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'x_log'"), "{errors:?}");
+        assert!(linter
+            .leg_events
+            .iter()
+            .any(|e| e.reason.contains("computed at runtime")));
+    }
+
+    #[test]
+    fn test_should_open_a_frame_assigned_a_double_star_mapping() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\
+             df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n\
+             df = df.assign(**build(df))\nprint(df[\"a_sq\"])\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_read_the_names_of_a_double_star_dict_literal_in_assign() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\
+             df = pd.read_csv(\"a.csv\", usecols=[\"a\"])\n\
+             df = df.assign(**{\"a_sq\": df[\"a\"] ** 2})\nprint(df[\"a_sq\"])\nprint(df[\"zz\"])\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'zz'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_explain_a_with_columns_whose_output_names_cannot_be_read() {
+        // arrange / act
+        let (linter, errors) = lint_polars_source(
+            "ex = [pl.col(\"a\").alias(\"c1\")]\nu = df.with_columns(ex)\nprint(u[\"a\"])\n",
+        );
+
+        // assert: known columns stay checkable-free, and the explain output names the argument
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(
+            linter
+                .leg_events
+                .iter()
+                .any(|e| e.var == "u" && e.reason.contains("the variable `ex`")),
+            "{:?}",
+            linter
+                .leg_events
+                .iter()
+                .map(|e| &e.reason)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn lint_polars_source(body: &str) -> (Linter, Vec<LintError>) {
+        lint_source(&format!(
+            "import polars as pl\ndf = pl.read_csv(\"x.csv\", columns=[\"a\", \"b\"])\n{body}"
+        ))
+    }
+
+    #[test]
+    fn test_should_keep_a_drop_made_after_a_columns_assignment_on_a_bare_load() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\
+             w = pd.read_csv(\"w.csv\")\n\
+             w.columns = [c.strip().lower() for c in w.columns]\n\
+             w.drop(columns=[\"snow\"], inplace=True)\n\
+             print(w[\"snow\"])\n",
+        );
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == CODE_UNKNOWN_COLUMN && e.message.contains("dropped")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_a_drop_through_a_boolean_mask_reassignment() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\
+             df = pd.read_csv(\"a.csv\")\n\
+             df.drop(columns=[\"days\"], inplace=True)\n\
+             df = df[df[\"flag\"].notna()]\n\
+             print(df[\"days\"])\n",
+        );
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == CODE_UNKNOWN_COLUMN && e.message.contains("dropped")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_a_polars_drop_then_select_on_a_lazy_frame_parameter() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\n\n\n\
+             def clean(lf: pl.LazyFrame) -> pl.LazyFrame:\n\
+             \x20   lf = lf.drop(\"v\", \"w\")\n\
+             \x20   return lf.select(\"id\", \"w\")\n",
+        );
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNKNOWN_COLUMN);
+        assert!(errors[0].message.contains("'w'"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_a_polars_drop_then_use_on_a_frame_with_unknown_columns() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\n\
+             df = pl.read_parquet(\"r.parquet\")\n\
+             df = df.drop([\"current_a\"])\n\
+             df.select(pl.col(\"current_a\").median())\n",
+        );
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == CODE_UNKNOWN_COLUMN && e.message.contains("dropped")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_require_the_polars_columns_a_function_reads_of_its_frame() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\n\n\n\
+             def monthly(frame: pl.DataFrame) -> pl.DataFrame:\n\
+             \x20   return frame.group_by(\"d\").agg(m=pl.col(\"ppss\").median())\n\n\n\
+             monthly(pl.read_parquet(\"f.parquet\", columns=[\"d\", \"pps\"]))\n",
+        );
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == CODE_MISSING_COLUMN && e.message.contains("{ppss}")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_require_a_column_the_function_creates_itself() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\n\n\n\
+             def f(frame: pl.DataFrame) -> pl.DataFrame:\n\
+             \x20   return frame.with_columns(pl.col(\"a\").alias(\"b\")).select(pl.col(\"b\"))\n\n\n\
+             f(pl.read_parquet(\"f.parquet\", columns=[\"a\"]))\n",
+        );
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_count_a_returned_load_as_an_origin() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import pandas as pd\n\n\n\
+             def read():\n\
+             \x20   return pd.read_csv(\"a.csv\")\n",
+        );
+
+        // assert: the same warning and count as `df = pd.read_csv(..); return df`
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, CODE_UNTRACKED_DATAFRAME);
+        assert_eq!(linter.untyped_sites.len(), 1);
+    }
+
+    #[test]
+    fn test_should_give_callers_the_literal_columns_of_a_returned_scan() {
+        // arrange / act
+        let (linter, errors) = lint_source(
+            "import polars as pl\n\n\n\
+             def read():\n\
+             \x20   return pl.read_parquet(\"a.parquet\", columns=[\"a\", \"b\"])\n\n\n\
+             lf = read()\nlf.select(\"zz\")\n",
+        );
+
+        // assert: counted once, at the call site, and checked there
+        assert_eq!(linter.dataframes_typed, 1);
+        assert!(
+            errors.iter().any(|e| e.code == CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_leave_a_function_with_a_declared_schema_return_alone() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nfrom typing import Annotated\n\n\
+             class S(BaseSchema):\n    a = Column(int)\n\n\n\
+             def read() -> Annotated[pd.DataFrame, S]:\n\
+             \x20   return pd.read_csv(\"a.csv\")\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNTRACKED_DATAFRAME),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_trust_dict_keys_when_the_columns_argument_is_not_a_literal() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\n\
+             def make(cols):\n\
+             \x20   result = pd.DataFrame({\"a\": [1]}, columns=cols)\n\
+             \x20   return result[\"b\"]\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNKNOWN_COLUMN),
+            "errors: {errors:?}"
+        );
+    }
+
+    fn unknown_column_errors(errors: &[LintError]) -> Vec<(usize, String)> {
+        errors
+            .iter()
+            .filter(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .map(|e| (e.line, e.message.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_should_not_warn_on_a_sibling_read_of_a_column_overwritten_in_place() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\nev = pl.read_parquet(\"e.parquet\")\n\
+             ev = ev.with_columns(pl.col(\"d\").fill_null(0), (pl.col(\"d\") / 1000).alias(\"s\"))\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_READ_BEFORE_ASSIGNMENT),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_explode_and_over_partition_columns_on_a_known_frame() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\nev = pl.read_parquet(\"e.parquet\")\n\
+             cats = ev.group_by(\"s\").agg(pl.col(\"c\").unique().alias(\"cats\"))\n\
+             print(cats.explode(\"cat\"))\n\
+             print(cats.with_columns(pl.col(\"cats\").len().over(\"ss\").alias(\"n\")))\n",
+        );
+
+        // assert
+        let found = unknown_column_errors(&errors);
+        assert!(
+            found.iter().any(|(l, m)| *l == 4 && m.contains("'cat'")),
+            "{errors:?}"
+        );
+        assert!(
+            found.iter().any(|(l, m)| *l == 5 && m.contains("'ss'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_report_an_old_name_read_after_a_rename_on_an_open_frame() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\nu = pl.read_csv(\"u.csv\")\n\
+             u = u.rename({\"Signup Date\": \"signup\"}).with_columns(pl.col(\"Signup Date\").alias(\"d\"))\n",
+        );
+
+        // assert
+        assert!(
+            unknown_column_errors(&errors)
+                .iter()
+                .any(|(_, m)| m.contains("'Signup Date'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_a_join_key_after_unique_when_pandas_is_also_imported() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\nimport polars as pl\nev = pl.scan_parquet(\"e.parquet\")\n\
+             prod = pl.read_parquet(\"p.parquet\")\nev = ev.unique(subset=[\"id\"])\n\
+             out = ev.join(prod.lazy().select(\"pid\", \"brand\"), on=\"pidd\", how=\"left\")\n",
+        );
+
+        // assert
+        assert!(
+            unknown_column_errors(&errors)
+                .iter()
+                .any(|(_, m)| m.contains("'pidd'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_a_polars_helper_against_the_known_frame_passed_to_it() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\n\n\ndef flags(d: pl.DataFrame) -> pl.DataFrame:\n\
+             \x20   return d.with_columns((pl.col(\"cart_vlaue\") > 0).alias(\"has\"))\n\n\n\
+             raw = pl.read_parquet(\"e.parquet\")\n\
+             agg = raw.group_by(\"s\").agg(pl.col(\"p\").sum().alias(\"cart_value\"))\n\
+             print(flags(agg).shape)\n",
+        );
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == CODE_MISSING_COLUMN && e.message.contains("cart_vlaue")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_resolve_string_enum_members_in_group_by_agg_and_drop() {
+        // arrange
+        let enum_def = "from enum import StrEnum\nimport polars as pl\n\n\n\
+             class F(StrEnum):\n    S = \"s\"\n    C = \"c\"\n    P = \"p\"\n\n\n\
+             raw = pl.read_parquet(\"e.parquet\")\n";
+
+        // act
+        let (_, agg) = lint_source(&format!(
+            "{enum_def}out = raw.group_by(F.S).agg(pl.col(F.C).unique().alias(\"cats\"))\n\
+             print(out.with_columns(pl.col(\"cts\").alias(\"n\")))\n"
+        ));
+        let (_, dropped) = lint_source(&format!(
+            "{enum_def}out = raw.with_columns(pl.col(F.C).shift(1).alias(F.P))\nout = out.drop(F.P)\n\
+             print(out.select(pl.col(F.P)))\n"
+        ));
+        let (_, member) = lint_source(&format!(
+            "{enum_def}print(raw.group_by(\"s\").agg(pl.len().alias(F.NOPE)))\n"
+        ));
+
+        // assert
+        assert!(
+            unknown_column_errors(&agg)
+                .iter()
+                .any(|(_, m)| m.contains("'cts'")),
+            "{agg:?}"
+        );
+        assert!(
+            unknown_column_errors(&dropped)
+                .iter()
+                .any(|(_, m)| m.contains("'p'")),
+            "{dropped:?}"
+        );
+        assert!(
+            member
+                .iter()
+                .any(|e| e.message.contains("no member 'NOPE'")),
+            "{member:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_report_a_later_typo_after_a_with_columns_typo_on_the_same_chain() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\nraw = pl.read_parquet(\"e.parquet\")\n\
+             stats = raw.group_by(\"z\").agg(pl.len().alias(\"cnt\"))\n\
+             stats = stats.with_columns(pl.col(\"cn\").cast(pl.Float64))\n\
+             out = stats.to_pandas()\nout[\"cnt\"] = out[\"cn\"].round()\n",
+        );
+
+        // assert: both lines, once each
+        let lines: Vec<usize> = unknown_column_errors(&errors)
+            .iter()
+            .map(|(l, _)| *l)
+            .collect();
+        assert_eq!(lines, vec![4, 6], "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_report_one_typo_once_per_line() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import polars as pl\nraw = pl.read_parquet(\"e.parquet\")\n\
+             agg = raw.group_by(\"s\").agg(pl.len().alias(\"n_events\"))\n\
+             agg = agg.with_columns((pl.col(\"n_evnts\") + 1).alias(\"n_plus\"))\n",
+        );
+
+        // assert
+        assert_eq!(unknown_column_errors(&errors).len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_warn_on_a_read_of_a_column_a_later_merge_brings_in() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.read_csv(\"t.csv\")\nwx = pd.read_parquet(\"w.parquet\")\n\
+             df[\"wet\"] = df[\"night\"] * df[\"precip\"]\n\
+             df = df.merge(wx[[\"hour\", \"precip\"]], on=\"hour\", how=\"left\")\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().any(|e| e.code == CODE_READ_BEFORE_ASSIGNMENT
+                && e.line == 4
+                && e.message.contains("'precip'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_not_warn_when_the_merge_brings_a_column_of_another_frame_bound_earlier() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\ndf = pd.read_csv(\"a.csv\")\nprint(df[\"precip\"])\n\
+             df = pd.read_csv(\"t.csv\")\nwx = pd.read_parquet(\"w.parquet\")\n\
+             df = df.merge(wx[[\"hour\", \"precip\"]], on=\"hour\")\n\
+             df2 = pd.read_csv(\"b.csv\")\nprint(df2[\"x\"])\n\
+             df2 = df2.merge(wx[[\"hour\", \"x\"]], on=\"hour\", suffixes=(\"\", \"_r\"))\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_READ_BEFORE_ASSIGNMENT),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_explain_why_pivot_and_a_join_of_an_unknown_left_side_end_tracking() {
+        // arrange / act
+        let (linter, _) = lint_source(
+            "import polars as pl\nraw = pl.read_parquet(\"e.parquet\")\n\
+             long = raw.group_by(\"s\", \"t\").agg(pl.len().alias(\"n\"))\n\
+             wide = long.pivot(on=\"t\", index=\"s\", values=\"n\").fill_null(0)\n\
+             sess = pl.read_csv(\"s.csv\")\nagg = raw.group_by(\"s\").agg(pl.len().alias(\"n\"))\n\
+             df = sess.join(agg, on=\"s\")\n",
+        );
+
+        // assert
+        let reasons: Vec<&str> = linter
+            .leg_events
+            .iter()
+            .map(|e| e.reason.as_str())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("`.pivot()` takes its new column names from the data")),
+            "{reasons:?}"
+        );
+        let join: Vec<_> = reasons
+            .iter()
+            .filter(|r| r.contains("left side of `.join()`"))
+            .collect();
+        assert_eq!(join.len(), 1, "{reasons:?}");
+    }
+
+    #[test]
+    fn test_should_not_say_from_pandas_is_unmodelled_for_a_parameter_frame() {
+        // arrange / act
+        let (linter, _) = lint_source(
+            "import pandas as pd\nimport polars as pl\n\n\ndef f(t: pd.DataFrame) -> pd.DataFrame:\n\
+             \x20   frame = pl.from_pandas(t)\n\
+             \x20   return frame.group_by(\"a\").agg(pl.len().alias(\"n\")).to_pandas()\n",
+        );
+
+        // assert
+        assert!(
+            linter
+                .leg_events
+                .iter()
+                .all(|e| !e.reason.contains("from_pandas")),
+            "{:?}",
+            linter
+                .leg_events
+                .iter()
+                .map(|e| &e.reason)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_should_keep_usecols_advice_and_unverifiable_reads_out_of_tests() {
+        // arrange / act
+        let (_, errors) = lint_source(
+            "import pandas as pd\n\n\ndef helper() -> pd.DataFrame:\n    return load()\n\n\n\
+             def test_trips():\n    raw = pd.read_csv(\"t.csv\")\n    assert raw[\"id\"].is_unique\n\
+             \x20   h = helper()\n    assert h[\"a\"].all()\n",
+        );
+
+        // assert
+        assert!(
+            errors.iter().all(|e| e.code != CODE_UNVERIFIABLE_COLUMN),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .filter(|e| e.code == CODE_UNTRACKED_DATAFRAME)
+                .all(|e| !e.message.contains("usecols") && e.message.contains("in a test")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_narrow_a_load_through_an_inplace_literal_rename() {
+        // arrange / act
+        let linter = suggest_for(
+            "import pandas as pd\n\n\ndef run():\n    wx = pd.read_parquet(\"w.parquet\")\n\
+             \x20   wx.rename(columns={\"obs\": \"hour\"}, inplace=True)\n\
+             \x20   wx[\"hr\"] = wx[\"hour\"].dt.hour\n    print(wx[\"temp\"].mean())\n",
+        );
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert_eq!(linter.suggestions[0].columns, vec!["obs", "temp"]);
+    }
+
+    #[test]
+    fn test_should_withhold_an_inplace_rename_onto_a_name_read_before_it() {
+        // arrange / act
+        let linter = suggest_for(
+            "import pandas as pd\n\n\ndef run():\n    wx = pd.read_parquet(\"w.parquet\")\n\
+             \x20   print(wx[\"hour\"])\n    wx.rename(columns={\"obs\": \"hour\"}, inplace=True)\n\
+             \x20   print(wx[\"hour\"])\n",
+        );
+
+        // assert
+        assert!(linter.suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_should_narrow_a_polars_load_through_with_columns_filter_and_select() {
+        // arrange / act
+        let linter = suggest_for(
+            "import polars as pl\n\n\ndef run():\n    s = pl.read_csv(\"s.csv\")\n\
+             \x20   s = s.with_columns(pl.col(\"device\").str.to_lowercase())\n\
+             \x20   s = s.filter(~pl.col(\"is_bot\"))\n    print(s.select(\"id\", \"device\"))\n",
+        );
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert_eq!(
+            linter.suggestions[0].columns,
+            vec!["device", "is_bot", "id"]
+        );
+    }
+
+    #[test]
+    fn test_should_withhold_a_polars_filter_over_every_column() {
+        // arrange / act
+        let linter = suggest_for(
+            "import polars as pl\n\n\ndef run():\n    s = pl.read_csv(\"s.csv\")\n\
+             \x20   s = s.filter(pl.all_horizontal(pl.all().is_not_null()))\n    print(s[\"id\"])\n",
+        );
+
+        // assert
+        assert!(linter.suggestions.is_empty());
+    }
+
+    fn errors_for(source: &str) -> Vec<LintError> {
+        Linter::new()
+            .check_file_internal(source, Path::new("test.py"))
+            .unwrap()
+    }
+
+    const TWO_FRAMES: &str = "import pandas as pd\n\nx = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ny = pd.read_csv(\"y.csv\", usecols=[\"c\"])\n";
+    const COMBINE: &str = "def combine(left, right):\n    return left[\"a\"] + right[\"b\"]\n";
+
+    fn missing_columns(errors: &[LintError]) -> Vec<&LintError> {
+        errors
+            .iter()
+            .filter(|e| e.code == CODE_MISSING_COLUMN)
+            .collect()
+    }
+
+    #[test]
+    fn test_should_check_a_frame_passed_by_keyword() {
+        // arrange
+        let source = format!("{TWO_FRAMES}\n\n{COMBINE}\n\ncombine(x, right=y)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert!(missing[0].message.contains("'y' passed to combine"));
+        assert!(missing[0].message.contains("as 'right'"));
+        assert!(missing[0].message.contains("{b}"));
+    }
+
+    #[test]
+    fn test_should_check_a_frame_passed_as_the_second_positional_argument() {
+        // arrange
+        let source = format!("{TWO_FRAMES}\n\n{COMBINE}\n\nout = combine(x, y)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert!(missing[0].message.contains("'y' passed to combine"));
+    }
+
+    #[test]
+    fn test_should_map_keywords_to_their_parameters_in_any_order() {
+        // arrange: each frame lacks what its own parameter reads.
+        let source = format!("{TWO_FRAMES}\n\n{COMBINE}\n\ncombine(right=x, left=y)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 2, "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_check_a_call_whose_arguments_cannot_be_bound() {
+        // arrange: unpacked arguments, and an unknown keyword.
+        let source = format!(
+            "{TWO_FRAMES}\n\n{COMBINE}\n\nargs = [x, y]\ncombine(*args)\ncombine(x, y, extra=1)\n"
+        );
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_a_call_to_a_method_of_the_enclosing_class() {
+        // arrange: the method is defined after the one calling it.
+        let source = "import pandas as pd\n\n\nclass Pipeline:\n    def run(self):\n        x = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n        return self.join(x, x)\n\n    def join(self, left, right):\n        return left[\"a\"] + right[\"z\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert!(missing[0].message.contains("as 'right'"));
+    }
+
+    #[test]
+    fn test_should_not_check_a_self_call_a_subclass_overrides_differently() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass Pipeline:\n    def run(self):\n        x = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n        return self.join(x, x)\n\n    def join(self, left, right):\n        return right[\"z\"]\n\n\nclass Other(Pipeline):\n    def join(self, left, right):\n        return right[\"a\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_a_helper_imported_from_another_file() {
+        // arrange
+        let main = format!("from helpers import combine\nimport helpers\n{TWO_FRAMES}\ncombine(x, y)\nhelpers.combine(left=x, right=y)\n");
+
+        // act
+        let (_, errors) = check_against_helpers(COMBINE, &main);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 2, "errors: {errors:?}");
+        assert!(missing.iter().all(|e| e.message.contains("helpers.py")));
+    }
+
+    #[test]
+    fn test_should_stay_silent_when_a_name_binds_to_two_same_named_functions() {
+        // arrange: `combine` is imported from two files, and `tool.combine` names no module.
+        let other = "def combine(left, right):\n    return right[\"zz\"]\n";
+        let main = format!("from helpers import combine\nfrom other import combine\n{TWO_FRAMES}\ncombine(x, y)\ntool = make_tool()\ntool.combine(x, y)\n");
+
+        // act
+        let (_, errors) = check_in_project(&[("helpers.py", COMBINE), ("other.py", other)], &main);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_check_a_self_call_a_subclass_in_another_file_overrides() {
+        // arrange
+        let main = "import pandas as pd\n\n\nclass Pipeline:\n    def go(self):\n        x = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n        return self.join(x, x)\n\n    def join(self, left, right):\n        return right[\"z\"]\n";
+        let sub = "from main import Pipeline\n\n\nclass Fast(Pipeline):\n    def join(self, left, right):\n        return left\n";
+
+        // act
+        let (_, errors) = check_in_project(&[("sub.py", sub)], main);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    const PROTOCOL_MAIN: &str = "import pandas as pd\nfrom typing import Protocol\n\nfrom steps import A, B\n\n\nclass Step(Protocol):\n    def apply(self, left, right): ...\n\n\ndef run(step: Step):\n    x = pd.read_csv(\"x.csv\", usecols=[\"a\"])\n    return step.apply(x, x)\n";
+
+    #[test]
+    fn test_should_stay_silent_on_a_protocol_whose_implementors_disagree() {
+        // arrange
+        let steps = "class A:\n    def apply(self, left, right):\n        return right[\"b\"]\n\n\nclass B:\n    def apply(self, left, right):\n        return right[\"c\"]\n";
+
+        // act
+        let (_, errors) = check_in_project(&[("steps.py", steps)], PROTOCOL_MAIN);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_check_a_protocol_call_every_implementor_agrees_on() {
+        // arrange
+        let steps = "class A:\n    def apply(self, left, right):\n        return right[\"b\"]\n\n\nclass B:\n    def apply(self, left, right):\n        out = right[\"b\"] * 2\n        return out\n";
+
+        // act
+        let (_, errors) = check_in_project(&[("steps.py", steps)], PROTOCOL_MAIN);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert!(missing[0].message.contains("every 'apply'"));
+    }
+
+    #[test]
+    fn test_should_inherit_the_requirement_of_a_helper_a_parameter_is_forwarded_to() {
+        // arrange
+        let source = format!("{TWO_FRAMES}\n\n{COMBINE}\n\ndef outer(first, second):\n    return combine(first, right=second)\n\n\nouter(x, y)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert!(missing[0].message.contains("'y' passed to outer"));
+    }
+
+    #[test]
+    fn test_should_inherit_a_forwarded_requirement_across_files() {
+        // arrange: middle.py forwards to base.py; main.py only sees middle.py.
+        let middle = "from helpers import combine\n\n\ndef outer(first, second):\n    return combine(first, second)\n";
+        let main = format!("from middle import outer\n{TWO_FRAMES}\nouter(x, y)\n");
+
+        // act
+        let (_, errors) =
+            check_in_project(&[("helpers.py", COMBINE), ("middle.py", middle)], &main);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert!(missing[0].message.contains("'y' passed to outer"));
+    }
+
+    #[test]
+    fn test_should_not_fold_a_constant_another_file_changes() {
+        // arrange
+        let cfg = "COLS = [\"a\"]\nNAME = \"a\"\nKEEP = [\"a\"]\n";
+        let plugin = "import cfg\nfrom cfg import COLS\n\ncfg.NAME = \"b\"\nCOLS.append(\"b\")\n";
+        let main = "import pandas as pd\n\nimport plugin  # noqa: F401\nfrom cfg import COLS, KEEP, NAME\n\na = pd.read_csv(\"x.csv\", usecols=COLS)\nb = pd.DataFrame({NAME: [1]})\nc = pd.read_csv(\"x.csv\", usecols=KEEP)\nprint(a[\"b\"], b[\"b\"], c[\"b\"])\n";
+
+        // act
+        let (_, errors) = check_in_project(&[("cfg.py", cfg), ("plugin.py", plugin)], main);
+
+        // assert
+        let unknown: Vec<&LintError> = errors
+            .iter()
+            .filter(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .collect();
+        assert_eq!(unknown.len(), 1, "{errors:?}");
+        assert!(unknown[0].message.contains("line 8"), "{errors:?}");
+    }
+
+    const GUARDED_MAYBE: &str =
+        "def maybe(df):\n    if \"a\" in df.columns:\n        return df[\"a\"]\n    return None\n";
+
+    #[test]
+    fn test_should_not_require_a_column_a_helper_reads_only_behind_a_guard() {
+        // arrange
+        let source = format!("import pandas as pd\n\n\n{GUARDED_MAYBE}\n\nclass K:\n    def maybe(self, df):\n        if \"a\" in df.columns:\n            return df[\"a\"]\n        return None\n\n    def run(self):\n        df = pd.DataFrame({{\"b\": [1]}})\n        return self.maybe(df)\n\n\ndef h():\n    df = pd.read_csv(\"x.csv\", usecols=[\"b\"])\n    return maybe(df)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_require_a_guarded_read_of_an_imported_helper() {
+        // arrange
+        let main = "import pandas as pd\n\nimport helpers\nfrom helpers import maybe\n\n\ndef g():\n    df = pd.DataFrame({\"b\": [1]})\n    return helpers.maybe(df)\n\n\ndef h():\n    df = pd.DataFrame({\"b\": [1]})\n    return maybe(df)\n";
+
+        // act
+        let (_, errors) = check_in_project(&[("helpers.py", GUARDED_MAYBE)], main);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_resolve_a_method_an_instance_attribute_shadows() {
+        // arrange
+        let source = "import pandas as pd\n\n\nclass Base:\n    def process(self, df):\n        return df[\"a\"]\n\n\nclass D(Base):\n    def __init__(self):\n        self.process = lambda df: df[\"b\"]\n\n    def run(self):\n        df = pd.DataFrame({\"b\": [1]})\n        return self.process(df)\n\n\nclass E(Base):\n    def run(self):\n        df = pd.DataFrame({\"b\": [1]})\n        return self.process(df)\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        let missing = missing_columns(&errors);
+        assert_eq!(missing.len(), 1, "errors: {errors:?}");
+        assert_eq!(missing[0].line, 21);
+    }
+
+    #[test]
+    fn test_should_not_check_a_frame_whose_columns_are_unknown() {
+        // arrange
+        let source = format!("import pandas as pd\n\n{COMBINE}\n\nx = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ny = pd.read_csv(\"y.csv\")\ncombine(x, y)\n\n\ndef job(frame):\n    return combine(x, frame)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_report_nothing_for_a_helper_no_one_calls() {
+        // arrange
+        let source = format!("import pandas as pd\n\n{COMBINE}\n\ndef outer(first, second):\n    return combine(first, second)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_accept_frames_with_every_required_column() {
+        // arrange
+        let source = format!("import pandas as pd\n\n{COMBINE}\n\nx = pd.read_csv(\"x.csv\", usecols=[\"a\"])\ny = pd.read_csv(\"y.csv\", usecols=[\"b\", \"c\"])\ncombine(x, y)\ncombine(right=y, left=x)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        assert!(errors.is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_require_a_column_read_only_after_a_branch_or_a_write() {
+        // arrange
+        let source = format!("{TWO_FRAMES}\n\ndef f(left, right):\n    right[\"b\"] = 1\n    out = right[\"b\"]\n    if \"d\" in right.columns:\n        return right[\"d\"]\n    return right[\"e\"]\n\n\nf(x, y)\n");
+
+        // act
+        let errors = errors_for(&source);
+
+        // assert
+        assert!(missing_columns(&errors).is_empty(), "errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_should_withhold_usecols_when_a_renamed_away_name_is_read() {
+        // arrange
+        let source = "import pandas as pd\nst = pd.read_csv(\"s.csv\")\nst.rename(columns={\"dock_type\": \"dock\"}, inplace=True)\nprint(st[[\"station_id\", \"dock_type\"]])\n";
+
+        // act
+        let linter = suggest_for(source);
+
+        // assert
+        assert!(linter.suggestions.is_empty());
+        assert!(linter.withheld[0]
+            .reason
+            .contains("reads 'dock_type' after a rename or drop removed it"));
+    }
+
+    #[test]
+    fn test_should_report_a_list_selection_of_a_renamed_away_column_on_an_open_frame() {
+        // arrange
+        let source = "import pandas as pd\nst = pd.read_csv(\"s.csv\")\nst.rename(columns={\"dock_type\": \"dock\"}, inplace=True)\nprint(st[[\"station_id\", \"dock_type\"]])\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(errors
+            .iter()
+            .any(|e| e.line == 4 && e.message.contains("renamed to 'dock'")));
+    }
+
+    #[test]
+    fn test_should_report_a_dropped_column_read_off_a_frame_stored_on_self() {
+        // arrange
+        let source = "import pandas as pd\n\nclass Pipe:\n    def __init__(self) -> None:\n        self.df = pd.DataFrame({\"sid\": [1], \"dock\": [\"a\"]})\n\n    def encode(self):\n        self.df = self.df.drop(columns=[\"dock\"])\n        return self.df[\"dock\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0]
+            .message
+            .contains("`self.df`: it was dropped at line 8"));
+    }
+
+    #[test]
+    fn test_should_report_a_typo_on_an_aggregate_stored_on_self() {
+        // arrange
+        let source = "import pandas as pd\n\nclass Pipe:\n    def __init__(self, maint: pd.DataFrame) -> None:\n        self.maint = maint\n\n    def summarise(self):\n        self.ev = self.maint.groupby(\"sid\").agg(total_cost=(\"cost\", \"sum\")).reset_index()\n        return self.ev[\"total_cst\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("did you mean 'total_cost'"));
+    }
+
+    #[test]
+    fn test_should_forget_self_frame_facts_after_a_call_that_reaches_self() {
+        // arrange
+        let source = "import pandas as pd\n\nclass Pipe:\n    def __init__(self) -> None:\n        self.df = pd.DataFrame({\"a\": [1], \"b\": [2]})\n\n    def restore(self) -> None:\n        self.df[\"b\"] = 1\n\n    def run(self):\n        self.df = self.df.drop(columns=[\"b\"])\n        self.restore()\n        return self.df[\"b\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_forget_self_frame_facts_after_calls_that_reach_self_without_naming_it() {
+        // arrange
+        let source = r#"import pandas as pd
+
+
+class Child:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def fill(self):
+        self.parent.df = self.parent.df.assign(b=1)
+
+
+class Base:
+    def enrich(self):
+        self.df = self.df.assign(b=1)
+
+
+class P(Base):
+    def __init__(self):
+        self.df = pd.DataFrame({"a": [1]})
+        self.child = Child(self)
+
+    def via_child(self):
+        self.df = pd.DataFrame({"a": [1]})
+        c = self.child
+        c.fill()
+        return self.df["b"]
+
+    def via_alias(self):
+        self.df = pd.DataFrame({"a": [1]})
+        obj = self
+        obj.df = obj.df.assign(b=2)
+        return self.df["b"]
+
+    def via_super(self):
+        self.df = pd.DataFrame({"a": [1]})
+        super().enrich()
+        return self.df["b"]
+
+    def via_closure(self):
+        self.df = pd.DataFrame({"a": [1]})
+
+        def add():
+            self.df = self.df.assign(b=1)
+
+        add()
+        return self.df["b"]
+
+    def via_hooks(self, hooks):
+        self.df = pd.DataFrame({"a": [1]})
+        for hook in hooks:
+            hook()
+        return self.df["b"]
+"#;
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_take_row_drops_level_drops_or_reset_index_as_lost_columns() {
+        // arrange
+        let source = r#"import pandas as pd
+
+
+def rows(path):
+    df = pd.read_parquet(path)
+    df = df.drop("x")
+    return df["x"]
+
+
+def rows_in_place(path):
+    df = pd.read_parquet(path)
+    df.drop(["x"], inplace=True)
+    return df["x"]
+
+
+def known_rows():
+    df = pd.DataFrame({"x": [1, 2]}, index=["x", "y"])
+    df = df.drop("x")
+    return df["x"]
+
+
+def level(path):
+    df = pd.read_parquet(path)
+    df = df.drop(columns="x", level=1)
+    return df["x"]
+
+
+def reset(path):
+    df = pd.read_parquet(path)
+    df = df.drop(columns=["x"])
+    df = df.reset_index()
+    return df["x"]
+
+
+def dummies(path):
+    df = pd.read_parquet(path)
+    df = pd.get_dummies(df, columns=["x"], prefix="", prefix_sep="")
+    return df["x"]
+
+
+def still_gone(path):
+    df = pd.read_parquet(path)
+    df = df.drop(columns=["x"])
+    df = df.reset_index(drop=True)
+    return df["x"]
+"#;
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        let unknown: Vec<usize> = errors
+            .iter()
+            .filter(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .map(|e| e.line)
+            .collect();
+        assert_eq!(unknown, [45], "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_take_positional_drop_labels_as_columns_on_a_polars_frame() {
+        // arrange
+        let source = "import polars as pl\n\n\ndef f(path):\n    df = pl.read_parquet(path)\n    df = df.drop(\"x\")\n    return df[\"x\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.line == 7 && e.code == CODE_UNKNOWN_COLUMN),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_self_frame_facts_across_frame_methods_and_builtins() {
+        // arrange
+        let source = r#"import pandas as pd
+
+
+class P:
+    def run(self):
+        self.df = pd.DataFrame({"a": [1]})
+        print(len(self.df), self.df.shape)
+        self.df = self.df.dropna()
+        return self.df["b"]
+"#;
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].line, 9);
+    }
+
+    #[test]
+    fn test_should_not_suggest_usecols_for_a_frame_stored_on_self() {
+        // arrange
+        let source = "import pandas as pd\n\nclass Loader:\n    def __init__(self, path: str) -> None:\n        self.df = pd.read_csv(path)\n        self.n = len(self.df[\"a\"])\n\n    def total(self):\n        return self.df[\"b\"].sum()\n";
+
+        // act
+        let linter = suggest_for(source);
+
+        // assert
+        assert!(linter.suggestions.is_empty());
+        assert_eq!(linter.withheld.len(), 1);
+    }
+
+    // ── pass 6: query/eval, aggregations, masks, containers, polars loops ──
+
+    fn unknown_names(source: &str) -> Vec<String> {
+        let (_, errors) = lint_source(source);
+        errors
+            .iter()
+            .filter(|e| e.code == CODE_UNKNOWN_COLUMN)
+            .map(|e| e.message.split('\'').nth(1).unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_should_check_names_in_query_and_eval_strings() {
+        // arrange
+        let source =
+            "import pandas as pd\n\ndf = pd.read_csv(\"f.csv\", usecols=[\"a\", \"b\"])\nlim = 3\n\
+            x = df.query(\"a > @lim and typo > 3 and b.str.contains('zz') and `b` > 1\")\n\
+            y = df.eval(\"a + typo2\")\nw = df.eval(\"c = a + b\")\nprint(w[\"c\"], w[\"nope\"])\n";
+
+        // act
+        let unknown = unknown_names(source);
+
+        // assert
+        assert_eq!(unknown, ["typo", "typo2", "nope"]);
+    }
+
+    #[test]
+    fn test_should_not_report_a_name_a_constructor_or_assignment_gave_the_index() {
+        // arrange
+        let source = r#"import pandas as pd
+
+
+def named_index():
+    df = pd.DataFrame({"v": [2]}, index=pd.Index([1], name="date"))
+    df2 = df.copy()
+    return df.query("date > 0"), df2.sort_values("date"), df.reset_index()["date"]
+
+
+def unknown_name(idx):
+    df = pd.DataFrame({"v": [2]}, index=idx)
+    return df.groupby("date").sum()
+
+
+def set_name():
+    df = pd.DataFrame({"v": [2]})
+    df.index.name = "date"
+    return df.groupby("date").sum()
+
+
+def in_place():
+    df = pd.DataFrame({"v": [2]})
+    df.rename_axis("date", inplace=True)
+    return df.sort_values("date")
+
+
+def unnamed():
+    df = pd.DataFrame({"v": [2]}, index=[1])
+    return df.sort_values("date")
+"#;
+
+        // act
+        let unknown = unknown_names(source);
+
+        // assert
+        assert_eq!(unknown, ["date"]);
+    }
+
+    #[test]
+    fn test_should_not_check_query_names_that_may_be_index_levels_or_resolvers() {
+        // arrange
+        let source = "import pandas as pd\n\ndf = pd.read_csv(\"f.csv\", usecols=[\"a\", \"b\"])\n\
+            s = df.set_index(\"a\")\nprint(s.query(\"a > 1\"), df.set_index(\"a\").query(\"a > 1\"))\n\
+            print(df.query(\"zz > 1\", local_dict={\"zz\": 1}), df.query(\"index > 2\"))\n";
+
+        // act / assert
+        assert!(unknown_names(source).is_empty());
+    }
+
+    #[test]
+    fn test_should_know_the_columns_of_a_series_agg_list_and_a_named_reset_index() {
+        // arrange
+        let source = "import pandas as pd\n\ndf = pd.read_csv(\"f.csv\", usecols=[\"k\", \"v\"])\n\
+            g = df.groupby(\"k\")[\"v\"].agg([\"mean\", \"sum\"])\nprint(g[\"mean\"], g[\"z1\"])\n\
+            r = df.groupby(\"k\")[\"v\"].agg([\"max\"]).reset_index()\nprint(r[\"k\"], r[\"max\"])\n\
+            n = df.groupby(\"k\")[\"v\"].nunique().reset_index(name=\"n\")\nprint(n[\"k\"], n[\"n\"], n[\"z2\"])\n\
+            c = df.groupby(\"k\").size().reset_index(name=\"cnt\")\nprint(c[\"k\"], c[\"cnt\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z1", "z2"]);
+    }
+
+    #[test]
+    fn test_should_name_the_column_of_to_frame_and_keep_its_index_levels() {
+        // arrange
+        let source = "import pandas as pd\n\ndf = pd.read_csv(\"f.csv\", usecols=[\"k\", \"v\", \"t\"])\n\
+            r = df.set_index(\"t\").resample(\"D\")[\"v\"].sum().to_frame()\nprint(r[\"v\"], r[\"z\"])\n\
+            s = df.groupby(\"k\")[\"v\"].sum().to_frame()\nprint(s.merge(df, on=\"k\"))\n\
+            s2 = s.reset_index()\nprint(s2[\"k\"], s2[\"v\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z"]);
+    }
+
+    #[test]
+    fn test_should_bring_back_index_levels_on_reset_index_of_a_named_index() {
+        // arrange
+        let source = "import pandas as pd\n\ndf = pd.read_csv(\"f.csv\", usecols=[\"k\", \"v\"])\n\
+            a = df.set_index(\"k\")\nb = a.reset_index()\na = a.reset_index()\nprint(b[\"k\"], a[\"k\"], a[\"z\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z"]);
+    }
+
+    #[test]
+    fn test_should_keep_the_columns_through_a_row_mask_and_copy() {
+        // arrange
+        let source = "import pandas as pd\n\na = pd.read_csv(\"f.csv\", usecols=[\"r\", \"s\"])\n\
+            b = a[a[\"r\"] > 3].copy()\nc = a[~a[\"r\"].isna() & (a[\"s\"] > 0)].copy()\nprint(b[\"s\"], b[\"z1\"], c[\"z2\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z1", "z2"]);
+    }
+
+    #[test]
+    fn test_should_follow_frames_in_a_dict_read_through_literal_keys() {
+        // arrange
+        let source = "import pandas as pd\n\nd = {\"one\": pd.read_csv(\"c.csv\", usecols=[\"p\"])}\n\
+            d[\"one\"][\"new\"] = 1\nprint(d[\"one\"][\"p\"], d[\"one\"][\"new\"], d[\"one\"][\"z\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z"]);
+    }
+
+    #[test]
+    fn test_should_not_follow_a_dict_used_any_other_way() {
+        // arrange
+        let source =
+            "import pandas as pd\n\nd = {\"one\": pd.read_csv(\"c.csv\", usecols=[\"p\"])}\n\
+            d.update(one=pd.read_csv(\"e.csv\"))\nprint(d[\"one\"][\"z\"])\n";
+
+        // act / assert
+        assert!(unknown_names(source).is_empty());
+    }
+
+    #[test]
+    fn test_should_unpack_a_tuple_of_frames_a_local_function_returns() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef load():\n    a = pd.read_csv(\"a.csv\", usecols=[\"x\"])\n\
+            \x20   b = pd.read_csv(\"b.csv\", usecols=[\"y\"])\n    return a, b\n\n\n\
+            first, second = load()\nprint(first[\"x\"], second[\"y\"], first[\"z1\"], second[\"z2\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z1", "z2"]);
+    }
+
+    #[test]
+    fn test_should_resolve_polars_aliases_computed_from_loop_variables() {
+        // arrange
+        let source = "import polars as pl\n\ndf = pl.read_csv(\"f.csv\", columns=[\"a\", \"b\"])\n\
+            out = df.with_columns([pl.col(c).alias(f\"{c}_x\") for c in [\"a\", \"b\"]])\n\
+            for g in [\"a\", \"b\"]:\n    out = out.with_columns(pl.col(g).alias(\"g_\" + g))\n\
+            print(out[\"a_x\"], out[\"g_b\"], out[\"z\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["z"]);
+    }
+
+    #[test]
+    fn test_should_say_why_a_grouped_agg_with_function_lists_is_not_followed() {
+        // arrange / act
+        let (linter, _) = lint_source(
+            "import pandas as pd\n\ndf = pd.read_csv(\"f.csv\", usecols=[\"k\", \"v\"])\n\
+             h = df.groupby(\"k\").agg({\"v\": [\"min\", \"max\"]})\ns = df.eval(\"k + v\")\n",
+        );
+
+        // assert: the MultiIndex result is named, and a Series from eval is not a lost frame
+        let rows: Vec<_> = linter
+            .leg_events
+            .iter()
+            .map(|e| (e.var.as_str(), e.reason.as_str()))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].1.contains("MultiIndex"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_should_keep_an_open_frame_rebound_in_a_loop_for_a_later_drop() {
+        // arrange
+        let source = "import polars as pl\n\ndf = pl.scan_parquet(\"t.parquet\")\n\
+            for t in [\"a\", \"b\"]:\n    df = df.with_columns(pl.col(\"tags\").alias(\"tag_\" + t))\n\
+            df = df.drop(\"created_at\")\ndf = df.with_columns(pl.col(\"created_at\").alias(\"z\"))\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.line == 7 && e.message.contains("dropped at line 6")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_report_a_read_after_a_rename_inside_the_same_loop_body_only() {
+        // arrange
+        let source = "import pandas as pd\n\nvalid = pd.read_csv(\"v.csv\")\nfor t in range(3):\n\
+            \x20   valid = valid.rename(columns={\"target\": \"target_x\"})\n    print(valid[\"target\"])\n\
+            print(valid[\"target\"])\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert: after the loop the frame may still be the one that has it
+        let lines: Vec<_> = errors
+            .iter()
+            .filter(|e| e.code == "unknown-column")
+            .map(|e| e.line)
+            .collect();
+        assert_eq!(lines, [6], "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_treat_a_drop_with_columns_on_an_unknown_value_as_an_open_frame() {
+        // arrange
+        let source = "class Svc:\n    def run(self):\n        a = self.repo.read().drop_duplicates()\n\
+            \x20       a = a.drop(columns=[\"year\"])\n        b = self.repo.read().rename(columns={\"x\": \"y\"})\n\
+            \x20       return a[\"year\"], a[\"other\"], b[\"x\"], b[\"y\"]\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        let errs: Vec<_> = errors.iter().filter(|e| e.severity == "error").collect();
+        assert_eq!(errs.len(), 2, "{errors:?}");
+        assert!(errs[0].message.contains("'year'") && errs[1].message.contains("'x'"));
+    }
+
+    #[test]
+    fn test_should_warn_on_a_read_ahead_of_the_with_columns_that_creates_it() {
+        // arrange
+        let source = "import polars as pl\n\ndf = pl.scan_parquet(\"t.parquet\")\n_ = df[\"bucket\"]\n\
+            df = df.with_columns(pl.col(\"h\").alias(\"bucket\"))\n_ = df[\"mrr\"]\n\
+            df = df.with_columns(pl.col(\"mrr\").fill_null(0.0))\n_ = df[\"k\"]\ndf = df.assign(k=1)\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        let lines: Vec<_> = errors
+            .iter()
+            .filter(|e| e.code == CODE_READ_BEFORE_ASSIGNMENT)
+            .map(|e| e.line)
+            .collect();
+        assert_eq!(lines, [4, 8], "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_follow_a_frame_from_a_protocol_method_through_a_chained_call() {
+        // arrange
+        let source = "from typing import Protocol\n\nimport pandas as pd\n\n\n\
+            class Repo(Protocol):\n    def read(self) -> pd.DataFrame: ...\n\n\n\
+            class Svc:\n    def __init__(self, repo: Repo) -> None:\n        self.repo = repo\n\n\
+            \x20   def run(self):\n        a = self.repo.read().drop_duplicates()\n        _ = a[\"age\"]\n\
+            \x20       a[\"age\"] = 1\n        return a\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == CODE_READ_BEFORE_ASSIGNMENT && e.line == 16),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_warn_on_a_likely_typo_named_nowhere_else() {
+        // arrange
+        let source = "import pandas as pd\n\ndf = pd.read_csv(\"a.csv\")\n\
+            df[\"year_built\"] = df[\"year_buitl\"] + 1\nprint(df[[\"seats\", \"tial_num\"]], df[\"tail_num\"].sum(), df[\"tail_num\"])\n\
+            print(df[\"sentiment\"], df[\"sentimernt\"])\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert: two names read once each, each the other's nearest, are left alone
+        let typos: Vec<_> = errors
+            .iter()
+            .filter(|e| e.code == CODE_LIKELY_TYPO)
+            .map(|e| (e.line, e.severity.as_str()))
+            .collect();
+        assert_eq!(typos, [(4, "warning"), (5, "warning")], "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_not_warn_on_a_read_of_a_column_a_rename_created_before_a_later_write() {
+        // arrange
+        let source = "import pandas as pd\n\n\ndef f(frame: pd.DataFrame):\n\
+            \x20   renamed = frame.rename(columns={\"C\": \"foo\"})\n    print(renamed[\"foo\"].sum())\n\
+            \x20   renamed.loc[:, \"foo\"] = 1.0\n";
+
+        // act
+        let errors = errors_for(source);
+
+        // assert
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_take_the_columns_of_a_multiindex_product_frame_from_its_names() {
+        // arrange
+        let source = "import pandas as pd\n\nw = pd.MultiIndex.from_product([[1], [2]], names=[\"station\", \"obs_date\"]).to_frame(index=False)\n\
+            print(w[\"station\"], w[\"temp\"])\n";
+
+        // act / assert
+        assert_eq!(unknown_names(source), ["temp"]);
+    }
+}
+
+// How often each name is mentioned: string literals (whole, and the words of one that is not
+// a plain name, such as SQL) and keyword names; with `identifiers`, also names, attributes and
+// parameters, which say a name is in use but not that it is a column.
+// Character pairs `report_likely_typos` may compare in one file (well under 0.1s of work).
+const TYPO_WORK_BUDGET: usize = 20_000_000;
+
+struct NameMentions<'m> {
+    counts: &'m mut HashMap<String, usize>,
+    identifiers: bool,
+}
+
+impl NameMentions<'_> {
+    fn add(&mut self, name: &str) {
+        *self.counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
+impl<'a> Visitor<'a> for NameMentions<'_> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if let (Stmt::FunctionDef(func), true) = (stmt, self.identifiers) {
+            for p in func
+                .parameters
+                .posonlyargs
+                .iter()
+                .chain(&func.parameters.args)
+                .chain(&func.parameters.kwonlyargs)
+            {
+                self.add(p.parameter.name.as_str());
+            }
+        }
+        ast_visitor::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        match expr {
+            Expr::StringLiteral(lit) => {
+                let text = lit.value.to_str();
+                if text
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
+                {
+                    self.add(text);
+                } else {
+                    for word in text
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .filter(|w| !w.is_empty())
+                    {
+                        self.add(word);
+                    }
+                }
+            }
+            Expr::Name(name) if self.identifiers => self.add(name.id.as_str()),
+            Expr::Attribute(attr) if self.identifiers => self.add(attr.attr.as_str()),
+            Expr::Call(call) => {
+                for kw in &call.arguments.keywords {
+                    if let Some(arg) = &kw.arg {
+                        self.add(arg.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+        ast_visitor::walk_expr(self, expr);
+    }
+}
+
+fn collect_value_strings(value: &static_eval::Value, out: &mut std::collections::HashSet<String>) {
+    match value {
+        static_eval::Value::Str(s) => {
+            out.insert(s.clone());
+        }
+        static_eval::Value::List(items)
+        | static_eval::Value::Tuple(items)
+        | static_eval::Value::Set(items) => {
+            for item in items {
+                collect_value_strings(item, out);
+            }
+        }
+        static_eval::Value::Dict(pairs) => {
+            for (k, v) in pairs {
+                collect_value_strings(k, out);
+                collect_value_strings(v, out);
+            }
+        }
+        _ => {}
     }
 }

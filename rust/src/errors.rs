@@ -2,7 +2,7 @@
 //!
 //! Lines containing `# typedframes: ignore` suppress all diagnostics on that line;
 //! `# typedframes: ignore[code1, code2]` suppresses only the listed codes. See
-//! [`is_line_ignored`], which is applied as a post-processing filter after all
+//! [`is_line_ignored_in`], which is applied as a post-processing filter after all
 //! diagnostics have been collected.
 
 use serde::{Deserialize, Serialize};
@@ -26,11 +26,23 @@ pub(crate) const CODE_UNVERIFIABLE_COLUMN: &str = "unverifiable-column";
 // A frame annotated with a schema the checker could not resolve to a class with columns, so
 // nothing on it is checked. Counted apart from typed frames instead of passing as 100%.
 pub(crate) const CODE_UNRESOLVED_SCHEMA: &str = "unresolved-schema";
+// A column read on a frame whose other columns are unknown, before the only statement that
+// gives the frame that column. A warning: the data may already carry it.
+pub(crate) const CODE_READ_BEFORE_ASSIGNMENT: &str = "column-read-before-assignment";
+// A column read once on a frame whose columns are unknown, named nowhere else in the file,
+// and one slip away from exactly one name the code does mention. A warning: it is a guess.
+pub(crate) const CODE_LIKELY_TYPO: &str = "likely-column-typo";
 
 // Return true if the source line at `line` (1-indexed) carries a
 // `# typedframes: ignore` or `# typedframes: ignore[code]` comment.
+#[cfg(test)]
 pub(crate) fn is_line_ignored(source: &str, line: usize, code: &str) -> bool {
     let lines: Vec<&str> = source.lines().collect();
+    is_line_ignored_in(&lines, line, code)
+}
+
+/// `is_line_ignored` over the source already split into lines.
+pub(crate) fn is_line_ignored_in(lines: &[&str], line: usize, code: &str) -> bool {
     if line == 0 || line > lines.len() {
         return false;
     }

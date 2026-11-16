@@ -303,16 +303,21 @@ pub(crate) fn coverage_json(
     })
 }
 
+// A site's line, within its notebook cell (`0` outside a notebook): lines repeat across cells.
+fn line_key(site: &Value) -> (i64, i64) {
+    (int(site, "cell"), int(site, "line"))
+}
+
 // Classifies one `all_dataframe_calls` site against the typed and untyped sites, by line. By line
 // and not by column: the sites record the enclosing statement's position and the call its own,
 // which differ on the same line by design. Two DataFrame-shaped calls on one line are ambiguous
 // under this scheme, an accepted and documented limitation.
 fn explain_status(
     site: &Value,
-    typed_by_line: &HashMap<i64, &Value>,
-    untyped_lines: &HashSet<i64>,
+    typed_by_line: &HashMap<(i64, i64), &Value>,
+    untyped_lines: &HashSet<(i64, i64)>,
 ) -> String {
-    let line = int(site, "line");
+    let line = line_key(site);
     if let Some(typed) = typed_by_line.get(&line) {
         return format!("COUNTED, typed (schema: {})", py_str(typed.get("schema")));
     }
@@ -414,22 +419,22 @@ pub(crate) fn format_explain(sources: &Sources, root: &Path) -> String {
     let mut lines: Vec<String> = Vec::new();
     for name in files_in(sources) {
         let name = name.as_str();
-        let typed_by_line: HashMap<i64, &Value> = typed
+        let typed_by_line: HashMap<(i64, i64), &Value> = typed
             .get(name)
             .into_iter()
             .flatten()
-            .map(|site| (int(site, "line"), *site))
+            .map(|site| (line_key(site), *site))
             .collect();
         let untyped_here: &[&Value] = untyped.get(name).map_or(&[], Vec::as_slice);
-        let untyped_lines: HashSet<i64> = untyped_here.iter().map(|s| int(s, "line")).collect();
-        let mut sites_per_line: HashMap<i64, usize> = HashMap::new();
+        let untyped_lines: HashSet<(i64, i64)> = untyped_here.iter().map(|s| line_key(s)).collect();
+        let mut sites_per_line: HashMap<(i64, i64), usize> = HashMap::new();
         for site in untyped_here {
-            *sites_per_line.entry(int(site, "line")).or_default() += 1;
+            *sites_per_line.entry(line_key(site)).or_default() += 1;
         }
-        let phrase_by_line: HashMap<i64, &str> = untyped_here
+        let phrase_by_line: HashMap<(i64, i64), &str> = untyped_here
             .iter()
-            .filter(|s| !text(s, "phrase").is_empty() && sites_per_line[&int(s, "line")] == 1)
-            .map(|s| (int(s, "line"), text(s, "phrase")))
+            .filter(|s| !text(s, "phrase").is_empty() && sites_per_line[&line_key(s)] == 1)
+            .map(|s| (line_key(s), text(s, "phrase")))
             .collect();
 
         if !lines.is_empty() {
@@ -438,7 +443,7 @@ pub(crate) fn format_explain(sources: &Sources, root: &Path) -> String {
         lines.push(relative_posix(name, root));
         for site in sorted_by_position(calls.get(name)) {
             let mut status = explain_status(site, &typed_by_line, &untyped_lines);
-            if let Some(phrase) = phrase_by_line.get(&int(site, "line")) {
+            if let Some(phrase) = phrase_by_line.get(&line_key(site)) {
                 if status.starts_with("COUNTED, untracked") {
                     status = format!("{status}  [{phrase}]");
                 }
@@ -504,22 +509,22 @@ pub(crate) fn explain_json(sources: &Sources, root: &Path) -> Value {
     let mut files = Vec::new();
     for name in files_in(sources) {
         let name = name.as_str();
-        let typed_by_line: HashMap<i64, &Value> = typed
+        let typed_by_line: HashMap<(i64, i64), &Value> = typed
             .get(name)
             .into_iter()
             .flatten()
-            .map(|site| (int(site, "line"), *site))
+            .map(|site| (line_key(site), *site))
             .collect();
-        let untyped_lines: HashSet<i64> = untyped
+        let untyped_lines: HashSet<(i64, i64)> = untyped
             .get(name)
             .into_iter()
             .flatten()
-            .map(|s| int(s, "line"))
+            .map(|s| line_key(s))
             .collect();
         let call_entries: Vec<Value> = sorted_by_position(calls.get(name))
             .into_iter()
             .map(|site| {
-                let line = int(site, "line");
+                let line = line_key(site);
                 let (counted, is_typed, schema) = if let Some(found) = typed_by_line.get(&line) {
                     (true, true, found["schema"].clone())
                 } else if untyped_lines.contains(&line) {
@@ -791,6 +796,40 @@ a.py
   7:5          pd.read_csv      NOT COUNTED \u{2014} a bare return
   9:5          pd.read_json     COUNTED, untracked -- no static column info  [quiet-amber]";
         assert_eq!(expected, report);
+    }
+
+    #[test]
+    fn test_should_not_match_a_site_to_one_on_the_same_line_of_another_cell() {
+        // arrange: line 2 of cell 2 is untracked, line 2 of cell 3 is typed
+        let calls = vec![
+            json!({"file": "/p/n.ipynb", "cell": 2, "line": 2, "col": 10, "label": "pd.read_csv", "context": "assignment"}),
+            json!({"file": "/p/n.ipynb", "cell": 3, "line": 2, "col": 7, "label": "pd.DataFrame", "context": "assignment"}),
+        ];
+        let typed = vec![json!({"file": "/p/n.ipynb", "cell": 3, "line": 2, "schema": "S"})];
+        let untyped =
+            vec![json!({"file": "/p/n.ipynb", "cell": 2, "line": 2, "col": 1, "var": "claims"})];
+        let sources = Sources {
+            all_dataframe_calls: &calls,
+            typed_sites: &typed,
+            untyped_sites: &untyped,
+            ..Sources::default()
+        };
+
+        // act
+        let report = format_explain(&sources, Path::new("/p"));
+
+        // assert
+        let row = |prefix: &str| report.lines().find(|l| l.trim_start().starts_with(prefix));
+        assert!(
+            row("cell 2:2:10").unwrap().contains("COUNTED, untracked"),
+            "{report}"
+        );
+        assert!(
+            row("cell 3:2:7")
+                .unwrap()
+                .contains("COUNTED, typed (schema: S)"),
+            "{report}"
+        );
     }
 
     #[test]

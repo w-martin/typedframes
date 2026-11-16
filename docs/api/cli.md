@@ -37,8 +37,9 @@ warnings on, text output, no coverage gate.
   references: the file, the project-local modules its `import` statements reach
   (followed transitively, up to three hops), and any installed package that closure
   calls in a DataFrame-shaped way. The project root is found by walking up from the file
-  to the nearest `pyproject.toml`; with no `pyproject.toml` anywhere above it, there is
-  nothing to resolve against and the file is checked in isolation. Unrelated project
+  to the nearest `pyproject.toml`; with no `pyproject.toml` anywhere above it, imports
+  resolve from the directory Python would import the file from (its own, or the one
+  above its package's `__init__.py` files), as they do in a directory check. Unrelated project
   files are never opened, which is what keeps a single-file check proportional to the
   file rather than to the project.
 
@@ -234,7 +235,9 @@ analysis.ipynb:cell 10:1:1: error[unknown-column] Column 'revenue' does not exis
 ```
 
 `cell N` counts every cell in the notebook, markdown and raw cells included, so it is a
-cell's position in the file rather than "the Nth code cell". Under `--output-format
+cell's position in the file rather than "the Nth code cell". It is also not Jupyter's `In [n]`, which
+is an execution count, nor the code-cell ordinal: a notebook that opens with a markdown cell and
+an imports cell has its first data cell at `cell 3`. Under `--output-format
 github`, `line`/`col` stay cell-relative and the cell number moves into the annotation
 title, since GitHub annotations address raw file lines and an `.ipynb` is JSON.
 

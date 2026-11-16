@@ -2,7 +2,7 @@
 //! suggestions and reports, the project contexts they share, and the process-wide
 //! deserialised-index cache.
 
-use crate::config::{find_project_root, find_project_root_opt, load_linter_config, LinterConfig};
+use crate::config::{find_project_root_opt, import_root, load_linter_config, LinterConfig};
 use crate::errors::{
     CheckFileResult, FileStats, LintError, UntypedSiteUsage, CODE_UNTRACKED_DATAFRAME,
 };
@@ -306,12 +306,13 @@ pub(crate) struct ProjectContext {
 // The root and settings of the project each file belongs to, found once per directory
 // rather than once per file: a batch of files shares a handful of directories, and reading
 // and parsing `pyproject.toml` for every one of them is pure repetition. A directory with no
-// `pyproject.toml` above it has no shared root -- each file there is its own root, as
-// `find_project_root` falls back to -- so only the fact that none exists is remembered.
+// `pyproject.toml` above it has no configuration; its files resolve imports from their
+// `package_root`, and only the fact that no root exists is remembered.
 #[derive(Default)]
 pub(crate) struct ProjectContexts {
     by_dir: RwLock<HashMap<PathBuf, Option<Arc<ProjectContext>>>>,
     by_root: RwLock<HashMap<PathBuf, Arc<ProjectContext>>>,
+    roots: crate::config::PackageRoots,
 }
 
 impl ProjectContexts {
@@ -325,10 +326,9 @@ impl ProjectContexts {
             }
             found
         });
-        // A file is its own root here, and a file holds no `pyproject.toml`.
         found.unwrap_or_else(|| {
             Arc::new(ProjectContext {
-                root: path.to_path_buf(),
+                root: self.roots.of_file(path),
                 config: LinterConfig::EMPTY,
             })
         })
@@ -452,7 +452,7 @@ pub(crate) fn check_notebook_impl(
 ) -> Result<String, CheckError> {
     let file_path = file_path.to_string();
     let path = Path::new(&file_path);
-    let project_root = find_project_root(path);
+    let project_root = import_root(path);
     let config = load_linter_config(&project_root);
 
     if !config.enabled.unwrap_or(true) {
@@ -536,21 +536,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_give_each_file_its_own_root_when_no_project_file_is_above_it() {
-        // arrange: with no `pyproject.toml` the file's own path is its root, so one file's
-        // answer must never be handed to its neighbours.
+    fn test_should_root_a_file_with_no_project_file_above_it_where_python_imports_it_from() {
+        // arrange: a flat script and a module inside a package, no `pyproject.toml`
         let dir = tempfile::tempdir().unwrap();
-        let (a, b) = (dir.path().join("a.py"), dir.path().join("b.py"));
-        fs::write(&a, "x = 1\n").unwrap();
-        fs::write(&b, "y = 2\n").unwrap();
+        let script = dir.path().join("a.py");
+        let module = dir.path().join("pkg/sub/b.py");
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&script, "x = 1\n").unwrap();
+        fs::write(&module, "y = 2\n").unwrap();
+        fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+        fs::write(dir.path().join("pkg/sub/__init__.py"), "").unwrap();
         let contexts = ProjectContexts::default();
 
         // act
-        let (first, second) = (contexts.of(&a), contexts.of(&b));
+        let (first, second) = (contexts.of(&script), contexts.of(&module));
 
-        // assert
-        assert_eq!(first.root, a);
-        assert_eq!(second.root, b);
+        // assert: both from the directory above the package
+        assert_eq!(first.root, dir.path());
+        assert_eq!(second.root, dir.path());
     }
 
     #[test]

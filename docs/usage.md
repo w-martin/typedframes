@@ -101,19 +101,26 @@ import config
 
 a = pd.read_csv("a.csv", usecols=metric_cols("m"))  # {m0, m1, order_id, amount}
 b = pd.read_csv("b.csv", usecols=config.BASE)  # {order_id, amount}
-c = pd.read_csv("c.csv", usecols=config.Cols.KEEP)  # not followed: see below
+c = pd.read_csv("c.csv", usecols=config.Cols.KEEP)  # {order_id}
 ```
 
 A function is evaluated only if its body is plain assignments and one `return` (no loops,
 branches, `global`, decorators or `*args`), every call in it evaluates, and the arguments
 are themselves evaluable. A class attribute (`Cols.KEEP`) is read when the class has at
-most one base class, also defined in the same file, no decorator or `metaclass`, and the
-attribute is assigned once and never set, deleted or mutated. Across files, a module's
-constants and functions are read as above; `from config import X`, `import config` and
-relative imports are resolved, but `config.Cols.KEEP` (a class in another file) is not. Relative imports
+most one base class, also defined in the same file, no decorator other than
+`dataclasses.dataclass` (without `slots=True`), no `metaclass`, and the attribute is assigned
+once and never set, deleted or mutated. String enum members (`Col.HR`, `Col.HR.value`) are read
+the same way, and `Col.NOPE` is an error when the enum has no such member. An instance of a
+`frozen=True` dataclass built with no arguments (`N = Names()`) gives its field defaults
+(`N.dow`), unless the class defines `__init__`, `__post_init__`, `__new__` or attribute hooks.
+Across files, a module's constants, functions, classes and enums are read as above:
+`from config import X`, `import config [as c]`, `from pkg import config`, relative imports and
+names a package's `__init__.py` re-exports are all resolved. Relative imports
 also bring in schemas, functions and helper summaries from the file they name, as absolute ones do.
 A function from another file can only read that file's own constants and functions, never
-the importing file's names.
+the importing file's names. A list, dict or set that another checked file may change
+(`COLS.append("b")` after importing it, or `cfg.COLS = ...`) is not read across files, and
+nor is any constant another file assigns through the module (`cfg.NAME = "b"`).
 
 **Never evaluated:** anything that depends on IO, randomness, time, the environment or
 runtime values (`open`, `json.load`, `os.environ`, `sys.argv`, `random`, `datetime.now`,
@@ -131,8 +138,7 @@ know, returning it, or storing it in a container or attribute. Reading it is fin
 DataFrame method (`select`, `drop`, `rename`, `merge`, `groupby`, ...) or to `pd.` /
 `pl.` functions. A string, number or tuple of them can't be changed at all, so it can be
 used any way. A name is also not followed if the file calls `globals()`, `vars()`,
-`exec`, `eval` or `locals()`, or has `from module import *`. Constants defined in other
-files are not followed.
+`exec`, `eval` or `locals()`, or has `from module import *`.
 
 **Jupyter notebooks are checked too.** `typedframes check src/` picks up `.ipynb` files
 alongside `.py` files with no flag and no conversion step, reporting each diagnostic as
@@ -205,6 +211,88 @@ print(slim["region"])  # ✗ unknown-column — was dropped
 enriched = df.assign(domain=df["email"].str.split("@").str[1])
 print(enriched["domain"])  # ✓ OK — newly added
 ```
+
+### Merges, concatenation and derived names
+
+`a.merge(b, on="k")` follows pandas' suffix rules: a non-key column both frames carry comes out as
+`<c>_x` / `<c>_y` (or the pair given as `suffixes=`), so a read of the bare name, or of a name that
+only an unused `suffixes=` would have produced, is an `unknown-column`. With no `on=` every shared
+column is the key. `pd.concat([a, b, c])` unions every operand; when one of them is a frame the
+checker cannot see, the result is no longer followed (rather than being treated as unresolved).
+
+A frame derived under a new name keeps its columns the way a reassignment does: `b = a.copy()`,
+`a[["x"]].copy()`, `a.astype(int)`, `a.drop_duplicates("x")`, `a.groupby("k").tail(1)`,
+`a.loc[mask]`, `a[a["x"] > 0].copy()`, `a.iloc[:2]`, `a.set_index("k")` and
+`a.sort_values("k").reset_index(drop=True)`. `df.groupby(k).agg(out=("col", "fn"))`,
+`df.groupby(k)["v"].agg(["mean", "sum"])`, `df.groupby(k)["v"].sum().to_frame()` and
+`df.pivot_table(index=…, values=…)` give a result whose columns are the outputs, and the group
+keys or pivot index are the index until `reset_index()` (`reset_index(name="n")` names a per-group
+Series).
+
+Frames held in a dict literal and read back only through literal keys (`frames["train"]["x"]`) are
+followed like named frames; any other use of the dict (`.items()`, a computed key, a store) leaves
+them alone. `a, b = load()` takes the columns of each frame a function of the same file returns as
+a tuple.
+
+`df.query("...")` and `df.eval("...")` strings are read as column names: a bare name the frame
+lacks is an `unknown-column`. `@locals`, attributes, function names and string literals are skipped;
+`eval("c = a + b")` adds `c` to the result.
+
+Column names passed as arguments are checked on a frame with a known column list: a list selection
+anywhere (`print(df[["a", "b"]])`), the sources of a named aggregation, the arguments of
+`pivot_table`/`pivot`/`melt`, and the columns an `assign(...)`, `pipe(...)` or row-wise `apply(...,
+axis=1)` lambda reads off its parameter.
+
+### Frames known only by name
+
+A frame with no column list can still be checked for what it certainly *lost*. After
+`items.drop(columns=["created_at"], inplace=True)`, `items = items.rename(columns={"old": "new"})` or
+`both = pd.get_dummies(df, columns=["category"])`, a read of `created_at`, `old` or `category` on that
+frame is an `unknown-column` error, whatever else the frame holds; an assignment, `assign` or `insert`
+of the name brings it back. Only edits that run on every path count, and a frame that is rebuilt or
+handed to a function the checker cannot see into starts over. See the
+[method matrix](method-matrix.md#frames-known-only-by-name-open-frames).
+
+A frame stored on `self` (`self.df = pd.read_csv(...)`, or a frame parameter, constructor or chain
+on another such attribute) is checked like a local inside each method. At a method's entry its
+columns are unknown, since another method or the caller may have changed them, so only edits made
+earlier in the same method count; a call that can reach `self` (`self.refresh()`, `helper(self)`)
+starts it over. `suggest` never narrows a load stored on `self`, and withholds a load whose frame
+later reads a name that a rename or drop on it took away.
+
+A read of a column on such a frame ahead of the only statement that gives the frame that column
+(`df["blend"] = df["prior"] * 2` and then `df["prior"] = ...`) raises the warning
+`column-read-before-assignment`. It cannot be an error, since the data may already carry the column;
+a statement that reads the column it writes (`df["x"] = df["x"].fillna(0)`) is taken as proof it did.
+The same warning covers a column read before `df = df.merge(right, on=...)` (or a polars `join`)
+brings it in as a non-key column of a known `right`: had `df` held it already, the merge would have
+suffixed both copies. A `suffixes=` argument turns this off. It also covers a column read before
+`df = df.with_columns(...alias("c"))` or `df = df.assign(c=...)` gives it, unless that call reads `c`.
+
+An edit made inside a loop or branch (`df = df.drop(columns=["c"])`) holds for the rest of that
+block; after it, only what every path removed is certain. `x.drop(columns=[...])` and
+`x.rename(columns={...})` mark `x` as a frame whatever produced it, as does a call to a method that
+the class of `self.<attr>` (a `Protocol` included) declares to return a bare frame.
+
+A column read once on such a frame and named nowhere else in the file (string literals, including
+the words of SQL text, identifiers, keyword names, and constants and enums of imported project
+modules) raises the warning `likely-column-typo` when it is one edit (two, for names of five or
+more characters) from exactly one name that is mentioned. Names that differ only in a short
+prefix or suffix word (`o_precip`/`d_precip`), or two names each read once and each other's
+nearest match, are left alone.
+
+A function that returns a chain of literal edits of its first parameter (`return frame.assign(p=1)`,
+`frame.with_columns(p_final=…)`, `frame.drop(columns=[…])`) gives its caller `frame`'s columns with
+those edits applied, whatever the return annotation says; a helper whose result cannot be derived
+leaves the caller's frame unresolved (reported once, as a warning, when a column is read from it).
+
+Two coverage notes. The summary counts a frame where it is created; frames derived from a tracked
+one that the checker later stopped following are reported beside it (`3 derived frames lost their
+columns later`) and listed by `--coverage-detail=explain`. A `ClassVar`-annotated column constant
+still gets the `assumed-constant` note: `ClassVar` does not stop a subclass rebinding it, and `Final`
+does while satisfying ruff's `RUF012`, so `typedframes suggest` rewrites `ClassVar[T]` to `Final[T]`
+and removes the `ClassVar` import when nothing else uses it. SQL text is not parsed for column
+reads; a `cursor.fetchall()` frame has columns when it is built with a literal `schema=[…]`.
 
 ### Supported column-set transforms
 
@@ -367,6 +455,11 @@ def contact_label(customers: Annotated[pd.DataFrame, CustomerSchema]):
 
 ### Transitive through delegate calls
 
+The first parameter's contract comes from the whole body only when every statement in
+it runs on each call (simple statements, a `return` last): a read behind an `if`, a loop,
+a conditional expression or `and`/`or` (`if "a" in df.columns: return df["a"]`) is no
+requirement.
+
 If a function only forwards its own parameter to other functions, the checker follows
 the chain and unions their requirements — even when no single function in the chain
 touches every required column itself:
@@ -398,6 +491,46 @@ def transform(df):
 `{a, b, c}`, the union of everything `preprocess`, `enrich`, and `finalize` need, so a
 caller supplying only `{a, b}` is still flagged at the `transform(df)` call site, even
 though `c` is only ever referenced two calls deep, inside `finalize`.
+
+### Every parameter, positional or keyword
+
+Other parameters get a contract from the columns the body reads off them on every path
+before anything could add them: reads after an `if`, loop or early `return`, or after the
+frame is written to, rebound or handed to another function, are not counted. Arguments
+are bound to parameters the way Python binds them, so keywords and later positions are
+checked:
+
+```python
+import pandas as pd
+
+
+def combine(left, right):
+    return left["a"] + right["b"]
+
+
+x = pd.read_csv("x.csv", usecols=["a"])
+y = pd.read_csv("y.csv", usecols=["c"])
+combine(x, right=y)
+```
+
+```
+main.py:10:1: error[missing-column] 'y' passed to combine (main.py:4) as 'right' is
+  missing column(s) {b} — available: {c}, required: {b}
+```
+
+A parameter passed straight on to another helper (`return combine(first, right=second)`)
+takes on that helper's requirement, one level deep, across files too.
+
+A call is checked only when its callee is a single known function: one defined in the
+file, imported with `from module import name`, `module.helper(...)` through a plain
+import, `self.helper(...)` (resolved through the class and its bases; silent if a
+subclass in another file overrides the method, one in the same file overrides it
+with a different requirement, or an instance attribute such as `self.helper = ...`
+shadows it), or a method
+called on a parameter annotated with a `typing.Protocol`, when every class in the project
+defining that method requires the same columns. A name bound to two functions, a call
+with `*args`/`**kwargs`, an argument that doesn't bind, a decorated, `async` or generator
+function, and a frame whose columns are unknown all produce nothing.
 
 ## Ingestion warnings and exploration mode (untracked-dataframe)
 
@@ -466,14 +599,25 @@ Two kinds of origin are recognized but never resolve to a concrete column list:
   is not a frame the checker counts, so it does not change the coverage numbers. A file
   checked on its own cannot follow every import, so check the whole project to resolve them.
 
-These do **not** count as covered, and every column accessed on one — at the origin or at
+These do **not** count as covered, and the first column accessed on one — at the origin or at
 any point downstream (a return, a reassignment, a `merge`/`concat`) — is flagged
-`unverifiable-column` rather than passed through silently. The checker genuinely doesn't
-know whether the column exists, so it says exactly that instead of guessing either way:
+`unverifiable-column` rather than passed through silently. The flag is raised once per frame, not
+once per use, and carries the fix; writing a column into the frame is not a read and raises nothing. The checker genuinely doesn't
+know whether the column exists, so it says exactly that instead of guessing either way. It is a
+*warning*, like `unresolved-schema` (the same situation: recognised, but nothing to check against):
+not knowing is not the same as being wrong, so correct code that calls a helper annotated
+`-> pd.DataFrame` is not reported as an error. `--strict` still fails the run on one (as it does
+on an `unresolved-schema`), and the coverage gate (`--coverage-fail-under`) measures how many such
+frames there are. The message names
+the line the frame came from:
 
 ```
-src/pipeline.py:8:7: error[unverifiable-column] Column 'conv_rate' cannot be verified: inferred column set {} (defined at line 5) has no concrete column list
+src/pipeline.py:8:7: warning[unverifiable-column] Column 'conv_rate' cannot be verified: the frame from line 5 has no known column list (the checker could not derive it there); fix: give the frame its columns where it is created (`usecols=`/`columns=`, or a schema annotation; `typedframes suggest` proposes it) and every column use on it is checked. Reported once per frame.
 ```
+
+A frame that merely *loses* tracking is not unresolved. `pd.concat([a, b])` with a frame the checker
+cannot see, a reshaping call it does not model: the name stops being checked, and
+`--coverage-detail=explain` lists the statement under `tracking ended` as `untracked`.
 
 Recovering coverage means giving the origin real column information: annotating the
 variable (`df: Annotated[pd.DataFrame, MySchema] = ...`), giving the library function a
@@ -552,7 +696,8 @@ is no walking up the ancestor chain, matching how `exclude` treats that path as 
 project root. Checking a single file (`typedframes check src/pipeline.py`) therefore
 picks up no coverage config file; use `--coverage-fail-under` there. (Single-file
 *indexing* is separate and does walk up to the nearest `pyproject.toml`, since it needs
-a root to resolve the file's imports against.)
+a root to resolve the file's imports against; with none, imports resolve from the
+directory Python would import the file from: its own, or the one above its package.)
 
 ### A worked example
 
@@ -697,13 +842,17 @@ typedframes check src/ --coverage-detail=explain
 src/train.py
   12:5   pd.read_csv    COUNTED, typed (schema: inferred column set {order_id, amount} (defined at line 12))
   30:9   pd.DataFrame   COUNTED, untracked -- no static column info
-  41:13  pd.read_csv    NOT COUNTED — a `return` value, not assigned to a variable first
+  41:13  pd.DataFrame   NOT COUNTED — a `return` value, not assigned to a variable first
 ```
 
-The checker only recognizes a load call as an origin when it is the direct value of a
-plain `x = ...` / `x: T = ...` assignment — a bare `return`, a call argument
-(`train(pd.DataFrame(...))`), or a list/dict element (`frames.append(pd.read_csv(...))`)
-is invisible to `dataframes_total` today, not just untyped. `explain` is what surfaces
+The checker recognizes a load call as an origin when it is the direct value of a plain
+`x = ...` / `x: T = ...` assignment. A `return pd.read_csv(...)` / `return pl.read_parquet(...)`
+is treated as if written `result = pd.read_csv(...)`; `return result`: it is counted, gets the
+`untracked-dataframe` warning when its columns are unknown, and `suggest` considers it (a returned
+frame is usually withheld, since callers can read any column). Not lifted: `DataFrame(...)`
+constructors, functions with more than one `return`, and functions whose return annotation already
+names a schema. Those, a call argument (`train(pd.DataFrame(...))`) and a list/dict element
+(`frames.append(pd.read_csv(...))`) are not counted in `dataframes_total` at all. `explain` is what surfaces
 that gap so you can see exactly which lines it applies to, rather than guessing from the
 ratio alone.
 
@@ -834,6 +983,18 @@ Not suggested:
 1 suggestion (0 safe, 1 review), 2 withheld, in 1 file. Dry run: no files were changed.
 ```
 
+A reason lists each use that blocks narrowing, up to four, then `, and N more`. A frame that is
+written to column by column (`items["a"] = ...`, `items["b"] = ...`) is one site, withheld once under
+the reason of the statement that made it.
+
+When a fix adds `from typing import Final`, it goes where an import sorter (ruff's `I001`) puts it:
+among the standard-library imports, ordered by module, or in a group of its own ahead of the
+third-party imports when the file has no standard-library import. Before writing a file, the re-check
+confirms that an ordered import block is still ordered, and withholds the file's suggestions if not.
+A numeric class constant read through `self` (a smoothing factor, a threshold) raises no
+`assumed-constant` notice and gets no `Final` suggestion: a subclass rebinding it changes no column
+name, which is what the notice is about.
+
 Each site has a two-word name (`quiet-amber`). It is derived from the file's path (relative to the
 project root), the site's own statement and a count of identical statements earlier in the same file,
 so it doesn't change when other code moves around it or when comments and spacing change. It does
@@ -854,6 +1015,7 @@ nothing).
 ```shell
 typedframes suggest src/ --apply
 typedframes suggest src/ --interactive
+typedframes suggest notebooks/ src/          # several paths, each on its own
 ```
 
 `--only NAME` (repeatable) limits any of these to the named site. With `--apply` it applies that
@@ -880,7 +1042,7 @@ Edits are written only if they are safe to undo and verified first:
 the frame is loaded. On a plain `read_csv` or `read_parquet` call that is a `usecols=` (pandas
 `read_csv`) or `columns=` keyword, so the other columns are never read at all; this is only done
 when the call's other options are harmless ones such as `sep` or `encoding` (a `parse_dates`, `names`
-or `dtype` option could name a column outside the list). Any other load gets a column selection on its
+or `dtype` option could name a column outside the list; a pandas `dtype=` mapping never defines a frame's columns). Any other load gets a column selection on its
 own line right after it: `df = df[["a", "b"]]` for pandas, `df = df.select("a", "b")` for polars. Either
 way the checker then knows the frame's exact columns, so later typos are caught. A column the scope
 assigns itself (`df["total"] = ...`) is not listed, since it isn't in the source data.
@@ -924,10 +1086,24 @@ column, so a site is **withheld** (and listed under `Not suggested:` with the re
   imported module, a method of another object, or a name the file never defines or imports),
   returned (see above), stored in an attribute or
   container, iterated over, or used through anything other than `df["col"]` / `df[["a", "b"]]`,
-  including methods like `.groupby("region")`, `.drop(columns=...)` or `.head()`, which can
+  including methods like `.groupby(some_variable)` or `.drop(labels)`, which can
   use columns by string argument or use every column (`len(df)`, `.index` and `.empty` are
-  fine, provided `len` is really the builtin);
-- `.columns`, `.shape`, `.dtypes` or `.size` is read, since narrowing changes their value;
+  fine, provided `len` is really the builtin). A new frame made with a method that takes no
+  column argument (`df.copy()`, `df.head(5)`, `df.sort_index()`) or by
+  `assign`/`with_columns` with readable output names is followed: its column reads count as
+  reads of the original. So are `df.groupby("k")["col"]`, `df.groupby("k").agg(out=("col", "fn"))`
+  (the keys and the aggregated columns are read), `df.rename(columns={"old": "new"})` (`old` is read;
+  `new` is the frame's own), `df.drop(columns=[...])`, and the row operations
+  `drop_duplicates(subset=…)`, `dropna(subset=…)`, `sort_values(…)` and polars
+  `unique`/`drop_nulls`/`sort` (their key columns are read), all with literal arguments. Without a
+  literal `subset=`, `drop_duplicates()`, `duplicated()`, `dropna()` and polars `unique()`/
+  `drop_nulls()` compare every column, so narrowing would change which rows survive: the site is
+  withheld. A bare
+  `df.groupby("k").sum()` reads every column and still withholds the site;
+- `.columns`, `.shape`, `.dtypes` or `.size` feeds other code (`n = df.shape[1]`), since narrowing
+  changes their value. Printed or shown on their own (`print(df.shape)`, a bare `df.head()`) they
+  only ask for review, and the suggestion says the output will show the selected columns;
+- the frame is used inside a test function (`test_*`), which should see the whole frame;
 - a nested function, class, lambda or comprehension also mentions the frame;
 - the name, or a name it was assigned to, is declared `global` or `nonlocal`, or
   `eval`/`exec`/`locals`/`globals`/`vars` is called after the load;

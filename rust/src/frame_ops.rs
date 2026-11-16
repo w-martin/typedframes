@@ -396,6 +396,59 @@ pub(crate) fn summarize_helper(func_def: &ast::StmtFunctionDef) -> Option<Helper
     })
 }
 
+// The column edits a returned chain `param.assign(..).drop(columns=..)` makes to a copy of
+// its parameter; `None` as soon as a link is not one the checker follows. A link whose
+// meaning depends on the library (`drop("x")` is a row label in pandas) is an unknown edit.
+fn returned_chain_edits(expr: &Expr, param: &str) -> Option<Vec<ColumnEdit>> {
+    match expr {
+        Expr::Name(name) => (name.id.as_str() == param).then(Vec::new),
+        Expr::Call(call) => {
+            let Expr::Attribute(attr) = &*call.func else {
+                return None;
+            };
+            let mut edits = returned_chain_edits(&attr.value, param)?;
+            let method = attr.attr.as_str();
+            if keyword(call, "inplace").is_some() {
+                return None;
+            }
+            let edit = match method {
+                "assign" => Some(
+                    ast_extract::assign_output_names(call)
+                        .map_or(ColumnEdit::Unknown, ColumnEdit::Add),
+                ),
+                "with_columns" => Some(
+                    ast_extract::with_columns_output_names(call)
+                        .map_or(ColumnEdit::Unknown, ColumnEdit::Add),
+                ),
+                "drop" if keyword(call, "columns").is_some() || keyword(call, "axis").is_some() => {
+                    Some(
+                        ast_extract::extract_drop_columns(call, false)
+                            .map_or(ColumnEdit::Unknown, ColumnEdit::Remove),
+                    )
+                }
+                "rename" if keyword(call, "columns").is_some() => Some(
+                    ast_extract::extract_rename_mapping(call)
+                        .map_or(ColumnEdit::Unknown, ColumnEdit::Rename),
+                ),
+                "drop" | "rename" => Some(ColumnEdit::Unknown),
+                "select" => Some(
+                    ast_extract::extract_select_args_columns(call)
+                        .map_or(ColumnEdit::Unknown, ColumnEdit::Replace),
+                ),
+                _ if ROW_PASSTHROUGH_METHODS.contains(&method)
+                    || SCHEMA_PRESERVING_METHODS.contains(&method) =>
+                {
+                    None
+                }
+                _ => return None,
+            };
+            edits.extend(edit);
+            Some(edits)
+        }
+        _ => None,
+    }
+}
+
 fn preserves_param(expr: &Expr, param: &str) -> bool {
     classify_rhs(expr, &|name| name == param)
         .is_some_and(|derived| derived.root == param && derived.kind == Kind::Preserves)
@@ -632,7 +685,19 @@ impl<'b> Visitor<'b> for PassthroughScan<'_> {
                 if let Some(callee) = value.and_then(|v| self.handed_on(v)) {
                     self.record_delegate(callee, true);
                 } else if !value.is_some_and(|value| preserves_param(value, self.param)) {
-                    self.ok = false;
+                    match value.and_then(|value| returned_chain_edits(value, self.param)) {
+                        Some(edits) => {
+                            for edit in edits {
+                                // On a new object, so the caller's own frame is untouched.
+                                self.edits.push(if self.depth > 0 {
+                                    ColumnEdit::Unknown
+                                } else {
+                                    edit
+                                });
+                            }
+                        }
+                        None => self.ok = false,
+                    }
                 }
             }
             Stmt::Assign(assign) => {
@@ -845,6 +910,54 @@ pub(crate) fn column_write_target(target: &Expr) -> Option<(String, Vec<String>)
     }
 }
 
+/// The frame `frame[key] = ..` / `frame.loc[rows, key] = ..` writes a column of under a name only
+/// the running program knows (an f-string, a loop variable, a call). A boolean row mask is not
+/// told apart from a variable key, so this over-approximates: the frame is merely left open.
+pub(crate) fn dynamic_column_write_receiver(target: &Expr) -> Option<(String, &Expr)> {
+    let Expr::Subscript(subscript) = target else {
+        return None;
+    };
+    let is_computed = |expr: &Expr| {
+        matches!(
+            expr,
+            Expr::FString(_) | Expr::Name(_) | Expr::Call(_) | Expr::BinOp(_) | Expr::Subscript(_)
+        )
+    };
+    match &*subscript.value {
+        Expr::Name(recv) => {
+            is_computed(&subscript.slice).then(|| (recv.id.to_string(), &*subscript.slice))
+        }
+        Expr::Attribute(indexer) if indexer.attr.as_str() == "loc" => {
+            let (Expr::Name(recv), Expr::Tuple(indexers)) = (&*indexer.value, &*subscript.slice)
+            else {
+                return None;
+            };
+            let [_, columns] = indexers.elts.as_slice() else {
+                return None;
+            };
+            is_computed(columns).then(|| (recv.id.to_string(), columns))
+        }
+        _ => None,
+    }
+}
+
+/// The frame `frame.loc[row] = ..` / `frame.at[row, col] = ..` writes a row of: values that may name
+/// columns the frame does not have yet.
+pub(crate) fn row_insert_receiver(target: &Expr) -> Option<String> {
+    let Expr::Subscript(subscript) = target else {
+        return None;
+    };
+    let Expr::Attribute(indexer) = &*subscript.value else {
+        return None;
+    };
+    let Expr::Name(recv) = &*indexer.value else {
+        return None;
+    };
+    let single_row = !matches!(&*subscript.slice, Expr::Tuple(_));
+    ((indexer.attr.as_str() == "loc" && single_row) || indexer.attr.as_str() == "at")
+        .then(|| recv.id.to_string())
+}
+
 pub(crate) fn keyword<'c>(call: &'c ast::ExprCall, name: &str) -> Option<&'c ast::Keyword> {
     call.arguments
         .keywords
@@ -901,6 +1014,9 @@ pub(crate) fn inplace_drop_columns(call: &ast::ExprCall) -> InplaceColumns<Vec<S
         ast_extract::extract_string_list_or_single(expr)
             .map_or(InplaceColumns::Unknown, InplaceColumns::Edit)
     };
+    if keyword(call, "level").is_some() {
+        return InplaceColumns::Unknown;
+    }
     if let Some(columns) = keyword(call, "columns") {
         return from(&columns.value);
     }
@@ -939,6 +1055,142 @@ pub(crate) fn inplace_rename_mapping(
             .map_or(InplaceColumns::Unknown, from),
         Axis::Dynamic => InplaceColumns::Unknown,
     }
+}
+
+/// The columns of `left.merge(right, ...)` under pandas' suffix rules: a column both
+/// sides carry that is not a shared join key comes out as `<c>_x`/`<c>_y` (or the given
+/// `suffixes=`), and the bare name is gone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Merged {
+    Columns(Vec<String>),
+    /// The suffixes cannot be read, so which names the overlap becomes is unknown.
+    Unknown,
+}
+
+enum JoinKeys {
+    Known(Vec<String>),
+    Unknown,
+}
+
+fn shared_join_keys(call: &ast::ExprCall, common: &[&String]) -> JoinKeys {
+    let strings = |name: &str| {
+        keyword(call, name).and_then(|k| ast_extract::extract_string_list_or_single(&k.value))
+    };
+    let index_join =
+        keyword(call, "left_index").is_some() || keyword(call, "right_index").is_some();
+    // `merge_asof(.., by=..)` / `merge_ordered(.., left_by=..)`: the group keys are join keys too.
+    let by = |keys: Vec<String>| match strings("by") {
+        Some(by) => [keys, by].concat(),
+        None if keyword(call, "by").is_some() => Vec::new(),
+        None => keys,
+    };
+    if keyword(call, "on").is_some() {
+        return match (
+            strings("on"),
+            keyword(call, "by").is_some() && strings("by").is_none(),
+        ) {
+            (Some(on), false) => JoinKeys::Known(by(on)),
+            _ => JoinKeys::Unknown,
+        };
+    }
+    if keyword(call, "left_on").is_some() || keyword(call, "right_on").is_some() {
+        return match (strings("left_on"), strings("right_on")) {
+            (Some(l), Some(r)) if l.len() == r.len() => JoinKeys::Known(by(l
+                .into_iter()
+                .zip(r)
+                .filter(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect())),
+            _ if index_join => JoinKeys::Known(Vec::new()),
+            _ => JoinKeys::Unknown,
+        };
+    }
+    let cross = matches!(
+        keyword(call, "how").map(|k| &k.value),
+        Some(Expr::StringLiteral(s)) if s.value.to_str() == "cross"
+    );
+    if index_join || cross {
+        return JoinKeys::Known(Vec::new());
+    }
+    // No keys named: pandas joins on the columns the two frames share.
+    JoinKeys::Known(common.iter().map(|c| (*c).clone()).collect())
+}
+
+/// `Some(None)` is an explicit `None` suffix (the name is left as it is).
+fn merge_suffixes(call: &ast::ExprCall) -> Option<(Option<String>, Option<String>)> {
+    let Some(suffixes) = keyword(call, "suffixes") else {
+        return Some((Some("_x".to_string()), Some("_y".to_string())));
+    };
+    let elements = match &suffixes.value {
+        Expr::Tuple(t) => &t.elts,
+        Expr::List(l) => &l.elts,
+        _ => return None,
+    };
+    let [left, right] = elements.as_slice() else {
+        return None;
+    };
+    let one = |e: &Expr| match e {
+        Expr::StringLiteral(s) => Some(Some(s.value.to_str().to_string())),
+        Expr::NoneLiteral(_) => Some(None),
+        _ => None,
+    };
+    Some((one(left)?, one(right)?))
+}
+
+pub(crate) fn merged_columns(left: &[String], right: &[String], call: &ast::ExprCall) -> Merged {
+    let common: Vec<&String> = left.iter().filter(|c| right.contains(c)).collect();
+    let keys = shared_join_keys(call, &common);
+    let overlap: Vec<&String> = match &keys {
+        JoinKeys::Known(keys) => common
+            .iter()
+            .copied()
+            .filter(|c| !keys.contains(c))
+            .collect(),
+        JoinKeys::Unknown => common.clone(),
+    };
+    if overlap.is_empty() {
+        let mut columns = left.to_vec();
+        columns.extend(right.iter().filter(|c| !left.contains(c)).cloned());
+        return Merged::Columns(columns);
+    }
+    let Some((left_suffix, right_suffix)) = merge_suffixes(call) else {
+        return Merged::Unknown;
+    };
+    let with = |name: &String, suffix: &Option<String>| match suffix {
+        Some(suffix) => format!("{name}{suffix}"),
+        None => name.clone(),
+    };
+    let JoinKeys::Known(keys) = keys else {
+        // Any common column may be a key (bare) or an overlap (suffixed): admit both.
+        let mut columns = left.to_vec();
+        columns.extend(right.iter().filter(|c| !left.contains(c)).cloned());
+        for name in overlap {
+            columns.push(with(name, &left_suffix));
+            columns.push(with(name, &right_suffix));
+        }
+        return Merged::Columns(columns);
+    };
+    let mut columns: Vec<String> = left
+        .iter()
+        .map(|c| {
+            if overlap.contains(&c) {
+                with(c, &left_suffix)
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    for c in right
+        .iter()
+        .filter(|c| !keys.contains(c) || !left.contains(c))
+    {
+        columns.push(if overlap.contains(&c) {
+            with(c, &right_suffix)
+        } else {
+            c.clone()
+        });
+    }
+    Merged::Columns(columns)
 }
 
 #[cfg(test)]
@@ -1349,5 +1601,77 @@ mod tests {
     #[test]
     fn test_should_unwrap_await() {
         assert_eq!(kind("await fetch(df)"), df(Kind::Derived));
+    }
+
+    fn merged(args: &str) -> Merged {
+        let source = format!("x = left.merge(right{args})\n");
+        let module = parse_module(&source).unwrap().into_syntax();
+        let Stmt::Assign(assign) = &module.body[0] else {
+            panic!("expected an assignment");
+        };
+        let Expr::Call(call) = &*assign.value else {
+            panic!("expected a call");
+        };
+        let owned = |cols: &[&str]| cols.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        merged_columns(
+            &owned(&["user_id", "segment", "ctr"]),
+            &owned(&["segment", "ctr", "size"]),
+            call,
+        )
+    }
+
+    fn merged_set(args: &str) -> Vec<String> {
+        match merged(args) {
+            Merged::Columns(mut columns) => {
+                columns.sort();
+                columns
+            }
+            Merged::Unknown => panic!("expected columns"),
+        }
+    }
+
+    #[test]
+    fn test_should_suffix_an_overlapping_non_key_column_by_default() {
+        // arrange / act / assert
+        assert_eq!(
+            merged_set(", on=\"segment\""),
+            ["ctr_x", "ctr_y", "segment", "size", "user_id"]
+        );
+    }
+
+    #[test]
+    fn test_should_apply_explicit_suffixes() {
+        assert_eq!(
+            merged_set(", on=\"segment\", suffixes=(\"\", \"_seg\")"),
+            ["ctr", "ctr_seg", "segment", "size", "user_id"]
+        );
+    }
+
+    #[test]
+    fn test_should_treat_every_common_column_as_a_key_without_on() {
+        assert_eq!(merged_set(""), ["ctr", "segment", "size", "user_id"]);
+    }
+
+    #[test]
+    fn test_should_merge_a_shared_name_given_as_both_left_on_and_right_on() {
+        assert_eq!(
+            merged_set(", left_on=\"segment\", right_on=\"segment\""),
+            ["ctr_x", "ctr_y", "segment", "size", "user_id"]
+        );
+    }
+
+    #[test]
+    fn test_should_admit_both_spellings_when_the_keys_are_not_literal() {
+        let columns = merged_set(", on=KEYS");
+        assert!(columns.contains(&"ctr".to_string()) && columns.contains(&"ctr_x".to_string()));
+    }
+
+    #[test]
+    fn test_should_give_up_on_unreadable_suffixes_only_when_there_is_an_overlap() {
+        assert_eq!(merged(", on=\"segment\", suffixes=SFX"), Merged::Unknown);
+        assert!(matches!(
+            merged(", on=[\"segment\", \"ctr\"], suffixes=SFX"),
+            Merged::Columns(_)
+        ));
     }
 }

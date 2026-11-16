@@ -448,12 +448,27 @@ fn apply_and_report(
 }
 
 /// Runs `suggest`: prints suggestions, or applies them with `--apply` / `--interactive`.
+/// Several paths are run one after another, each on its own.
 pub(crate) fn run_suggest(
     args: &SuggestArgs,
     out: &mut impl Write,
     input: &mut impl BufRead,
 ) -> io::Result<i32> {
-    let path = match resolve_existing_path(&args.path) {
+    let mut worst = 0;
+    for path in &args.path {
+        let code = run_suggest_path(path, args, out, input)?;
+        worst = worst.max(code);
+    }
+    Ok(worst)
+}
+
+fn run_suggest_path(
+    path: &Path,
+    args: &SuggestArgs,
+    out: &mut impl Write,
+    input: &mut impl BufRead,
+) -> io::Result<i32> {
+    let path = match resolve_existing_path(path) {
         Ok(path) => path,
         Err(code) => return Ok(code),
     };

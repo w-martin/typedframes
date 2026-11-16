@@ -100,6 +100,192 @@ pub(crate) const HARMLESS_USES: &[&str] = &["`.index`", "`.empty`", "passed to `
 /// is shown, never whether the program runs, so it asks for review rather than blocking.
 pub(crate) const OUTPUT_USE_PREFIX: &str = "output via ";
 
+/// Attributes and methods that describe or sample the frame without choosing a column.
+/// Printed or shown bare, they only display it, so narrowing changes the output and nothing
+/// else; anywhere else their result may feed code that depends on the full column list.
+const DISPLAY_ONLY_NAMES: &[&str] = &[
+    "shape", "columns", "dtypes", "size", "ndim", "head", "tail", "info", "describe",
+];
+
+/// Methods that return the same columns, as a new frame, when no argument names a column.
+const SAME_COLUMNS_METHODS: &[&str] = &[
+    "copy",
+    "clone",
+    "head",
+    "tail",
+    "sample",
+    "sort_index",
+    "ffill",
+    "bfill",
+    "reverse",
+    "limit",
+    "lazy",
+    "collect",
+];
+
+/// For `.rename(columns={..})` / `.drop(columns=[..])` with literal arguments: the columns the
+/// call names (they must exist in the source) and the names it introduces.
+fn editing_columns_call(call: &ast::ExprCall) -> Option<(Vec<String>, Vec<String>)> {
+    let Expr::Attribute(attr) = &*call.func else {
+        return None;
+    };
+    let only = |allowed: &[&str]| {
+        call.arguments.args.is_empty()
+            && call.arguments.keywords.iter().all(|k| {
+                k.arg
+                    .as_ref()
+                    .is_some_and(|a| allowed.contains(&a.as_str()))
+            })
+    };
+    match attr.attr.as_str() {
+        "rename" if only(&["columns", "errors"]) => {
+            let columns = crate::frame_ops::keyword(call, "columns")?;
+            let Expr::Dict(dict) = &columns.value else {
+                return None;
+            };
+            let mapping = crate::ast_extract::extract_string_dict(dict)?;
+            let mut pairs: Vec<_> = mapping.into_iter().collect();
+            pairs.sort();
+            Some(pairs.into_iter().unzip())
+        }
+        "drop" if only(&["columns", "errors"]) => {
+            let columns = crate::frame_ops::keyword(call, "columns")?;
+            let dropped = crate::ast_extract::extract_string_list_or_single(&columns.value)?;
+            Some((dropped, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
+/// For a polars `.filter(...)` whose predicates are built only from `pl.col("name")`,
+/// `pl.lit(..)` and literals: the columns it reads. `None` for anything else, including
+/// pandas' column-selecting `filter(items=..)`.
+fn polars_filter_reads(call: &ast::ExprCall) -> Option<Vec<String>> {
+    let Expr::Attribute(attr) = &*call.func else {
+        return None;
+    };
+    if attr.attr.as_str() != "filter"
+        || call.arguments.args.is_empty()
+        || !call.arguments.keywords.is_empty()
+    {
+        return None;
+    }
+    fn plain(expr: &Expr) -> bool {
+        match expr {
+            Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::StringLiteral(_) => true,
+            Expr::UnaryOp(u) => plain(&u.operand),
+            Expr::BinOp(b) => plain(&b.left) && plain(&b.right),
+            Expr::BoolOp(b) => b.values.iter().all(plain),
+            Expr::Compare(c) => plain(&c.left) && c.comparators.iter().all(plain),
+            Expr::List(l) => l.elts.iter().all(plain),
+            Expr::Tuple(t) => t.elts.iter().all(plain),
+            Expr::Call(c) => {
+                if let Expr::Attribute(a) = &*c.func {
+                    if matches!(&*a.value, Expr::Name(n) if matches!(n.id.as_str(), "pl" | "polars"))
+                    {
+                        return match a.attr.as_str() {
+                            "col" => {
+                                c.arguments.args.len() == 1
+                                    && c.arguments.keywords.is_empty()
+                                    && crate::ast_extract::extract_string_literal(
+                                        &c.arguments.args[0],
+                                    )
+                                    .is_some_and(|n| !n.starts_with('^') && n != "*")
+                            }
+                            "lit" => c.arguments.args.iter().all(plain),
+                            _ => false,
+                        };
+                    }
+                    return plain(&a.value)
+                        && c.arguments.args.iter().all(plain)
+                        && c.arguments.keywords.iter().all(|k| plain(&k.value));
+                }
+                false
+            }
+            Expr::Attribute(a) => !matches!(&*a.value, Expr::Name(_)) && plain(&a.value),
+            _ => false,
+        }
+    }
+    if !call.arguments.args.iter().all(plain) {
+        return None;
+    }
+    let reads: Vec<String> = call
+        .arguments
+        .args
+        .iter()
+        .flat_map(crate::ast_extract::collect_pl_col_names)
+        .collect();
+    (!reads.is_empty()).then_some(reads)
+}
+
+/// Row operations whose result depends on every column unless a literal `subset=` names the
+/// ones compared: narrowing the load would change which rows survive.
+const ROW_DEPENDENT_METHODS: &[&str] = &[
+    "drop_duplicates",
+    "duplicated",
+    "dropna",
+    "drop_nulls",
+    "unique",
+];
+
+/// For a row operation that names its key columns literally (`drop_duplicates(subset=["id"])`,
+/// `dropna(subset=..)`, `sort_values("a")`, polars `unique`/`drop_nulls`/`sort`): the columns
+/// it reads. The other arguments must be plain flags, so no further column can hide there.
+fn row_op_reads(call: &ast::ExprCall) -> Option<Vec<String>> {
+    let Expr::Attribute(attr) = &*call.func else {
+        return None;
+    };
+    let (key_kw, positional) = match attr.attr.as_str() {
+        "drop_duplicates" | "duplicated" | "unique" | "drop_nulls" => ("subset", true),
+        "dropna" => ("subset", false),
+        "sort_values" | "sort" => ("by", true),
+        _ => return None,
+    };
+    let flag = |e: &Expr| match e {
+        Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::StringLiteral(_) => true,
+        Expr::List(l) => l.elts.iter().all(|x| matches!(x, Expr::BooleanLiteral(_))),
+        _ => false,
+    };
+    let mut keys = None;
+    match &*call.arguments.args {
+        [] => {}
+        [first] if positional => {
+            keys = Some(crate::ast_extract::extract_string_list_or_single(first)?);
+        }
+        _ => return None,
+    }
+    for kw in &call.arguments.keywords {
+        let name = kw.arg.as_ref()?.as_str();
+        if name == key_kw && keys.is_none() {
+            keys = Some(crate::ast_extract::extract_string_list_or_single(
+                &kw.value,
+            )?);
+        } else if name == "inplace" || name == "axis" || !flag(&kw.value) {
+            return None;
+        }
+    }
+    keys.filter(|k| !k.is_empty())
+}
+
+/// For an `.assign(...)`/`.with_columns(...)` call: `Some(Some(names))` when the columns it
+/// adds can be read, `Some(None)` when they can't, `None` for any other call.
+fn adding_columns_call(call: &ast::ExprCall) -> Option<Option<Vec<String>>> {
+    let Expr::Attribute(attr) = &*call.func else {
+        return None;
+    };
+    match attr.attr.as_str() {
+        "assign" => Some(crate::ast_extract::assign_output_names(call)),
+        "with_columns" => Some(crate::ast_extract::with_columns_output_names(call)),
+        _ => None,
+    }
+}
+
 /// Whether a use stops the frame's columns from being narrowed.
 pub(crate) fn blocks_narrowing(other: &OtherUse) -> bool {
     !HARMLESS_USES.contains(&other.description.as_str())
@@ -184,6 +370,7 @@ pub(crate) fn scan_usage_with<'s>(
         tainted: HashSet::from([root.to_string()]),
         depth: 0,
         written: HashSet::new(),
+        gone: HashSet::new(),
         usage: ColumnUsage {
             ever_tainted: HashSet::from([root.to_string()]),
             ..ColumnUsage::default()
@@ -390,6 +577,9 @@ struct UsageScan<'a> {
     // Columns assigned into the frame on every path so far (`df["new"] = ...`): a later
     // read of one is not a read of the source, so it isn't recorded as an access.
     written: HashSet<String>,
+    // Columns a rename or drop on a tracked name took away: a later read of one fails at
+    // runtime, so narrowing the load to it would bless the bug.
+    gone: HashSet<String>,
     usage: ColumnUsage,
     // While walking a tainted-receiver subscript's slice (`df[<slice>]`), the
     // receiver's own bare name is already summarized by the observation just
@@ -514,9 +704,111 @@ impl UsageScan<'_> {
 
     // Whether `value` hands the tracked frame on: a plain alias or a call that returns it,
     // but not a call whose use of the frame is fully known.
+    // `df.drop_duplicates()`, `df.dropna().copy()`: a new frame with the tracked frame's
+    // columns, so reads of it are reads of the tracked frame. Only when no argument could
+    // name a column (a count, a flag, `keep="first"`); `sort_values("a")` or
+    // `drop_duplicates("id")` read columns this scan would lose by treating them as the
+    // same frame.
+    fn derives_same_columns(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Name(n) => self.tainted.contains(n.id.as_str()),
+            Expr::Call(call) => {
+                let Expr::Attribute(attr) = &*call.func else {
+                    return false;
+                };
+                if let Some(added) = adding_columns_call(call) {
+                    return added.is_some() && self.derives_same_columns(&attr.value);
+                }
+                if editing_columns_call(call).is_some()
+                    || polars_filter_reads(call).is_some()
+                    || row_op_reads(call).is_some()
+                {
+                    return self.derives_same_columns(&attr.value);
+                }
+                let literal = |e: &Expr| {
+                    matches!(
+                        e,
+                        Expr::NumberLiteral(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_)
+                    )
+                };
+                SAME_COLUMNS_METHODS.contains(&attr.attr.as_str())
+                    && call.arguments.args.iter().all(literal)
+                    && call.arguments.keywords.iter().all(|k| {
+                        let name = k.arg.as_ref().map(|a| a.as_str());
+                        name != Some("inplace")
+                            && (literal(&k.value)
+                                || matches!(
+                                    (&k.value, name),
+                                    (Expr::StringLiteral(_), Some("how" | "keep"))
+                                ))
+                    })
+                    && self.derives_same_columns(&attr.value)
+            }
+            _ => false,
+        }
+    }
+
+    // The reads and writes of the `assign`/`with_columns` calls in a derivation chain that
+    // `derives_same_columns` accepted: their expressions read columns of the tracked frame
+    // and the names they produce are not source columns.
+    fn record_derivation_effects(&mut self, expr: &Expr) {
+        let Expr::Call(call) = expr else {
+            return;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return;
+        };
+        self.record_derivation_effects(&attr.value);
+        if let Some(reads) = polars_filter_reads(call).or_else(|| row_op_reads(call)) {
+            let at = call.range().start();
+            for column in reads {
+                self.record_column(at, column);
+            }
+        }
+        if let Some((named, introduced)) = editing_columns_call(call) {
+            let at = call.range().start();
+            for column in named {
+                self.record_column(at, column.clone());
+                if !introduced.contains(&column) {
+                    self.gone.insert(column);
+                }
+            }
+            for column in &introduced {
+                self.gone.remove(column);
+            }
+            self.written.extend(introduced);
+        }
+        if let Some(Some(added)) = adding_columns_call(call) {
+            let at = call.range().start();
+            if attr.attr.as_str() == "with_columns" {
+                let reads: Vec<String> = call
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                    .flat_map(crate::ast_extract::collect_pl_col_names)
+                    .collect();
+                for column in reads {
+                    self.record_column(at, column);
+                }
+            } else {
+                for value in call
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                {
+                    self.visit_expr(value);
+                }
+            }
+            self.written.extend(added);
+        }
+    }
+
     fn forwards(&self, value: &Expr) -> bool {
-        expr_forwards_tainted(&self.tainted, value)
-            && !matches!(value, Expr::Call(call) if self.call_is_fully_summarized(call))
+        self.derives_same_columns(value)
+            || expr_forwards_tainted(&self.tainted, value)
+                && !matches!(value, Expr::Call(call) if self.call_is_fully_summarized(call))
     }
 
     fn taint(&mut self, name: &str) {
@@ -550,8 +842,68 @@ impl UsageScan<'_> {
         }
     }
 
+    // `frame.rename(columns={literal}, inplace=True)` on the tracked frame: the old names are
+    // source columns and the new ones are not. Declined once a new name was read earlier,
+    // since that read was of a source column of the same name.
+    fn inplace_literal_rename(&mut self, expr: &Expr) -> bool {
+        let Expr::Call(call) = expr else {
+            return false;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return false;
+        };
+        if attr.attr.as_str() != "rename"
+            || !matches!(&*attr.value, Expr::Name(n) if self.tainted.contains(n.id.as_str()))
+            || !call.arguments.args.is_empty()
+        {
+            return false;
+        }
+        let mut columns = None;
+        for keyword in &call.arguments.keywords {
+            match keyword.arg.as_ref().map(|a| a.as_str()) {
+                Some("inplace") if matches!(&keyword.value, Expr::BooleanLiteral(b) if b.value) => {
+                }
+                Some("columns") => columns = Some(&keyword.value),
+                _ => return false,
+            }
+        }
+        let Some(Expr::Dict(dict)) = columns else {
+            return false;
+        };
+        let Some(mapping) = crate::ast_extract::extract_string_dict(dict) else {
+            return false;
+        };
+        if mapping
+            .values()
+            .any(|new| self.usage.accesses.iter().any(|a| &a.column == new))
+        {
+            return false;
+        }
+        let at = call.range().start();
+        let mut pairs: Vec<_> = mapping.into_iter().collect();
+        pairs.sort();
+        let introduced: HashSet<String> = pairs.iter().map(|(_, new)| new.clone()).collect();
+        for (old, new) in pairs {
+            self.record_column(at, old.clone());
+            if !introduced.contains(&old) {
+                self.gone.insert(old);
+            }
+            self.gone.remove(&new);
+            self.written.insert(new);
+        }
+        true
+    }
+
     fn record_column(&mut self, at: TextSize, column: String) {
         if self.written.contains(&column) {
+            return;
+        }
+        if self.gone.contains(&column) {
+            self.record_other(
+                at,
+                format!("reads '{column}' after a rename or drop removed it"),
+                Consumption::Unknown,
+            );
             return;
         }
         let line = (self.line_of)(at);
@@ -587,6 +939,26 @@ impl UsageScan<'_> {
             line,
             callee,
         });
+    }
+
+    // `df.shape`, `df.columns`, `df.head()` ... (optionally subscripted), when `expr` is
+    // exactly that and nothing more.
+    fn display_only_use(&self, expr: &Expr) -> Option<String> {
+        let mut inner = expr;
+        while let Expr::Subscript(sub) = inner {
+            inner = &sub.value;
+        }
+        let (receiver, name) = match inner {
+            Expr::Attribute(attr) => (&*attr.value, attr.attr.as_str()),
+            Expr::Call(call) => match &*call.func {
+                Expr::Attribute(attr) => (&*attr.value, attr.attr.as_str()),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let receiver = self.tainted_name(receiver)?;
+        (!self.is_suppressed(receiver) && DISPLAY_ONLY_NAMES.contains(&name))
+            .then(|| name.to_string())
     }
 
     fn visit_body(&mut self, body: &[Stmt]) {
@@ -756,7 +1128,18 @@ impl UsageScan<'_> {
                 Some(value) => self.visit_expr(value),
                 None => {}
             },
-            Stmt::Expr(expr_stmt) => self.visit_expr(&expr_stmt.value),
+            Stmt::Expr(expr_stmt) if self.inplace_literal_rename(&expr_stmt.value) => {}
+            Stmt::Expr(expr_stmt) => match self.display_only_use(&expr_stmt.value) {
+                Some(name) => {
+                    let at = expr_stmt.value.range().start();
+                    self.record_other(
+                        at,
+                        format!("{OUTPUT_USE_PREFIX}the bare expression `.{name}`"),
+                        classify_name(&name),
+                    );
+                }
+                None => self.visit_expr(&expr_stmt.value),
+            },
             Stmt::Assign(assign) => {
                 // A bare `out = df` is pure aliasing, already fully captured by
                 // `rebind_name` below -- must NOT also fall through to `visit_expr`'s
@@ -772,8 +1155,10 @@ impl UsageScan<'_> {
                         "stored in an attribute or container",
                         Consumption::Unknown,
                     );
+                } else if self.derives_same_columns(&assign.value) {
+                    self.record_derivation_effects(&assign.value);
                 } else {
-                    self.visit_unless_tainted(&assign.value);
+                    self.visit_expr(&assign.value);
                 }
                 let forwards = self.forwards(&assign.value);
                 for target in &assign.targets {
@@ -789,8 +1174,10 @@ impl UsageScan<'_> {
                             "stored in an attribute or container",
                             Consumption::Unknown,
                         );
+                    } else if self.derives_same_columns(value) {
+                        self.record_derivation_effects(value);
                     } else {
-                        self.visit_unless_tainted(value);
+                        self.visit_expr(value);
                     }
                     let forwards = self.forwards(value);
                     self.visit_store_target(&ann.target, Some(forwards));
@@ -897,9 +1284,95 @@ impl UsageScan<'_> {
         }
     }
 
+    // `frame.groupby("key")` / `frame.groupby(["a", "b"], as_index=False)` on the tracked
+    // frame: the key columns it reads.
+    fn groupby_keys(&self, expr: &Expr) -> Option<Vec<String>> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let Expr::Attribute(attr) = &*call.func else {
+            return None;
+        };
+        let receiver = self.tainted_name(&attr.value)?;
+        if attr.attr.as_str() != "groupby" || self.is_suppressed(receiver) {
+            return None;
+        }
+        let plain = call.arguments.keywords.iter().all(|k| {
+            k.arg.as_ref().is_some_and(|a| {
+                matches!(
+                    a.as_str(),
+                    "as_index" | "sort" | "dropna" | "observed" | "group_keys"
+                ) && matches!(&k.value, Expr::BooleanLiteral(_))
+            })
+        });
+        let [keys] = &*call.arguments.args else {
+            return None;
+        };
+        if !plain {
+            return None;
+        }
+        crate::ast_extract::extract_string_list_or_single(keys)
+    }
+
+    // `frame.groupby(keys).agg(out=("col", "fn"), ..)` or `.agg({"col": "fn"})`: the keys and
+    // the columns aggregated. Any other argument might aggregate every column.
+    fn record_named_aggregation(&mut self, call: &ast::ExprCall) -> bool {
+        let Expr::Attribute(attr) = &*call.func else {
+            return false;
+        };
+        if !matches!(attr.attr.as_str(), "agg" | "aggregate") {
+            return false;
+        }
+        let Some(keys) = self.groupby_keys(&attr.value) else {
+            return false;
+        };
+        let mut sources: Vec<String> = Vec::new();
+        for keyword in &call.arguments.keywords {
+            let Expr::Tuple(pair) = &keyword.value else {
+                return false;
+            };
+            match pair.elts.first() {
+                Some(Expr::StringLiteral(s)) if keyword.arg.is_some() => {
+                    sources.push(s.value.to_str().to_string());
+                }
+                _ => return false,
+            }
+        }
+        match &*call.arguments.args {
+            [] => {}
+            [Expr::Dict(dict)] if call.arguments.keywords.is_empty() => {
+                match crate::ast_extract::extract_string_dict_keys(dict) {
+                    Some(names) => sources.extend(names),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+        if sources.is_empty() {
+            return false;
+        }
+        let at = call.range().start();
+        for column in keys.into_iter().chain(sources) {
+            self.record_column(at, column);
+        }
+        true
+    }
+
     fn visit_expr(&mut self, expr: &Expr) {
         let at = expr.range().start();
         match expr {
+            Expr::Subscript(sub) if self.groupby_keys(&sub.value).is_some() => {
+                // `frame.groupby(keys)["col"]`: the keys and the selected columns.
+                let keys = self.groupby_keys(&sub.value).unwrap_or_default();
+                match crate::ast_extract::extract_string_list_or_single(&sub.slice) {
+                    Some(selected) => {
+                        for column in keys.into_iter().chain(selected) {
+                            self.record_column(at, column);
+                        }
+                    }
+                    None => self.record_other(at, "`.groupby()`", Consumption::Unknown),
+                }
+            }
             Expr::Subscript(sub) => {
                 if let Some(receiver) = self.tainted_name(&sub.value) {
                     match crate::ast_extract::extract_string_list_or_single(&sub.slice) {
@@ -951,11 +1424,48 @@ impl UsageScan<'_> {
                         );
                     }
                 }
+                if self.record_named_aggregation(call) {
+                    return;
+                }
                 match &*call.func {
                     // A method call ON the tainted var: `var.method(...)` -- one
                     // "other use" for the whole call, not also the generic
                     // attribute-access case above.
                     Expr::Attribute(attr) => match self.tainted_name(&attr.value) {
+                        // Polars `frame.select("a", pl.col("b"))`: exactly those columns.
+                        Some(receiver)
+                            if !self.is_suppressed(receiver)
+                                && attr.attr.as_str() == "select"
+                                && call.arguments.keywords.is_empty()
+                                && !call.arguments.args.is_empty()
+                                && call.arguments.args.iter().all(|a| {
+                                    crate::ast_extract::literal_key_columns(a).is_some_and(|cs| {
+                                        cs.iter().all(|c| !c.starts_with('^') && c != "*")
+                                    })
+                                }) =>
+                        {
+                            for arg in &call.arguments.args {
+                                for column in
+                                    crate::ast_extract::literal_key_columns(arg).unwrap_or_default()
+                                {
+                                    self.record_column(at, column);
+                                }
+                            }
+                        }
+                        Some(receiver)
+                            if !self.is_suppressed(receiver)
+                                && ROW_DEPENDENT_METHODS.contains(&attr.attr.as_str())
+                                && row_op_reads(call).is_none() =>
+                        {
+                            let name = attr.attr.as_str();
+                            self.record_other(
+                                at,
+                                format!(
+                                    "`.{name}()` without a literal `subset=` considers every column, so narrowing would change which rows it keeps"
+                                ),
+                                Consumption::All,
+                            );
+                        }
                         Some(receiver) if !self.is_suppressed(receiver) => {
                             let name = attr.attr.as_str();
                             self.record_other(at, format!("`.{name}()`"), classify_name(name));
@@ -985,7 +1495,17 @@ impl UsageScan<'_> {
                 let via = resolved.as_ref().map(|(name, _)| name.as_str());
                 let summaries = resolved.as_ref().map(|(_, all)| all);
                 for (position, arg) in call.arguments.args.iter().enumerate() {
-                    if self.is_tainted(arg) {
+                    let displayed = passed
+                        .starts_with(OUTPUT_USE_PREFIX)
+                        .then(|| self.display_only_use(arg))
+                        .flatten();
+                    if let Some(name) = displayed {
+                        self.record_other(
+                            arg.range().start(),
+                            format!("{passed} of `.{name}`"),
+                            classify_name(&name),
+                        );
+                    } else if self.is_tainted(arg) {
                         let summary =
                             summaries.and_then(|all| all.iter().find(|p| p.position == position));
                         self.passed_argument(at, &passed, via, summary, callee_class);
@@ -1142,6 +1662,77 @@ mod tests {
     }
 
     #[test]
+    fn test_should_withhold_for_row_operations_that_compare_every_column() {
+        for call in [
+            "drop_duplicates()",
+            "dropna()",
+            "duplicated()",
+            "unique()",
+            "drop_nulls()",
+            "drop_duplicates(keep=\"last\")",
+            "copy().drop_duplicates()",
+            "drop_duplicates().copy()",
+        ] {
+            let u = usage(&format!("x = df.{call}\nprint(x[\"a\"])\n"));
+            assert!(
+                u.other_uses.iter().any(|o| blocks_narrowing(o)
+                    && (call.contains("copy") || o.description.contains("considers every column"))),
+                "{call}: {u:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_follow_row_operations_with_a_literal_subset() {
+        for call in [
+            "drop_duplicates(subset=[\"id\"])",
+            "dropna(subset=[\"id\"])",
+            "unique(subset=\"id\")",
+            "drop_nulls(\"id\")",
+        ] {
+            let u = usage(&format!("x = df.{call}\nprint(x[\"a\"])\n"));
+            assert_eq!(cols(&u), vec![("id", false), ("a", false)], "{call}");
+            assert!(u.other_uses.is_empty(), "{call}: {u:?}");
+        }
+    }
+
+    #[test]
+    fn test_should_follow_a_frame_derived_without_column_arguments() {
+        let u =
+            usage("x = df.sort_index().copy()\nprint(x[\"a\"])\ny = x.head(5)\nprint(y[\"b\"])\n");
+        assert_eq!(cols(&u), vec![("a", false), ("b", false)]);
+        assert!(u.other_uses.is_empty(), "{u:?}");
+    }
+
+    #[test]
+    fn test_should_not_follow_a_derivation_whose_argument_names_a_column() {
+        let u = usage("x = df.drop_duplicates(keys)\nprint(x[\"a\"])\n");
+        assert!(u.other_uses.iter().any(blocks_narrowing), "{u:?}");
+    }
+
+    #[test]
+    fn test_should_follow_a_row_operation_with_literal_key_columns_and_read_them() {
+        let u = usage(
+            "x = df.drop_duplicates(subset=[\"id\"]).sort_values(\"t\", ascending=False)\nprint(x[\"a\"])\n",
+        );
+        assert_eq!(cols(&u), vec![("id", false), ("t", false), ("a", false)]);
+        assert!(u.other_uses.is_empty(), "{u:?}");
+    }
+
+    #[test]
+    fn test_should_follow_a_frame_derived_by_with_columns_and_not_count_new_columns() {
+        let u = usage("x = df.with_columns((pl.col(\"a\") * 2).alias(\"d\"), e=pl.col(\"b\"))\nprint(x[\"d\"], x[\"e\"], x[\"c\"])\n");
+        assert_eq!(cols(&u), vec![("a", false), ("b", false), ("c", false)]);
+        assert!(u.other_uses.is_empty(), "{u:?}");
+    }
+
+    #[test]
+    fn test_should_not_follow_a_with_columns_whose_output_name_is_unreadable() {
+        let u = usage("x = df.with_columns(pl.all() * 2)\nprint(x[\"c\"])\n");
+        assert!(u.other_uses.iter().any(blocks_narrowing), "{u:?}");
+    }
+
+    #[test]
     fn test_should_record_an_unconditional_column_access() {
         let u = usage("print(df[\"a\"])\nprint(df[\"b\"])\n");
         assert_eq!(cols(&u), vec![("a", false), ("b", false)]);
@@ -1208,7 +1799,7 @@ mod tests {
 
     #[test]
     fn test_should_record_an_attribute_access_as_an_other_use() {
-        let u = usage("print(df.columns)\n");
+        let u = usage("names = list(df.columns)\n");
         assert_eq!(others(&u), vec![("`.columns`", false, Consumption::None)]);
     }
 
@@ -1277,8 +1868,21 @@ mod tests {
 
     #[test]
     fn test_should_classify_a_non_consuming_attribute_by_name() {
-        let u = usage("print(df.shape)\n");
+        let u = usage("n = df.shape[0]\n");
         assert_eq!(others(&u), vec![("`.shape`", false, Consumption::None)]);
+    }
+
+    #[test]
+    fn test_should_record_a_printed_shape_or_head_as_output_not_a_blocker() {
+        let u = usage("print(df.shape)\nprint(df.head(3))\ndf.head()\n");
+        assert!(u.other_uses.iter().all(|o| !blocks_narrowing(o)), "{u:?}");
+        assert_eq!(u.other_uses.len(), 3);
+    }
+
+    #[test]
+    fn test_should_keep_a_shape_that_feeds_other_code_as_a_blocker() {
+        let u = usage("x = np.zeros(df.shape)\ncols = [c for c in df.columns]\n");
+        assert!(u.other_uses.iter().all(blocks_narrowing), "{u:?}");
     }
 
     #[test]

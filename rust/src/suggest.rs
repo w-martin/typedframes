@@ -11,6 +11,7 @@
 //! Output is byte-range edits plus a rendered diff; `apply` is what writes them.
 
 use crate::column_usage::{ColumnUsage, OtherUse};
+use crate::constants::STDLIB_MODULES;
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
 use ruff_text_size::Ranged;
 use serde::Serialize;
@@ -79,6 +80,8 @@ pub(crate) struct Origin<'a> {
     /// Local names (and parameters) of the enclosing function that are certainly an
     /// instance of a class, by class name: `svc = Service()`, `def f(svc: Service)`.
     pub(crate) receivers: &'a HashMap<String, String>,
+    /// Every column name any frame in the project is known to have, for spotting a misspelling.
+    pub(crate) known_columns: &'a [String],
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -367,6 +370,8 @@ pub(crate) fn function_libraries(module: &ModModule) -> HashMap<String, Library>
     LibraryContext::new(&module.body, &HashMap::new()).functions
 }
 
+const MAX_NAMED_BLOCKERS: usize = 4;
+
 /// `Ok` with a suggestion, or `Err` with the reason none could be made.
 pub(crate) fn suggest_selection(
     origin: &Origin,
@@ -376,23 +381,32 @@ pub(crate) fn suggest_selection(
     let in_call = in_call_selection(origin, library);
     let insertion = insertion_point(origin)?;
 
-    let blockers: Vec<&OtherUse> = usage
+    let mut blockers: Vec<&OtherUse> = usage
         .other_uses
         .iter()
         .filter(|u| crate::column_usage::blocks_narrowing(u))
         .collect();
-    if let Some(first) = blockers.first() {
-        let more = match blockers.len() - 1 {
+    // A use that touches no columns (`n = df.shape[0]`) is rarely what makes narrowing
+    // unsafe; name one that does.
+    blockers.sort_by_key(|u| u.consumes == crate::column_usage::Consumption::None);
+    if !blockers.is_empty() {
+        // Name each use up to a handful, so the reason can be acted on without a second run.
+        let named = blockers
+            .iter()
+            .take(MAX_NAMED_BLOCKERS)
+            .map(|u| {
+                let callee = u
+                    .callee
+                    .map_or_else(String::new, |class| format!(", {class}"));
+                format!("{}{callee} (line {})", u.description, u.line)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let more = match blockers.len().saturating_sub(MAX_NAMED_BLOCKERS) {
             0 => String::new(),
             n => format!(", and {n} more"),
         };
-        let callee = first
-            .callee
-            .map_or_else(String::new, |class| format!(", {class}"));
-        return Err(format!(
-            "can't see everything done with it: {}{callee} (line {}){more}",
-            first.description, first.line
-        ));
+        return Err(format!("can't see everything done with it: {named}{more}"));
     }
     if usage.accesses.is_empty() {
         return Err("no column is read from it later in this scope".to_string());
@@ -406,6 +420,38 @@ pub(crate) fn suggest_selection(
     }
 
     let mut notes: Vec<String> = Vec::new();
+    // A name read once, nowhere else, a couple of edits from another column the project knows,
+    // is as likely a typo as a column: the selection would write it down as if it were real.
+    for column in &columns {
+        let reads = usage
+            .accesses
+            .iter()
+            .filter(|a| &a.column == column)
+            .count();
+        let quoted_in_file = origin.source.matches(&format!("\"{column}\"")).count()
+            + origin.source.matches(&format!("'{column}'")).count();
+        if reads != 1 || quoted_in_file > 1 {
+            continue;
+        }
+        let near = columns
+            .iter()
+            .map(String::as_str)
+            .chain(origin.known_columns.iter().map(String::as_str))
+            .find(|other| {
+                other != column
+                    && column.chars().count() >= 5
+                    && other.chars().count() >= 5
+                    && crate::typo::levenshtein(column, other) <= 2
+                    && crate::typo::levenshtein(column, other) * 2
+                        <= column.chars().count().max(other.chars().count())
+            });
+        if let Some(other) = near {
+            notes.push(format!(
+                "'{column}' is read once and nowhere else in this file, and is a couple of edits \
+                 from the known column '{other}'; if it is a misspelling the selection would keep it"
+            ));
+        }
+    }
     for column in &columns {
         let mut reads = usage.accesses.iter().filter(|a| &a.column == column);
         if reads.clone().all(|a| a.conditional) {
@@ -752,6 +798,8 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
     let mut innermost_call: Option<&ast::ExprCall> = None;
     // The attribute applied directly to the root name: `make` in `self.make().copy()`.
     let mut root_attribute: Option<&str> = None;
+    // The one before it, when there is one: `store` in `self.store.read()`.
+    let mut attribute_before_root: Option<&str> = None;
     loop {
         match current {
             Expr::Call(call) => {
@@ -759,11 +807,32 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
                 current = &call.func;
             }
             Expr::Attribute(attribute) => {
+                attribute_before_root = root_attribute;
                 root_attribute = Some(attribute.attr.as_str());
                 current = &attribute.value;
             }
             Expr::Name(name) => {
                 let id = name.id.as_str();
+                // `self.store.read()`: `store` holds an instance of a class this file names.
+                if let (true, Some(method), Some(attr), true) = (
+                    id == "self",
+                    attribute_before_root,
+                    root_attribute,
+                    innermost_call.is_some(),
+                ) {
+                    if let Some(library) =
+                        origin
+                            .receivers
+                            .get(&format!("self.{attr}"))
+                            .and_then(|class| {
+                                context
+                                    .class_methods
+                                    .get(&(class.clone(), method.to_string()))
+                            })
+                    {
+                        return Ok(*library);
+                    }
+                }
                 if matches!(id, "self" | "cls") && innermost_call.is_some() {
                     if let Some(library) = root_attribute.and_then(|m| context.functions.get(m)) {
                         return Ok(*library);
@@ -932,6 +1001,138 @@ fn rebinds_final(module: &ModModule) -> bool {
     })
 }
 
+// Adds `Final` to an existing top-level `from typing import ...` instead of a second import
+// line, which an import sorter (ruff's `I001`) would then reject. Placed among the names
+// the way isort orders them: CamelCase names alphabetically, lowercase ones after.
+// Ruff's isort order for imported members (`order-by-type`, case-insensitive): constants
+// (`TYPE_CHECKING`), then classes (`Any`), then everything else, each alphabetical.
+fn isort_member_key(name: &str) -> (u8, String) {
+    let constant = name.chars().count() > 1
+        && name.chars().any(char::is_alphabetic)
+        && !name.chars().any(char::is_lowercase);
+    let rank = if constant {
+        0
+    } else if name.chars().next().is_some_and(char::is_uppercase) {
+        1
+    } else {
+        2
+    };
+    (rank, name.to_lowercase())
+}
+
+fn merge_into_typing_import(module: &ModModule) -> Option<Edit> {
+    let import = module.body.iter().find_map(|stmt| match stmt {
+        Stmt::ImportFrom(import)
+            if import.level == 0
+                && import
+                    .module
+                    .as_ref()
+                    .is_some_and(|m| m.as_str() == "typing")
+                && import.names.iter().all(|a| a.name.as_str() != "*") =>
+        {
+            Some(import)
+        }
+        _ => None,
+    })?;
+    let final_key = isort_member_key("Final");
+    let before = import
+        .names
+        .iter()
+        .find(|a| isort_member_key(a.name.as_str()) > final_key);
+    let (at, replacement) = match before {
+        Some(alias) => (alias.range().start().to_usize(), "Final, "),
+        None => (import.names.last()?.range().end().to_usize(), ", Final"),
+    };
+    Some(Edit {
+        start: at,
+        end: at,
+        replacement: replacement.to_string(),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum ImportSection {
+    Future,
+    Stdlib,
+    Other,
+}
+
+fn import_module(stmt: &Stmt) -> String {
+    match stmt {
+        Stmt::Import(import) => import
+            .names
+            .first()
+            .map_or(String::new(), |a| a.name.to_string()),
+        Stmt::ImportFrom(import) => {
+            let dots = ".".repeat(import.level as usize);
+            format!(
+                "{dots}{}",
+                import.module.as_ref().map_or("", |m| m.as_str())
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn import_section(stmt: &Stmt) -> ImportSection {
+    let module = import_module(stmt);
+    let top = module.split('.').next().unwrap_or("");
+    if matches!(stmt, Stmt::ImportFrom(i) if i.level == 0) && top == "__future__" {
+        ImportSection::Future
+    } else if !module.starts_with('.') && STDLIB_MODULES.contains(&top) {
+        ImportSection::Stdlib
+    } else {
+        ImportSection::Other
+    }
+}
+
+// How an import sorter orders statements within a section: `import x` before `from x import`,
+// then by module name without regard to case.
+fn import_key(stmt: &Stmt) -> (u8, String) {
+    (
+        u8::from(matches!(stmt, Stmt::ImportFrom(_))),
+        import_module(stmt).to_lowercase(),
+    )
+}
+
+// The import statements opening the file, after any docstring.
+fn leading_imports(module: &ModModule) -> Vec<&Stmt> {
+    let is_docstring =
+        |stmt: &Stmt| matches!(stmt, Stmt::Expr(e) if matches!(&*e.value, Expr::StringLiteral(_)));
+    module
+        .body
+        .iter()
+        .skip_while(|stmt| is_docstring(stmt))
+        .take_while(|stmt| matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)))
+        .collect()
+}
+
+/// Whether the file's opening imports are grouped and ordered the way an import sorter
+/// (ruff's `I001`) wants them, as far as sections and the standard library go: `__future__`,
+/// then the standard library, then everything else, a blank line between groups and none
+/// within one.
+pub(crate) fn imports_in_order(source: &str) -> bool {
+    let Ok(module) = ruff_python_parser::parse_module(source) else {
+        return true;
+    };
+    let module = module.into_syntax();
+    let leading = leading_imports(&module);
+    leading.windows(2).all(|pair| {
+        let (before, after) = (import_section(pair[0]), import_section(pair[1]));
+        let between = &source[pair[0].range().end().to_usize()..pair[1].range().start().to_usize()];
+        let blank_lines = between.matches('\n').count().saturating_sub(1);
+        match before.cmp(&after) {
+            std::cmp::Ordering::Less => blank_lines >= 1,
+            std::cmp::Ordering::Equal => match after {
+                // Third-party and first-party code are groups of their own.
+                ImportSection::Other => blank_lines <= 1,
+                _ => blank_lines == 0 && import_key(pair[0]) <= import_key(pair[1]),
+            },
+            std::cmp::Ordering::Greater => false,
+        }
+    })
+}
+
 fn final_name(module: &ModModule, source: &str) -> Result<FinalName, String> {
     if rebinds_final(module) {
         return Err("`Final` is already bound to something else in this file".to_string());
@@ -959,44 +1160,77 @@ fn final_name(module: &ModModule, source: &str) -> Result<FinalName, String> {
             _ => {}
         }
     }
-    let is_import = |stmt: &&Stmt| matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_));
+    if let Some(edit) = merge_into_typing_import(module) {
+        return Ok(FinalName::Add(edit));
+    }
     let is_docstring =
         |stmt: &Stmt| matches!(stmt, Stmt::Expr(e) if matches!(&*e.value, Expr::StringLiteral(_)));
-    let leading: Vec<&Stmt> = module
-        .body
+    let leading = leading_imports(module);
+    let line_start = |stmt: &Stmt| {
+        let start = stmt.range().start().to_usize();
+        source[..start].rfind('\n').map_or(0, |i| i + 1)
+    };
+    // Where an import sorter (ruff's `I001`) wants `from typing import Final`: inside the
+    // standard-library group, by module name, or in a group of its own ahead of the rest.
+    let stdlib: Vec<&Stmt> = leading
         .iter()
-        .skip_while(|stmt| is_docstring(stmt))
-        .take_while(|stmt| is_import(stmt))
+        .copied()
+        .filter(|stmt| import_section(stmt) == ImportSection::Stdlib)
         .collect();
-    let edit = match leading.last() {
-        Some(last) => {
-            // Inserted before the line's newline, so in a notebook the import stays in
-            // the cell that holds the last import.
-            let at = logical_line_end(module, source, last.range().end().to_usize());
-            let eol = line_ending_at(source, at.saturating_sub(1));
-            let at = if source[..at].ends_with('\r') {
-                at - 1
-            } else {
-                at
-            };
-            Edit {
-                start: at,
-                end: at,
-                replacement: format!("{eol}from typing import Final"),
-            }
+    let target = (1, "typing".to_string());
+    let after_last = |last: &Stmt| {
+        // Inserted before the line's newline, so in a notebook the import stays in
+        // the cell that holds the last import.
+        let at = logical_line_end(module, source, last.range().end().to_usize());
+        let eol = line_ending_at(source, at.saturating_sub(1));
+        let at = if source[..at].ends_with('\r') {
+            at - 1
+        } else {
+            at
+        };
+        (at, eol)
+    };
+    let edit = if let Some(next) = stdlib.iter().find(|stmt| import_key(stmt) > target) {
+        let at = line_start(next);
+        let eol = line_ending_at(source, at.saturating_sub(1));
+        Edit {
+            start: at,
+            end: at,
+            replacement: format!("from typing import Final{eol}"),
         }
-        None => {
-            let first = module.body.iter().find(|stmt| !is_docstring(stmt));
-            let at = first.map_or(source.len(), |stmt| {
-                let start = stmt.range().start().to_usize();
-                source[..start].rfind('\n').map_or(0, |i| i + 1)
-            });
-            let eol = line_ending_at(source, at.saturating_sub(1));
-            Edit {
-                start: at,
-                end: at,
-                replacement: format!("from typing import Final{eol}{eol}"),
-            }
+    } else if let Some(last) = stdlib.last() {
+        let (at, eol) = after_last(last);
+        Edit {
+            start: at,
+            end: at,
+            replacement: format!("{eol}from typing import Final"),
+        }
+    } else if let Some(first_other) = leading
+        .iter()
+        .find(|stmt| import_section(stmt) != ImportSection::Future)
+    {
+        let at = line_start(first_other);
+        let eol = line_ending_at(source, at.saturating_sub(1));
+        Edit {
+            start: at,
+            end: at,
+            replacement: format!("from typing import Final{eol}{eol}"),
+        }
+    } else if let Some(last) = leading.last() {
+        let (at, eol) = after_last(last);
+        Edit {
+            start: at,
+            end: at,
+            replacement: format!("{eol}{eol}from typing import Final"),
+        }
+    } else {
+        let first = module.body.iter().find(|stmt| !is_docstring(stmt));
+        let at = first.map_or(source.len(), line_start);
+        let eol = line_ending_at(source, at.saturating_sub(1));
+        Edit {
+            start: at,
+            end: at,
+            replacement: format!("from typing import Final{eol}{eol}"),
         }
     };
     Ok(FinalName::Add(edit))
@@ -1105,6 +1339,112 @@ fn rebinding_subclass<'a>(module: &'a ModModule, defining: &str, attr: &str) -> 
     })
 }
 
+/// Whether `name` appears in `source` as an identifier outside the byte ranges `except`.
+fn mentions_outside(source: &str, name: &str, except: &[std::ops::Range<usize>]) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    source.match_indices(name).any(|(at, _)| {
+        let end = at + name.len();
+        !except.iter().any(|r| r.start <= at && end <= r.end)
+            && !source[..at].chars().next_back().is_some_and(is_ident)
+            && !source[end..].chars().next().is_some_and(is_ident)
+    })
+}
+
+/// The edit that drops `ClassVar` from `from typing import ...` once the rewrite has removed
+/// its last use, so the fix does not leave an unused import (`F401`) behind. It reuses the
+/// `, Final` insertion in `edits` when `ClassVar` was the only name imported.
+fn drop_orphaned_class_var(
+    module: &ModModule,
+    source: &str,
+    edits: &mut Vec<Edit>,
+    replaced: std::ops::Range<usize>,
+) {
+    let Some(import) = module.body.iter().find_map(|stmt| match stmt {
+        Stmt::ImportFrom(import)
+            if import.level == 0
+                && import
+                    .module
+                    .as_ref()
+                    .is_some_and(|m| m.as_str() == "typing")
+                && import.names.iter().all(|a| a.name.as_str() != "*") =>
+        {
+            Some(import)
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+    let Some(position) = import
+        .names
+        .iter()
+        .position(|a| a.name.as_str() == "ClassVar" && a.asname.is_none())
+    else {
+        return;
+    };
+    let import_range = import.range().start().to_usize()..import.range().end().to_usize();
+    if mentions_outside(source, "ClassVar", &[import_range, replaced]) {
+        return;
+    }
+    let alias = &import.names[position];
+    let (start, end) = (
+        alias.range().start().to_usize(),
+        alias.range().end().to_usize(),
+    );
+    if import.names.len() == 1 {
+        if let Some(insertion) = edits
+            .iter_mut()
+            .find(|e| e.start == end && e.end == end && e.replacement == ", Final")
+        {
+            *insertion = Edit {
+                start,
+                end,
+                replacement: "Final".to_string(),
+            };
+        }
+        return;
+    }
+    let edit = match import.names.get(position + 1) {
+        Some(next) => Edit {
+            start,
+            end: next.range().start().to_usize(),
+            replacement: String::new(),
+        },
+        None => Edit {
+            start: import.names[position - 1].range().end().to_usize(),
+            end,
+            replacement: String::new(),
+        },
+    };
+    edits.push(edit);
+}
+
+/// `source` without a `ClassVar` import that nothing uses any more, as left behind when
+/// several constants of one file were each rewritten from `ClassVar` to `Final`.
+pub(crate) fn without_orphaned_class_var(original: &str, source: &str) -> String {
+    // An import that was already unused is not ours to remove.
+    let line_of_import = |text: &str| {
+        text.lines()
+            .find(|l| l.starts_with("from typing import") && l.contains("ClassVar"))
+            .map(str::to_string)
+    };
+    let used_before = line_of_import(original).is_some_and(|import| {
+        let rest = original.replacen(&import, "", 1);
+        mentions_outside(&rest, "ClassVar", &[])
+    });
+    if !used_before {
+        return source.to_string();
+    }
+    let Ok(module) = ruff_python_parser::parse_module(source) else {
+        return source.to_string();
+    };
+    let module = module.into_syntax();
+    let mut edits = Vec::new();
+    drop_orphaned_class_var(&module, source, &mut edits, 0..0);
+    // Only a plain removal: the `, Final` swap belongs to the single-constant path.
+    edits.retain(|e| e.replacement.is_empty());
+    crate::apply::apply_edits(source, &edits).unwrap_or_else(|| source.to_string())
+}
+
 /// `NAME: Final = ...` for a class constant read through `self`, so no subclass in another
 /// file can rebind what the checker resolved. Withheld unless the constant is one plain
 /// assignment directly in the body of a top-level class of this file, the reading class or
@@ -1162,6 +1502,12 @@ pub(crate) fn suggest_final_constant(
                 end: range.end().to_usize(),
                 replacement,
             });
+            drop_orphaned_class_var(
+                module,
+                source,
+                &mut edits,
+                range.start().to_usize()..range.end().to_usize(),
+            );
         }
         _ => {
             let end = target.range().end().to_usize();
@@ -1242,6 +1588,70 @@ fn interleave<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(char, &'a str)> {
     out
 }
 
+// A shortest edit script between `old` and `new` (Myers), or `None` once it takes more than
+// `MAX_EDITS` insertions and deletions, where the table would get large.
+fn shortest_edit_script<'a>(old: &[&'a str], new: &[&'a str]) -> Option<Vec<(char, &'a str)>> {
+    const MAX_EDITS: isize = 1000;
+    let (n, m) = (old.len() as isize, new.len() as isize);
+    let limit = (n + m).min(MAX_EDITS);
+    let offset = limit + 1;
+    let at = |k: isize| (k + offset) as usize;
+    let mut v = vec![0isize; (2 * limit + 3) as usize];
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut found = None;
+    'search: for d in 0..=limit {
+        trace.push(v.clone());
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
+                v[at(k + 1)]
+            } else {
+                v[at(k - 1)] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && old[x as usize] == new[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[at(k)] = x;
+            if x >= n && y >= m {
+                found = Some(d);
+                break 'search;
+            }
+            k += 2;
+        }
+    }
+    let last = found?;
+    let mut ops = Vec::new();
+    let (mut x, mut y) = (n, m);
+    for d in (0..=last).rev() {
+        let before = &trace[d as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && before[at(k - 1)] < before[at(k + 1)]) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let (prev_x, prev_y) = (before[at(prev_k)], before[at(prev_k)] - prev_k);
+        while x > prev_x && y > prev_y {
+            ops.push((' ', old[(x - 1) as usize]));
+            x -= 1;
+            y -= 1;
+        }
+        if d > 0 {
+            if x == prev_x {
+                ops.push(('+', new[(y - 1) as usize]));
+            } else {
+                ops.push(('-', old[(x - 1) as usize]));
+            }
+        }
+        x = prev_x;
+        y = prev_y;
+    }
+    ops.reverse();
+    Some(ops)
+}
+
 pub(crate) fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     const CONTEXT: usize = 3;
     let old_lines: Vec<&str> = old.lines().collect();
@@ -1264,38 +1674,48 @@ pub(crate) fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     {
         suffix += 1;
     }
-
-    let before = prefix.min(CONTEXT);
-    let after = suffix.min(CONTEXT);
-    let start = prefix - before;
     let old_changed_end = old_lines.len() - suffix;
     let new_changed_end = new_lines.len() - suffix;
-    let old_end = old_changed_end + after;
-    let new_end = new_changed_end + after;
+    let middle_old = &old_lines[prefix..old_changed_end];
+    let middle_new = &new_lines[prefix..new_changed_end];
+    let middle = shortest_edit_script(middle_old, middle_new)
+        .unwrap_or_else(|| interleave(middle_old, middle_new));
 
-    let mut out = format!(
-        "--- a/{path}\n+++ b/{path}\n@@ -{},{} +{},{} @@\n",
-        start + 1,
-        old_end - start,
-        start + 1,
-        new_end - start
-    );
-    let mut push = |marker: char, line: &str| {
-        out.push(marker);
-        out.push_str(line);
-        out.push('\n');
-    };
-    for line in &old_lines[start..prefix] {
-        push(' ', line);
+    let mut ops: Vec<(char, &str)> = old_lines[..prefix].iter().map(|l| (' ', *l)).collect();
+    ops.extend(middle);
+    ops.extend(old_lines[old_changed_end..].iter().map(|l| (' ', *l)));
+
+    let changed: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, (marker, _))| *marker != ' ')
+        .map(|(i, _)| i)
+        .collect();
+    // Changes closer together than two contexts share a hunk.
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    for &i in &changed {
+        let from = i.saturating_sub(CONTEXT);
+        let to = (i + CONTEXT + 1).min(ops.len());
+        match hunks.last_mut() {
+            Some(last) if from <= last.1 => last.1 = to,
+            _ => hunks.push((from, to)),
+        }
     }
-    for (marker, line) in interleave(
-        &old_lines[prefix..old_changed_end],
-        &new_lines[prefix..new_changed_end],
-    ) {
-        push(marker, line);
-    }
-    for line in &old_lines[old_changed_end..old_end] {
-        push(' ', line);
+
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    for (from, to) in hunks {
+        let old_start = ops[..from].iter().filter(|(m, _)| *m != '+').count() + 1;
+        let new_start = ops[..from].iter().filter(|(m, _)| *m != '-').count() + 1;
+        let old_len = ops[from..to].iter().filter(|(m, _)| *m != '+').count();
+        let new_len = ops[from..to].iter().filter(|(m, _)| *m != '-').count();
+        out.push_str(&format!(
+            "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
+        ));
+        for (marker, line) in &ops[from..to] {
+            out.push(*marker);
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     out
 }
@@ -1348,6 +1768,7 @@ mod tests {
                 stmt_end: assign.range().end().to_usize(),
                 function_local,
                 receivers: &HashMap::new(),
+                known_columns: &[],
             },
             &usage,
         )
@@ -1426,6 +1847,7 @@ mod tests {
                 stmt_end: assign.range().end().to_usize(),
                 function_local: true,
                 receivers: &HashMap::new(),
+                known_columns: &[],
             },
             &usage,
         )
@@ -1477,6 +1899,7 @@ mod tests {
                 stmt_end: source.len(),
                 function_local: true,
                 receivers: &HashMap::new(),
+                known_columns: &[],
             },
             &usage,
         )
@@ -1606,6 +2029,35 @@ mod tests {
     }
 
     #[test]
+    fn test_should_suggest_when_shape_and_head_are_only_displayed() {
+        // arrange: nothing but display uses besides the column reads
+        let source = "df = pd.read_csv(\"x.csv\")\nprint(df.shape)\nprint(df.head())\ndf.head()\nprint(df[\"a\"])\n";
+
+        // act
+        let suggestion = run(source, true).unwrap();
+
+        // assert: narrowing goes ahead, with the display flagged for review
+        assert!(
+            suggestion.notes.iter().any(|n| n.contains("displayed")),
+            "{:?}",
+            suggestion.notes
+        );
+    }
+
+    #[test]
+    fn test_should_name_the_use_that_blocks_not_a_shape_read_first() {
+        // arrange
+        let source = "df = pd.read_csv(\"x.csv\")\nn = df.shape[0]\nhelper(df)\nprint(df[\"a\"])\n";
+
+        // act
+        let reason = run(source, true).unwrap_err();
+
+        // assert
+        assert!(reason.contains("passed to"), "{reason}");
+        assert!(reason.contains("line 3"), "{reason}");
+    }
+
+    #[test]
     fn test_should_withhold_when_the_frame_is_passed_to_a_call() {
         let source = "df = pd.read_json(\"x\")\nhelper(df)\nprint(df[\"a\"])\n";
         let reason = run(source, true).unwrap_err();
@@ -1614,9 +2066,19 @@ mod tests {
     }
 
     #[test]
-    fn test_should_count_additional_blockers() {
-        let source = "df = pd.read_json(\"x\")\nhelper(df)\ndf.groupby(\"a\")\nprint(df[\"a\"])\n";
-        assert!(run(source, true).unwrap_err().ends_with("and 1 more"));
+    fn test_should_name_every_blocker_up_to_a_handful_then_count_the_rest() {
+        let few = "df = pd.read_json(\"x\")\nhelper(df)\ndf.groupby(\"a\")\nprint(df[\"a\"])\n";
+        let many = "df = pd.read_json(\"x\")\nh1(df)\nh2(df)\nh3(df)\nh4(df)\nh5(df)\nh6(df)\nprint(df[\"a\"])\n";
+
+        let reason = run(few, true).unwrap_err();
+        let overflow = run(many, true).unwrap_err();
+
+        assert!(
+            reason.contains("(line 2)") && reason.contains("(line 3)"),
+            "{reason}"
+        );
+        assert!(!reason.contains("more"), "{reason}");
+        assert!(overflow.ends_with(", and 2 more"), "{overflow}");
     }
 
     #[test]
@@ -1628,7 +2090,7 @@ mod tests {
 
     #[test]
     fn test_should_block_on_columns_because_narrowing_changes_it() {
-        let source = "df = pd.read_json(\"x\")\nprint(df.columns)\nprint(df[\"a\"])\n";
+        let source = "df = pd.read_json(\"x\")\nkeep = [c for c in df.columns]\nprint(df[\"a\"])\n";
         assert!(run(source, true).is_err());
     }
 
@@ -1660,6 +2122,28 @@ mod tests {
         assert!(s.notes[0].contains("SettingWithCopyWarning"));
         let polars = "df = pl.read_json(\"x\")\ndf[\"t\"] = df[\"a\"]\nprint(df[\"a\"])\n";
         assert_eq!(run(polars, true).unwrap().tier, "safe");
+    }
+
+    #[test]
+    fn test_should_mark_a_column_read_once_next_to_a_near_miss_as_review() {
+        // arrange: `risk_calc` is read once and nowhere else, two edits from `risk_cal`
+        let source = "df = pd.read_json(\"x\")\nprint(df[\"risk_cal\"], df[\"risk_cal\"], df[\"risk_calc\"])\n";
+
+        // act
+        let s = run(source, true).unwrap();
+
+        // assert
+        assert_eq!(s.tier, "review");
+        assert!(s
+            .notes
+            .iter()
+            .any(|n| n.contains("'risk_calc'") && n.contains("misspelling")));
+    }
+
+    #[test]
+    fn test_should_keep_distinct_columns_read_once_each_safe() {
+        let source = "df = pd.read_json(\"x\")\nprint(df[\"age\"], df[\"income\"])\n";
+        assert_eq!(run(source, true).unwrap().tier, "safe");
     }
 
     #[test]
@@ -1818,6 +2302,7 @@ mod tests {
                 stmt_end: source.lines().next().unwrap().len(),
                 function_local: true,
                 receivers: &HashMap::new(),
+                known_columns: &[],
             },
             &usage,
         )
@@ -1833,6 +2318,45 @@ mod tests {
     }
 
     #[test]
+    fn test_should_add_final_to_an_existing_typing_import_in_sorted_position() {
+        // arrange
+        let source = "from typing import Any, Optional\n\nimport pandas as pd\n\n\nclass Repo:\n    A = \"a\"\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert: one typing import, with `Final` where isort would put it
+        assert!(
+            edited.starts_with("from typing import Any, Final, Optional\n"),
+            "{edited}"
+        );
+        assert_eq!(edited.matches("import Final").count(), 0, "{edited}");
+    }
+
+    #[test]
+    fn test_should_put_final_after_constants_and_before_functions_like_ruff_isort() {
+        for (names, expected) in [
+            ("TYPE_CHECKING, Any", "TYPE_CHECKING, Any, Final"),
+            ("TYPE_CHECKING", "TYPE_CHECKING, Final"),
+            ("Any, cast", "Any, Final, cast"),
+            ("Generic, TypeVar", "Final, Generic, TypeVar"),
+            ("cast", "Final, cast"),
+        ] {
+            // arrange
+            let source = format!("from typing import {names}\n\n\nclass Repo:\n    A = \"a\"\n");
+
+            // act
+            let (_, edited) = final_fix(&source, "Repo", "A").unwrap();
+
+            // assert
+            assert!(
+                edited.starts_with(&format!("from typing import {expected}\n")),
+                "{edited}"
+            );
+        }
+    }
+
+    #[test]
     fn test_should_declare_a_plain_class_constant_final_and_import_final() {
         // arrange
         let source = "import pandas as pd\n\n\nclass Repo:\n    A = \"a\"\n";
@@ -1845,7 +2369,7 @@ mod tests {
         assert_eq!(suggestion.tier, "safe");
         assert_eq!(
             edited,
-            "import pandas as pd\nfrom typing import Final\n\n\nclass Repo:\n    A: Final = \"a\"\n"
+            "from typing import Final\n\nimport pandas as pd\n\n\nclass Repo:\n    A: Final = \"a\"\n"
         );
     }
 
@@ -1891,7 +2415,7 @@ mod tests {
         // assert
         assert!(
             edited.starts_with(
-                "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations\nfrom typing import Final\n"
+                "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations\n\nfrom typing import Final\n"
             ),
             "{edited}"
         );
@@ -2018,7 +2542,7 @@ mod tests {
 
         // assert: the pragma stays on the import it belongs to.
         assert!(
-            edited.starts_with("import pandas as pd  # noqa: F401\nfrom typing import Final\n"),
+            edited.starts_with("from typing import Final\n\nimport pandas as pd  # noqa: F401\n"),
             "{edited}"
         );
     }
@@ -2080,6 +2604,67 @@ mod tests {
     }
 
     #[test]
+    fn test_should_drop_the_class_var_import_once_nothing_uses_it() {
+        // arrange
+        let one = "from typing import ClassVar\n\nimport pandas as pd\n\n\nclass T:\n    A: ClassVar[list[str]] = [\"a\"]\n";
+        let kept = "from typing import Any, ClassVar\n\n\nclass T:\n    A: ClassVar[list[str]] = [\"a\"]\n    B: ClassVar[list[str]] = [\"b\"]\n";
+        let several = "from typing import ClassVar, Final\n\n\nclass T:\n    A: ClassVar[list[str]] = [\"a\"]\n    B: ClassVar[list[str]] = [\"b\"]\n";
+
+        // act
+        let (_, only) = final_fix(one, "T", "A").unwrap();
+        let (_, shared) = final_fix(kept, "T", "A").unwrap();
+        let both = without_orphaned_class_var(several, &several.replace("ClassVar[", "Final["));
+
+        // assert
+        assert!(only.starts_with("from typing import Final\n"), "{only}");
+        assert!(shared.contains("import Any, ClassVar, Final"), "{shared}");
+        assert!(both.starts_with("from typing import Final\n"), "{both}");
+    }
+
+    #[test]
+    fn test_should_leave_an_already_unused_class_var_import_alone() {
+        // arrange
+        let source = "from typing import ClassVar, Final\n\n\nclass T:\n    A: Final = 1\n";
+
+        // act / assert
+        assert_eq!(source, without_orphaned_class_var(source, source));
+    }
+
+    #[test]
+    fn test_should_render_two_distant_edits_as_two_hunks() {
+        // arrange
+        let old: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let new = old.replacen("line 1\n", "line one\n", 1).replacen(
+            "line 35\n",
+            "line thirty-five\n",
+            1,
+        );
+
+        // act
+        let diff = render_unified_diff("f.py", &old, &new);
+
+        // assert
+        assert_eq!(2, diff.matches("@@ -").count(), "{diff}");
+        assert!(diff.contains("-line 35\n+line thirty-five\n"), "{diff}");
+        assert!(!diff.contains("line 15"), "{diff}");
+    }
+
+    #[test]
+    fn test_should_join_hunks_whose_context_meets() {
+        // arrange
+        let old: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let new = old
+            .replacen("line 5\n", "five\n", 1)
+            .replacen("line 9\n", "nine\n", 1);
+
+        // act
+        let diff = render_unified_diff("f.py", &old, &new);
+
+        // assert
+        assert_eq!(1, diff.matches("@@ -").count(), "{diff}");
+    }
+
+    #[test]
     fn test_should_withhold_when_final_is_already_something_else() {
         // arrange
         let assigned = "import os\n\nFinal = 3\n\n\nclass Repo:\n    A = 1\n";
@@ -2090,5 +2675,104 @@ mod tests {
             let reason = final_fix(source, "Repo", "A").map(|_| ()).unwrap_err();
             assert!(reason.contains("`Final`"), "{reason}");
         }
+    }
+
+    #[test]
+    fn test_should_put_the_import_in_the_standard_library_group_in_sorted_position() {
+        // arrange
+        let cls = "\n\nclass Repo:\n    A = 1\n";
+        let before_third_party =
+            format!("import os\nfrom pathlib import Path\n\nimport pandas as pd\n{cls}");
+        let between = format!("import os\nfrom collections import Counter\nfrom zlib import crc32\n\nimport pandas as pd\n{cls}");
+        let first_from = format!(
+            "from pathlib import Path\nfrom zipfile import ZipFile\n\nimport pandas as pd\n{cls}"
+        );
+
+        // act
+        let (_, a) = final_fix(&before_third_party, "Repo", "A").unwrap();
+        let (_, b) = final_fix(&between, "Repo", "A").unwrap();
+        let (_, c) = final_fix(&first_from, "Repo", "A").unwrap();
+
+        // assert: after the last smaller module, before the first larger one, no stray blank lines
+        assert!(
+            a.starts_with(
+                "import os\nfrom pathlib import Path\nfrom typing import Final\n\nimport pandas"
+            ),
+            "{a}"
+        );
+        assert!(b.starts_with("import os\nfrom collections import Counter\nfrom typing import Final\nfrom zlib import crc32\n\nimport pandas"), "{b}");
+        assert!(c.starts_with("from pathlib import Path\nfrom typing import Final\nfrom zipfile import ZipFile\n\nimport pandas"), "{c}");
+        for edited in [a, b, c] {
+            assert!(imports_in_order(&edited), "{edited}");
+        }
+    }
+
+    #[test]
+    fn test_should_start_a_group_of_its_own_before_third_party_imports() {
+        // arrange
+        let source = "import numpy as np\nimport pandas as pd\n\nfrom myapp import util\n\n\nclass Repo:\n    A = 1\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert
+        assert!(
+            edited.starts_with("from typing import Final\n\nimport numpy as np\nimport pandas as pd\n\nfrom myapp import util\n"),
+            "{edited}"
+        );
+        assert!(imports_in_order(&edited));
+    }
+
+    #[test]
+    fn test_should_tell_ordered_import_blocks_from_unordered_ones() {
+        // arrange / act / assert
+        assert!(imports_in_order(
+            "import os\nimport sys\n\nimport pandas as pd\n"
+        ));
+        assert!(!imports_in_order("import pandas as pd\nimport os\n"));
+        assert!(!imports_in_order(
+            "import pandas as pd\nfrom typing import Final\n"
+        ));
+        assert!(!imports_in_order(
+            "import os\nfrom typing import Final\nfrom pathlib import Path\n"
+        ));
+        assert!(!imports_in_order("import os\n\nimport sys\n"));
+    }
+
+    #[test]
+    fn test_should_read_the_columns_of_a_selected_groupby_and_a_literal_rename() {
+        // arrange
+        let source = "items = pd.read_parquet(\"i.parquet\")\nitems[\"price\"] = items[\"price\"].fillna(items.groupby(\"category\")[\"price\"].transform(\"median\"))\nitems = items.rename(columns={\"quality_score\": \"qscore\"})\nprint(items[\"qscore\"].mean())\n";
+
+        // act
+        let suggestion = run(source, false).unwrap();
+
+        // assert: the group key, the selected column and the renamed source are read; the new
+        // name is not a column of the file
+        assert_eq!(suggestion.columns, ["price", "category", "quality_score"]);
+    }
+
+    #[test]
+    fn test_should_read_the_sources_of_a_named_aggregation() {
+        // arrange
+        let source = "items = pd.read_parquet(\"i.parquet\")\nseg = items.groupby(\"category\").agg(avg=(\"price\", \"mean\"))\nprint(seg)\n";
+
+        // act
+        let suggestion = run(source, false).unwrap();
+
+        // assert
+        assert_eq!(suggestion.columns, ["category", "price"]);
+    }
+
+    #[test]
+    fn test_should_still_block_a_groupby_whose_result_reads_every_column() {
+        // arrange
+        let source = "items = pd.read_parquet(\"i.parquet\")\ntotals = items.groupby(\"category\").sum()\nprint(items[\"price\"])\n";
+
+        // act
+        let reason = run(source, false).unwrap_err();
+
+        // assert
+        assert!(reason.contains(".groupby()"), "{reason}");
     }
 }

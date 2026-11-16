@@ -105,6 +105,40 @@ pub(crate) fn gather(files: &[PathBuf], outcomes: Vec<FileOutcome>) -> Findings 
 }
 
 impl Findings {
+    // Distinct frames, per file, that were tracked and then fell out of tracking. Not part of the
+    // coverage ratio, whose denominator is the frames the checker found at their creation.
+    fn lost_frames(&self) -> u64 {
+        self.leg_events
+            .iter()
+            .filter(|e| matches!(str_of(e, "outcome"), "untracked" | "unresolved"))
+            .map(|e| (str_of(e, "file"), str_of(e, "var")))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64
+    }
+
+    // Load calls the scan found that no tracked or untracked site accounts for (`pd.read_csv(..)`
+    // as an argument or inside an expression): frames the percentage knows nothing about. Matched
+    // by line, as `--coverage-detail=explain` does.
+    fn uncounted_loads(&self) -> u64 {
+        let line = |site: &Value| {
+            (
+                str_of(site, "file").to_string(),
+                int_of(site, "cell"),
+                int_of(site, "line"),
+            )
+        };
+        let counted: std::collections::HashSet<_> = self
+            .typed_sites
+            .iter()
+            .chain(self.untyped_sites.iter())
+            .map(line)
+            .collect();
+        self.all_dataframe_calls
+            .iter()
+            .filter(|site| !counted.contains(&line(site)))
+            .count() as u64
+    }
+
     fn sources(&self) -> Sources<'_> {
         Sources {
             all_dataframe_calls: &self.all_dataframe_calls,
@@ -197,26 +231,10 @@ pub(crate) fn format_github(errors: &[Value]) -> String {
 }
 
 fn error_summary_parts(errors_only: &[&Value], warnings: usize) -> Vec<String> {
-    let unverifiable = errors_only
-        .iter()
-        .filter(|e| str_of(e, "code") == "unverifiable-column")
-        .count();
-    let confirmed = errors_only.len() - unverifiable;
     let mut parts = Vec::new();
-    // Confirmed and unverifiable only get two phrases when there is an unverifiable one, so the
-    // common case reads as it always has ("N errors").
-    if confirmed > 0 || unverifiable == 0 {
-        let label = if confirmed == 1 { "error" } else { "errors" };
-        parts.push(format!("{confirmed} {label}"));
-    }
-    if unverifiable > 0 {
-        let label = if unverifiable == 1 {
-            "unverifiable error"
-        } else {
-            "unverifiable errors"
-        };
-        parts.push(format!("{unverifiable} {label}"));
-    }
+    let errors = errors_only.len();
+    let label = if errors == 1 { "error" } else { "errors" };
+    parts.push(format!("{errors} {label}"));
     if warnings > 0 {
         let label = if warnings == 1 { "warning" } else { "warnings" };
         parts.push(format!("{warnings} {label}"));
@@ -254,7 +272,13 @@ pub(crate) fn low_coverage_caveat(
 
 /// The low-key coverage summary line: how much information the checker had, not a validation
 /// result.
-pub(crate) fn coverage_message(total: u64, typed: u64, unresolved: u64) -> String {
+pub(crate) fn coverage_message(
+    total: u64,
+    typed: u64,
+    unresolved: u64,
+    lost: u64,
+    uncounted: u64,
+) -> String {
     if total == 0 {
         return "\u{2139} No DataFrames with recognized loads/schemas found to check".to_string();
     }
@@ -264,8 +288,26 @@ pub(crate) fn coverage_message(total: u64, typed: u64, unresolved: u64) -> Strin
     } else {
         String::new()
     };
+    let lost_note = if lost > 0 {
+        let (noun, verb) = if lost == 1 {
+            ("frame", "lost its")
+        } else {
+            ("frames", "lost their")
+        };
+        format!(
+            ", {lost} derived {noun} {verb} columns later (`--coverage-detail=explain` lists them)"
+        )
+    } else {
+        String::new()
+    };
+    let uncounted_note = if uncounted > 0 {
+        let noun = if uncounted == 1 { "load" } else { "loads" };
+        format!(", not counting {uncounted} {noun} inside other expressions")
+    } else {
+        String::new()
+    };
     format!(
-        "\u{2139} {typed}/{total} DataFrames had column info ({pct}%){unresolved_note} \u{2014} DataFrame schema coverage, not a pass/fail result"
+        "\u{2139} {typed}/{total} DataFrames had column info ({pct}%){unresolved_note}{lost_note}{uncounted_note} \u{2014} DataFrame schema coverage, not a pass/fail result"
     )
 }
 
@@ -289,6 +331,10 @@ struct Run {
     total: u64,
     typed: u64,
     unresolved: u64,
+    // Frames derived from a tracked one whose columns the checker lost along the way.
+    lost: u64,
+    // Load calls no site accounts for.
+    uncounted: u64,
 }
 
 fn drop_after_chars(text: &str, n: usize) -> &str {
@@ -332,7 +378,16 @@ fn print_results(
             writeln!(
                 out,
                 "::notice title=typedframes DataFrame schema coverage::{}",
-                drop_after_chars(&coverage_message(run.total, run.typed, run.unresolved), 2)
+                drop_after_chars(
+                    &coverage_message(
+                        run.total,
+                        run.typed,
+                        run.unresolved,
+                        run.lost,
+                        run.uncounted
+                    ),
+                    2
+                )
             )?;
         }
         return Ok(());
@@ -369,7 +424,16 @@ fn print_results(
         writeln!(
             out,
             "{}",
-            paint(DIM, &coverage_message(run.total, run.typed, run.unresolved))
+            paint(
+                DIM,
+                &coverage_message(
+                    run.total,
+                    run.typed,
+                    run.unresolved,
+                    run.lost,
+                    run.uncounted
+                )
+            )
         )?;
     }
     Ok(())
@@ -602,6 +666,8 @@ pub(crate) fn run_check(
         total: findings.total,
         typed: findings.typed,
         unresolved: findings.unresolved,
+        lost: findings.lost_frames(),
+        uncounted: findings.uncounted_loads(),
     };
 
     let errors = apply_diagnostic_policy(findings.errors.clone(), args);
@@ -612,11 +678,13 @@ pub(crate) fn run_check(
     // The flag wins over the config key, so a one-off `--coverage-detail` doesn't mean editing
     // project config.
     // Counted before --no-warnings hides the warnings: that flag silences output, and --strict
-    // must still fail on a schema the checker could not resolve.
+    // must still fail on a frame the checker could not look inside (a schema it could not
+    // resolve, a column it could not verify): those are warnings, not errors, since not
+    // knowing is not being wrong, but strict is the mode that asks for everything known.
     let unresolved_schemas = findings
         .errors
         .iter()
-        .filter(|e| e["code"] == "unresolved-schema")
+        .filter(|e| e["code"] == "unresolved-schema" || e["code"] == "unverifiable-column")
         .count();
     let detail = args.coverage_detail.unwrap_or(coverage_config.detail);
     let format = args.format();
@@ -716,20 +784,17 @@ mod tests {
     }
 
     #[test]
-    fn test_should_count_unverifiable_errors_separately_only_when_there_are_some() {
+    fn test_should_count_errors_and_warnings_in_the_summary() {
         // arrange
         let plain = error("a.py", 1, "error", "unknown-column");
-        let unverifiable = error("a.py", 2, "error", "unverifiable-column");
 
         // act
         let only_plain = error_summary_parts(&[&plain, &plain], 1);
-        let mixed = error_summary_parts(&[&plain, &unverifiable, &unverifiable], 0);
-        let only_unverifiable = error_summary_parts(&[&unverifiable], 0);
+        let none = error_summary_parts(&[], 2);
 
         // assert
         assert_eq!(vec!["2 errors", "1 warning"], only_plain);
-        assert_eq!(vec!["1 error", "2 unverifiable errors"], mixed);
-        assert_eq!(vec!["1 unverifiable error"], only_unverifiable);
+        assert_eq!(vec!["0 errors", "2 warnings"], none);
     }
 
     #[test]
@@ -747,16 +812,49 @@ mod tests {
     fn test_should_word_the_coverage_summary() {
         assert_eq!(
             "\u{2139} No DataFrames with recognized loads/schemas found to check",
-            coverage_message(0, 0, 0)
+            coverage_message(0, 0, 0, 0, 0)
         );
         assert_eq!(
             "\u{2139} 1/3 DataFrames had column info (33%) \u{2014} DataFrame schema coverage, not a pass/fail result",
-            coverage_message(3, 1, 0)
+            coverage_message(3, 1, 0, 0, 0)
         );
         assert_eq!(
             "\u{2139} 1/3 DataFrames had column info (33%), 2 annotated with an unresolved schema \u{2014} DataFrame schema coverage, not a pass/fail result",
-            coverage_message(3, 1, 2)
+            coverage_message(3, 1, 2, 0, 0)
         );
+    }
+
+    #[test]
+    fn test_should_say_how_many_loads_the_percentage_does_not_cover() {
+        assert!(coverage_message(1, 1, 0, 0, 1).contains("not counting 1 load inside other"));
+        assert!(coverage_message(1, 1, 0, 0, 2).contains("not counting 2 loads inside other"));
+        assert!(!coverage_message(1, 1, 0, 0, 0).contains("not counting"));
+    }
+
+    #[test]
+    fn test_should_say_how_many_derived_frames_lost_their_columns() {
+        assert_eq!(
+            "\u{2139} 2/3 DataFrames had column info (67%), 1 derived frame lost its columns later (`--coverage-detail=explain` lists them) \u{2014} DataFrame schema coverage, not a pass/fail result",
+            coverage_message(3, 2, 0, 1, 0)
+        );
+        assert!(coverage_message(3, 2, 0, 4, 0).contains("4 derived frames lost their columns"));
+    }
+
+    #[test]
+    fn test_should_count_each_lost_frame_once_per_file() {
+        // arrange
+        let findings = Findings {
+            leg_events: vec![
+                json!({"file": "a.py", "var": "x", "outcome": "untracked"}),
+                json!({"file": "a.py", "var": "x", "outcome": "unresolved"}),
+                json!({"file": "b.py", "var": "x", "outcome": "unresolved"}),
+                json!({"file": "a.py", "var": "y", "outcome": "something else"}),
+            ],
+            ..Findings::default()
+        };
+
+        // act / assert
+        assert_eq!(2, findings.lost_frames());
     }
 
     #[test]

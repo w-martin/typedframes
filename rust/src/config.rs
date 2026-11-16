@@ -142,8 +142,100 @@ pub fn find_project_root(start_path: &Path) -> PathBuf {
     find_project_root_opt(start_path).unwrap_or_else(|| start_path.to_path_buf())
 }
 
+/// The directory Python would put on `sys.path` to import `path` as written: the nearest
+/// ancestor that is not itself a package (has no `__init__.py`). For a script in a flat
+/// directory that is its own directory, as `python script.py` sees it.
+pub(crate) fn package_root(path: &Path) -> PathBuf {
+    let mut dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf).unwrap_or_default()
+    };
+    while dir.join("__init__.py").is_file() {
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => dir = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir
+    }
+}
+
+/// `package_root` answers by directory, so files sharing a package share one walk up the tree.
+#[derive(Default)]
+pub(crate) struct PackageRoots(std::sync::RwLock<std::collections::HashMap<PathBuf, PathBuf>>);
+
+impl PackageRoots {
+    /// `package_root(file)` for a path that is a file.
+    pub(crate) fn of_file(&self, file: &Path) -> PathBuf {
+        let mut walked = Vec::new();
+        let mut current = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let root = loop {
+            if let Some(known) = self.0.read().ok().and_then(|m| m.get(&current).cloned()) {
+                break known;
+            }
+            walked.push(current.clone());
+            if !current.join("__init__.py").is_file() {
+                break current;
+            }
+            match current.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+                _ => break current,
+            }
+        };
+        let root = if root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            root
+        };
+        if let Ok(mut memo) = self.0.write() {
+            for dir in walked {
+                memo.insert(dir, root.clone());
+            }
+        }
+        root
+    }
+}
+
+/// The root imports are resolved against: the `pyproject.toml` directory, else the
+/// [`package_root`] of `path`.
+pub(crate) fn import_root(path: &Path) -> PathBuf {
+    find_project_root_opt(path).unwrap_or_else(|| package_root(path))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_should_cache_package_roots_without_changing_the_answer() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for package in ["pkg", "pkg/sub", "pkg/sub/deep"] {
+            std::fs::create_dir_all(root.join(package)).unwrap();
+            std::fs::write(root.join(package).join("__init__.py"), "").unwrap();
+        }
+        std::fs::create_dir_all(root.join("loose")).unwrap();
+        let files = [
+            "pkg/sub/deep/mod.py",
+            "pkg/sub/other.py",
+            "pkg/top.py",
+            "loose/script.py",
+        ];
+        let roots = PackageRoots::default();
+
+        // act / assert: the first call walks, the second is answered from the cache
+        for _ in 0..2 {
+            for file in files {
+                let path = root.join(file);
+                std::fs::write(&path, "").unwrap();
+                assert_eq!(package_root(&path), roots.of_file(&path), "{file}");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

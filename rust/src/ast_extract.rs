@@ -335,28 +335,40 @@ pub(crate) fn extract_bare_dataframe_type(expr: &Expr) -> bool {
     }
 }
 
+/// A parameter annotated `pd.DataFrame`, `pl.DataFrame` or `pl.LazyFrame`: certainly a frame, with
+/// columns the signature does not give.
+pub(crate) fn extract_frame_parameter_type(expr: &Expr) -> bool {
+    let name = match expr {
+        Expr::Attribute(attr) => attr.attr.as_str(),
+        Expr::Name(name) => name.id.as_str(),
+        _ => return false,
+    };
+    is_frame_type(name) || name == "LazyFrame"
+}
+
 // Extract a list of string literals from a `["a", "b", ...]` list expression.
 // Returns None if the expression is not a list or any element is not a string literal.
 pub(crate) fn extract_string_list(expr: &Expr) -> Option<Vec<String>> {
-    if let Expr::List(list) = expr {
-        let mut result = Vec::new();
-        for el in &list.elts {
-            if let Expr::StringLiteral(s) = el {
-                result.push(s.value.to_str().to_string());
-            } else {
-                return None;
-            }
+    let elements = match expr {
+        Expr::List(list) => &list.elts,
+        Expr::Tuple(tuple) => &tuple.elts,
+        _ => return None,
+    };
+    let mut result = Vec::new();
+    for el in elements {
+        if let Expr::StringLiteral(s) = el {
+            result.push(s.value.to_str().to_string());
+        } else {
+            return None;
         }
-        Some(result)
-    } else {
-        None
     }
+    Some(result)
 }
 
 // Extract columns from a list or single string expression.
 pub(crate) fn extract_string_list_or_single(expr: &Expr) -> Option<Vec<String>> {
     match expr {
-        Expr::List(_) => extract_string_list(expr),
+        Expr::List(_) | Expr::Tuple(_) => extract_string_list(expr),
         Expr::StringLiteral(s) => Some(vec![s.value.to_str().to_string()]),
         _ => None,
     }
@@ -469,7 +481,18 @@ pub(crate) fn is_file_parent_expr(expr: &Expr) -> bool {
 // FIFO under the project root would otherwise hang the linter, since reading one
 // blocks until a writer opens it).
 
-pub(crate) fn extract_drop_columns(call: &ast::ExprCall) -> Option<Vec<String>> {
+/// The columns a `drop(..)` call certainly removes. Positional labels without `axis=` are
+/// columns only in polars (`polars`); pandas reads them as row labels.
+pub(crate) fn extract_drop_columns(call: &ast::ExprCall, polars: bool) -> Option<Vec<String>> {
+    // `level=` drops from one level of a MultiIndex: the flat name may survive.
+    if call
+        .arguments
+        .keywords
+        .iter()
+        .any(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "level"))
+    {
+        return None;
+    }
     // Check `columns=` kwarg first (pandas pattern — always correct for column drops)
     for keyword in &call.arguments.keywords {
         if keyword.arg.as_ref().map(|s| s.as_str()) == Some("columns") {
@@ -498,15 +521,29 @@ pub(crate) fn extract_drop_columns(call: &ast::ExprCall) -> Option<Vec<String>> 
         return None; // axis present but not 1 → row drop
     }
 
-    // No axis kwarg → polars pattern, use first positional arg
-    if let Some(first_arg) = call.arguments.args.first() {
-        return extract_string_list_or_single(first_arg);
+    if !polars {
+        return None;
     }
-
-    None
+    // `drop("a", "b")` and `drop(["a"], "b")` both name columns.
+    let mut dropped = Vec::new();
+    for arg in &call.arguments.args {
+        dropped.extend(extract_string_list_or_single(arg)?);
+    }
+    (!dropped.is_empty()).then_some(dropped)
 }
 
 // Extract rename mapping from a rename() call: {"old": "new", ...}.
+// The string keys of a dict literal whose keys are all string literals.
+pub(crate) fn extract_string_dict_keys(dict: &ast::ExprDict) -> Option<Vec<String>> {
+    dict.items
+        .iter()
+        .map(|item| match item.key.as_ref()? {
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn extract_rename_mapping(call: &ast::ExprCall) -> Option<HashMap<String, String>> {
     // Check `columns={"old": "new"}` kwarg (pandas)
     for keyword in &call.arguments.keywords {
@@ -605,6 +642,121 @@ pub(crate) fn extract_string_dict(dict: &ast::ExprDict) -> Option<HashMap<String
         }
     }
     Some(map)
+}
+
+/// The column names a `.assign(...)` call adds, from its keywords.
+pub(crate) fn assign_output_names(call: &ast::ExprCall) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for keyword in &call.arguments.keywords {
+        match &keyword.arg {
+            Some(name) => names.push(name.to_string()),
+            // `**{"a": ..}` names its columns; `**mapping` can name any.
+            None => {
+                let Expr::Dict(dict) = &keyword.value else {
+                    return None;
+                };
+                for item in &dict.items {
+                    names.push(extract_string_literal(item.key.as_ref()?)?.to_string());
+                }
+            }
+        }
+    }
+    Some(names)
+}
+
+/// The name a polars expression outputs: its `.alias("name")`, else the column its chain
+/// starts from (`pl.col("a").sum()` is `a`). `None` when the name can't be read
+/// statically -- an expression over several columns, a renaming namespace, `pl.all()`.
+pub(crate) fn pl_expr_output_name(expr: &Expr) -> Option<String> {
+    if let Some(name) = extract_pl_col_name(expr) {
+        return Some(name);
+    }
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Attribute(attr) = &*call.func else {
+        return None;
+    };
+    if attr.attr.as_str() == "alias" {
+        return Some(extract_string_literal(call.arguments.args.first()?)?.to_string());
+    }
+    let mut receiver = &*attr.value;
+    loop {
+        if let Some(name) = extract_pl_col_name(receiver) {
+            return Some(name);
+        }
+        match receiver {
+            Expr::Call(inner) => match &*inner.func {
+                Expr::Attribute(a) => {
+                    if a.attr.as_str() == "alias" {
+                        return None;
+                    }
+                    receiver = &*a.value;
+                }
+                _ => return None,
+            },
+            // A namespace (`.str`, `.dt`) keeps the name; these rename.
+            Expr::Attribute(a) if matches!(a.attr.as_str(), "name" | "struct") => return None,
+            Expr::Attribute(a) => receiver = &*a.value,
+            _ => return None,
+        }
+    }
+}
+
+/// The column names a polars `.with_columns(...)`/`.agg(...)` call outputs, or `None` when
+/// an expression's output name can't be read statically.
+pub(crate) fn with_columns_output_names(call: &ast::ExprCall) -> Option<Vec<String>> {
+    let mut names = assign_output_names(call)?;
+    for arg in &call.arguments.args {
+        names.push(pl_expr_output_name(arg)?);
+    }
+    Some(names)
+}
+
+/// Output names of `.with_columns(...)` positional expressions named by the column their
+/// chain starts from rather than an `.alias(...)`: `pl.col("x").cast(..)` outputs `x`.
+pub(crate) fn with_columns_unaliased_outputs(call: &ast::ExprCall) -> Vec<String> {
+    call.arguments
+        .args
+        .iter()
+        .filter(|arg| {
+            !matches!(arg, Expr::Call(c) if matches!(&*c.func, Expr::Attribute(a) if a.attr.as_str() == "alias"))
+        })
+        .filter_map(pl_expr_output_name)
+        .collect()
+}
+
+/// The key columns of a polars `.group_by(...)`/`.join(on=...)` argument: a string, a
+/// `pl.col("x")`, or a list of them.
+pub(crate) fn literal_key_columns(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::StringLiteral(s) => Some(vec![s.value.to_str().to_string()]),
+        Expr::List(list) => list.elts.iter().map(single_key_column).collect(),
+        other => single_key_column(other).map(|c| vec![c]),
+    }
+}
+
+fn single_key_column(expr: &Expr) -> Option<String> {
+    extract_string_literal(expr)
+        .map(str::to_string)
+        .or_else(|| extract_pl_col_name(expr))
+}
+
+/// The key columns given to `group_by`: every positional argument, or `by=`.
+pub(crate) fn group_by_keys(call: &ast::ExprCall) -> Option<Vec<String>> {
+    let mut keys = Vec::new();
+    for arg in &call.arguments.args {
+        keys.extend(literal_key_columns(arg)?);
+    }
+    if let Some(by) = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_ref().map(|a| a.as_str()) == Some("by"))
+    {
+        keys.extend(literal_key_columns(&by.value)?);
+    }
+    (!keys.is_empty()).then_some(keys)
 }
 
 // Create a synthetic inferred schema and register it. Returns the schema name.
@@ -723,6 +875,18 @@ pub(crate) fn collect_pl_col_names(expr: &Expr) -> Vec<String> {
             let mut names = Vec::new();
             if let Expr::Attribute(attr) = &*call.func {
                 names.extend(collect_pl_col_names(&attr.value));
+                // `.over("a", ["b"])`, `.over(partition_by=..)`: bare strings are column names.
+                if attr.attr.as_str() == "over" {
+                    for arg in call.arguments.args.iter().chain(
+                        call.arguments
+                            .keywords
+                            .iter()
+                            .filter(|k| k.arg.as_ref().map(|a| a.as_str()) == Some("partition_by"))
+                            .map(|k| &k.value),
+                    ) {
+                        names.extend(extract_string_list_or_single(arg).unwrap_or_default());
+                    }
+                }
             }
             for arg in &call.arguments.args {
                 names.extend(collect_pl_col_names(arg));
@@ -752,6 +916,8 @@ pub(crate) fn collect_pl_col_names(expr: &Expr) -> Vec<String> {
             .flat_map(collect_pl_col_names)
             .collect(),
         Expr::UnaryOp(unary) => collect_pl_col_names(&unary.operand),
+        // A namespace step: `pl.col("a").list.len()`.
+        Expr::Attribute(attr) => collect_pl_col_names(&attr.value),
         _ => Vec::new(),
     }
 }

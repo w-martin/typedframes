@@ -3,7 +3,89 @@
 //! Determines which columns a function implicitly requires of a DataFrame passed
 //! into it, by tracking which locals are forwarded from a tainted parameter.
 
-use ruff_python_ast::{Expr, Stmt};
+use ruff_python_ast::visitor::{self as ast_visitor, Visitor};
+use ruff_python_ast::{self as ast, Expr, Stmt};
+
+/// Whether `expr` is a method chain that starts from a tainted name (`frame.group_by("a")`).
+fn chain_starts_at_tainted(tainted: &std::collections::HashSet<String>, expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => tainted.contains(n.id.as_str()),
+        Expr::Call(call) => chain_starts_at_tainted(tainted, &call.func),
+        Expr::Attribute(attr) => chain_starts_at_tainted(tainted, &attr.value),
+        _ => false,
+    }
+}
+
+/// Column names a polars chain on a tainted frame reads: `pl.col("x")` in the arguments of the
+/// expression methods, plus string arguments to `select`, `group_by` and `sort`.
+fn polars_reads(call: &ast::ExprCall, method: &str) -> Vec<String> {
+    if !matches!(
+        method,
+        "select" | "with_columns" | "filter" | "group_by" | "agg" | "sort"
+    ) {
+        return Vec::new();
+    }
+    let literal = matches!(method, "select" | "group_by" | "sort");
+    let mut names = Vec::new();
+    for arg in call
+        .arguments
+        .args
+        .iter()
+        .chain(call.arguments.keywords.iter().map(|k| &k.value))
+    {
+        names.extend(crate::ast_extract::collect_pl_col_names(arg));
+        if literal {
+            names
+                .extend(crate::ast_extract::extract_string_list_or_single(arg).unwrap_or_default());
+        }
+    }
+    names
+}
+
+/// Names the function makes itself (`.alias("x")`, `with_columns(x=..)`, `df["x"] = ..`), which
+/// a caller's frame need not have.
+pub(crate) fn created_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    #[derive(Default)]
+    struct Created(std::collections::HashSet<String>);
+    impl<'a> Visitor<'a> for Created {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Call(call) => {
+                    if let Expr::Attribute(attr) = &*call.func {
+                        if attr.attr.as_str() == "alias" {
+                            if let Some(name) = call
+                                .arguments
+                                .args
+                                .first()
+                                .and_then(crate::ast_extract::extract_string_literal)
+                            {
+                                self.0.insert(name.to_string());
+                            }
+                        }
+                    }
+                    for keyword in &call.arguments.keywords {
+                        if let Some(name) = &keyword.arg {
+                            self.0.insert(name.to_string());
+                        }
+                    }
+                }
+                Expr::Subscript(sub) if sub.ctx == ast::ExprContext::Store => {
+                    self.0.extend(
+                        crate::ast_extract::extract_string_list_or_single(&sub.slice)
+                            .unwrap_or_default(),
+                    );
+                }
+                _ => {}
+            }
+            ast_visitor::walk_expr(self, expr);
+        }
+    }
+    let mut created = Created::default();
+    for stmt in body {
+        created.visit_stmt(stmt);
+    }
+    created.0
+}
 
 pub(crate) fn expr_forwards_tainted(
     tainted: &std::collections::HashSet<String>,
@@ -52,6 +134,11 @@ pub(crate) fn scan_expr_for_contract(
             scan_expr_for_contract(tainted, &attr.value, direct, delegates);
         }
         Expr::Call(call) => {
+            if let Expr::Attribute(attr) = &*call.func {
+                if chain_starts_at_tainted(tainted, &attr.value) {
+                    direct.extend(polars_reads(call, attr.attr.as_str()));
+                }
+            }
             let first_arg_tainted = call
                 .arguments
                 .args

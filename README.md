@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.14.5) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.15.0) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -34,7 +34,8 @@ typedframes check src/ --coverage-fail-under=90
 `--coverage-fail-under=N` is the same idea as a test-coverage or mypy type-coverage gate, applied to how many DataFrames
 the checker can resolve to a concrete column list — a DataFrame it merely recognizes but can't resolve columns for
 (a Feast retrieval whose entity_df isn't itself concrete, a bare `-> pd.DataFrame` return with no attached Schema)
-does not count, and any column accessed on it is flagged `unverifiable-column` rather than passed through silently.
+does not count, and the first column accessed on it is flagged with an `unverifiable-column` warning (once per frame,
+with the fix) rather than passed through silently.
 See [DataFrame Schema Coverage Thresholds](#dataframe-schema-coverage-thresholds-opt-in).
 Add `BaseSchema` classes later for cross-file awareness and IDE autocomplete — see [Quick Start](#quick-start).
 
@@ -73,7 +74,7 @@ tracking and IDE autocomplete; they're a progressive enhancement, not a prerequi
 
 **What you get:**
 
-- ✅ **Works without schema annotations** - Column inference from `usecols=`, `dtype=`, and method chains catches errors on unannotated code
+- ✅ **Works without schema annotations** - Column inference from `usecols=`, `columns=`, dict literals, and method chains catches errors on unannotated code
 - ✅ **CI gate via coverage threshold** - `--coverage-fail-under=N` fails the build when too much of your codebase is invisible to the checker, the same way you'd gate on test coverage or a type checker's type-coverage number
 - ✅ **Rust-fast** - Milliseconds, not seconds, even on hundreds of files; fast enough for pre-commit hooks and CI (see [benchmarks](#static-analysis-performance))
 - ✅ **Cross-file awareness** - Add `BaseSchema` and typed return annotations to follow schemas across module boundaries
@@ -232,7 +233,10 @@ checker catches real bugs from day one without it.
 ### Inferred Schemas
 
 When you pass `usecols=` (pandas) or `schema=` / `columns=` (polars), the checker builds an inferred column set
-and validates all subscript access against it — no schema annotation required:
+and validates all subscript access against it — no schema annotation required. A pandas `dtype=` mapping is not
+a column list (it types some columns and says nothing about the rest); polars' `schema=` is complete. Writing a
+new column (`df["new"] = ...`, `df[["a", "b"]] = ...`, `df.loc[mask, "flag"] = ...`) adds it to an inferred set;
+only a declared `BaseSchema` rejects a column it does not list:
 
 ```python
 # Checker infers {user_id, email} from usecols= — no annotation needed
@@ -265,6 +269,10 @@ trimmed = df.drop(columns=["age"])
 # assign() — new column added to inferred set
 augmented = df.assign(created_at="2024-01-01")
 print(augmented["created_at"])  # ✓ OK
+
+# query() / eval() strings — bare names are checked as columns
+adults = df.query("age >= 18")  # ✓ OK
+# df.query("agee >= 18")        # ✗ Error: 'agee' not in inferred column set
 ```
 
 ### Inference Gaps and Warnings
@@ -314,6 +322,17 @@ trimmed = df.drop(columns=["nonexistent"])
 # ⚠ dropped-unknown-column: Dropped column 'nonexistent' does not exist in UserData
 ```
 
+**Even without a column list, what a frame lost is known.** After
+`items.drop(columns=["created_at"], inplace=True)`, `items = items.rename(columns={"old": "new"})` or
+`pd.get_dummies(df, columns=["category"])`, reading `created_at`, `old` or `category` off that frame is an
+`unknown-column` error, and reading a column ahead of the only statement that assigns it is the warning
+`column-read-before-assignment` (the data may already have it). `a.merge(b)` follows pandas' `_x`/`_y`
+(or `suffixes=`) renaming of the columns both sides carry. A column read once on such a frame, named nowhere
+else in the file, and one slip from exactly one name the code does mention raises the warning
+`likely-column-typo`. Details in
+[the usage guide](docs/usage.md#frames-known-only-by-name) and the
+[method matrix](docs/method-matrix.md).
+
 ### Function Parameter Contracts
 
 Beyond validating access at the point it happens, the checker infers a *contract* for any function's
@@ -335,10 +354,24 @@ contact_label(customers)
 #   column(s) {email} — available: {customer_id, name, region}, required: {email, name}
 ```
 
+The body counts only when every statement in it runs on each call: a read behind an `if`, a loop, a
+conditional expression or `and`/`or` (`if "a" in df.columns: return df["a"]`) is no requirement.
+
 The contract is resolved *transitively*: if a function only forwards its parameter to other functions
 (`step1 = preprocess(df); step2 = enrich(step1)`), the checker follows the chain and unions their
 requirements, catching a missing column even when no single function in the chain touches it directly.
 Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
+
+Every other parameter has a contract too: the columns the body reads off it on every path, before
+anything could have added them (reads after a branch, loop or `return`, or after the frame is written
+to or handed to another function, don't count). Arguments are matched to parameters by position and by
+keyword (`combine(left, right=orders)`), and a parameter passed straight on to another helper takes on
+that helper's requirement, one level deep. A call is checked only when its callee is one known function:
+a local function, an imported one, `module.helper(...)`, `self.helper(...)` (unless an instance
+attribute of that name shadows it, a subclass in another file overrides it, or one in the same file
+overrides it with a different requirement), or a method on a `Protocol`-typed receiver whose every
+implementation in the project requires the same columns. Calls with `*args`/`**kwargs`, names bound to
+two functions, and frames whose columns are unknown are left alone.
 
 **Known limitations:**
 - Cross-file delegate/schema resolution follows `from module import name`, plain `import module` +
@@ -350,9 +383,8 @@ Column-list slices (`df[["a", "b"]]`) contribute to the contract too.
   true requirements.
 - A cycle in the delegate graph (mutually- or self-delegating helpers) contributes only each function's own
   direct requirements to the cycle, not the full transitive union — conservative rather than exhaustive.
-- If two plainly-imported modules both define a same-named function, an attribute-style delegate call
-  (`module.helper(df)`) resolves to whichever one is found first — the checker doesn't disambiguate by which
-  module the call site actually used.
+- The first parameter's transitive delegate chain, resolved at the index level, may still follow a bare
+  delegate name to whichever plainly-imported module defines it first.
 
 ### See Also
 
@@ -496,7 +528,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.14.5"]
+        additional_dependencies: ["typedframes==0.15.0"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -545,7 +577,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.14.5"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.15.0"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
@@ -563,6 +595,7 @@ typedframes suggest src/                              # dry run: prints diffs, c
 typedframes suggest src/ --apply                      # write the safe suggestions
 typedframes suggest src/ --apply --only quiet-amber   # act on just that site
 typedframes suggest src/ --interactive                # ask about each suggestion
+typedframes suggest notebooks/ src/                   # several paths, each looked at on its own
 ```
 
 Edits need a clean git work tree and tracked files, each edited file is re-checked in memory before anything is written,
@@ -673,9 +706,10 @@ the
 Some DataFrames are recognized but never resolve to a concrete column list — a Feast
 retrieval whose `entity_df` isn't itself concretely typed, or a bare `-> pd.DataFrame`
 return with no attached `Schema`. These do **not** count as covered, and accessing any
-column on one is flagged `unverifiable-column` rather than passed through silently —
-the checker genuinely doesn't know whether the column exists, so it says so instead of
-guessing either way. A Feast retrieval whose `entity_df` argument IS a concretely typed
+column on one is flagged with an `unverifiable-column` warning (once per frame, not once per use) rather
+than passed through silently — the checker genuinely doesn't know whether the column exists, so it
+says so instead of guessing either way; a warning rather than an error, because not knowing is not the
+same as being wrong (it fails the run under `--strict`). Inside a `test_*` function the warning is not raised: the test's own reads are the run-time check. A Feast retrieval whose `entity_df` argument IS a concretely typed
 DataFrame is fully resolved instead: Feast's real output is `entity_df`'s own columns
 plus the requested features, so both halves get checked normally. See
 [Unresolved schemas](docs/usage.md#unresolved-schemas-recognized-but-not-column-checked).
@@ -685,17 +719,17 @@ plus the requested features, so both halves get checked normally. See
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (median of 5 runs ± one standard deviation, 3 warmup, caches cleared between runs):
-*2026-10-24 · Darwin 27.0.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
+*2026-11-15 · Darwin 27.2.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
 
 | Tool | Version | What it does | typedframes (12 files) | great_expectations (494 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.14.5 | DataFrame column checker | 21.8 ± 0.1 ms | 55.0 ± 0.3 ms |
-| ruff | 0.17.2 | Linter (no type checking) | 29.5 ± 1.0 ms | 233.7 ± 2.1 ms |
-| ty | 0.0.91 | Type checker | 55.6 ± 0.4 ms | 821.0 ± 73.5 ms |
-| pyrefly | 1.4.0 | Type checker | 121.3 ± 6.0 ms | 386.6 ± 24.9 ms |
-| mypy | 2.4.0 | Type checker (no plugin) | 2.02 ± 0.12 s | 3.28 ± 0.15 s |
-| mypy + typedframes | 2.4.0 | Type checker + column checker | 2.06 ± 0.01 s | 3.50 ± 0.08 s |
-| pyright | 1.1.414 | Type checker | 778.0 ± 22.3 ms | 4.11 ± 0.09 s |
+| typedframes | 0.15.0 | DataFrame column checker | 19.6 ± 0.3 ms | 115.8 ± 1.7 ms |
+| ruff | 0.17.3 | Linter (no type checking) | 24.3 ± 0.6 ms | 220.7 ± 3.2 ms |
+| ty | 0.0.95 | Type checker | 52.5 ± 2.3 ms | 768.4 ± 18.5 ms |
+| pyrefly | 1.4.0 | Type checker | 109.3 ± 16.9 ms | 272.8 ± 11.4 ms |
+| mypy | 2.4.1 | Type checker (no plugin) | 1.83 ± 0.14 s | 3.06 ± 0.03 s |
+| mypy + typedframes | 2.4.1 | Type checker + column checker | 1.84 ± 0.02 s | 3.30 ± 0.01 s |
+| pyright | 1.1.414 | Type checker | 674.0 ± 5.5 ms | 3.93 ± 0.04 s |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 
@@ -1223,7 +1257,7 @@ A: The mypy plugin doesn't work with pyright. Use the standalone checker (`typed
 validation. Schema descriptor access (`df[Schema.column]`) works natively in pyright without any plugin.
 
 **Q: Do I need to write `BaseSchema` classes to get value?**
-A: No. The standalone checker works entirely from inference: `usecols=`/`columns=`/`dtype=` arguments on read
+A: No. The standalone checker works entirely from inference: `usecols=`/`columns=` arguments on read
 calls give it enough information to validate column access and propagate that knowledge through method chains
 (`rename`, `drop`, `assign`, `select`, …). `BaseSchema` is a progressive enhancement that unlocks cross-file
 awareness (schemas travel with function return types across module boundaries) and IDE autocomplete via

@@ -15,7 +15,7 @@ use crate::constants::STDLIB_MODULES;
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
 use ruff_text_size::Ranged;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One byte-range replacement against the ORIGINAL source (`start == end` inserts).
 #[derive(Debug, Clone, Serialize)]
@@ -125,16 +125,20 @@ pub(crate) struct LibraryContext {
     // Functions whose return annotation says pandas or polars, by bare name: this file's
     // own, plus those imported from other project files (from the index).
     functions: HashMap<String, Library>,
-    // Methods of this file's classes whose return annotation says pandas or polars, by
-    // `(class, method)`: a call on a receiver known to be an instance of the class.
+    // Methods whose return annotation says pandas or polars, by `(class, method)`: a call on
+    // a receiver known to be an instance of the class. This file's classes, plus those it
+    // imports from other project files (from the index).
     class_methods: HashMap<(String, String), Library>,
 }
 
 impl LibraryContext {
     /// `imported_functions`: libraries of functions this file imports from other files.
+    /// `imported_class_methods`: libraries of the methods of classes it imports, by
+    /// `(class, method)`.
     pub(crate) fn new(
         body: &[Stmt],
         imported_functions: &HashMap<String, Library>,
+        imported_class_methods: &HashMap<(String, String), Library>,
     ) -> LibraryContext {
         let mut context = LibraryContext {
             functions: imported_functions.clone(),
@@ -144,13 +148,25 @@ impl LibraryContext {
         // A name defined twice with different libraries can't be trusted either way.
         let mut own: HashMap<String, Option<Library>> = HashMap::new();
         collect_function_returns(body, &context, &mut own);
-        for (name, library) in own {
+        let mut own_classes = HashSet::new();
+        let mut bases = Vec::new();
+        collect_classes(body, &mut own_classes, &mut bases);
+        let inherited =
+            inherited_method_libraries(&bases, &own_classes, &own, imported_class_methods);
+        for (name, library) in own.into_iter().chain(inherited) {
             match library {
                 Some(library) => context.functions.insert(name, library),
                 None => context.functions.remove(&name),
             };
         }
         context.class_methods = class_method_libraries(body, &context);
+        for ((class, method), library) in imported_class_methods {
+            if !own_classes.contains(class) {
+                context
+                    .class_methods
+                    .insert((class.clone(), method.clone()), *library);
+            }
+        }
         context
     }
 
@@ -364,10 +380,64 @@ fn class_method_libraries(
         .collect()
 }
 
+// The names of the classes `body` defines, and `(subclass, base)` pairs for each base named
+// plainly.
+fn collect_classes(body: &[Stmt], names: &mut HashSet<String>, bases: &mut Vec<(String, String)>) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(class) => {
+                names.insert(class.name.to_string());
+                for base in class.bases() {
+                    if let Expr::Name(base) = base {
+                        bases.push((class.name.to_string(), base.id.to_string()));
+                    }
+                }
+                collect_classes(&class.body, names, bases);
+            }
+            Stmt::FunctionDef(function) => collect_classes(&function.body, names, bases),
+            _ => {}
+        }
+    }
+}
+
+// What `self.<method>()` returns for methods a class of this file inherits from an imported
+// base, keyed by bare name like this file's own methods. A name this file defines itself is
+// left to that definition; `None` once two imported bases disagree.
+fn inherited_method_libraries(
+    bases: &[(String, String)],
+    own_classes: &HashSet<String>,
+    own: &HashMap<String, Option<Library>>,
+    imported_class_methods: &HashMap<(String, String), Library>,
+) -> HashMap<String, Option<Library>> {
+    let mut inherited: HashMap<String, Option<Library>> = HashMap::new();
+    for (_, base) in bases.iter().filter(|(_, base)| !own_classes.contains(base)) {
+        for ((class, method), library) in imported_class_methods {
+            if class != base || own.contains_key(method) {
+                continue;
+            }
+            inherited
+                .entry(method.clone())
+                .and_modify(|existing| {
+                    if *existing != Some(*library) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(*library));
+        }
+    }
+    inherited
+}
+
 /// The library each function of `module` returns, by name -- what the index stores so
 /// other files can resolve a call to it.
 pub(crate) fn function_libraries(module: &ModModule) -> HashMap<String, Library> {
-    LibraryContext::new(&module.body, &HashMap::new()).functions
+    LibraryContext::new(&module.body, &HashMap::new(), &HashMap::new()).functions
+}
+
+/// The library each method of each class of `module` returns, by `(class, method)` -- what
+/// the index stores so other files can resolve a call on an instance of the class.
+pub(crate) fn class_method_libraries_of(module: &ModModule) -> HashMap<(String, String), Library> {
+    LibraryContext::new(&module.body, &HashMap::new(), &HashMap::new()).class_methods
 }
 
 const MAX_NAMED_BLOCKERS: usize = 4;
@@ -1732,7 +1802,7 @@ mod tests {
         let imports = parse_module("import pandas as pd\nimport polars as pl\n")
             .unwrap()
             .into_syntax();
-        LibraryContext::new(&imports.body, &HashMap::new())
+        LibraryContext::new(&imports.body, &HashMap::new(), &HashMap::new())
     }
 
     // Runs the rule on the first assignment of `source`, scanning the rest of the module.

@@ -66,6 +66,19 @@ class TestWithheldShapes(TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("only 'price' is read later", completed.stdout)
 
+    def test_should_read_the_library_from_a_method_of_a_class_imported_from_another_file(self) -> None:
+        """Test that an instance, an annotated parameter and a subclass of an imported class resolve the library."""
+        # arrange
+        path = FIXTURES / "xclass"
+
+        # act
+        groups = _report_groups(path=path)
+
+        # assert
+        reasons = [group["reason"] for group in groups]
+        self.assertFalse(any("can't tell whether it is pandas or polars" in reason for reason in reasons), reasons)
+        self.assertEqual(3, sum(group["count"] for group in groups if group["outcome"] == "suggested"), reasons)
+
     def test_should_list_frames_the_checker_does_not_track(self) -> None:
         """Test that `--outcome untracked` lists only untracked frames."""
         # arrange

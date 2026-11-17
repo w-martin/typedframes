@@ -133,6 +133,12 @@ pub(crate) struct IndexEntry {
     // resolves to via `resolve_module_file`, not through a third file's indirection.
     #[serde(default)]
     pub(crate) class_methods: HashMap<String, HashMap<String, String>>,
+    // Class name -> {method name -> "pandas" | "polars"}, for methods whose return annotation
+    // names that library's frame type. Lets a file that imports the class tell which library
+    // `instance.method()` or an inherited `self.method()` returns; `class_methods` above can't,
+    // as it marks a bare frame return the same way for both.
+    #[serde(default)]
+    pub(crate) class_method_libraries: HashMap<String, HashMap<String, String>>,
     // Base class names (as written) of every class defined in this file, keyed by class
     // name -- a direct copy of `Linter::class_bases`. Every class gets an entry, even one
     // with no bases, so presence of a key is "this class is defined in this file". Same-file
@@ -921,7 +927,10 @@ pub(crate) fn index_source(
         let usages = crate::helpers::module_param_usages_in(&analysis, module);
         analysis.reset();
         let folds = crate::static_eval::plan_folds(module, &analysis);
-        let libraries = crate::suggest::function_libraries(module);
+        let libraries = (
+            crate::suggest::function_libraries(module),
+            crate::suggest::class_method_libraries_of(module),
+        );
         let names = module_exports_and_imports(module);
         let call_sites = module_call_sites(module);
         as_written = Some((eval, usages, libraries, names, call_sites, folds));
@@ -935,7 +944,7 @@ pub(crate) fn index_source(
             None => (
                 Default::default(),
                 HashMap::new(),
-                HashMap::new(),
+                (HashMap::new(), HashMap::new()),
                 (Vec::new(), HashMap::new(), HashMap::new()),
                 CallSites::default(),
                 None,
@@ -1006,6 +1015,14 @@ pub(crate) fn index_source(
             )
         })
         .collect();
+    let (libraries, class_libraries) = libraries;
+    let mut class_method_libraries: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for ((class, method), library) in class_libraries {
+        class_method_libraries
+            .entry(class)
+            .or_default()
+            .insert(method, library.as_str().to_string());
+    }
     for (name, library) in libraries {
         if let Some(function) = functions.get_mut(&name) {
             function.returns_library = library.as_str().to_string();
@@ -1107,6 +1124,7 @@ pub(crate) fn index_source(
             imports,
             module_aliases,
             class_methods: linter.class_methods,
+            class_method_libraries,
             class_bases: linter.class_bases,
             class_helper_summaries,
             eval,
@@ -3181,6 +3199,7 @@ mod tests {
                 imports: HashMap::new(),
                 module_aliases: HashMap::new(),
                 class_methods: HashMap::new(),
+                class_method_libraries: HashMap::new(),
                 class_bases: HashMap::new(),
                 class_helper_summaries: HashMap::new(),
                 eval: Default::default(),
@@ -4385,6 +4404,25 @@ def load_{i}(path: str) -> pd.DataFrame:
         // assert
         let svc = project.path().join("svc.py").to_str().unwrap().to_string();
         assert!(index.called_functions[&svc].contains("run"));
+    }
+
+    #[test]
+    fn test_should_record_the_library_each_class_method_returns() {
+        // arrange
+        let project = project_with(&[(
+            "repo.py",
+            "import pandas as pd\nimport polars as pl\n\n\nclass Repo:\n    def orders(self) -> pd.DataFrame:\n        return pd.read_csv(\"o.csv\")\n\n    def users(self) -> pl.DataFrame:\n        return pl.read_csv(\"u.csv\")\n\n    def name(self) -> str:\n        return \"r\"\n",
+        )]);
+
+        // act
+        let index = build_index_cached(project.path(), None);
+
+        // assert
+        let repo = project.path().join("repo.py").to_str().unwrap().to_string();
+        let methods = &index.files[&repo].class_method_libraries["Repo"];
+        assert_eq!(methods.get("orders").map(String::as_str), Some("pandas"));
+        assert_eq!(methods.get("users").map(String::as_str), Some("polars"));
+        assert!(!methods.contains_key("name"));
     }
 
     fn call_sites_of(source: &str) -> CallSites {

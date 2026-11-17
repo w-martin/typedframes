@@ -52,7 +52,48 @@ pub struct SiteReport {
     pub refusal: Option<String>,
 }
 
-// Replaces quoted names, backticked names and numbers with placeholders.
+// Whether backticked code in a reason may stay as written: every name in it is one a snippet
+// keeps in the same position, and it holds no string or number that could be data.
+fn keeps_code(code: &str) -> bool {
+    let chars: Vec<char> = code.chars().collect();
+    let next_solid = |from: usize| (from..chars.len()).find(|&j| !chars[j].is_whitespace());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if matches!(c, '\'' | '"') || c.is_ascii_digit() {
+            return false;
+        }
+        if !(c.is_alphabetic() || c == '_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let name: String = chars[start..i].iter().collect();
+        let before = chars[..start].iter().rev().find(|c| !c.is_whitespace());
+        let after = next_solid(i);
+        // As the snippet renames: a library member stays after a dot and a library keyword
+        // before `=`, but a bare name or call (`load`, `keep()`) is taken to be the user's.
+        let library = if before == Some(&'.') {
+            keeps_library_name(&name, 'a')
+        } else if after.is_some_and(|j| chars[j] == '=' && chars.get(j + 1) != Some(&'=')) {
+            keeps_library_name(&name, 'k')
+        } else {
+            false
+        };
+        let constant = matches!(name.as_str(), "True" | "False" | "None");
+        if !(constant || library || keeps_name(&name)) {
+            return false;
+        }
+    }
+    true
+}
+
+// Replaces quoted names, backticked names and numbers with placeholders. Backticked code
+// whose names are all library or Python names stays, so a reason still says which method
+// or call withheld the site.
 fn mask(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -70,7 +111,11 @@ fn mask(text: &str) -> String {
                 }
                 inner.push(next);
             }
-            if closed {
+            if closed && close == '`' && keeps_code(&inner) {
+                out.push(close);
+                out.push_str(&inner);
+                out.push(close);
+            } else if closed {
                 out.push(close);
                 out.push('_');
                 out.push(close);
@@ -507,6 +552,17 @@ fn contains(range: ruff_text_size::TextRange, offset: usize) -> bool {
     range.start().to_usize() <= offset && offset < range.end().to_usize()
 }
 
+// Every name in `start..end`.
+fn names_in(source: &str, tokens: &[Tok], start: usize, end: usize) -> BTreeSet<String> {
+    let first = tokens.partition_point(|t| t.start < start);
+    let last = tokens.partition_point(|t| t.start < end);
+    tokens[first..last]
+        .iter()
+        .filter(|t| t.kind == "Name")
+        .map(|t| source[t.start..t.end].to_string())
+        .collect()
+}
+
 // Names called anywhere in `start..end`: a name directly followed by `(`.
 fn callee_names(source: &str, tokens: &[Tok], start: usize, end: usize) -> BTreeSet<String> {
     let first = tokens.partition_point(|t| t.start < start);
@@ -581,6 +637,7 @@ fn build_snippet(
     source: &str,
     site_offset: usize,
     stubs: &HashMap<String, Library>,
+    class_stubs: &HashMap<(String, String), Library>,
 ) -> Result<(String, (usize, usize)), String> {
     let parsed = parse_module(source).map_err(|_| "the file does not parse".to_string())?;
     let tokens: Vec<Tok> = parsed
@@ -802,6 +859,55 @@ fn build_snippet(
             ));
         }
     }
+    // Stand-ins for imported classes the kept code names, with the methods whose library
+    // the index knew; named as the kept code will name them, so the stub comes first.
+    let defined_classes: BTreeSet<&str> = body
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::ClassDef(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    for i in tops
+        .iter()
+        .copied()
+        .chain(class_top)
+        .chain(other_classes.keys().copied())
+    {
+        let r = body[i].range();
+        referenced.extend(names_in(
+            source,
+            &tokens,
+            r.start().to_usize(),
+            r.end().to_usize(),
+        ));
+    }
+    let mut stub_classes: BTreeMap<&str, Vec<(&str, Library)>> = BTreeMap::new();
+    for ((class, method), library) in class_stubs {
+        if referenced.contains(class) && !defined_classes.contains(class.as_str()) {
+            stub_classes
+                .entry(class)
+                .or_default()
+                .push((method, *library));
+        }
+    }
+    for (class, mut methods) in stub_classes {
+        methods.sort_by_key(|(method, _)| *method);
+        let renamed = redactor.namer.name(class, 'C', false);
+        stub_lines.push_str(&format!("class {renamed}:\n"));
+        for (method, library) in methods {
+            let (alias, module) = match library {
+                Library::Pandas => ("pd", "pandas"),
+                Library::Polars => ("pl", "polars"),
+            };
+            stub_libraries.insert(module);
+            let method = redactor.namer.name(method, 'f', true);
+            stub_lines.push_str(&format!(
+                "    def {method}(self, *args, **kwargs) -> {alias}.DataFrame: ...\n"
+            ));
+        }
+    }
     for module in stub_libraries {
         let alias = if module == "pandas" { "pd" } else { "pl" };
         let line = format!("import {module} as {alias}\n");
@@ -899,7 +1005,14 @@ fn untracked_report(
     };
     let built = phrase::offset_of(source, index, call.line, call.col)
         .ok_or_else(|| "the frame's position could not be found".to_string())
-        .and_then(|offset| build_snippet(source, offset, linter.imported_function_libraries()))
+        .and_then(|offset| {
+            build_snippet(
+                source,
+                offset,
+                linter.imported_function_libraries(),
+                linter.imported_class_method_libraries(),
+            )
+        })
         .and_then(|(snippet, at)| {
             verify_untracked(&snippet, at)?;
             let (reduced, _) =
@@ -963,7 +1076,12 @@ pub(crate) fn report_for(source: &str, linter: &Linter, name: &str) -> Option<Si
     let offset = phrase::offset_of(source, &index, site.line, site.col);
     let built = offset
         .ok_or_else(|| "the site's position could not be found".to_string())
-        .and_then(|offset| build_snippet(source, offset, linter.imported_function_libraries()))
+        .and_then(|offset| build_snippet(
+            source,
+            offset,
+            linter.imported_function_libraries(),
+            linter.imported_class_method_libraries(),
+        ))
         .and_then(|(snippet, position)| {
             verify(&snippet, position, &verdict)?;
             let (reduced, _) = minimize(&snippet, position, |text, at| {
@@ -1028,9 +1146,14 @@ mod tests {
             .expect("no such site");
         let index = LineIndex::from_source_text(source);
         let offset = phrase::offset_of(source, &index, site.line, site.col).expect("offset");
-        build_snippet(source, offset, linter.imported_function_libraries())
-            .expect("a snippet")
-            .0
+        build_snippet(
+            source,
+            offset,
+            linter.imported_function_libraries(),
+            linter.imported_class_method_libraries(),
+        )
+        .expect("a snippet")
+        .0
     }
 
     const PRIVATE: &str = r#"import pandas as pd
@@ -1614,11 +1737,38 @@ def run(a):
         stubs.insert("load_orders".to_string(), Library::Pandas);
 
         // act
-        let (snippet, _position) = build_snippet(source, offset, &stubs).unwrap();
+        let (snippet, _position) = build_snippet(source, offset, &stubs, &HashMap::new()).unwrap();
 
         // assert
         assert!(snippet.contains("-> pd.DataFrame: ..."), "{snippet}");
         assert!(snippet.contains("import pandas as pd"), "{snippet}");
+        assert!(!snippet.contains("load_orders"), "{snippet}");
+        assert!(!snippet.contains("lib_private"), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_stand_in_for_an_imported_class_by_its_frame_methods_only() {
+        // arrange
+        let source = "from lib_private import OrderRepo\n\n\ndef run(repo: OrderRepo):\n    df = repo.load_orders()\n    return df[\"a\"]\n";
+        let offset = source.find("df =").unwrap();
+        let mut class_stubs = HashMap::new();
+        class_stubs.insert(
+            ("OrderRepo".to_string(), "load_orders".to_string()),
+            Library::Polars,
+        );
+
+        // act
+        let (snippet, _position) =
+            build_snippet(source, offset, &HashMap::new(), &class_stubs).unwrap();
+
+        // assert
+        assert!(snippet.contains("class C1:"), "{snippet}");
+        assert!(
+            snippet.contains("(self, *args, **kwargs) -> pl.DataFrame: ..."),
+            "{snippet}"
+        );
+        assert!(snippet.contains("import polars as pl"), "{snippet}");
+        assert!(!snippet.contains("OrderRepo"), "{snippet}");
         assert!(!snippet.contains("load_orders"), "{snippet}");
         assert!(!snippet.contains("lib_private"), "{snippet}");
     }
@@ -1637,6 +1787,47 @@ def run(a):
             mask("can't see everything done with it: x"),
             "can't see everything done with it: x"
         );
+    }
+
+    #[test]
+    fn test_should_keep_library_and_checker_wording_in_a_verdict() {
+        // arrange
+        let unknown_library = "can't tell whether it is pandas or polars: the value is built \
+             from `repo`, not a direct `pd.`/`pl.` call, a call to a function annotated \
+             `-> pd.DataFrame` or `-> pl.DataFrame`, or a method like `.to_df()`";
+
+        // act
+        let masked = mask(unknown_library);
+
+        // assert
+        assert_eq!(
+            masked,
+            "can't tell whether it is pandas or polars: the value is built from `_`, not a \
+             direct `pd.`/`pl.` call, a call to a function annotated `-> pd.DataFrame` or \
+             `-> pl.DataFrame`, or a method like `.to_df()`"
+        );
+        assert_eq!(mask("built from `self`"), "built from `self`");
+        assert_eq!(
+            mask("`.columns` (line 11); `.reset_index()` (line 22)"),
+            "`.columns` (line N); `.reset_index()` (line N)"
+        );
+        assert_eq!(
+            mask("`.drop(inplace=True)` is not modelled"),
+            "`.drop(inplace=True)` is not modelled"
+        );
+    }
+
+    #[test]
+    fn test_should_mask_backticked_code_holding_a_user_name_string_or_number() {
+        // act / assert
+        assert_eq!(mask("`.price` (line 3)"), "`_` (line N)");
+        assert_eq!(mask("`clean()` (line 3)"), "`_` (line N)");
+        assert_eq!(mask("callers of `load`"), "callers of `_`");
+        assert_eq!(mask("`keep()`"), "`_`");
+        assert_eq!(mask("`self.revenue_store`"), "`_`");
+        assert_eq!(mask("`df['price']`"), "`_`");
+        assert_eq!(mask("`.iloc[5]`"), "`_`");
+        assert_eq!(mask("`.agg(revenue=None)`"), "`_`");
     }
 
     #[test]

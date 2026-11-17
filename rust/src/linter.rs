@@ -620,6 +620,9 @@ pub struct Linter {
     value_checked_early: bool,
     // Libraries of functions imported from other project files, by name, from the index.
     imported_function_libraries: HashMap<String, suggest::Library>,
+    // Libraries of the methods of classes imported from other project files, by
+    // `(class, method)`, from the index.
+    imported_class_method_libraries: HashMap<(String, String), suggest::Library>,
     // What functions imported from other project files do with their parameters, by local
     // name, from the index.
     imported_param_usage: HashMap<String, Vec<column_usage::ParamUsage>>,
@@ -2535,6 +2538,7 @@ impl Linter {
             missing_enum_members: Vec::new(),
             value_checked_early: false,
             imported_function_libraries: HashMap::new(),
+            imported_class_method_libraries: HashMap::new(),
             imported_param_usage: HashMap::new(),
             project_index: None,
             string_var_candidates: HashMap::new(),
@@ -3105,7 +3109,11 @@ impl Linter {
             .map(|site| ((site.line, site.col), site.var.as_str()))
             .collect();
         let mut results = SiteScanResults::default();
-        let libraries = suggest::LibraryContext::new(body, &self.imported_function_libraries);
+        let libraries = suggest::LibraryContext::new(
+            body,
+            &self.imported_function_libraries,
+            &self.imported_class_method_libraries,
+        );
         let no_imports = static_eval::ImportedModules::new();
         let analysis = static_eval::Analysis::build(module, &no_imports);
         let helpers =
@@ -3127,6 +3135,14 @@ impl Linter {
     // Libraries of functions this file imports from other project files, by local name.
     pub(crate) fn imported_function_libraries(&self) -> &HashMap<String, suggest::Library> {
         &self.imported_function_libraries
+    }
+
+    // Libraries of the methods of classes this file imports from other project files, by
+    // `(class, method)`.
+    pub(crate) fn imported_class_method_libraries(
+        &self,
+    ) -> &HashMap<(String, String), suggest::Library> {
+        &self.imported_class_method_libraries
     }
 
     // The file's path relative to the project root, with `/` separators, so a site's name
@@ -3960,6 +3976,14 @@ impl Linter {
                         self.schema_locations
                             .insert(schema_name.clone(), loc.clone());
                     }
+                }
+            }
+        }
+        if let Some(methods) = entry.class_method_libraries.get(name) {
+            for (method, library) in methods {
+                if let Some(library) = suggest::Library::from_name(library) {
+                    self.imported_class_method_libraries
+                        .insert((name.to_string(), method.clone()), library);
                 }
             }
         }
@@ -13825,6 +13849,100 @@ class UseCase:
         // assert: the library is read from the injected class, so a pandas selection is made
         assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
         assert!(linter.suggestions[0].diff.contains("[[\"qty\"]]"));
+    }
+
+    // Collects the suggestions for `main_source`, in a project where `repo.py` holds
+    // `repo_source`.
+    fn suggest_with_repo_file(repo_source: &str, main_source: &str) -> Linter {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::write(root.join("repo.py"), repo_source).unwrap();
+        fs::write(root.join("main.py"), main_source).unwrap();
+        let index = build_index_internal(root);
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+        let main_path = root.join("main.py");
+        linter.load_cross_file_symbols(&index, main_source, &main_path, root);
+        linter.check_file_internal(main_source, &main_path).unwrap();
+        linter
+    }
+
+    const PANDAS_REPO: &str = "import pandas as pd\n\n\nclass Repo:\n    def fetch(self) -> pd.DataFrame:\n        return pd.read_csv(\"x.csv\")\n";
+
+    #[test]
+    fn test_should_read_the_library_from_a_method_of_an_instance_of_a_class_in_another_file() {
+        // arrange
+        let main = "from repo import Repo\n\n\ndef run():\n    repo = Repo()\n    frame = repo.fetch()\n    return frame[\"qty\"].sum()\n";
+
+        // act
+        let linter = suggest_with_repo_file(PANDAS_REPO, main);
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert!(linter.suggestions[0].diff.contains("[[\"qty\"]]"));
+    }
+
+    #[test]
+    fn test_should_read_the_library_from_a_parameter_annotated_with_a_class_in_another_file() {
+        // arrange
+        let main = "from repo import Repo\n\n\ndef run(repo: Repo):\n    frame = repo.fetch()\n    return frame[\"qty\"].sum()\n";
+
+        // act
+        let linter = suggest_with_repo_file(PANDAS_REPO, main);
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+    }
+
+    #[test]
+    fn test_should_read_the_library_from_a_self_method_inherited_from_a_class_in_another_file() {
+        // arrange
+        let main = "from repo import Repo\n\n\nclass Job(Repo):\n    def run(self):\n        frame = self.fetch()\n        return frame[\"qty\"].sum()\n";
+
+        // act
+        let linter = suggest_with_repo_file(PANDAS_REPO, main);
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+    }
+
+    #[test]
+    fn test_should_read_polars_from_a_method_of_a_class_in_another_file() {
+        // arrange
+        let repo = "import polars as pl\n\n\nclass Repo:\n    def fetch(self) -> pl.DataFrame:\n        return pl.read_csv(\"x.csv\")\n";
+        let main = "from repo import Repo\n\n\ndef run(repo: Repo):\n    frame = repo.fetch()\n    return frame[\"qty\"].sum()\n";
+
+        // act
+        let linter = suggest_with_repo_file(repo, main);
+
+        // assert
+        assert_eq!(linter.suggestions.len(), 1, "{:?}", linter.withheld);
+        assert!(
+            linter.suggestions[0].diff.contains("select"),
+            "{}",
+            linter.suggestions[0].diff
+        );
+    }
+
+    #[test]
+    fn test_should_not_read_the_library_from_an_imported_method_this_file_overrides() {
+        // arrange: Job's own `fetch` says nothing about its library.
+        let main = "from repo import Repo\n\n\nclass Job(Repo):\n    def fetch(self):\n        return load()\n\n    def run(self):\n        frame = self.fetch()\n        return frame[\"qty\"].sum()\n";
+
+        // act
+        let linter = suggest_with_repo_file(PANDAS_REPO, main);
+
+        // assert
+        assert!(linter.suggestions.is_empty());
+        assert!(
+            linter
+                .withheld
+                .iter()
+                .any(|w| w.reason.contains("pandas or polars")),
+            "{:?}",
+            linter.withheld
+        );
     }
 
     fn lint_for_leg_tests(body: &str) -> (Linter, Vec<LintError>) {

@@ -9,9 +9,10 @@
 //! anything it can't attribute to a column, or that lets the frame escape, is one.
 //!
 //! Scope limits:
-//! - A nested function, class, lambda or comprehension body is its own scope and is not
-//!   walked. `first_nested_scope_mention` reports whether any of them mention the frame,
-//!   since a closure can read columns this scan never sees.
+//! - A nested function, class, lambda or generator expression body is its own scope and is
+//!   not walked. `first_nested_scope_mention` reports whether any of them mention the frame,
+//!   since a closure can read columns this scan never sees. A list, set or dict comprehension
+//!   runs where it is written, so its body is walked as part of the scope.
 //! - A `.method()`/`.attribute` use is tagged with its [`Consumption`], but which names
 //!   read every column or none is decided by the table in `column_consuming_methods`.
 
@@ -122,6 +123,43 @@ const SAME_COLUMNS_METHODS: &[&str] = &[
     "lazy",
     "collect",
 ];
+
+/// Series methods that return a boolean mask over the same rows.
+const MASK_METHODS: &[&str] = &[
+    "isin",
+    "isna",
+    "notna",
+    "isnull",
+    "notnull",
+    "between",
+    "duplicated",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+];
+
+/// `.str` methods that return a boolean mask over the same rows.
+const STR_MASK_METHODS: &[&str] = &[
+    "contains",
+    "startswith",
+    "endswith",
+    "match",
+    "fullmatch",
+    "isdigit",
+    "isalpha",
+    "isalnum",
+    "isnumeric",
+    "isspace",
+    "islower",
+    "isupper",
+];
+
+fn is_all_rows(expr: &Expr) -> bool {
+    matches!(expr, Expr::Slice(s) if s.lower.is_none() && s.upper.is_none() && s.step.is_none())
+}
 
 /// For `.rename(columns={..})` / `.drop(columns=[..])` with literal arguments: the columns the
 /// call names (they must exist in the source) and the names it introduces.
@@ -385,7 +423,7 @@ pub(crate) fn scan_usage_with<'s>(
 }
 
 /// The offset of the first mention of any of `names` inside a nested function, class,
-/// lambda or comprehension anywhere in `body` -- the scan above deliberately does not
+/// lambda or generator expression anywhere in `body` -- the scan above deliberately does not
 /// walk those scopes, but a closure can read columns it never sees. Pass the WHOLE
 /// scope body (not just the statements after the origin): a function defined above
 /// the origin can still read the variable once called.
@@ -515,17 +553,9 @@ impl<'a> Visitor<'a> for NestedMentionFinder<'_> {
                 self.visit_expr(&lambda.body);
                 self.depth -= 1;
             }
-            Expr::ListComp(c) => self.visit_comprehension(&c.generators, &[&c.elt]),
-            Expr::SetComp(c) => self.visit_comprehension(&c.generators, &[&c.elt]),
+            // A generator runs later, perhaps once the name holds another frame; an eager
+            // comprehension runs here and `UsageScan` walks it.
             Expr::Generator(c) => self.visit_comprehension(&c.generators, &[&c.elt]),
-            Expr::DictComp(c) => {
-                let mut elements: Vec<&Expr> = Vec::with_capacity(2);
-                if let Some(key) = &c.key {
-                    elements.push(key);
-                }
-                elements.push(&c.value);
-                self.visit_comprehension(&c.generators, &elements);
-            }
             _ => ast_visitor::walk_expr(self, expr),
         }
     }
@@ -552,6 +582,17 @@ impl<'a> Visitor<'a> for ScopeDeclFinder<'_> {
             }
             _ => ast_visitor::walk_stmt(self, stmt),
         }
+    }
+}
+
+// Whether assigning to `target` rebinds `name` (not `name["col"] = ..` or `name.attr = ..`).
+fn binds(target: &Expr, name: &str) -> bool {
+    match target {
+        Expr::Name(n) => n.id.as_str() == name,
+        Expr::Tuple(t) => t.elts.iter().any(|e| binds(e, name)),
+        Expr::List(l) => l.elts.iter().any(|e| binds(e, name)),
+        Expr::Starred(s) => binds(&s.value, name),
+        _ => false,
     }
 }
 
@@ -622,6 +663,114 @@ impl UsageScan<'_> {
 
     fn is_suppressed(&self, name: &str) -> bool {
         self.suppressed_self_reference.as_deref() == Some(name)
+    }
+
+    fn is_frame_column(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Subscript(s) if self.is_tainted(&s.value)
+            && crate::ast_extract::extract_string_literal(&s.slice).is_some())
+    }
+
+    // A boolean row mask built from the tracked frame's own columns (`df["a"] > 0`,
+    // `~df["a"].isin(keep)`, `df["a"].notna() & (df["b"] == 1)`). A bare name or a column of
+    // another frame could be a column list, so neither is one.
+    fn is_row_mask(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::UnaryOp(u) => {
+                matches!(u.op, ast::UnaryOp::Invert) && self.is_row_mask(&u.operand)
+            }
+            Expr::BinOp(b) => {
+                matches!(
+                    b.op,
+                    ast::Operator::BitAnd | ast::Operator::BitOr | ast::Operator::BitXor
+                ) && self.is_row_mask(&b.left)
+                    && self.is_row_mask(&b.right)
+            }
+            // A chained comparison asks for the truth of a Series, which pandas refuses.
+            Expr::Compare(c) => {
+                matches!(
+                    &*c.ops,
+                    [ast::CmpOp::Eq
+                        | ast::CmpOp::NotEq
+                        | ast::CmpOp::Lt
+                        | ast::CmpOp::LtE
+                        | ast::CmpOp::Gt
+                        | ast::CmpOp::GtE]
+                ) && std::iter::once(&*c.left)
+                    .chain(c.comparators.iter())
+                    .any(|e| self.is_frame_column(e))
+            }
+            Expr::Call(call) => {
+                let Expr::Attribute(method) = &*call.func else {
+                    return false;
+                };
+                let name = method.attr.as_str();
+                (MASK_METHODS.contains(&name) && self.is_frame_column(&method.value))
+                    || (STR_MASK_METHODS.contains(&name)
+                        && matches!(&*method.value, Expr::Attribute(s)
+                            if s.attr.as_str() == "str" && self.is_frame_column(&s.value)))
+            }
+            _ => false,
+        }
+    }
+
+    // `df.loc[rows]` or `df.loc[rows, columns]` on a tracked name, `rows` being a row mask or
+    // `:`.
+    fn loc_selection<'e>(
+        &self,
+        sub: &'e ast::ExprSubscript,
+    ) -> Option<(&'e Expr, Option<&'e Expr>)> {
+        let Expr::Attribute(attr) = &*sub.value else {
+            return None;
+        };
+        if attr.attr.as_str() != "loc" || !self.is_tainted(&attr.value) {
+            return None;
+        }
+        let (rows, columns) = match &*sub.slice {
+            Expr::Tuple(t) => match t.elts.as_slice() {
+                [rows, columns] => (rows, Some(columns)),
+                _ => return None,
+            },
+            rows => (rows, None),
+        };
+        (self.is_row_mask(rows) || is_all_rows(rows)).then_some((rows, columns))
+    }
+
+    // The row selector of an expression that keeps every column of the tracked frame and
+    // only drops rows: `df[mask]`, `df[2:5]`, `df.loc[mask]`, `df.loc[mask, :]`.
+    fn row_filter<'e>(&self, expr: &'e Expr) -> Option<&'e Expr> {
+        let Expr::Subscript(sub) = expr else {
+            return None;
+        };
+        if self.is_tainted(&sub.value) {
+            return (self.is_row_mask(&sub.slice) || matches!(&*sub.slice, Expr::Slice(_)))
+                .then_some(&*sub.slice);
+        }
+        match self.loc_selection(sub)? {
+            (rows, None) => Some(rows),
+            (rows, Some(columns)) if is_all_rows(columns) => Some(rows),
+            _ => None,
+        }
+    }
+
+    // `df[mask]["b"]`, `df.loc[mask, "b"]`, `df.loc[:, ["b", "c"]]`: reads of the mask's
+    // columns and the selected ones. Returns whether `sub` was one.
+    fn visit_filtered_selection(&mut self, sub: &ast::ExprSubscript) -> bool {
+        let (rows, columns) = match self.loc_selection(sub) {
+            Some((rows, Some(columns))) if !is_all_rows(columns) => (rows, columns),
+            _ => match self.row_filter(&sub.value) {
+                Some(rows) => (rows, &*sub.slice),
+                None => return false,
+            },
+        };
+        let Some(selected) = crate::ast_extract::extract_string_list_or_single(columns) else {
+            return false;
+        };
+        self.visit_expr(rows);
+        let at = sub.range().start();
+        for column in selected {
+            self.record_column(at, column);
+        }
+        true
     }
 
     // The frame is passed as an argument. If the callee's use of that parameter is known
@@ -712,10 +861,19 @@ impl UsageScan<'_> {
     fn derives_same_columns(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Name(n) => self.tainted.contains(n.id.as_str()),
+            Expr::Subscript(_) => self.row_filter(expr).is_some(),
             Expr::Call(call) => {
                 let Expr::Attribute(attr) = &*call.func else {
                     return false;
                 };
+                // Without `drop=True` the old index becomes a column.
+                if attr.attr.as_str() == "reset_index" {
+                    return call.arguments.args.is_empty()
+                        && matches!(&*call.arguments.keywords, [k]
+                            if k.arg.as_ref().is_some_and(|a| a.as_str() == "drop")
+                                && matches!(&k.value, Expr::BooleanLiteral(b) if b.value))
+                        && self.derives_same_columns(&attr.value);
+                }
                 if let Some(added) = adding_columns_call(call) {
                     return added.is_some() && self.derives_same_columns(&attr.value);
                 }
@@ -752,6 +910,10 @@ impl UsageScan<'_> {
     // `derives_same_columns` accepted: their expressions read columns of the tracked frame
     // and the names they produce are not source columns.
     fn record_derivation_effects(&mut self, expr: &Expr) {
+        if let Some(rows) = self.row_filter(expr) {
+            self.visit_expr(rows);
+            return;
+        }
         let Expr::Call(call) = expr else {
             return;
         };
@@ -973,8 +1135,46 @@ impl UsageScan<'_> {
         self.depth -= 1;
     }
 
-    // See the `Expr::ListComp` etc. arms in `visit_expr` for why only the first
-    // generator's iterable is visited here.
+    // A list, set or dict comprehension runs here, once per item, so its body is part of this
+    // scope; its reads are conditional, since it may run for no item at all. A target that
+    // rebinds the frame's name hides it from the body.
+    fn visit_eager_comprehension(&mut self, generators: &[ast::Comprehension], elements: &[&Expr]) {
+        self.visit_outer_comprehension_iter(generators);
+        if let Some(generator) = generators
+            .iter()
+            .find(|g| self.tainted.iter().any(|name| binds(&g.target, name)))
+        {
+            self.record_other(
+                generator.target.range().start(),
+                "rebound by a comprehension target",
+                Consumption::Unknown,
+            );
+            return;
+        }
+        self.depth += 1;
+        for (i, generator) in generators.iter().enumerate() {
+            if i > 0 {
+                if self.is_tainted(&generator.iter) {
+                    self.record_other(
+                        generator.iter.range().start(),
+                        "iterated over directly",
+                        Consumption::Unknown,
+                    );
+                } else {
+                    self.visit_expr(&generator.iter);
+                }
+            }
+            for condition in &generator.ifs {
+                self.visit_expr(condition);
+            }
+        }
+        for element in elements {
+            self.visit_expr(element);
+        }
+        self.depth -= 1;
+    }
+
+    // Only the first generator's iterable runs in the enclosing scope.
     fn visit_outer_comprehension_iter(&mut self, generators: &[ast::Comprehension]) {
         let Some(first) = generators.first() else {
             return;
@@ -1360,6 +1560,11 @@ impl UsageScan<'_> {
 
     fn visit_expr(&mut self, expr: &Expr) {
         let at = expr.range().start();
+        if let Expr::Subscript(sub) = expr {
+            if self.visit_filtered_selection(sub) {
+                return;
+            }
+        }
         match expr {
             Expr::Subscript(sub) if self.groupby_keys(&sub.value).is_some() => {
                 // `frame.groupby(keys)["col"]`: the keys and the selected columns.
@@ -1567,16 +1772,19 @@ impl UsageScan<'_> {
                     self.visit_expr(el);
                 }
             }
-            // A comprehension/generator expression is its own scope, like `Lambda`
-            // -- EXCEPT for one CPython-documented exception: the iterable of the
-            // OUTERMOST `for` clause is evaluated in the enclosing scope, before the
-            // comprehension's own scope even exists. That one sub-expression is a
-            // real access happening HERE (e.g. `sum(x for x in df["a"])` must still
-            // record `"a"`); the element/key/value, `if` filters, and any nested
-            // `for` clauses are not walked, matching `Lambda`.
-            Expr::ListComp(comp) => self.visit_outer_comprehension_iter(&comp.generators),
-            Expr::SetComp(comp) => self.visit_outer_comprehension_iter(&comp.generators),
-            Expr::DictComp(comp) => self.visit_outer_comprehension_iter(&comp.generators),
+            Expr::ListComp(comp) => self.visit_eager_comprehension(&comp.generators, &[&comp.elt]),
+            Expr::SetComp(comp) => self.visit_eager_comprehension(&comp.generators, &[&comp.elt]),
+            Expr::DictComp(comp) => {
+                let mut elements: Vec<&Expr> = Vec::with_capacity(2);
+                if let Some(key) = &comp.key {
+                    elements.push(key);
+                }
+                elements.push(&comp.value);
+                self.visit_eager_comprehension(&comp.generators, &elements);
+            }
+            // A generator expression is its own scope, like `Lambda`, run whenever it is
+            // consumed -- except that the iterable of its OUTERMOST `for` clause is
+            // evaluated here (e.g. `sum(x for x in df["a"])` still reads `"a"`).
             Expr::Generator(comp) => self.visit_outer_comprehension_iter(&comp.generators),
             Expr::Yield(y) => {
                 if let Some(value) = &y.value {
@@ -2053,14 +2261,46 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_descend_into_a_comprehension_body() {
-        // arrange / act: the element expression and any nested `for` clauses ARE the
-        // comprehension's own scope -- unlike the outermost iterable, not walked.
-        let u = usage("out = [df[\"a\"] for x in xs]\n");
+    fn test_should_not_descend_into_a_generator_body() {
+        // arrange / act: a generator runs when consumed, so only its outermost iterable is
+        // evaluated here.
+        let u = usage("out = (df[\"a\"] for x in xs)\n");
 
         // assert
         assert!(u.accesses.is_empty());
         assert!(u.other_uses.is_empty());
+    }
+
+    #[test]
+    fn test_should_walk_an_eager_comprehension_body_as_conditional() {
+        for source in [
+            "out = [df[\"a\"] for x in xs if df[\"b\"] is not None]\n",
+            "out = {x: df[\"a\"] for x in xs for y in df[\"b\"]}\n",
+            "out = {k: {j: df[\"a\"] for j in js} for k in ks if df[\"b\"].any()}\n",
+        ] {
+            // act
+            let u = usage(source);
+
+            // assert
+            assert!(u.other_uses.is_empty(), "{source}: {:?}", u.other_uses);
+            let mut read = cols(&u);
+            read.sort_unstable();
+            assert_eq!(read, vec![("a", true), ("b", true)], "{source}");
+        }
+    }
+
+    #[test]
+    fn test_should_record_uses_inside_an_eager_comprehension() {
+        // act
+        let u = usage("out = [f(df, x) for x in xs]\nother = [df for df in frames]\n");
+
+        // assert
+        assert!(has_other(&u, "passed to `f()`"), "{:?}", u.other_uses);
+        assert!(
+            has_other(&u, "rebound by a comprehension target"),
+            "{:?}",
+            u.other_uses
+        );
     }
 
     #[test]
@@ -2140,6 +2380,91 @@ mod tests {
             others(&u),
             vec![("this subscript", false, Consumption::Unknown)]
         );
+    }
+
+    #[test]
+    fn test_should_follow_a_frame_filtered_by_a_mask_of_its_own_columns() {
+        for source in [
+            "out = df[df[\"a\"] > 0]\nprint(out[\"b\"])\n",
+            "out = df[~df[\"a\"].isin(keep)].reset_index(drop=True)\nprint(out[\"b\"])\n",
+            "out = df[df[\"a\"].notna() & (df[\"c\"] == 1)]\nprint(out[\"b\"])\n",
+            "out = df[df[\"a\"].str.startswith(\"x\")].copy()\nprint(out[\"b\"])\n",
+            "out = df.loc[df[\"a\"] > 0]\nprint(out[\"b\"])\n",
+            "out = df.loc[df[\"a\"] > 0, :]\nprint(out[\"b\"])\n",
+        ] {
+            // act
+            let u = usage(source);
+
+            // assert
+            assert!(u.other_uses.is_empty(), "{source}: {:?}", u.other_uses);
+            let read: HashSet<&str> = u.accesses.iter().map(|a| a.column.as_str()).collect();
+            assert!(
+                read.contains("a") && read.contains("b"),
+                "{source}: {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_follow_a_row_slice() {
+        // act
+        let u = usage("out = df[:10]\nprint(out[\"b\"])\n");
+
+        // assert
+        assert!(u.other_uses.is_empty(), "{:?}", u.other_uses);
+        assert_eq!(cols(&u), vec![("b", false)]);
+    }
+
+    #[test]
+    fn test_should_read_the_columns_a_loc_or_filtered_frame_selects() {
+        for (source, expected) in [
+            ("print(df.loc[df[\"a\"] > 0, \"b\"])\n", vec!["a", "b"]),
+            ("print(df.loc[:, \"b\"])\n", vec!["b"]),
+            (
+                "print(df.loc[df[\"a\"] == 0, [\"b\", \"c\"]])\n",
+                vec!["a", "b", "c"],
+            ),
+            ("print(df[df[\"a\"] > 0][\"b\"])\n", vec!["a", "b"]),
+        ] {
+            // act
+            let u = usage(source);
+
+            // assert
+            assert!(u.other_uses.is_empty(), "{source}: {:?}", u.other_uses);
+            let mut read: Vec<&str> = u.accesses.iter().map(|a| a.column.as_str()).collect();
+            read.sort_unstable();
+            assert_eq!(read, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn test_should_not_take_a_selector_that_may_name_columns_as_a_row_mask() {
+        for source in [
+            "out = df[keep]\n",
+            "out = df[other[\"a\"] > 0]\n",
+            "out = df[0 < df[\"a\"] < 5]\n",
+            "out = df.loc[keep, \"b\"]\n",
+            "out = df.loc[df[\"a\"] > 0, cols]\n",
+            "out = df[df[\"a\"] > 0].reset_index()\n",
+        ] {
+            // act
+            let u = usage(source);
+
+            // assert
+            assert!(!u.other_uses.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn test_should_keep_a_filtered_frame_that_escapes_as_an_unknown_use() {
+        // act
+        let u = usage(
+            "print(df[df[\"a\"] > 0])\nreturn_value = df.loc[df[\"a\"] > 0]\nfoo(return_value)\n",
+        );
+
+        // assert
+        assert!(has_other(&u, "this subscript"), "{:?}", u.other_uses);
+        assert!(has_other(&u, "passed to `foo()`"), "{:?}", u.other_uses);
     }
 
     // --- soundness: what a suggestion that edits code depends on ---
@@ -2374,13 +2699,18 @@ mod tests {
     }
 
     #[test]
-    fn test_should_find_a_mention_inside_a_comprehension_body() {
-        assert!(mention("out = [df[\"a\"] for x in xs]\n"));
+    fn test_should_find_a_mention_inside_a_generator_body() {
+        assert!(mention("out = (df[\"a\"] for x in xs)\n"));
+        assert!(mention("out = (y for x in xs for y in df)\n"));
+        assert!(mention("out = [(df[\"a\"] for _ in ys) for x in xs]\n"));
+        assert!(mention("out = [lambda: df for x in xs]\n"));
     }
 
     #[test]
-    fn test_should_find_a_mention_in_a_later_generator_clause() {
-        assert!(mention("out = [y for x in xs for y in df]\n"));
+    fn test_should_not_count_an_eager_comprehension_body() {
+        // it runs here, and `scan_usage` walks it.
+        assert!(!mention("out = [df[\"a\"] for x in xs]\n"));
+        assert!(!mention("out = {x: y for x in xs for y in df}\n"));
     }
 
     #[test]

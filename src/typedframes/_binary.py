@@ -50,19 +50,30 @@ def _requested_in_process() -> bool:
     return os.environ.get(IN_PROCESS_VARIABLE, "").strip().lower() not in _OFF_VALUES
 
 
+def _free_threaded() -> bool:
+    """Whether this interpreter is a free-threaded (no-GIL) build."""
+    return bool(get_config_var("Py_GIL_DISABLED"))
+
+
 def _extension() -> ModuleType:
     """The `typedframes._rust` extension module.
 
     Raises:
-        BinaryNotFoundError: If the package was installed without it.
+        BinaryNotFoundError: If the package was installed without one this interpreter can load.
     """
     try:
         return import_module("typedframes._rust")
     except ImportError as e:
-        msg = (
-            "The typedframes extension module (typedframes._rust) was not found. "
-            "Reinstall typedframes from a wheel, or build it from source with: uv run inv build"
-        )
+        if _free_threaded():
+            msg = (
+                "The typedframes extension module (typedframes._rust) has no build for this free-threaded Python: "
+                "it needs Python 3.15t or later on Linux or macOS. Use the typedframes executable instead."
+            )
+        else:
+            msg = (
+                "The typedframes extension module (typedframes._rust) was not found. "
+                "Reinstall typedframes from a wheel, or build it from source with: uv run inv build"
+            )
         raise BinaryNotFoundError(msg) from e
 
 

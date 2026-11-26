@@ -1,6 +1,6 @@
 [package]
 name = "typedframes_python"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 description = "The typedframes checker as a Python extension module, for interpreters that may not start new executables"
 license = "MIT"
@@ -13,6 +13,11 @@ crate-type = ["cdylib"]
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 unwrap_used = "warn"
+
+[features]
+# Free-threaded interpreters cannot load an abi3 module. Built with this feature against a free-threaded
+# 3.15+ interpreter, the module is `_rust.abi3t.*` (PEP 803), which the wheel carries beside the abi3 one.
+abi3t = ["pyo3/abi3t-py315"]
 
 [dependencies]
 typedframes_checker = { path = ".." }

@@ -82,6 +82,8 @@ pub(crate) struct Origin<'a> {
     pub(crate) receivers: &'a HashMap<String, String>,
     /// Every column name any frame in the project is known to have, for spotting a misspelling.
     pub(crate) known_columns: &'a [String],
+    /// The function or module body the origin is in, for the library of a local it is built from.
+    pub(crate) scope_body: &'a [Stmt],
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -843,16 +845,116 @@ pub(crate) fn is_column_selection_of(stmt: &Stmt, var: &str) -> bool {
 // (`pd.read_parquet(...)`, `read_csv(...)` imported from pandas, connectorx's
 // `return_type=`); the return annotation of a function it calls.
 fn library_of(origin: &Origin) -> Result<Library, String> {
-    let context = origin.libraries;
     if let Some(library) = origin
         .annotation
-        .and_then(|a| context.annotation_library(a))
+        .and_then(|a| origin.libraries.annotation_library(a))
     {
         return Ok(library);
     }
     let value = origin
         .value
         .ok_or_else(|| "it has no assigned value".to_string())?;
+    library_of_value(origin, value, 0)
+}
+
+/// How many locals deep `library_of_value` follows `b = a.rename(..)`, `c = b[mask]`, ...
+const MAX_LOCAL_DEPTH: usize = 8;
+
+// Whether assigning to `target` rebinds `name`; storing into `name["col"]` or `name.attr`
+// does not.
+fn binds(target: &Expr, name: &str) -> bool {
+    match target {
+        Expr::Name(n) => n.id.as_str() == name,
+        Expr::Tuple(t) => t.elts.iter().any(|e| binds(e, name)),
+        Expr::List(l) => l.elts.iter().any(|e| binds(e, name)),
+        Expr::Starred(s) => binds(&s.value, name),
+        _ => false,
+    }
+}
+
+// Every assignment to `name` in `body` that ends before `before`, not looking inside nested
+// functions or classes: the annotation, when there is one, and the value.
+fn earlier_assignments<'a>(
+    body: &'a [Stmt],
+    name: &str,
+    before: usize,
+) -> Vec<(Option<&'a Expr>, Option<&'a Expr>)> {
+    struct Finder<'a, 'n> {
+        name: &'n str,
+        before: usize,
+        found: Vec<(Option<&'a Expr>, Option<&'a Expr>)>,
+    }
+    impl<'a> ast::visitor::source_order::SourceOrderVisitor<'a> for Finder<'a, '_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if stmt.range().start().to_usize() >= self.before
+                || matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_))
+            {
+                return;
+            }
+            let name = self.name;
+            let is_name = |e: &Expr| matches!(e, Expr::Name(n) if n.id.as_str() == name);
+            let mentions = |e: &Expr| binds(e, name);
+            // Bound by a loop or `with` target: the value can't be read here.
+            let loop_or_with = match stmt {
+                Stmt::For(f) => mentions(&f.target),
+                Stmt::With(w) => w
+                    .items
+                    .iter()
+                    .any(|i| i.optional_vars.as_deref().is_some_and(mentions)),
+                _ => false,
+            };
+            if loop_or_with {
+                self.found.push((None, None));
+            }
+            if stmt.range().end().to_usize() > self.before {
+                ast::visitor::source_order::walk_stmt(self, stmt);
+                return;
+            }
+            match stmt {
+                Stmt::Assign(a) if a.targets.iter().any(is_name) => {
+                    self.found.push((None, Some(&a.value)));
+                }
+                Stmt::AnnAssign(a) if is_name(&a.target) => {
+                    self.found.push((Some(&a.annotation), a.value.as_deref()));
+                }
+                // Unpacked or augmented: the value can't be read here.
+                Stmt::Assign(a) if a.targets.iter().any(mentions) => self.found.push((None, None)),
+                Stmt::AugAssign(a) if is_name(&a.target) => self.found.push((None, None)),
+                _ => ast::visitor::source_order::walk_stmt(self, stmt),
+            }
+        }
+        fn visit_expr(&mut self, _expr: &'a Expr) {}
+    }
+    let mut finder = Finder {
+        name,
+        before,
+        found: Vec::new(),
+    };
+    ast::visitor::source_order::SourceOrderVisitor::visit_body(&mut finder, body);
+    finder.found
+}
+
+// The library of `id`, a local of the origin's scope bound before `before`: the one every
+// earlier assignment to it agrees on.
+fn local_library(origin: &Origin, id: &str, before: usize, depth: usize) -> Option<Library> {
+    if depth >= MAX_LOCAL_DEPTH {
+        return None;
+    }
+    let mut agreed = None;
+    for (annotation, value) in earlier_assignments(origin.scope_body, id, before) {
+        let library = annotation
+            .and_then(|a| origin.libraries.annotation_library(a))
+            .or_else(|| value.and_then(|v| library_of_value(origin, v, depth + 1).ok()))?;
+        if agreed.is_some_and(|known| known != library) {
+            return None;
+        }
+        agreed = Some(library);
+    }
+    agreed
+}
+
+fn library_of_value(origin: &Origin, value: &Expr, depth: usize) -> Result<Library, String> {
+    let context = origin.libraries;
     if let Expr::Call(call) = value {
         if let Expr::Attribute(attribute) = &*call.func {
             match attribute.attr.as_str() {
@@ -881,6 +983,7 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
                 root_attribute = Some(attribute.attr.as_str());
                 current = &attribute.value;
             }
+            Expr::Subscript(subscript) => current = &subscript.value,
             Expr::Name(name) => {
                 let id = name.id.as_str();
                 // `self.store.read()`: `store` holds an instance of a class this file names.
@@ -927,6 +1030,11 @@ fn library_of(origin: &Origin) -> Result<Library, String> {
                 }
                 if let Some(library) = context.names.get(id).or_else(|| context.functions.get(id)) {
                     return Ok(*library);
+                }
+                if let Some(library) =
+                    local_library(origin, id, value.range().start().to_usize(), depth)
+                {
+                    return Ok(library);
                 }
                 let evidence = root_attribute
                     .filter(|method| {
@@ -1839,6 +1947,7 @@ mod tests {
                 function_local,
                 receivers: &HashMap::new(),
                 known_columns: &[],
+                scope_body: &module.body,
             },
             &usage,
         )
@@ -1918,6 +2027,7 @@ mod tests {
                 function_local: true,
                 receivers: &HashMap::new(),
                 known_columns: &[],
+                scope_body: &[],
             },
             &usage,
         )
@@ -1970,6 +2080,7 @@ mod tests {
                 function_local: true,
                 receivers: &HashMap::new(),
                 known_columns: &[],
+                scope_body: &[],
             },
             &usage,
         )
@@ -2373,6 +2484,7 @@ mod tests {
                 function_local: true,
                 receivers: &HashMap::new(),
                 known_columns: &[],
+                scope_body: &[],
             },
             &usage,
         )
@@ -2400,6 +2512,23 @@ mod tests {
             edited.starts_with("from typing import Any, Final, Optional\n"),
             "{edited}"
         );
+        assert_eq!(edited.matches("import Final").count(), 0, "{edited}");
+    }
+
+    #[test]
+    fn test_should_keep_a_lazy_typing_import_lazy_when_adding_final() {
+        // arrange
+        let source = "lazy from typing import Any\n\nlazy import pandas as pd\n\n\nclass Repo:\n    A = \"a\"\n";
+
+        // act
+        let (_, edited) = final_fix(source, "Repo", "A").unwrap();
+
+        // assert
+        assert!(
+            edited.starts_with("lazy from typing import Any, Final\n"),
+            "{edited}"
+        );
+        assert!(edited.contains("\nlazy import pandas as pd\n"), "{edited}");
         assert_eq!(edited.matches("import Final").count(), 0, "{edited}");
     }
 

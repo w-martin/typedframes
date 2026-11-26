@@ -13,7 +13,7 @@ use crate::phrase;
 use crate::report_minimize::minimize;
 use crate::report_names::{keeps_library_name, keeps_name, keeps_string, KEPT_IMPORT_ROOTS};
 use crate::suggest::Library;
-use ruff_python_ast::{Stmt, StmtClassDef};
+use ruff_python_ast::{self as ast, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_source_file::LineIndex;
 use ruff_text_size::Ranged;
@@ -147,7 +147,35 @@ fn mask_hiding(text: &str, columns: &[String]) -> String {
     for column in ordered {
         hidden = hidden.replace(&format!("'{column}'"), "'_'");
     }
-    mask(&hidden)
+    count_hidden_columns(&mask(&hidden))
+}
+
+// `'_', '_', '_'` says nothing a count doesn't: "3 columns".
+fn count_hidden_columns(text: &str) -> String {
+    const HIDDEN: &str = "'_'";
+    const SEPARATOR: &str = ", ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(HIDDEN) {
+        out.push_str(&rest[..start]);
+        let mut after = &rest[start + HIDDEN.len()..];
+        let mut count = 1;
+        while let Some(next) = after
+            .strip_prefix(SEPARATOR)
+            .and_then(|a| a.strip_prefix(HIDDEN))
+        {
+            after = next;
+            count += 1;
+        }
+        if count > 1 {
+            out.push_str(&format!("{count} columns"));
+        } else {
+            out.push_str(HIDDEN);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn verdict_of(linter: &Linter, phrase: &str) -> Option<Verdict> {
@@ -213,6 +241,11 @@ fn verify(snippet: &str, position: (usize, usize), real: &Verdict) -> Result<(),
         .ok_or("the snippet's site was neither suggested nor withheld")?;
     if same_verdict(&redacted, real) {
         Ok(())
+    } else if redacted.outcome == real.outcome {
+        Err(format!(
+            "the snippet is {} for another reason: {}",
+            redacted.outcome, redacted.reason
+        ))
     } else {
         Err(format!(
             "the snippet is classified differently ({} here, {} originally)",
@@ -252,7 +285,12 @@ impl Namer {
         }
         let count = self.counts.entry(prefix).or_insert(0);
         *count += 1;
-        let renamed = format!("{prefix}{count}");
+        // The checker treats a `test_` function as a test, and the prefix says nothing else.
+        let renamed = if original.starts_with("test_") {
+            format!("test_{prefix}{count}")
+        } else {
+            format!("{prefix}{count}")
+        };
         self.names.insert(original.to_string(), renamed.clone());
         renamed
     }
@@ -892,6 +930,56 @@ fn build_snippet(
                 .push((method, *library));
         }
     }
+    // Other imports the kept code uses, renamed, so an imported name stays imported.
+    let stubbed_classes: BTreeSet<&str> = stub_classes.keys().copied().collect();
+    let mut import_lines = String::new();
+    for stmt in body.iter().filter(|s| !is_kept_import(s)) {
+        let (module, aliases) = match stmt {
+            Stmt::Import(i) => (None, &i.names),
+            Stmt::ImportFrom(i) => match i.module.as_ref().map(ast::Identifier::as_str) {
+                Some("__future__") => continue,
+                module => (Some(module.unwrap_or("")), &i.names),
+            },
+            _ => continue,
+        };
+        for alias in aliases {
+            let imported = alias.name.as_str();
+            let bound = alias.asname.as_ref().map_or_else(
+                || imported.split('.').next().unwrap_or(imported),
+                |a| a.as_str(),
+            );
+            if imported == "*"
+                || !referenced.contains(bound)
+                || defined.contains(bound)
+                || defined_classes.contains(bound)
+                || stubs.contains_key(bound)
+                || stubbed_classes.contains(bound)
+            {
+                continue;
+            }
+            let prefix = if called.contains(bound) {
+                'f'
+            } else if bound.starts_with(char::is_uppercase) {
+                'C'
+            } else {
+                'v'
+            };
+            let renamed = redactor.namer.name(bound, prefix, false);
+            if renamed == bound {
+                continue;
+            }
+            let line = match module {
+                Some(module) => {
+                    let module = redactor.namer.name(&format!("module:{module}"), 'm', false);
+                    format!("from {module} import {renamed}\n")
+                }
+                None => format!("import {renamed}\n"),
+            };
+            if !import_lines.contains(&line) {
+                import_lines.push_str(&line);
+            }
+        }
+    }
     for (class, mut methods) in stub_classes {
         methods.sort_by_key(|(method, _)| *method);
         let renamed = redactor.namer.name(class, 'C', false);
@@ -917,6 +1005,7 @@ fn build_snippet(
     }
     // The inserted imports shift the site's recorded position only if it was already
     // seen; imports come first, so nothing has been recorded yet.
+    redactor.out.push_str(&import_lines);
     redactor.out.push_str(&stub_lines);
 
     // The kept code, in source order.
@@ -1074,16 +1163,29 @@ pub(crate) fn report_for(source: &str, linter: &Linter, name: &str) -> Option<Si
     let verdict = verdict_of(linter, name)?;
     let index = LineIndex::from_source_text(source);
     let offset = phrase::offset_of(source, &index, site.line, site.col);
-    let built = offset
-        .ok_or_else(|| "the site's position could not be found".to_string())
-        .and_then(|offset| build_snippet(
+    let offset = offset.ok_or_else(|| "the site's position could not be found".to_string());
+    let attempt = |stubs: &HashMap<String, Library>| {
+        let offset = offset.clone()?;
+        let (snippet, position) = build_snippet(
             source,
             offset,
-            linter.imported_function_libraries(),
+            stubs,
             linter.imported_class_method_libraries(),
-        ))
+        )?;
+        verify(&snippet, position, &verdict)?;
+        Ok((snippet, position))
+    };
+    // A stub stands for a function that returns a frame; one the frame is passed to is
+    // better kept as an import, which the stub turns into a function of this file.
+    let stubs = linter.imported_function_libraries();
+    let built = attempt(stubs)
+        .or_else(|first: String| {
+            if stubs.is_empty() {
+                return Err(first);
+            }
+            attempt(&HashMap::new()).map_err(|_| first)
+        })
         .and_then(|(snippet, position)| {
-            verify(&snippet, position, &verdict)?;
             let (reduced, _) = minimize(&snippet, position, |text, at| {
                 verify(text, at, &verdict).is_ok()
             });
@@ -1673,6 +1775,104 @@ def run(client):
             snippet.contains(".fetch(") && !snippet.contains("price"),
             "{snippet}"
         );
+    }
+
+    #[test]
+    fn test_should_keep_an_imported_callee_imported_in_the_snippet() {
+        let source = r#"
+import pandas as pd
+from app.helpers import clean
+
+
+def run():
+    orders = pd.read_csv("orders.csv")
+    clean(orders)
+    return orders["total"].sum()
+"#;
+        let linter = linter_for(source);
+
+        let reports = report_all(source, &linter);
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(
+            reports[0].verdict.reason.contains("an imported function"),
+            "{reports:?}"
+        );
+        let snippet = reports[0].snippet.as_deref().unwrap_or_else(|| {
+            panic!("no snippet: {:?}", reports[0].refusal);
+        });
+        assert!(
+            snippet.contains("from m1 import f1\n") && !snippet.contains("helpers"),
+            "{snippet}"
+        );
+    }
+
+    #[test]
+    fn test_should_import_rather_than_stub_a_function_the_frame_is_passed_to() {
+        // arrange: the index knows `clean` returns a pandas frame, so it would be stubbed
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("pyproject.toml"), "").unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/__init__.py"), "").unwrap();
+        std::fs::write(
+            root.join("app/helpers.py"),
+            "import pandas as pd\n\n\ndef clean(df: pd.DataFrame) -> pd.DataFrame:\n    df.to_csv(\"out.csv\")\n    return df\n",
+        )
+        .unwrap();
+        let source = "import pandas as pd\n\nfrom app.helpers import clean\n\n\ndef run() -> None:\n    orders = pd.read_csv(\"orders.csv\")\n    clean(orders)\n    print(orders[\"total\"])\n";
+        let main = root.join("app/main.py");
+        std::fs::write(&main, source).unwrap();
+        let index = crate::index::build_index_internal(&root);
+        let mut linter = Linter::new();
+        linter.collect_suggestions = true;
+        linter.load_cross_file_symbols(&index, source, &main, &root);
+        linter.check_file_internal(source, &main).unwrap();
+
+        // act
+        let reports = report_all(source, &linter);
+
+        // assert
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        let snippet = reports[0].snippet.as_deref().unwrap_or_else(|| {
+            panic!("no snippet: {:?}", reports[0].refusal);
+        });
+        assert!(snippet.contains("from m1 import f1\n"), "{snippet}");
+    }
+
+    #[test]
+    fn test_should_keep_a_test_function_a_test_in_the_snippet() {
+        let source = r#"
+import pandas as pd
+
+
+def test_orders():
+    orders = pd.read_csv("orders.csv")
+    assert orders["total"].sum() > 0
+"#;
+        let linter = linter_for(source);
+
+        let reports = report_all(source, &linter);
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].verdict.reason.contains("inside a test"));
+        let snippet = reports[0].snippet.as_deref().unwrap_or_else(|| {
+            panic!("no snippet: {:?}", reports[0].refusal);
+        });
+        assert!(
+            snippet.contains("def test_f1(") && !snippet.contains("orders"),
+            "{snippet}"
+        );
+    }
+
+    #[test]
+    fn test_should_count_masked_columns_rather_than_list_them() {
+        assert_eq!(
+            count_hidden_columns("only '_', '_', '_' are read later; '_' is renamed"),
+            "only 3 columns are read later; '_' is renamed"
+        );
+        assert_eq!(count_hidden_columns("'_', '_'"), "2 columns");
+        assert_eq!(count_hidden_columns("no columns"), "no columns");
     }
 
     #[test]

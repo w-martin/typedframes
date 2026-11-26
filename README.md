@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Proof of Concept**
 >
-> `typedframes` (v0.15.1) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
+> `typedframes` (v0.15.2) is currently an experimental proof-of-concept. The core static analysis and mypy/Rust
 > integrations work, but expect rough edges. The codebase prioritizes demonstrating the viability of static DataFrame
 > column checking over production-grade stability.
 >
@@ -128,7 +128,8 @@ the wheel, instead of starting the `typedframes` executable. Results and exit st
 asked to capture its output (as the mypy plugin does), a usage error or a missing path comes back with it, and any
 warning a command prints still goes to the terminal. Without the extension installed (for example from a source
 distribution) `TYPEDFRAMES_INPROC=1` is an error. The `typedframes-py` command always runs in the interpreter, without
-the variable.
+the variable. On a free-threaded (no-GIL) Python the extension needs Python 3.15t or later on Linux or macOS, and keeps
+the GIL off; elsewhere free-threaded builds use the executable.
 
 ---
 
@@ -528,7 +529,7 @@ repos:
         name: typedframes check
         entry: typedframes check . --strict
         language: python
-        additional_dependencies: ["typedframes==0.15.1"]
+        additional_dependencies: ["typedframes==0.15.2"]
         types_or: [python, jupyter]
         pass_filenames: false
 ```
@@ -577,7 +578,7 @@ The action installs the PyPI wheel into a throwaway virtualenv and runs the chec
 | Input | Default | |
 |-------|---------|-|
 | `path` | `.` | File or directory to check |
-| `version` | `latest` | PyPI version to install, e.g. `"0.15.1"` |
+| `version` | `latest` | PyPI version to install, e.g. `"0.15.2"` |
 | `strict` | `true` | Fail the step on errors — `typedframes check` exits 0 without it |
 | `coverage-fail-under` | *(unset)* | Minimum DataFrame schema coverage, e.g. `"90"` |
 | `coverage-detail` | `summary` | Or `term-missing` for the per-file breakdown, `explain` to diagnose a lower-than-expected total |
@@ -719,17 +720,17 @@ plus the requested features, so both halves get checked normally. See
 Fast feedback reduces development time. The typedframes Rust binary provides near-instant column checking.
 
 **Benchmark results** (median of 5 runs ± one standard deviation, 3 warmup, caches cleared between runs):
-*2026-11-17 · Darwin 27.2.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
+*2026-11-26 · Darwin 27.2.0 · arm · CPython 3.15.0 · 64GiB RAM · Great Expectations pinned @ 1.23.2*
 
 | Tool | Version | What it does | typedframes (12 files) | great_expectations (494 files) |
 |------|---------|--------------|------------------------|--------------------------------|
-| typedframes | 0.15.1 | DataFrame column checker | 18.9 ± 0.2 ms | 113.6 ± 0.5 ms |
-| ruff | 0.17.3 | Linter (no type checking) | 24.2 ± 0.8 ms | 220.5 ± 2.0 ms |
-| ty | 0.0.95 | Type checker | 52.7 ± 9.9 ms | 784.3 ± 8.3 ms |
-| pyrefly | 1.4.0 | Type checker | 109.4 ± 16.8 ms | 274.5 ± 16.9 ms |
-| mypy | 2.4.1 | Type checker (no plugin) | 1.82 ± 0.14 s | 3.15 ± 0.07 s |
-| mypy + typedframes | 2.4.1 | Type checker + column checker | 1.86 ± 0.01 s | 3.32 ± 0.07 s |
-| pyright | 1.1.414 | Type checker | 691.5 ± 6.5 ms | 4.08 ± 0.08 s |
+| typedframes | 0.15.2 | DataFrame column checker | 12.8 ± 0.2 ms | 109.7 ± 0.3 ms |
+| ruff | 0.17.3 | Linter (no type checking) | 18.8 ± 1.0 ms | 220.9 ± 3.0 ms |
+| ty | 0.0.95 | Type checker | 46.6 ± 1.1 ms | 776.8 ± 13.5 ms |
+| pyrefly | 1.4.0 | Type checker | 105.4 ± 13.7 ms | 277.2 ± 17.0 ms |
+| mypy | 2.4.1 | Type checker (no plugin) | 1.89 ± 0.12 s | 3.13 ± 0.02 s |
+| mypy + typedframes | 2.4.1 | Type checker + column checker | 1.92 ± 0.01 s | 3.39 ± 0.01 s |
+| pyright | 1.1.414 | Type checker | 695.6 ± 7.7 ms | 3.99 ± 0.03 s |
 
 *Run `uv run python benchmarks/benchmark_checkers.py` to reproduce.*
 

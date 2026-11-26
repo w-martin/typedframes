@@ -423,7 +423,7 @@ impl<'r> Evaluator<'r> {
             Expr::ListComp(c) => {
                 let mut out = Vec::new();
                 self.comprehension(&c.generators, true, &mut || {
-                    out.push(self.ev(&c.elt)?);
+                    out.extend(self.comprehension_items(&c.elt, true)?);
                     (out.len() <= MAX_ELEMENTS).then_some(())
                 })?;
                 Self::capped(Value::List(out))
@@ -431,17 +431,27 @@ impl<'r> Evaluator<'r> {
             Expr::SetComp(c) => {
                 let mut out = Vec::new();
                 self.comprehension(&c.generators, false, &mut || {
-                    let v = self.ev(&c.elt)?;
-                    v.hashable().then_some(())?;
-                    set_insert(&mut out, v);
+                    for v in self.comprehension_items(&c.elt, false)? {
+                        v.hashable().then_some(())?;
+                        set_insert(&mut out, v);
+                    }
                     (out.len() <= MAX_ELEMENTS).then_some(())
                 })?;
                 Self::capped(Value::Set(out))
             }
             Expr::DictComp(c) => {
-                let key_expr = c.key.as_deref()?;
                 let mut out = Vec::new();
                 self.comprehension(&c.generators, true, &mut || {
+                    // No key: `{**m for ...}` (PEP 798) merges each mapping in turn.
+                    let Some(key_expr) = c.key.as_deref() else {
+                        let Value::Dict(entries) = self.ev(&c.value)? else {
+                            return None;
+                        };
+                        for (k, v) in entries {
+                            dict_insert(&mut out, k, v);
+                        }
+                        return (out.len() <= MAX_ELEMENTS).then_some(());
+                    };
                     let k = self.ev(key_expr)?;
                     k.hashable().then_some(())?;
                     let v = self.ev(&c.value)?;
@@ -474,10 +484,23 @@ impl<'r> Evaluator<'r> {
         };
         let mut out = Vec::new();
         self.comprehension(&g.generators, ordered, &mut || {
-            out.push(self.ev(&g.elt)?);
+            out.extend(self.comprehension_items(&g.elt, ordered)?);
             (out.len() <= MAX_ELEMENTS).then_some(())
         })?;
         Self::capped(Value::List(out))
+    }
+
+    // A comprehension's element, or the items a `*element` (PEP 798) unpacks.
+    fn comprehension_items(&self, elt: &Expr, ordered: bool) -> Option<Vec<Value>> {
+        let Expr::Starred(starred) = elt else {
+            return Some(vec![self.ev(elt)?]);
+        };
+        let inner = self.ev(&starred.value)?;
+        if ordered {
+            Self::iterate(&inner)
+        } else {
+            Self::iterate_unordered(&inner)
+        }
     }
 
     /// The sequence a `for` loop runs over, where a lazy `enumerate`/`zip` is consumed once.
@@ -1120,7 +1143,7 @@ impl<'r> Evaluator<'r> {
                 }
                 Some(Value::Int(total))
             }
-            "dict" => {
+            "dict" | "frozendict" => {
                 let mut out: Vec<(Value, Value)> = Vec::new();
                 let args = self.positional(call, true)?;
                 match args.as_slice() {
@@ -1585,6 +1608,7 @@ const INTERIOR_BUILTINS: &[&str] = &[
     "sorted",
     "reversed",
     "dict",
+    "frozendict",
     "zip",
     "enumerate",
     "iter",
@@ -1753,6 +1777,7 @@ const PLAIN_ANNOTATION_NAMES: &[&str] = &[
     "tuple",
     "Tuple",
     "dict",
+    "frozendict",
     "Dict",
     "set",
     "Set",
@@ -3340,6 +3365,7 @@ const EVALUATED_BUILTINS: &[&str] = &[
     "max",
     "sum",
     "dict",
+    "frozendict",
     "str",
     "int",
     "bool",
@@ -4394,6 +4420,47 @@ mod evaluator_tests {
         assert_eq!(
             eval("[a + b for a, b in zip([\"x\"], [\"y\"])]"),
             Some(strs(&["xy"]))
+        );
+    }
+
+    #[test]
+    fn test_should_unpack_into_comprehensions() {
+        assert_eq!(
+            eval("[*g for g in [BASE, [\"x\"]]]"),
+            Some(strs(&["id", "amount", "x"]))
+        );
+        assert_eq!(
+            eval("{*g for g in [[\"a\", \"b\"], [\"b\"]]}"),
+            Some(Value::Set(vec![s("a"), s("b")]))
+        );
+        assert_eq!(
+            eval("list(*g for g in [BASE, [\"x\"]])"),
+            Some(strs(&["id", "amount", "x"]))
+        );
+        assert_eq!(
+            eval("{**m for m in [{\"a\": 1, \"b\": 2}, {\"a\": 3}]}"),
+            Some(Value::Dict(vec![
+                (s("a"), Value::Int(3)),
+                (s("b"), Value::Int(2))
+            ]))
+        );
+        assert_eq!(eval("[*unknown_thing for _ in [1]]"), None);
+        assert_eq!(eval("[*N for _ in [1]]"), None);
+        assert_eq!(eval("{**g for g in [BASE]}"), None);
+    }
+
+    #[test]
+    fn test_should_evaluate_frozendict_like_dict() {
+        assert_eq!(
+            eval("frozendict(a=1)"),
+            Some(Value::Dict(vec![(s("a"), Value::Int(1))]))
+        );
+        assert_eq!(
+            eval("frozendict({\"a\": 1}, b=2)"),
+            Some(Value::Dict(vec![
+                (s("a"), Value::Int(1)),
+                (s("b"), Value::Int(2))
+            ]))
         );
     }
 

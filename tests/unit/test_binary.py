@@ -258,6 +258,21 @@ class TestInProcess(TestCase):
         # assert
         self.assertIn("typedframes._rust", str(ctx.exception))
 
+    def test_should_name_the_free_threaded_requirement_when_the_extension_cannot_load(self) -> None:
+        """Test the error on a free-threaded Python the wheel ships no extension module for."""
+        # arrange
+        with (
+            patch.dict(os.environ, {IN_PROCESS_VARIABLE: "1"}),
+            patch("typedframes._binary.import_module", side_effect=ImportError),
+            patch("typedframes._binary._free_threaded", return_value=True),
+            self.assertRaises(BinaryNotFoundError) as ctx,
+        ):
+            # act
+            run_binary(["check", "."])
+
+        # assert
+        self.assertIn("3.15t or later", str(ctx.exception))
+
     def test_should_exit_with_the_extensions_status_from_the_module_entry_point(self) -> None:
         """Test that `python -m typedframes` runs in this process, not as a replacement, when asked."""
         # arrange

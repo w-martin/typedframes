@@ -71,11 +71,12 @@ orders = pd.read_sql(f"SELECT order_id, amount FROM {TABLE}", conn)
 Evaluated: string, number, boolean, `None`, list, tuple, set and dict literals (with
 `*`/`**` spreads); f-strings, `str.format`, `+` and `*`, set and dict operators,
 `and`/`or`/`not`, comparisons and `a if c else b`; indexing and slicing; `len`, `list`,
-`tuple`, `set`, `dict`, `sorted`, `reversed`, `range`, `zip`, `enumerate`, `min`, `max`,
+`tuple`, `set`, `dict` (and `frozendict`), `sorted`, `reversed`, `range`, `zip`, `enumerate`, `min`, `max`,
 `sum`, `str`, `int`, `bool`, `any`, `all`; the common string methods (`join`, `split`,
 `replace`, `strip`, `lower`, `upper`, `title`, `startswith`, ...) and `dict.keys()`,
 `.values()`, `.items()`, `.get()`; and list, set and dict comprehensions over anything
-that is itself evaluable. Scopes are respected: a name bound once inside a function
+that is itself evaluable, including the PEP 798 unpacking forms (`[*g for g in groups]`,
+`{**m for m in maps}`). Scopes are respected: a name bound once inside a function
 resolves there, and a module-level constant is visible inside functions unless a function
 rebinds it.
 
@@ -115,7 +116,8 @@ the same way, and `Col.NOPE` is an error when the enum has no such member. An in
 (`N.dow`), unless the class defines `__init__`, `__post_init__`, `__new__` or attribute hooks.
 Across files, a module's constants, functions, classes and enums are read as above:
 `from config import X`, `import config [as c]`, `from pkg import config`, relative imports and
-names a package's `__init__.py` re-exports are all resolved. Relative imports
+names a package's `__init__.py` re-exports are all resolved, and `lazy import` / `lazy from` are
+read like their eager forms. Relative imports
 also bring in schemas, functions and helper summaries from the file they name, as absolute ones do.
 A function from another file can only read that file's own constants and functions, never
 the importing file's names. A list, dict or set that another checked file may change
@@ -890,9 +892,11 @@ src/train.py
 ```
 
 Only a frame assigned at the top level of its function or module is scanned, and the
-scan reads that one scope: a use inside a nested function, class, lambda or
-comprehension is reported as a single unclassified use ("also mentioned inside a nested
-function, class, lambda or comprehension") rather than followed.
+scan reads that one scope: a use inside a nested function, class, lambda or generator
+expression is reported as a single unclassified use ("also mentioned inside a nested
+function, class, lambda or generator expression") rather than followed. A list, set or dict
+comprehension runs where it is written, so its uses are followed like the rest of the scope and
+marked `(conditional)`.
 
 `--output-format=json` nests the same information under `coverage.files[].calls[]`
 (and `coverage.files[].tracking_ended[]`, `coverage.files[].columns_used[]`), each entry
@@ -1095,7 +1099,12 @@ column, so a site is **withheld** (and listed under `Not suggested:` with the re
   (the keys and the aggregated columns are read), `df.rename(columns={"old": "new"})` (`old` is read;
   `new` is the frame's own), `df.drop(columns=[...])`, and the row operations
   `drop_duplicates(subset=…)`, `dropna(subset=…)`, `sort_values(…)` and polars
-  `unique`/`drop_nulls`/`sort` (their key columns are read), all with literal arguments. Without a
+  `unique`/`drop_nulls`/`sort` (their key columns are read), all with literal arguments. A row filter
+  keeps every column and is followed too: `df[mask]`, `df.loc[mask]` or a row slice (`df[:10]`), where
+  the mask is built from the frame's own columns (`df["a"] > 0`, `~df["a"].isin(keep)`,
+  `df["a"].notna() & df["b"].str.startswith("x")`; the mask's columns are read), and so is
+  `.reset_index(drop=True)`. `df.loc[mask, "b"]`, `df.loc[:, ["b", "c"]]` and `df[mask]["b"]` read
+  the mask's columns and the selected ones. Without a
   literal `subset=`, `drop_duplicates()`, `duplicated()`, `dropna()` and polars `unique()`/
   `drop_nulls()` compare every column, so narrowing would change which rows survive: the site is
   withheld. A bare
@@ -1104,10 +1113,13 @@ column, so a site is **withheld** (and listed under `Not suggested:` with the re
   changes their value. Printed or shown on their own (`print(df.shape)`, a bare `df.head()`) they
   only ask for review, and the suggestion says the output will show the selected columns;
 - the frame is used inside a test function (`test_*`), which should see the whole frame;
-- a nested function, class, lambda or comprehension also mentions the frame;
+- a nested function, class, lambda or generator expression also mentions the frame (a list, set or
+  dict comprehension is followed like the rest of the scope);
 - the name, or a name it was assigned to, is declared `global` or `nonlocal`, or
   `eval`/`exec`/`locals`/`globals`/`vars` is called after the load;
-- the load isn't recognisably pandas or polars (a method called on a local or parameter is read
+- the load isn't recognisably pandas or polars (a frame built from another local, such as
+  `out = df.rename(...)` or `out = df[mask]`, takes that local's library when every earlier assignment
+  to it agrees; a method called on a local or parameter is read
   from its return annotation only when the local is built as `svc = Class(...)`, or the parameter
   is annotated `Class`, the name is never rebound (by assignment, `:=`, `for`, `with`, `except`,
   `match`, `import`, `global` or `nonlocal`), and the class in this file annotates the method
@@ -1158,9 +1170,12 @@ site (names and numbers masked), and a redacted copy of the code around it. **Re
 anonymous**: read the whole body before posting it, and don't use it on code you aren't allowed to
 share. The body starts with a reminder to do so.
 
-*Replaced:* variables become `v1`, `v2`, functions `f1`, classes `C1`, attributes `a1`, and string
-literals `c1`, `c2`; every number except 0 and 1 becomes a placeholder; comments and docstrings are
-dropped; imports other than pandas, polars, numpy, typing and typedframes are left out.
+*Replaced:* variables become `v1`, `v2`, functions `f1` (a test function keeps its prefix, `test_f1`,
+since that is what makes it a test), classes `C1`, attributes `a1`, and string literals `c1`, `c2`;
+every number except 0 and 1 becomes a placeholder; comments and docstrings are dropped; imports other
+than pandas, polars, numpy, typing and typedframes are renamed (`from m1 import f2`) and kept only for
+the names the code uses. In what the checker decided, a list of masked column names is shown as their
+count ("only 3 columns are read later").
 
 *Kept as written:* the names Python itself defines, `pd`, `pl` and `np`, and the public names of the
 numpy, pandas and polars versions installed when the list was generated (`rust/src/library_names.txt`,
@@ -1176,7 +1191,9 @@ something about what the code does.
 
 The snippet starts from the enclosing function or class member, the same-file functions it calls,
 and, for a call to a function imported from another file whose return type the project index knew, a
-signature-only stand-in. It is then cut down to the code the decision rests on: statements and
+signature-only stand-in. When the stand-ins change the decision (a frame passed into such a function,
+which the stand-in makes a function of this file), the snippet is built again with the renamed imports
+instead. It is then cut down to the code the decision rests on: statements and
 parameters whose removal leaves the site classified the same way are dropped, and imports are
 dropped only when nothing left uses them. Before printing it, `report` runs the checker on the
 snippet and prints it only if the site is classified exactly as the original was (apart from how

@@ -19,7 +19,7 @@ are validated against the new schema.
 | `df.drop(columns=[…])` | Removes listed columns | `df.drop(columns=["a", "b"])` |
 | `df.drop([…], axis=1)` | Removes listed columns; without `axis=1`/`columns=` pandas drops rows, and with `level=` the columns are left as they were | `df.drop(["a", "b"], axis=1)` |
 | `df.assign(col=…)` | Adds new column(s) to the schema | `df.assign(full_name=…)` |
-| `df.rename(columns={…})` | Renames columns in the schema; a dict comprehension over `df.columns` with fixed string steps is evaluated | `df.rename(columns={"a": "b"})` |
+| `df.rename(columns={…})` | Renames columns in the schema; a `dict(...)`/`frozendict(...)` mapping is read like a literal, and a dict comprehension over `df.columns` with fixed string steps is evaluated | `df.rename(columns={"a": "b"})` |
 | `df.columns = […]` | Replaces the columns; a list comprehension over `df.columns` with fixed string steps is evaluated | `df.columns = [c.lower() for c in df.columns]` |
 | `df.with_columns(…)` (polars) | Adds the columns the keywords, `.alias(...)` and bare `pl.col(...)` chains name, also inside a list, a comprehension over a literal list, or a loop over one (`alias(f"{c}_x")`, `alias("g_" + g)`); an unreadable output name leaves the columns unknown | `df.with_columns(total=pl.col("a") * 2)` |
 | `df.group_by(keys).agg(…)` (polars) | Keys followed by the aggregates' output names | `df.group_by("card").agg(s=pl.col("x").sum())` |

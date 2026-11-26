@@ -1807,6 +1807,7 @@ const HARMLESS_CALLEES: &[&str] = &[
     "set",
     "tuple",
     "dict",
+    "frozendict",
     "sorted",
     "str",
     "repr",
@@ -3451,7 +3452,7 @@ impl Linter {
         {
             usage.other_uses.push(column_usage::OtherUse {
                 description:
-                    "also mentioned inside a nested function, class, lambda or comprehension"
+                    "also mentioned inside a nested function, class, lambda or generator expression"
                         .to_string(),
                 conditional: false,
                 consumes: column_usage::Consumption::Unknown,
@@ -3500,6 +3501,7 @@ impl Linter {
                         function_local: scope.in_function,
                         receivers: &scope.receivers,
                         known_columns: &self.known_columns,
+                        scope_body: scope.body,
                     },
                     &usage,
                 )
@@ -16669,6 +16671,125 @@ print(df["nope"])
     }
 
     #[test]
+    fn test_should_resolve_a_column_list_unpacked_in_a_comprehension() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("f.csv", usecols=[*[f"{p}_x", f"{p}_y"] for p in ["a", "b"]])
+print(df["b_y"])
+print(df["nope"])
+"#;
+
+        // act
+        let (linter, errors) = lint(source);
+
+        // assert
+        assert_eq!(linter.dataframes_typed, 1);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("{a_x, a_y, b_x, b_y}"));
+    }
+
+    #[test]
+    fn test_should_rename_through_a_mapping_merged_in_a_comprehension() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("f.csv", usecols=["user_id", "email"])
+out = df.rename(columns={**m for m in [{"email": "mail"}, {"user_id": "uid"}]})
+print(out["uid"], out["mail"])
+print(out["email"])
+"#;
+
+        // act
+        let (_, errors) = lint(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'email'"), "{errors:?}");
+        assert!(errors[0].message.contains("{uid, mail}"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_rename_through_a_frozendict_mapping() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+df = pd.read_csv("f.csv", usecols=["user_id", "email"])
+out = df.rename(columns=frozendict(email="mail"))
+out2 = out.rename(columns=frozendict({"user_id": "uid"}))
+print(out2["uid"], out2["mail"])
+print(out2["email"])
+"#;
+
+        // act
+        let (_, errors) = lint(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("'email'"), "{errors:?}");
+        assert!(errors[0].message.contains("{uid, mail}"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_rename_through_the_frozendict_backport_before_python_3_15() {
+        // arrange
+        let source = r#"
+import pandas as pd
+from frozendict import frozendict
+
+df = pd.read_csv("f.csv", usecols=["user_id", "email"])
+out = df.rename(columns=frozendict(email="mail"))
+print(out["mail"])
+print(out["email"])
+"#;
+
+        // act
+        let (_, errors) = lint(source);
+
+        // assert
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("{user_id, mail}"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_should_resolve_lazy_imports_like_eager_ones() {
+        // arrange
+        let body = r#"
+class UserSchema(BaseSchema):
+    user_id = Column(type=int)
+    email = Column(type=str)
+
+
+def f(df: Annotated[pd.DataFrame, UserSchema]) -> None:
+    print(df["emai"])
+
+
+def g() -> None:
+    df = pd.read_csv("u.csv", usecols=["user_id", "email"])
+    print(df["nope"])
+"#;
+        let eager = format!("from typing import Annotated\nimport pandas as pd\nfrom typedframes import BaseSchema, Column\n{body}");
+        let lazy = format!("lazy from typing import Annotated\nlazy import pandas as pd\nlazy from typedframes import BaseSchema, Column\n{body}");
+
+        // act
+        let (_, eager_errors) = lint(&eager);
+        let (_, lazy_errors) = lint(&lazy);
+
+        // assert
+        let codes = |errors: &[LintError]| -> Vec<(usize, String)> {
+            errors
+                .iter()
+                .map(|e| (e.line, e.code.to_string()))
+                .collect()
+        };
+        assert_eq!(eager_errors.len(), 2, "{eager_errors:?}");
+        assert_eq!(codes(&lazy_errors), codes(&eager_errors));
+    }
+
+    #[test]
     fn test_should_resolve_columns_returned_by_a_helper_function() {
         let source = r#"
 import pandas as pd
@@ -18399,7 +18520,7 @@ def load():
         assert!(linter.suggestions.is_empty());
         assert!(
             linter.withheld[0].reason.contains(
-                "also mentioned inside a nested function, class, lambda or comprehension"
+                "also mentioned inside a nested function, class, lambda or generator expression"
             ),
             "{:?}",
             linter.withheld
@@ -18614,6 +18735,36 @@ def run():
 
         let errors = linter.check_file_internal(main, &main_path).unwrap();
 
+        assert!(
+            errors.iter().any(|e| e.code == "unknown-column"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_check_columns_against_a_lazily_imported_schema() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::write(root.join("app/__init__.py"), "").unwrap();
+        fs::write(
+            root.join("app/schemas.py"),
+            "from typedframes import BaseSchema, Column\n\n\nclass CustomerSchema(BaseSchema):\n    name = Column(type=str)\n",
+        )
+        .unwrap();
+        let main = "lazy from typing import Annotated\n\nlazy import pandas as pd\n\nlazy from app.schemas import CustomerSchema\n\n\ndef run(df: Annotated[pd.DataFrame, CustomerSchema]) -> None:\n    df[\"missing\"]\n";
+        let main_path = root.join("app/main.py");
+        fs::write(&main_path, main).unwrap();
+        let index = build_index_internal(&root);
+        let mut linter = Linter::new();
+        linter.load_cross_file_symbols(&index, main, &main_path, &root);
+
+        // act
+        let errors = linter.check_file_internal(main, &main_path).unwrap();
+
+        // assert
         assert!(
             errors.iter().any(|e| e.code == "unknown-column"),
             "{errors:?}"
@@ -18861,6 +19012,79 @@ class PolarsService:
         assert!(caller
             .reason
             .contains("can't tell whether it is pandas or polars"));
+    }
+
+    #[test]
+    fn test_should_read_the_library_of_a_frame_built_from_a_local() {
+        // arrange
+        let source = r#"
+import pandas as pd
+
+
+def load() -> pd.DataFrame:
+    return pd.read_csv("x.csv")
+
+
+def run():
+    df = load()
+    df["c"] = 1
+    df = df.rename(columns={"a": "b"})
+    out = df[df["b"] > 0]
+    print(out["b"], out["c"])
+"#;
+
+        // act
+        let linter = suggest_for(source);
+
+        // assert
+        assert!(
+            linter
+                .withheld
+                .iter()
+                .all(|w| !w.reason.contains("pandas or polars")),
+            "{:?}",
+            linter.withheld
+        );
+        assert!(linter.suggestions.iter().any(|s| s.var == "df"));
+    }
+
+    #[test]
+    fn test_should_not_read_the_library_of_a_local_bound_differently_on_two_paths() {
+        // arrange
+        let disagreeing = r#"
+import pandas as pd
+import polars as pl
+
+
+def run(flag):
+    if flag:
+        df = pd.DataFrame({"a": [1]})
+    else:
+        df = pl.DataFrame({"a": [1]})
+    out = df.rename(columns={"a": "b"})
+    print(out["b"])
+"#;
+        let looped = r#"
+import pandas as pd
+
+
+def run(frames):
+    for df in frames:
+        out = df.rename(columns={"a": "b"})
+        print(out["b"])
+"#;
+
+        for source in [disagreeing, looped] {
+            // act
+            let linter = suggest_for(source);
+
+            // assert
+            assert!(
+                linter.suggestions.iter().all(|s| s.var != "out"),
+                "{source}: {:?}",
+                linter.suggestions
+            );
+        }
     }
 
     #[test]

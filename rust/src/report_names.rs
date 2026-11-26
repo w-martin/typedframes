@@ -13,6 +13,7 @@ const PYTHON: &[&str] = &[
     "len",
     "list",
     "dict",
+    "frozendict",
     "set",
     "tuple",
     "str",

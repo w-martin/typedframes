@@ -150,17 +150,40 @@ jobs:
           manylinux: auto
           docker-options: ${{ matrix.docker_options }}
 
-      - name: Stage the extension module
+      # Free-threaded interpreters cannot load the abi3 module, so a second one is built for them (PEP 803's abi3t,
+      # 3.15+). The interpreter is only handed to maturin: the steps after keep the runner's own Python. Not on
+      # Windows, where an abi3t module is also named `_rust.pyd` and would replace the abi3 one.
+      - name: Set up free-threaded Python
+        id: free-threaded
+        if: runner.os != 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.15t'
+          update-environment: false
+
+      - name: Build the free-threaded extension module
+        if: runner.os != 'Windows'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # Inside the manylinux container the host's interpreter path does not exist; the image has its own.
+          args: --release --features abi3t -i ${{ runner.os == 'Linux' && 'python3.15t' || steps.free-threaded.outputs.python-path }} --out ../../extension-dist
+          working-directory: rust/python
+          manylinux: auto
+          docker-options: ${{ matrix.docker_options }}
+
+      - name: Stage the extension modules
         shell: python
         run: |
           from pathlib import Path
           from zipfile import ZipFile
 
-          with ZipFile(next(Path("extension-dist").glob("*.whl"))) as wheel:
-              for member in wheel.namelist():
-                  name = Path(member).name
-                  if name.startswith("_rust.") and Path(name).suffix in {".so", ".pyd"}:
-                      Path("src/typedframes", name).write_bytes(wheel.read(member))
+          for built in Path("extension-dist").glob("*.whl"):
+              with ZipFile(built) as wheel:
+                  for member in wheel.namelist():
+                      name = Path(member).name
+                      if name.startswith("_rust.") and Path(name).suffix in {".so", ".pyd"}:
+                          Path("src/typedframes", name).write_bytes(wheel.read(member))
 
       - uses: PyO3/maturin-action@v1
         with:
@@ -169,7 +192,7 @@ jobs:
           manylinux: auto
           docker-options: ${{ matrix.docker_options }}
 
-      - name: Check the wheel holds the executable and the extension module
+      - name: Check the wheel holds the executable and both extension modules
         shell: python
         run: |
           from pathlib import Path
@@ -177,7 +200,10 @@ jobs:
 
           names = ZipFile(next(Path("dist").glob("*.whl"))).namelist()
           assert any("/scripts/typedframes" in n for n in names), "executable missing"
-          assert any(Path(n).name.startswith("_rust.") and n.startswith("typedframes/") for n in names), "extension missing"
+          modules = [Path(n).name for n in names if n.startswith("typedframes/_rust.")]
+          if "${{ runner.os }}" != "Windows":
+              assert any(".abi3t" in m for m in modules), f"free-threaded extension missing: {modules}"
+          assert any(".abi3t" not in m and m.endswith((".so", ".pyd")) for m in modules), f"extension missing: {modules}"
 
       # Loading is what fails when the extension is linked wrongly (e.g. jemalloc's TLS model), not the
       # file being absent. Only on runners that can run the target.
@@ -190,6 +216,14 @@ jobs:
           $PY -m pip install --no-index --find-links dist typedframes
           mkdir -p check-project && echo "x = 1" > check-project/a.py
           TYPEDFRAMES_INPROC=1 $PY -m typedframes check check-project --no-cache
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            "${{ steps.free-threaded.outputs.python-path }}" -m venv check-venv-ft
+            FT=check-venv-ft/bin/python
+            $FT -m pip install --no-index --find-links dist typedframes
+            TYPEDFRAMES_INPROC=1 $FT -m typedframes check check-project --no-cache
+            # Loading a module that does not declare free-threading support turns the GIL back on.
+            $FT -c "import sys, typedframes._rust; assert not sys._is_gil_enabled(), 'GIL re-enabled'"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

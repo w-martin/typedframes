@@ -1,0 +1,475 @@
+//! Jupyter notebook (.ipynb) support built on `ruff_notebook` -- the same crate
+//! Ruff and Pyrefly use for their own notebook linting.
+//!
+//! `ruff_notebook::Notebook` loads the `.ipynb` JSON and exposes a concatenated
+//! Python source (`source_code()`) plus a `NotebookIndex` mapping concatenated-source
+//! lines back to `(cell, cell-relative line)`. The linter (see
+//! `Linter::check_notebook_internal` in `linter.rs`) runs against that concatenated
+//! source exactly as it would against a real `.py` file's contents -- this module's
+//! only job is translating its output back to notebook coordinates afterwards.
+
+use ruff_notebook::{Notebook, NotebookError, NotebookIndex, RawNotebook};
+use ruff_source_file::OneIndexed;
+use serde::Serialize;
+
+use crate::errors::{FileStats, LintError};
+
+/// One diagnostic, relocated from the synthetic concatenated-source line/col
+/// `Linter::check_notebook_internal` actually parsed to the notebook cell/line
+/// it came from. `cell` is 1-indexed among ALL cells in the notebook (markdown
+/// and raw included), matching `ruff_notebook::NotebookIndex`'s own convention
+/// -- not "the Nth code cell".
+#[derive(Debug, Serialize)]
+pub struct NotebookLintError {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub code: String,
+    pub message: String,
+    pub severity: String,
+}
+
+/// The untyped-DataFrame-site counterpart of [`NotebookLintError`].
+#[derive(Debug, Serialize)]
+pub struct NotebookUntypedSite {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub phrase: String,
+}
+
+/// The [`crate::errors::TypedSite`] counterpart, relocated to notebook coordinates.
+#[derive(Debug, Serialize)]
+pub struct NotebookTypedSite {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub schema: String,
+}
+
+/// The [`crate::errors::DataFrameCallSite`] counterpart, relocated to notebook
+/// coordinates.
+#[derive(Debug, Serialize)]
+pub struct NotebookDataFrameCallSite {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub label: String,
+    pub context: String,
+}
+
+/// The [`crate::errors::LegEvent`] counterpart, relocated to notebook coordinates.
+#[derive(Debug, Serialize)]
+pub struct NotebookLegEvent {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub outcome: String,
+    pub reason: String,
+}
+
+/// The [`crate::errors::UntypedSiteUsage`] counterpart, relocated to notebook
+/// coordinates.
+#[derive(Debug, Serialize)]
+pub struct NotebookUntypedSiteUsage {
+    pub cell: usize,
+    pub line: usize,
+    pub col: usize,
+    pub var: String,
+    pub accesses: Vec<crate::column_usage::ColumnAccess>,
+    pub other_uses: Vec<crate::column_usage::OtherUse>,
+}
+
+/// The notebook counterpart of [`FileStats`], nested under `stats` in
+/// [`NotebookCheckResult`] -- matching [`crate::errors::CheckFileResult`]'s shape so
+/// the Python side can treat both JSON payloads the same way.
+#[derive(Debug, Default, Serialize)]
+pub struct NotebookFileStats {
+    pub dataframes_total: usize,
+    pub dataframes_typed: usize,
+    pub dataframes_unresolved: usize,
+    pub untyped_sites: Vec<NotebookUntypedSite>,
+    pub typed_sites: Vec<NotebookTypedSite>,
+    pub all_dataframe_calls: Vec<NotebookDataFrameCallSite>,
+    pub leg_events: Vec<NotebookLegEvent>,
+    pub untyped_site_usage: Vec<NotebookUntypedSiteUsage>,
+}
+
+/// The JSON payload returned by the `check_notebook` entry point. Same shape as
+/// [`crate::errors::CheckFileResult`], the `check_file` counterpart.
+#[derive(Debug, Serialize)]
+pub struct NotebookCheckResult {
+    pub errors: Vec<NotebookLintError>,
+    pub stats: NotebookFileStats,
+}
+
+/// Translate a concatenated-source line (1-indexed) to `(cell, cell-relative line)`,
+/// both 1-indexed. Falls back to `(1, line)` for a line the index has no cell for --
+/// defensive only: every line the linter reports comes from the exact source the
+/// index was itself built from, so a miss here should never actually happen.
+pub(crate) fn translate(index: &NotebookIndex, line: usize) -> (usize, usize) {
+    let Some(row) = OneIndexed::new(line) else {
+        return (1, line);
+    };
+    let cell = index.cell(row).unwrap_or(OneIndexed::MIN);
+    let cell_row = index.cell_row(row).unwrap_or(row);
+    (cell.get(), cell_row.get())
+}
+
+/// Rewrite `<file_display>:<concatenated line>` references inside a message to
+/// `<file_display> cell <N>:<cell line>`.
+///
+/// Covers a schema defined earlier in the SAME notebook, whose "(defined at ...)"
+/// cross-reference (see `Linter::schema_display`) would otherwise cite a line number
+/// from the synthetic concatenated source -- meaningless in the actual `.ipynb` file,
+/// which is JSON, not source text.
+fn rewrite_message(message: &str, file_display: &str, index: &NotebookIndex) -> String {
+    let prefix = format!("{file_display}:");
+    let Some(start) = message.find(prefix.as_str()) else {
+        return message.to_string();
+    };
+    let after_prefix = &message[start + prefix.len()..];
+    let digit_count = after_prefix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count();
+    let Ok(line) = after_prefix[..digit_count].parse::<usize>() else {
+        return message.to_string();
+    };
+    let (cell, cell_line) = translate(index, line);
+    format!(
+        "{before}{file_display} cell {cell}:{cell_line}{after}",
+        before = &message[..start],
+        after = &after_prefix[digit_count..],
+    )
+}
+
+/// Translate every error and untyped-DataFrame site the linter produced -- all in
+/// concatenated-source coordinates -- into notebook cell/line coordinates.
+pub(crate) fn translate_result(
+    errors: Vec<LintError>,
+    stats: FileStats,
+    file_display: &str,
+    index: &NotebookIndex,
+) -> NotebookCheckResult {
+    let errors = errors
+        .into_iter()
+        .map(|e| {
+            let (cell, line) = translate(index, e.line);
+            NotebookLintError {
+                cell,
+                line,
+                col: e.col,
+                code: e.code,
+                message: rewrite_message(&e.message, file_display, index),
+                severity: e.severity,
+            }
+        })
+        .collect();
+
+    translate_stats(stats, index, errors)
+}
+
+fn translate_stats(
+    stats: FileStats,
+    index: &NotebookIndex,
+    errors: Vec<NotebookLintError>,
+) -> NotebookCheckResult {
+    let untyped_sites = stats
+        .untyped_sites
+        .into_iter()
+        .map(|item| untyped_site(index, item))
+        .collect();
+
+    let typed_sites = stats
+        .typed_sites
+        .into_iter()
+        .map(|item| typed_site(index, item))
+        .collect();
+
+    let all_dataframe_calls = stats
+        .all_dataframe_calls
+        .into_iter()
+        .map(|item| dataframe_call(index, item))
+        .collect();
+
+    let leg_events = stats
+        .leg_events
+        .into_iter()
+        .map(|item| leg_event(index, item))
+        .collect();
+
+    let untyped_site_usage = stats
+        .untyped_site_usage
+        .into_iter()
+        .map(|item| site_usage(index, item))
+        .collect();
+
+    NotebookCheckResult {
+        errors,
+        stats: NotebookFileStats {
+            dataframes_total: stats.dataframes_total,
+            dataframes_typed: stats.dataframes_typed,
+            dataframes_unresolved: stats.dataframes_unresolved,
+            untyped_sites,
+            typed_sites,
+            all_dataframe_calls,
+            leg_events,
+            untyped_site_usage,
+        },
+    }
+}
+
+fn untyped_site(index: &NotebookIndex, s: crate::errors::UntypedSite) -> NotebookUntypedSite {
+    let (cell, line) = translate(index, s.line);
+    NotebookUntypedSite {
+        cell,
+        line,
+        col: s.col,
+        var: s.var,
+        phrase: s.phrase,
+    }
+}
+
+fn typed_site(index: &NotebookIndex, s: crate::errors::TypedSite) -> NotebookTypedSite {
+    let (cell, line) = translate(index, s.line);
+    NotebookTypedSite {
+        cell,
+        line,
+        col: s.col,
+        var: s.var,
+        schema: s.schema,
+    }
+}
+
+fn dataframe_call(
+    index: &NotebookIndex,
+    s: crate::errors::DataFrameCallSite,
+) -> NotebookDataFrameCallSite {
+    let (cell, line) = translate(index, s.line);
+    NotebookDataFrameCallSite {
+        cell,
+        line,
+        col: s.col,
+        label: s.label,
+        context: s.context,
+    }
+}
+
+fn leg_event(index: &NotebookIndex, e: crate::errors::LegEvent) -> NotebookLegEvent {
+    let (cell, line) = translate(index, e.line);
+    NotebookLegEvent {
+        cell,
+        line,
+        col: e.col,
+        var: e.var,
+        outcome: e.outcome,
+        reason: e.reason,
+    }
+}
+
+fn site_usage(
+    index: &NotebookIndex,
+    u: crate::errors::UntypedSiteUsage,
+) -> NotebookUntypedSiteUsage {
+    let (cell, line) = translate(index, u.line);
+    NotebookUntypedSiteUsage {
+        cell,
+        line,
+        col: u.col,
+        var: u.var,
+        accesses: u.accesses,
+        other_uses: u.other_uses,
+    }
+}
+
+/// The notebook a `.ipynb` file's bytes hold, read as `Notebook::from_path` reads a file.
+pub fn parse(bytes: &[u8]) -> Result<Notebook, NotebookError> {
+    let trailing_newline = bytes.last() == Some(&b'\n');
+    let raw: RawNotebook = serde_json::from_slice(bytes).map_err(|err| {
+        use serde_json::error::Category;
+        match err.classify() {
+            Category::Io => NotebookError::Json(err),
+            Category::Syntax | Category::Eof => NotebookError::InvalidJson(err),
+            Category::Data => NotebookError::InvalidSchema(err),
+        }
+    })?;
+    Notebook::from_raw_notebook(raw, trailing_newline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::{DataFrameCallSite, LegEvent, TypedSite, UntypedSite};
+    use ruff_notebook::Notebook;
+
+    // Four cells: markdown, code (2 lines), markdown, code (1 line). Cell numbers
+    // are 1-indexed among ALL cells (markdown included), matching ruff_notebook's
+    // own convention -- so the two code cells are cell 2 and cell 4, not 1 and 2.
+    fn sample_notebook() -> Notebook {
+        let json = r##"{
+            "cells": [
+                {"cell_type": "markdown", "metadata": {}, "source": "# Title"},
+                {"cell_type": "code", "metadata": {}, "execution_count": null, "outputs": [], "source": "a = 1\nb = 2"},
+                {"cell_type": "markdown", "metadata": {}, "source": "text"},
+                {"cell_type": "code", "metadata": {}, "execution_count": null, "outputs": [], "source": "c = 3"}
+            ],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        }"##;
+        Notebook::from_source_code(json).unwrap()
+    }
+
+    #[test]
+    fn test_should_translate_concatenated_line_to_cell_and_cell_relative_line() {
+        // arrange
+        let notebook = sample_notebook();
+
+        // act / assert
+        assert_eq!(translate(notebook.index(), 1), (2, 1)); // a = 1
+        assert_eq!(translate(notebook.index(), 2), (2, 2)); // b = 2
+        assert_eq!(translate(notebook.index(), 3), (4, 1)); // c = 3
+    }
+
+    #[test]
+    fn test_should_fall_back_to_line_1_for_a_non_positive_line_number() {
+        // arrange
+        let notebook = sample_notebook();
+
+        // act / assert
+        assert_eq!(translate(notebook.index(), 0), (1, 0));
+    }
+
+    #[test]
+    fn test_should_rewrite_defined_at_reference_in_message() {
+        // arrange
+        let notebook = sample_notebook();
+        let message = "Column 'x' does not exist in S {y} (defined at analysis.ipynb:3)";
+
+        // act
+        let rewritten = rewrite_message(message, "analysis.ipynb", notebook.index());
+
+        // assert
+        assert_eq!(
+            rewritten,
+            "Column 'x' does not exist in S {y} (defined at analysis.ipynb cell 4:1)"
+        );
+    }
+
+    #[test]
+    fn test_should_leave_message_unchanged_when_no_file_reference_present() {
+        // arrange
+        let notebook = sample_notebook();
+        let message = "Column 'x' does not exist in S {y}";
+
+        // act
+        let rewritten = rewrite_message(message, "analysis.ipynb", notebook.index());
+
+        // assert
+        assert_eq!(rewritten, message);
+    }
+
+    #[test]
+    fn test_should_leave_message_unchanged_when_prefix_has_no_trailing_digits() {
+        // arrange
+        let notebook = sample_notebook();
+        let message = "see analysis.ipynb:not-a-line-number for details";
+
+        // act
+        let rewritten = rewrite_message(message, "analysis.ipynb", notebook.index());
+
+        // assert
+        assert_eq!(rewritten, message);
+    }
+
+    #[test]
+    fn test_should_translate_result_end_to_end() {
+        // arrange
+        let notebook = sample_notebook();
+        let errors = vec![LintError {
+            line: 3,
+            col: 5,
+            code: "unknown-column".to_string(),
+            message: "Column 'z' not in S (defined at analysis.ipynb:1)".to_string(),
+            severity: "error".to_string(),
+        }];
+        let stats = FileStats {
+            dataframes_total: 3,
+            dataframes_typed: 2,
+            dataframes_unresolved: 0,
+            untyped_sites: vec![UntypedSite {
+                line: 1,
+                col: 1,
+                var: "df".to_string(),
+                phrase: String::new(),
+            }],
+            typed_sites: vec![TypedSite {
+                line: 1,
+                col: 1,
+                var: "df2".to_string(),
+                schema: "S".to_string(),
+            }],
+            all_dataframe_calls: vec![DataFrameCallSite {
+                line: 1,
+                col: 1,
+                label: "pd.DataFrame".to_string(),
+                context: "the direct value of a plain assignment".to_string(),
+            }],
+            leg_events: vec![LegEvent {
+                line: 1,
+                col: 1,
+                var: "df".to_string(),
+                outcome: "unresolved".to_string(),
+                reason: "`clean()` is not modelled".to_string(),
+            }],
+            untyped_site_usage: vec![crate::errors::UntypedSiteUsage {
+                line: 1,
+                col: 1,
+                var: "df".to_string(),
+                accesses: vec![crate::column_usage::ColumnAccess {
+                    column: "a".to_string(),
+                    conditional: false,
+                    line: 0,
+                    via: None,
+                }],
+                other_uses: vec![],
+            }],
+        };
+
+        // act
+        let result = translate_result(errors, stats, "analysis.ipynb", notebook.index());
+
+        // assert
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].cell, 4);
+        assert_eq!(result.errors[0].line, 1);
+        assert_eq!(result.errors[0].col, 5);
+        assert!(result.errors[0].message.contains("analysis.ipynb cell 2:1"));
+        assert_eq!(result.stats.dataframes_total, 3);
+        assert_eq!(result.stats.dataframes_typed, 2);
+        assert_eq!(result.stats.untyped_sites.len(), 1);
+        assert_eq!(result.stats.untyped_sites[0].cell, 2);
+        assert_eq!(result.stats.untyped_sites[0].line, 1);
+        assert_eq!(result.stats.untyped_sites[0].var, "df");
+        assert_eq!(result.stats.typed_sites.len(), 1);
+        assert_eq!(result.stats.typed_sites[0].cell, 2);
+        assert_eq!(result.stats.typed_sites[0].line, 1);
+        assert_eq!(result.stats.typed_sites[0].var, "df2");
+        assert_eq!(result.stats.typed_sites[0].schema, "S");
+        assert_eq!(result.stats.all_dataframe_calls.len(), 1);
+        assert_eq!(result.stats.all_dataframe_calls[0].cell, 2);
+        assert_eq!(result.stats.all_dataframe_calls[0].line, 1);
+        assert_eq!(result.stats.all_dataframe_calls[0].label, "pd.DataFrame");
+        assert_eq!(result.stats.leg_events.len(), 1);
+        assert_eq!(result.stats.leg_events[0].cell, 2);
+        assert_eq!(result.stats.leg_events[0].outcome, "unresolved");
+        assert_eq!(result.stats.untyped_site_usage.len(), 1);
+        assert_eq!(result.stats.untyped_site_usage[0].cell, 2);
+        assert_eq!(result.stats.untyped_site_usage[0].line, 1);
+        assert_eq!(result.stats.untyped_site_usage[0].accesses[0].column, "a");
+    }
+}

@@ -1,20 +1,52 @@
-[package]
-name = "typedframes_checker"
+[workspace]
+# `domain` is the analysis, `app` the use cases on top of it, `adapters` the ports implemented on the
+# real system, and `cli` the command line, which wires them together.
+# `python` is the PyO3 glue: PyO3's macros expand to `unsafe`, which the other crates forbid, so it is a
+# crate of its own.
+members = ["crates/domain", "crates/app", "crates/adapters", "crates/cli", "python"]
+resolver = "2"
+
+[workspace.package]
 version = "0.15.2"
 edition = "2021"
-description = "A high-performance Rust-based checker for typedframes DataFrame column schemas"
 license = "MIT"
 repository = "https://github.com/w-martin/typedframes"
 homepage = "https://github.com/w-martin/typedframes"
 documentation = "https://github.com/w-martin/typedframes"
 
-[workspace]
-# `python` is the PyO3 glue. PyO3's macros expand to `unsafe`, which this crate forbids, so it is a crate of its own.
-members = ["python"]
+[workspace.dependencies]
+typedframes_domain = { path = "crates/domain" }
+typedframes_app = { path = "crates/app" }
+typedframes_adapters = { path = "crates/adapters" }
+typedframes_cli = { path = "crates/cli" }
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_source_file = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_notebook = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+ruff_diagnostics = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+rmp-serde = "1"
+anyhow = "1.0"
+toml = { version = "1.1", features = ["preserve_order"] }
+sqlparser = { version = "0.62", default-features = false, features = ["std", "recursive-protection"] }
+clap = { version = "4.6.7", features = ["derive"] }
+tikv-jemallocator = { version = "0.7", features = ["disable_initial_exec_tls"] }
+mimalloc = { version = "0.1.52", default-features = false }
+tempfile = "3.8"
+criterion = { version = "0.8", features = ["html_reports"] }
 
-[[bin]]
-name = "typedframes"
-path = "src/main.rs"
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "warn"
+# Thresholds live in clippy.toml.
+too_many_lines = "deny"
+cognitive_complexity = "deny"
+excessive_nesting = "deny"
 
 [profile.release]
 lto = true
@@ -29,42 +61,3 @@ strip = "symbols"
 inherits = "release"
 panic = "abort"
 opt-level = "s"
-
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-unwrap_used = "warn"
-
-[dependencies]
-ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
-ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
-ruff_source_file = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
-ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
-ruff_notebook = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
-ruff_diagnostics = { git = "https://github.com/astral-sh/ruff", tag = "0.16.2" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
-rmp-serde = "1"
-anyhow = "1.0"
-toml = { version = "1.1", features = ["preserve_order"] }
-sqlparser = { version = "0.62", default-features = false, features = ["std", "recursive-protection"] }
-clap = { version = "4.6.7", features = ["derive"] }
-# The allocator split ruff and ty use: jemalloc where it builds, mimalloc on Windows (jemalloc
-# has no MSVC support), the platform allocator elsewhere. Keep the `cfg`s in `src/lib.rs` in
-# step with these. jemalloc is tuned for a short run on many threads in `../.cargo/config.toml`.
-[target.'cfg(all(not(target_os = "windows"), not(target_os = "openbsd"), not(target_os = "aix"), not(target_os = "android"), any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64", target_arch = "riscv64")))'.dependencies]
-# No initial-exec TLS: that model fails to `dlopen` into a process that did not link jemalloc at start (the extension module).
-tikv-jemallocator = { version = "0.7", features = ["disable_initial_exec_tls"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-mimalloc = { version = "0.1.52", default-features = false }
-
-[dev-dependencies]
-tempfile = "3.8"
-criterion = { version = "0.8", features = ["html_reports"] }
-
-[[bench]]
-name = "parser_bench"
-harness = false

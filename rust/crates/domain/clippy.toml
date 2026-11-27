@@ -1,0 +1,37 @@
+# Clippy reads only the nearest clippy.toml, so the workspace thresholds are repeated here.
+too-many-lines-threshold = 80
+cognitive-complexity-threshold = 25
+excessive-nesting-threshold = 5
+
+# The analysis reaches files, the environment and processes only through `ports`.
+disallowed-methods = [
+    { path = "std::fs::read", reason = "read files through ports::FileSystem" },
+    { path = "std::fs::read_to_string", reason = "read files through ports::FileSystem" },
+    { path = "std::fs::read_dir", reason = "list directories through ports::FileSystem" },
+    { path = "std::fs::metadata", reason = "stat files through ports::FileSystem" },
+    { path = "std::fs::canonicalize", reason = "canonicalize through ports::FileSystem" },
+    { path = "std::fs::write", reason = "the analysis does not write files" },
+    { path = "std::fs::create_dir_all", reason = "the analysis does not write files" },
+    { path = "std::fs::remove_file", reason = "the analysis does not write files" },
+    { path = "std::fs::rename", reason = "the analysis does not write files" },
+    { path = "std::path::Path::exists", reason = "check paths through ports::FileSystem" },
+    { path = "std::path::Path::is_file", reason = "check paths through ports::FileSystem" },
+    { path = "std::path::Path::is_dir", reason = "check paths through ports::FileSystem" },
+    { path = "std::path::Path::canonicalize", reason = "canonicalize through ports::FileSystem" },
+    { path = "std::path::Path::read_dir", reason = "list directories through ports::FileSystem" },
+    { path = "std::path::Path::metadata", reason = "stat files through ports::FileSystem" },
+    { path = "std::env::var", reason = "configuration arrives from the caller" },
+    { path = "std::env::var_os", reason = "configuration arrives from the caller" },
+    { path = "std::env::current_dir", reason = "use ports::FileSystem::current_dir" },
+]
+disallowed-types = [
+    { path = "std::fs::File", reason = "read files through ports::FileSystem" },
+    { path = "std::process::Command", reason = "the analysis runs no processes" },
+]
+disallowed-macros = [
+    { path = "std::println", reason = "the analysis returns results; the cli prints them" },
+    { path = "std::eprintln", reason = "the analysis returns results; the cli prints them" },
+    { path = "std::print", reason = "the analysis returns results; the cli prints them" },
+    { path = "std::eprint", reason = "the analysis returns results; the cli prints them" },
+    { path = "std::dbg", reason = "debug output does not ship" },
+]

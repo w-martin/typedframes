@@ -555,7 +555,15 @@ def ensure_release_build(project_root: Path) -> None:
     """
     print("Building the typedframes executable in release mode...", flush=True)
     result = subprocess.run(
-        ["uv", "run", "maturin", "develop", "--release", "--manifest-path", str(project_root / "rust" / "Cargo.toml")],
+        [
+            "uv",
+            "run",
+            "maturin",
+            "develop",
+            "--release",
+            "--manifest-path",
+            str(project_root / "rust" / "crates" / "cli" / "Cargo.toml"),
+        ],
         cwd=project_root,
         capture_output=True,
         text=True,

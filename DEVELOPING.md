@@ -67,6 +67,11 @@ Runs all linters:
 - `complexipy` - Complexity checking on `src/` (fails a function above 50); a separate,
   stricter mccabe check runs inside `ruff check` (fails above 10) and covers both `src/`
   and `rust/`'s Python-facing glue
+- `cargo fmt` and `cargo clippy` - Rust formatting and linting. Clippy denies a function longer
+  than 80 lines, a cognitive complexity above 25 and nesting deeper than 5 (`rust/clippy.toml`),
+  and, in the domain and app crates, any file, environment, process or console access
+  (`rust/crates/{domain,app}/clippy.toml`)
+- A length check that fails any Rust file, tests included, over 500 lines
 
 ### Fix Linting Issues
 
@@ -88,11 +93,11 @@ build fails.
 The Rust tests can also be run on their own:
 
 ```shell
-cd rust && cargo test
+cd rust && cargo test --workspace
 ```
 
 The Rust tests need no Python. They include end-to-end tests of the `typedframes` command
-(`rust/tests/cli.rs`).
+(`rust/crates/cli/tests/cli/`).
 
 ### Verify Licenses
 
@@ -144,6 +149,21 @@ This project requires 100% branch coverage. The coverage configuration excludes:
 - `TYPE_CHECKING` blocks
 - `raise NotImplementedError` statements
 - Lines marked with `# pragma: no cover`
+
+## Rust crates
+
+`rust/` is a Cargo workspace laid out as ports and adapters:
+
+- `crates/domain` (`typedframes_domain`) - the analysis: parsing, column inference, checks,
+  suggestions and bug-report snippets. It reaches files and the index cache only through the
+  traits in `ports.rs`.
+- `crates/app` (`typedframes_app`) - the use cases: checking a project in parallel and applying
+  suggestions, over the same ports.
+- `crates/adapters` (`typedframes_adapters`) - the ports implemented on the real system: the
+  file system, the on-disk index cache, git and the environment.
+- `crates/cli` (`typedframes_cli`) - the `typedframes` command, which wires the adapters into the
+  use cases.
+- `python` - the extension module, which runs the same command in-process.
 
 ## Building the `typedframes` executable
 

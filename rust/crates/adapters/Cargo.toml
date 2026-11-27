@@ -1,0 +1,18 @@
+[package]
+name = "typedframes_adapters"
+description = "The typedframes ports implemented on the real system: the file system, the index cache, git and the environment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+typedframes_domain.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

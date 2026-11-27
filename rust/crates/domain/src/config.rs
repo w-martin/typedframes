@@ -1,0 +1,387 @@
+//! `pyproject.toml` `[tool.typedframes]` configuration loading and project-root
+//! discovery.
+
+use std::path::{Path, PathBuf};
+
+// Root deserialisation target for `pyproject.toml`.
+#[derive(serde::Deserialize)]
+struct Config {
+    tool: Option<ToolConfig>,
+}
+
+// `[tool]` section of `pyproject.toml`.
+#[derive(serde::Deserialize)]
+struct ToolConfig {
+    typedframes: Option<LinterConfig>,
+}
+
+// `[tool.typedframes]` configuration block.
+// All fields are optional; absent keys default as documented on each field.
+#[derive(serde::Deserialize)]
+pub struct LinterConfig {
+    pub enabled: Option<bool>,         // default: true
+    pub(crate) warnings: Option<bool>, // default: true
+    // Dialect name used to fold unquoted SQL identifier case when inferring columns
+    // from a literal SELECT list (e.g. "snowflake", "postgres", "bigquery"). Unknown or
+    // absent values fall back to `SqlDialect::Generic` (no folding) — see
+    // `SqlDialect::from_config_str`.
+    pub(crate) sql_dialect: Option<String>,
+    // Explicit allowlist of installed (non-project) package names whose own
+    // Annotated[...]/BaseSchema declarations and recognized transform patterns should
+    // be indexed the same way first-party files are -- e.g. an internal company
+    // package that wraps a SQL connector. Resolved from the project's own auto-detected
+    // `.venv` site-packages directory (see `find_site_packages_dir`); no editable-install
+    // support and no path override in this version. Deliberately an explicit allowlist
+    // rather than indexing all of site-packages, which would be both expensive and a
+    // much larger, unbounded trust surface.
+    pub(crate) trace_external_packages: Option<Vec<String>>,
+    // Opt-out counterpart to the default-on candidate tracing (see
+    // `discover_external_package_candidates` in index.rs): a package named here is
+    // never traced, even if the project's own code calls it in a way that looks
+    // DataFrame-shaped. Does NOT affect `trace_external_packages` -- an explicit
+    // force-include there always wins, since naming a package in both lists is a
+    // contradiction the user should resolve, not one this checker should silently
+    // arbitrate.
+    pub(crate) excluded_external_packages: Option<Vec<String>>,
+    // Directory names to prune when collecting `.py` files. When set, REPLACES the
+    // built-in default set (`DEFAULT_EXCLUDED_DIRS` -- `.git`, `.venv`, `node_modules`,
+    // `__pycache__`, `.claude`, etc.) entirely rather than adding to it, matching
+    // ruff's own `exclude` (as opposed to `extend-exclude`, which this checker doesn't
+    // have a separate option for) -- an explicit `exclude = []` means "prune nothing
+    // at all", a deliberate override, not "nothing configured". Matches by bare
+    // directory name, not a path/glob pattern. The Python CLI's own file collector
+    // (`_collect_python_files` in cli.py) reads this same key independently via
+    // `tomllib`, so both collectors stay in sync from one config value.
+    pub(crate) exclude: Option<Vec<String>>,
+}
+
+impl LinterConfig {
+    pub const EMPTY: Self = Self {
+        enabled: None,
+        warnings: None,
+        sql_dialect: None,
+        trace_external_packages: None,
+        excluded_external_packages: None,
+        exclude: None,
+    };
+}
+
+// Read `[tool.typedframes]` from `pyproject.toml` at `project_root`.
+// Returns a config with all fields `None` if the file is absent, unreadable, or has no
+// `[tool.typedframes]` section; callers use `.unwrap_or(true)` on each field.
+pub fn load_linter_config(fs: &dyn crate::ports::FileSystem, project_root: &Path) -> LinterConfig {
+    let config_path = project_root.join("pyproject.toml");
+    if !fs.exists(&config_path) {
+        return LinterConfig::EMPTY;
+    }
+
+    let content = match fs.read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return LinterConfig::EMPTY,
+    };
+
+    let config: Config = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return LinterConfig::EMPTY,
+    };
+
+    config
+        .tool
+        .and_then(|t| t.typedframes)
+        .unwrap_or(LinterConfig::EMPTY)
+}
+
+/// Return `true` if the linter is enabled for `project_root` (default: `true`).
+pub fn is_enabled(fs: &dyn crate::ports::FileSystem, project_root: &Path) -> bool {
+    load_linter_config(fs, project_root).enabled.unwrap_or(true)
+}
+
+/// Walk up the directory tree from `start_path` until a `pyproject.toml` is found.
+///
+/// Returns `None` when no `pyproject.toml` exists anywhere in the ancestor chain --
+/// i.e. there is no project root to speak of (a standalone script in a scratch
+/// directory, a file under `/tmp`, ...). Callers that need a best-effort directory
+/// regardless should use [`find_project_root`], which substitutes `start_path`.
+///
+/// `pyproject.toml` is the ONE project-root marker this checker recognises, and it is
+/// deliberately the same marker used everywhere else: `load_linter_config` reads
+/// `[tool.typedframes]` out of it, and `find_site_packages_dir` looks for `.venv`
+/// beside it. Single-file and directory checks must agree on where the root is, or the
+/// same file would resolve its imports differently depending on how it was checked.
+pub fn find_project_root_opt(
+    fs: &dyn crate::ports::FileSystem,
+    start_path: &Path,
+) -> Option<PathBuf> {
+    let mut current = start_path.to_path_buf();
+    if fs.is_file(&current) {
+        current.pop();
+    }
+    loop {
+        if fs.exists(&current.join("pyproject.toml")) {
+            // `current.pop()` can walk `current` all the way down to the empty
+            // `PathBuf` (when `start_path` was relative and its project root is the
+            // CWD itself). The empty PathBuf is a valid *join* target (joining onto
+            // it is a no-op) but `fs::canonicalize("")` errors -- unlike
+            // `fs::canonicalize(".")`, which resolves to the CWD -- so normalize here
+            // to keep that invariant for every caller that canonicalizes the root.
+            return Some(if current.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                current
+            });
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Walk up the directory tree from `start_path` until a `pyproject.toml` is found.
+///
+/// Returns the directory containing `pyproject.toml`, or `start_path` itself if no
+/// `pyproject.toml` exists anywhere in the ancestor chain (e.g. standalone scripts).
+pub fn find_project_root(fs: &dyn crate::ports::FileSystem, start_path: &Path) -> PathBuf {
+    find_project_root_opt(fs, start_path).unwrap_or_else(|| start_path.to_path_buf())
+}
+
+/// The directory Python would put on `sys.path` to import `path` as written: the nearest
+/// ancestor that is not itself a package (has no `__init__.py`). For a script in a flat
+/// directory that is its own directory, as `python script.py` sees it.
+pub(crate) fn package_root(fs: &dyn crate::ports::FileSystem, path: &Path) -> PathBuf {
+    let mut dir = if fs.is_dir(path) {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf).unwrap_or_default()
+    };
+    while fs.is_file(&dir.join("__init__.py")) {
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => dir = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir
+    }
+}
+
+/// `package_root` answers by directory, so files sharing a package share one walk up the tree.
+#[derive(Default)]
+pub struct PackageRoots(std::sync::RwLock<std::collections::HashMap<PathBuf, PathBuf>>);
+
+impl PackageRoots {
+    /// `package_root(file)` for a path that is a file.
+    pub fn of_file(&self, fs: &dyn crate::ports::FileSystem, file: &Path) -> PathBuf {
+        let mut walked = Vec::new();
+        let mut current = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let root = loop {
+            if let Some(known) = self.0.read().ok().and_then(|m| m.get(&current).cloned()) {
+                break known;
+            }
+            walked.push(current.clone());
+            if !fs.is_file(&current.join("__init__.py")) {
+                break current;
+            }
+            match current.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+                _ => break current,
+            }
+        };
+        let root = if root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            root
+        };
+        if let Ok(mut memo) = self.0.write() {
+            for dir in walked {
+                memo.insert(dir, root.clone());
+            }
+        }
+        root
+    }
+}
+
+/// The root imports are resolved against: the `pyproject.toml` directory, else the
+/// [`package_root`] of `path`.
+pub fn import_root(fs: &dyn crate::ports::FileSystem, path: &Path) -> PathBuf {
+    find_project_root_opt(fs, path).unwrap_or_else(|| package_root(fs, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ports::test_files::OsFiles;
+    use std::fs;
+    #[test]
+    fn test_should_cache_package_roots_without_changing_the_answer() {
+        // arrange
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for package in ["pkg", "pkg/sub", "pkg/sub/deep"] {
+            std::fs::create_dir_all(root.join(package)).unwrap();
+            std::fs::write(root.join(package).join("__init__.py"), "").unwrap();
+        }
+        std::fs::create_dir_all(root.join("loose")).unwrap();
+        let files = [
+            "pkg/sub/deep/mod.py",
+            "pkg/sub/other.py",
+            "pkg/top.py",
+            "loose/script.py",
+        ];
+        let roots = PackageRoots::default();
+
+        // act / assert: the first call walks, the second is answered from the cache
+        for _ in 0..2 {
+            for file in files {
+                let path = root.join(file);
+                std::fs::write(&path, "").unwrap();
+                assert_eq!(
+                    package_root(&OsFiles, &path),
+                    roots.of_file(&OsFiles, &path),
+                    "{file}"
+                );
+            }
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_find_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sub = root.join("a/b/c");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+
+        assert_eq!(find_project_root(&OsFiles, &sub), root);
+        assert_eq!(find_project_root(&OsFiles, root), root);
+    }
+
+    #[test]
+    fn test_find_project_root_opt_reports_when_there_is_no_root_at_all() {
+        // arrange: a directory tree with no pyproject.toml anywhere above it. The
+        // best-effort `find_project_root` still has to return *something*, which is
+        // exactly why the Option-returning variant exists -- a caller that needs to
+        // skip gracefully (single-file indexing) can't tell "root found" from "gave
+        // up and handed back the start path" through the infallible one.
+        let temp = tempfile::tempdir().unwrap();
+        let sub = temp.path().join("a/b/c");
+        fs::create_dir_all(&sub).unwrap();
+
+        // act / assert -- no pyproject.toml exists in the tempdir, but a real one may
+        // well exist further up (e.g. checked-out under a repo), so only assert the
+        // agreement between the two functions rather than an absolute None.
+        match find_project_root_opt(&OsFiles, &sub) {
+            Some(found) => assert_eq!(find_project_root(&OsFiles, &sub), found),
+            None => assert_eq!(find_project_root(&OsFiles, &sub), sub),
+        }
+
+        // A root that genuinely exists is reported as Some(that root).
+        fs::write(temp.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(
+            find_project_root_opt(&OsFiles, &sub),
+            Some(temp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn test_is_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Case 1: No pyproject.toml -> enabled by default
+        assert!(is_enabled(&OsFiles, root));
+
+        // Case 2: pyproject.toml without tool section -> enabled by default
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.something]\nenabled = false",
+        )
+        .unwrap();
+        assert!(is_enabled(&OsFiles, root));
+
+        // Case 3: pyproject.toml with tool.typedframes.enabled = false
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = false",
+        )
+        .unwrap();
+        assert!(!is_enabled(&OsFiles, root));
+
+        // Case 4: pyproject.toml with tool.typedframes.enabled = true
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = true",
+        )
+        .unwrap();
+        assert!(is_enabled(&OsFiles, root));
+    }
+
+    #[test]
+    fn test_load_linter_config_reads_sql_dialect() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Absent entirely -> None, so `with_context` leaves the dialect at its
+        // Generic default rather than overwriting it.
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = true",
+        )
+        .unwrap();
+        assert_eq!(load_linter_config(&OsFiles, root).sql_dialect, None);
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nsql_dialect = \"snowflake\"",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(&OsFiles, root).sql_dialect,
+            Some("snowflake".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_linter_config_reads_exclude_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexclude = [\".claude\", \"vendor\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(&OsFiles, root).exclude,
+            Some(vec![".claude".to_string(), "vendor".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_load_linter_config_reads_excluded_external_packages() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nenabled = true",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(&OsFiles, root).excluded_external_packages,
+            None
+        );
+
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.typedframes]\nexcluded_external_packages = [\"huge_untrusted_pkg\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            load_linter_config(&OsFiles, root).excluded_external_packages,
+            Some(vec!["huge_untrusted_pkg".to_string()])
+        );
+    }
+}

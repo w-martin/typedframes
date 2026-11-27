@@ -42,7 +42,7 @@ polars = ["polars>=1.0"]
 mypy = ["mypy"]
 
 [tool.maturin]
-manifest-path = "rust/Cargo.toml"
+manifest-path = "rust/crates/cli/Cargo.toml"
 python-source = "src"
 # The wheel carries the Rust `typedframes` executable (installed as a script) next to the Python package.
 bindings = "bin"

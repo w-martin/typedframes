@@ -1178,7 +1178,7 @@ the names the code uses. In what the checker decided, a list of masked column na
 count ("only 3 columns are read later").
 
 *Kept as written:* the names Python itself defines, `pd`, `pl` and `np`, and the public names of the
-numpy, pandas and polars versions installed when the list was generated (`rust/src/library_names.txt`,
+numpy, pandas and polars versions installed when the list was generated (`rust/crates/domain/src/library_names.txt`,
 regenerated with `inv names`). A library name stays only after a dot (`np.percentile`, `.groupby`) or as
 a call keyword (`.fillna(value=...)`); a bare name stays only if a kept import brought it in
 (`from pandas import DataFrame`). Names you define (`def`, `class`) and bare variables are always

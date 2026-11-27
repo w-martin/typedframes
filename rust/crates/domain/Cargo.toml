@@ -1,0 +1,34 @@
+[package]
+name = "typedframes_domain"
+description = "The typedframes analysis: column inference and checking for pandas and polars DataFrames"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruff_python_parser.workspace = true
+ruff_python_ast.workspace = true
+ruff_source_file.workspace = true
+ruff_text_size.workspace = true
+ruff_notebook.workspace = true
+ruff_diagnostics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+anyhow.workspace = true
+toml.workspace = true
+sqlparser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "parser_bench"
+harness = false

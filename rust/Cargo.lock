@@ -1466,13 +1466,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
-name = "typedframes_checker"
+name = "typedframes_adapters"
+version = "0.15.2"
+dependencies = [
+ "tempfile",
+ "typedframes_domain",
+]
+
+[[package]]
+name = "typedframes_app"
+version = "0.15.2"
+dependencies = [
+ "ruff_notebook",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "typedframes_adapters",
+ "typedframes_domain",
+]
+
+[[package]]
+name = "typedframes_cli"
+version = "0.15.2"
+dependencies = [
+ "clap",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tikv-jemallocator",
+ "toml",
+ "typedframes_adapters",
+ "typedframes_app",
+ "typedframes_domain",
+]
+
+[[package]]
+name = "typedframes_domain"
 version = "0.15.2"
 dependencies = [
  "anyhow",
- "clap",
  "criterion",
- "mimalloc",
  "rmp-serde",
  "ruff_diagnostics",
  "ruff_notebook",
@@ -1484,7 +1518,6 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tempfile",
- "tikv-jemallocator",
  "toml",
 ]
 
@@ -1494,7 +1527,7 @@ version = "0.15.2"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
- "typedframes_checker",
+ "typedframes_cli",
 ]
 
 [[package]]

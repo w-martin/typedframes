@@ -12,15 +12,18 @@ from typing import Any
 from warnings import catch_warnings, simplefilter
 from zipfile import ZipFile
 
-from invoke import Context, task
+from invoke import Context, Exit, task
 
 RUST_DIR = Path("rust")
-LIBRARY_NAMES = RUST_DIR / "src" / "library_names.txt"
+CRATES_DIR = RUST_DIR / "crates"
+CLI_MANIFEST = CRATES_DIR / "cli" / "Cargo.toml"
+LIBRARY_NAMES = CRATES_DIR / "domain" / "src" / "library_names.txt"
 PACKAGE_DIR = Path("src") / "typedframes"
 EXAMPLES_DIR = Path("examples")
 TARGET_DIR = Path(environ.get("CARGO_TARGET_DIR", RUST_DIR / "target"))
 EXTENSION_BUILD_DIR = TARGET_DIR / "extension"
 EXTENSION_SUFFIXES = {".so", ".pyd"}
+MAX_RUST_FILE_LINES = 500
 
 
 def _installed_binary() -> Path | None:
@@ -66,14 +69,11 @@ def _needs_build() -> bool:
         return True
 
     built = min(binary.stat().st_mtime, *(extension.stat().st_mtime for extension in extensions))
-    src_dir = RUST_DIR / "src"
+    crates = [*sorted(CRATES_DIR.iterdir()), RUST_DIR / "python"]
     sources = [
-        *src_dir.rglob("*.rs"),
-        *src_dir.rglob("*.txt"),
-        *(RUST_DIR / "python").glob("src/*.rs"),
-        RUST_DIR / "python" / "build.rs",
+        *(path for crate in crates for path in (crate / "src").rglob("*") if path.suffix in {".rs", ".txt"}),
+        *(crate / name for crate in crates for name in ("build.rs", "Cargo.toml")),
         RUST_DIR / "Cargo.toml",
-        RUST_DIR / "python" / "Cargo.toml",
         RUST_DIR / "Cargo.lock",
     ]
     return any(source.exists() and source.stat().st_mtime > built for source in sources)
@@ -85,7 +85,7 @@ def build(ctx: Context, *, force: bool = False) -> None:
     if force or _needs_build():
         print("Building Rust checker...")
         _stage_extension(ctx, release=False)
-        ctx.run("maturin develop --manifest-path rust/Cargo.toml")
+        ctx.run(f"maturin develop --manifest-path {CLI_MANIFEST}")
     else:
         print("Rust checker is up to date.")
 
@@ -216,7 +216,7 @@ def _library_names() -> tuple[set[str], set[str], set[str]]:
 def names(_ctx: Context) -> None:
     """Regenerate the library names a bug-report snippet may keep, from the installed numpy, pandas and polars.
 
-    Each line of `rust/src/library_names.txt` is `m<name>` (a name numpy, pandas or polars defines
+    Each line of `rust/crates/domain/src/library_names.txt` is `m<name>` (a name numpy, pandas or polars defines
     in a module), `a<name>` (a class or instance member) or `k<name>` (a parameter name). The
     redactor keeps them only after a dot or as call keywords; names the libraries merely import
     (`os`, `json`) and single letters are left out.
@@ -250,9 +250,16 @@ def format_code(ctx: Context) -> None:
     ctx.run("ruff format .")
 
 
+def _long_rust_files() -> list[tuple[Path, int]]:
+    """Rust sources, tests included, longer than `MAX_RUST_FILE_LINES`."""
+    sources = [*(CRATES_DIR.rglob("*.rs")), *((RUST_DIR / "python").rglob("*.rs"))]
+    counts = [(path, len(path.read_text(encoding="utf-8").splitlines())) for path in sorted(sources)]
+    return [(path, count) for path, count in counts if count > MAX_RUST_FILE_LINES]
+
+
 @task
 def lint(ctx: Context) -> None:
-    """Run all linters: ruff check, ty check, bandit, complexipy, cargo fmt, cargo clippy."""
+    """Run all linters: ruff check, ty check, bandit, complexipy, cargo fmt, cargo clippy, Rust file length."""
     ctx.run("ruff check .")
     ctx.run("ty check .")
     ctx.run("bandit -r src/ -c pyproject.toml")
@@ -261,6 +268,11 @@ def lint(ctx: Context) -> None:
     ctx.run(f"cd {RUST_DIR} && cargo fmt --all -- --check")
     print("Running Rust clippy...")
     ctx.run(f"cd {RUST_DIR} && cargo clippy --workspace -- -D warnings")
+    print(f"Checking Rust files are at most {MAX_RUST_FILE_LINES} lines...")
+    if long_files := _long_rust_files():
+        listing = "\n".join(f"  {path}: {count} lines" for path, count in long_files)
+        message = f"Rust files over {MAX_RUST_FILE_LINES} lines:\n{listing}"
+        raise Exit(message, code=1)
 
 
 @task

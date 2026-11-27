@@ -24,7 +24,7 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: Rust clippy
-        entry: bash -c 'cd rust && cargo clippy -- -D warnings'
+        entry: bash -c 'cd rust && cargo clippy --workspace -- -D warnings'
         language: system
         files: \.rs$
         pass_filenames: false
